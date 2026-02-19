@@ -72,9 +72,6 @@ class Core:
         self.firm1_mode = firm1_mode
         self.firm2_mode = firm2_mode
 
-        self.firm1 = FirmHeuristicPricer(seed=seed) if firm1_mode == "heuristic" else FirmStaticPricer()
-        self.firm2 = FirmHeuristicPricer(seed=seed + 1) if firm2_mode == "heuristic" else FirmStaticPricer()
-
         # apply static overrides (if any)
         f1_vals = _parse_kv_floats(firm1_static_values)
         f2_vals = _parse_kv_floats(firm2_static_values)
@@ -87,6 +84,9 @@ class Core:
         # last batch summaries (optional; can be logged)
         self.airport_rate_last = self.market.airport_prob
         self.mean_distance_last = 4.0
+        
+        self.opt_keys = ["base_fare", "per_minute"]
+        
 
     @staticmethod
     def estimate_duration(miles: float, hod: int) -> float:
