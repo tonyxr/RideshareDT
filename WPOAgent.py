@@ -113,6 +113,9 @@ class WassersteinWPOAgent:
     @torch.no_grad()
     def act(self, s_np: np.ndarray) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         s = torch.tensor(s_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+        expected_dim = self.net.trunk[0].in_features
+        if s.shape[-1] != expected_dim:
+            raise ValueError(f"State dim mismatch: got {s.shape[-1]}, expected {expected_dim}")
         logits, value = self.net(s)
         dist = torch.distributions.Categorical(logits=logits)
         a = dist.sample()

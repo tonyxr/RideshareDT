@@ -141,8 +141,9 @@ class FirmRLPricer:
         self.config = default_specs_for(opt_keys)
         self.overrides = CoefficientOverrides()
         
-        # State: 11 context features + length of optimized coefficients
-        state_dim = 11 + len(opt_keys)
+        self.step_scale = 0.5
+        # State: 10 context features + length of optimized coefficients
+        state_dim = 10 + len(opt_keys)
         action_dim = 3 # 0: Decrease, 1: No-op, 2: Increase
         
         # Initialize Agent
@@ -156,7 +157,7 @@ class FirmRLPricer:
         """Maps the discrete RL action to coefficient updates."""
         for key in self.opt_keys:
             current_val = getattr(self.overrides, key) or 1.0 
-            step = self.config.step[key]
+            step = self.config.step[key] * self.step_scale
             
             if action == 0: # Decrease
                 new_val = current_val - step
