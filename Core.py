@@ -19,6 +19,10 @@ from typing import Dict, Any, List, Tuple
 import numpy as np
 import torch
 
+import importlib.util
+import os
+from collections import Counter
+
 from MarketInteraction import MarketInteraction, RideContext
 from Market_models import CoefficientOverrides
 from GenerateAgent import GenerateAgent
@@ -108,6 +112,8 @@ class Core:
         
         self.training_logs = []
         self.evaluation_logs = []
+        
+        self.run_logs = []
         
 
     @staticmethod
@@ -342,7 +348,11 @@ class Core:
                 # RL memory + reward shaping
                 if self.firm1_mode == "RL" and rl_step is not None:
                     action, s_ts, logits, val = rl_step
-                    reward = (0.65 * m1.share) + (0.35 * np.tanh(m1.rev_per_request / 12.0))
+                    dev_penalty = (
+                        abs(float(self.firm1.overrides.base_fare) - float(base.base_fare)) / max(1e-6, float(base.base_fare))
+                        + abs(float(self.firm1.overrides.per_minute) - float(base.per_minute)) / max(1e-6, float(base.per_minute))
+                    )
+                    reward = (0.65 * m1.share) + (0.35 * np.tanh(m1.rev_per_request / 12.0)) - (0.12 * dev_penalty)
                     done = (t == timesteps_per_day - 1)
                     self.firm1.agent.store(s_ts, action, float(reward), done, None, logits, val)
 
@@ -355,13 +365,23 @@ class Core:
 
             if self.firm1_mode == "RL":
                 self.firm1.agent.update(epochs=5)
-                
+            
+            avg_share = share_sum / max(1, timesteps_per_day)
+            avg_revpr = revpr_sum / max(1, timesteps_per_day)
+            avg_gap = gap_sum / max(1, timesteps_per_day)
+            avg_reward = (0.65 * avg_share) + (0.35 * np.tanh(avg_revpr / 12.0))
+            self.run_logs.append({
+                "day": d + 1,
+                "avg_share": float(avg_share),
+                "avg_revpr": float(avg_revpr),
+                "avg_gap": float(avg_gap),
+                "avg_reward": float(avg_reward),
+            })
+            
             # print every ~10% of days
             k = max(1, days // 10)
             if (d + 1) % k == 0 or (d + 1) == 1 or (d + 1) == days:
-                avg_share = share_sum / max(1, timesteps_per_day)
-                avg_revpr = revpr_sum / max(1, timesteps_per_day)
-                avg_gap = gap_sum / max(1, timesteps_per_day)
+
                 print(
                     f"[Day {d+1}/{days}] avg_share(F1)={avg_share:.3f} avg_revPR(F1)=${avg_revpr:.2f} "
                     f"avg_gap(F2-F1)=${avg_gap:.2f}"
@@ -379,6 +399,168 @@ def _write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         w.writerows(rows)
+
+def _ensure_parent_dir(path: str) -> None:
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+
+def _write_distribution_csv(path: str, rows: List[Dict[str, Any]]) -> None:
+    counters = {
+        "DayOfWeek": Counter(),
+        "Weather": Counter(),
+        "Hour": Counter(),
+        "Airport": Counter(),
+        "Service": Counter(),
+        "Choice": Counter(),
+        "DistanceBin": Counter(),
+    }
+
+    for r in rows:
+        counters["DayOfWeek"][str(r.get("DayOfWeek"))] += 1
+        counters["Weather"][str(r.get("Weather"))] += 1
+        counters["Hour"][str(r.get("Hour"))] += 1
+        counters["Airport"][str(r.get("Airport"))] += 1
+        counters["Service"][str(r.get("Service"))] += 1
+        counters["Choice"][str(r.get("Choice"))] += 1
+
+        dist = float(r.get("TravelDistance", 0.0))
+        if dist < 2:
+            b = "0-2"
+        elif dist < 5:
+            b = "2-5"
+        elif dist < 10:
+            b = "5-10"
+        else:
+            b = "10+"
+        counters["DistanceBin"][b] += 1
+
+    total = max(1, len(rows))
+    out_rows: List[Dict[str, Any]] = []
+    for param, c in counters.items():
+        if param in {"DayOfWeek", "Hour"}:
+            sorted_items = sorted(c.items(), key=lambda kv: int(kv[0]))
+        elif param == "Airport":
+            sorted_items = sorted(c.items(), key=lambda kv: (kv[0] != "False", kv[0]))
+        else:
+            sorted_items = sorted(c.items(), key=lambda kv: kv[0])
+
+        for v, n in sorted_items:
+            out_rows.append({
+                "parameter": param,
+                "value": v,
+                "count": int(n),
+                "share": float(n / total),
+            })
+
+    _ensure_parent_dir(path)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["parameter", "value", "count", "share"])
+        w.writeheader()
+        w.writerows(out_rows)
+
+
+def _plot_reports(
+    rows: List[Dict[str, Any]],
+    run_logs: List[Dict[str, Any]],
+    training_logs: List[Dict[str, Any]],
+    evaluation_logs: List[Dict[str, Any]],
+    prefix: str,
+) -> None:
+    if importlib.util.find_spec("matplotlib") is None:
+        print("[WARN] matplotlib not installed; skipping graph generation.")
+        return
+
+    import matplotlib.pyplot as plt
+
+    _ensure_parent_dir(prefix + "_dummy")
+
+    # 1) Ride parameter distributions
+    params = ["DayOfWeek", "Weather", "Hour", "Airport", "Service", "Choice"]
+    for p in params:
+        c = Counter(str(r.get(p)) for r in rows)
+        if not c:
+            continue
+
+        if p in {"DayOfWeek", "Hour"}:
+            xs = sorted(c.keys(), key=lambda x: int(x))
+        elif p == "Airport":
+            xs = sorted(c.keys(), key=lambda x: (x != "False", x))
+        else:
+            xs = sorted(c.keys())
+
+        ys = [c[x] for x in xs]
+        plt.figure(figsize=(8, 4))
+        plt.bar(xs, ys)
+        plt.title(f"Ride Distribution by {p}")
+        plt.xlabel(p)
+        plt.ylabel("Count")
+        plt.tight_layout()
+        out = f"{prefix}_dist_{p}.png"
+        _ensure_parent_dir(out)
+        plt.savefig(out, dpi=150)
+        plt.close()
+
+    # 2) Distance histogram
+    if rows:
+        dvals = [float(r.get("TravelDistance", 0.0)) for r in rows]
+        plt.figure(figsize=(8, 4))
+        plt.hist(dvals, bins=20)
+        plt.title("Ride Distance Distribution")
+        plt.xlabel("TravelDistance")
+        plt.ylabel("Count")
+        plt.tight_layout()
+        out = f"{prefix}_dist_TravelDistance.png"
+        _ensure_parent_dir(out)
+        plt.savefig(out, dpi=150)
+        plt.close()
+
+    # 3) run reward trajectory
+    if run_logs:
+        xs = [int(r["day"]) for r in run_logs]
+        ys = [float(r["avg_reward"]) for r in run_logs]
+        plt.figure(figsize=(9, 4))
+        plt.plot(xs, ys)
+        plt.title("Run Reward Trajectory")
+        plt.xlabel("Day")
+        plt.ylabel("Reward")
+        plt.tight_layout()
+        out = f"{prefix}_reward_run.png"
+        _ensure_parent_dir(out)
+        plt.savefig(out, dpi=150)
+        plt.close()
+
+    # 4) training trajectory (run_experiment)
+    if training_logs:
+        xs = [int(r["batch"]) + 1 for r in training_logs]
+        ys = [float(r["avg_reward"]) for r in training_logs]
+        plt.figure(figsize=(9, 4))
+        plt.plot(xs, ys)
+        plt.title("Training Reward Trajectory")
+        plt.xlabel("Batch")
+        plt.ylabel("Avg Reward")
+        plt.tight_layout()
+        out = f"{prefix}_reward_training.png"
+        _ensure_parent_dir(out)
+        plt.savefig(out, dpi=150)
+        plt.close()
+
+    # 5) evaluation trajectory (run_experiment)
+    if evaluation_logs:
+        xs = [int(r["day"]) for r in evaluation_logs]
+        ys = [0.65 * float(r["rl_share"]) + 0.35 * np.tanh(float(r["rl_revenue"]) / 12.0) for r in evaluation_logs]
+        plt.figure(figsize=(9, 4))
+        plt.plot(xs, ys)
+        plt.title("Evaluation Reward Trajectory")
+        plt.xlabel("Day")
+        plt.ylabel("Reward")
+        plt.tight_layout()
+        out = f"{prefix}_reward_evaluation.png"
+        _ensure_parent_dir(out)
+        plt.savefig(out, dpi=150)
+        plt.close()
+
 
 
 def main():
@@ -399,7 +581,10 @@ def main():
     parser.add_argument("--firm2_static_values", type=str, default="")
 
     parser.add_argument("--pool", type=int, default=20000, help="Static customer pool size.")
-
+    
+    parser.add_argument("--report_prefix", type=str, default="artifacts/report")
+    parser.add_argument("--run_experiment", action="store_true", help="Run 100-day train + 50-day eval study")
+    
     args = parser.parse_args()
 
     core = Core(
@@ -414,9 +599,26 @@ def main():
         total_customers_pool=args.pool,
     )
 
-    rows = core.run(days=args.days, timesteps_per_day=args.timesteps, customers_per_step=args.customers)
-    _write_csv(args.out, rows)
-    print(f"Saved -> {args.out}")
+    if args.run_experiment:
+        core.run_experiment()
+        rows = []
+    else:
+        rows = core.run(days=args.days, timesteps_per_day=args.timesteps, customers_per_step=args.customers)
+        _write_csv(args.out, rows)
+        print(f"Saved -> {args.out}")
+
+    if rows:
+        dist_csv = f"{args.report_prefix}_ride_distributions.csv"
+        _write_distribution_csv(dist_csv, rows)
+        print(f"Saved -> {dist_csv}")
+
+    _plot_reports(
+        rows=rows,
+        run_logs=core.run_logs,
+        training_logs=core.training_logs,
+        evaluation_logs=core.evaluation_logs,
+        prefix=args.report_prefix,
+    )
 
 
 if __name__ == "__main__":
