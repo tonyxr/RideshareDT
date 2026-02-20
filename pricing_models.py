@@ -23,10 +23,6 @@ class FirmMetrics:
     revenue: float = 0.0
     wins: int = 0
     total: int = 0
-    
-    def __init__(self, share: float, rev_per_request: float):
-        self.share = share
-        self.rev_per_request = rev_per_request
 
     @property
     def share(self) -> float:
@@ -44,6 +40,9 @@ class FirmStaticPricer:
     def act(self, **kwargs) -> None:
         # no-op: coefficients remain fixed
         return
+    
+    def update(self, *args, **kwargs) -> None:
+        pass
 
 class FirmHeuristicPricer:
     """

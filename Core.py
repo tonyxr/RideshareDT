@@ -88,8 +88,18 @@ class Core:
         self.mean_distance_last = 4.0
         
         self.opt_keys = ["base_fare", "per_minute"]
-        self.firm1 = FirmRLPricer(seed=seed, opt_keys=self.opt_keys)
-        self.firm2 = FirmHeuristicPricer(seed=seed + 1)
+        
+        if firm1_mode == "RL":
+            self.firm1 = FirmRLPricer(seed = seed, opt_keys = self.opt_keys)
+        elif firm1_mode == "heuristic":
+            self.firm1 = FirmHeuristicPricer(seed = seed)
+        else:
+            self.firm1 = FirmStaticPricer()
+            
+        if firm2_mode == "heuristic":
+            self.firm2 = FirmHeuristicPricer(seed=seed + 1)
+        else:
+            self.firm2 = FirmStaticPricer()
         
         self.training_logs = []
         self.evaluation_logs = []
