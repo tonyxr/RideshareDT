@@ -161,9 +161,9 @@ class WassersteinWPOAgent:
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         return adv, ret
 
-    def update(self, epochs: int = 5, batch_size: int = 256):
+    def update(self, epochs: int = 5, batch_size: int = 256) -> dict:
         if len(self.buf) == 0:
-            return
+            return {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "wdist": 0.0, "entropy": 0.0}
 
         adv, ret = self._gae()
 
@@ -173,9 +173,14 @@ class WassersteinWPOAgent:
         p_old = torch.softmax(OLD_LOGITS, dim=-1).detach()
 
         N = S.size(0)
-        idx = torch.randperm(N, device=self.device)
+        last_loss = 0.0
+        last_policy = 0.0
+        last_value = 0.0
+        last_wdist = 0.0
+        last_entropy = 0.0
 
         for _ in range(epochs):
+            idx = torch.randperm(N, device=self.device)
             for start in range(0, N, batch_size):
                 j = idx[start:start + batch_size]
                 s_b = S[j]
@@ -205,5 +210,18 @@ class WassersteinWPOAgent:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
                 self.opt.step()
+                
+                last_loss = float(loss.item())
+                last_policy = float(policy_loss.item())
+                last_value = float(value_loss.item())
+                last_wdist = float(wdist.item())
+                last_entropy = float(entropy.item())
 
         self.buf.clear()
+        return {
+            "loss": last_loss,
+            "policy_loss": last_policy,
+            "value_loss": last_value,
+            "wdist": last_wdist,
+            "entropy": last_entropy,
+        }

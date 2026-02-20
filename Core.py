@@ -133,13 +133,15 @@ class Core:
                 batch_reward += m1.share
             
             # Optimization step: Update RL policy using the 5-day batch data
-            metrics = self.firm1.agent.update(epochs=5)
+            metrics = {"loss": 0.0}
+            if self.firm1_mode == "RL":
+                metrics = self.firm1.agent.update(epochs=5)
             
             avg_reward = batch_reward / 5
             self.training_logs.append({
                 "batch": batch_idx, 
                 "avg_reward": avg_reward,
-                "loss": metrics.get("loss", 0)
+                "loss": metrics.get("loss", 0.0)
             })
             print(f"Batch {batch_idx+1}/20 complete. Avg Share: {avg_reward:.2f}")
 
@@ -162,39 +164,51 @@ class Core:
     def simulate_day_cycle(self, day_ctx, rides, is_training):
         """Runs a 200-ride cycle for a single day."""
         # 1. Encode Market State
-        s_vec = build_state_vector(
+        hour = 12
+        base = self.market.curr_market
+
+        rl_step = None
+        if self.firm1_mode == "RL":
+            s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
+            action, s_ts, logits, val = self.firm1.agent.act(s_vec)
+            self.firm1.apply_action(action)
+            rl_step = (action, s_ts, logits, val)
+        elif self.firm1_mode == "heuristic":
+            self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+
+        if self.firm2_mode == "heuristic":
+            self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+
+        results, m1, m2, gap, air, dist = self.simulate_batch(day_ctx.day_of_week, day_ctx.weather, hour, rides)
+
+        if is_training and self.firm1_mode == "RL" and rl_step is not None:
+            action, s_ts, logits, val = rl_step
+            reward = (0.65 * m1.share) + (0.35 * np.tanh(m1.rev_per_request / 12.0))
+            self.firm1.agent.store(s_ts, action, float(reward), True, None, logits, val)
+
+        self.airport_rate_last = air
+        self.mean_distance_last = dist
+
+        return results, m1, m2
+    
+    def _build_rl_state(self, day_of_week: int, hour: int, weather: str) -> np.ndarray:
+        """Build state vector for Firm1 RL controller from current market + recent summaries."""
+        f2_ema_share = getattr(self.firm2, "ema_share", 0.5)
+        f2_ema_gap = getattr(self.firm2, "ema_gap", 0.0)
+        f2_cooldown = float(getattr(self.firm2, "cooldown", 0.0))
+        return build_state_vector(
             base=self.market.curr_market,
             ov_firm1=self.firm1.overrides,
             opt_keys=self.opt_keys,
-            day_of_week=day_ctx.day_of_week,
-            hour=12, # Noon reference
-            weather=day_ctx.weather,
-            airport_rate_last=0.15,
-            mean_distance_last=4.0,
-            firm2_ema_share=self.firm2.ema_share,
-            firm2_ema_gap=0.0,
-            firm2_cooldown=0.0
+            day_of_week=day_of_week,
+            hour=hour,
+            weather=weather,
+            airport_rate_last=self.airport_rate_last,
+            mean_distance_last=self.mean_distance_last,
+            firm2_ema_share=float(f2_ema_share),
+            firm2_ema_gap=float(f2_ema_gap),
+            firm2_cooldown=f2_cooldown,
         )
-        
-        # 2. RL Agent Action (Firm 1)
-        action, s_ts, logits, val = self.firm1.agent.act(s_vec)
-        self.firm1.apply_action(action)
-        
-        # 3. Heuristic Action (Firm 2)
-        self.firm2.act(self.market.curr_market) 
-
-        # 4. Run the simulation batch
-        results, m1, m2, gap, air, dist = self.simulate_batch(
-            day_ctx.day_of_week, day_ctx.weather, 12, rides
-        )
-        
-        # 5. Reward & Storage (If training)
-        if is_training:
-            # Formula: R = w1*Share + w2*Revenue
-            reward = (0.5 * m1.share) + (0.5 * (m1.rev_per_request / 10.0))
-            self.firm1.agent.store(s_ts, action, reward, False, None, logits, val)
-            
-        return results, m1, m2
 
     def simulate_batch(
         self,
@@ -297,9 +311,17 @@ class Core:
                 hour = hours[t]
                 base = self.market.curr_market
 
-                # Firm actions (heuristic or static)
-                if self.firm1_mode == "heuristic":
+                # Firm 1 action
+                rl_step = None
+                if self.firm1_mode == "RL":
+                    s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
+                    action, s_ts, logits, val = self.firm1.agent.act(s_vec)
+                    self.firm1.apply_action(action)
+                    rl_step = (action, s_ts, logits, val)
+                elif self.firm1_mode == "heuristic":                
                     self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+                
+                # Firm 2 action
                 if self.firm2_mode == "heuristic":
                     self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
@@ -316,6 +338,13 @@ class Core:
                     self.firm1.update(metrics=m1, price_gap_mean=-mean_gap)  # note sign: Firm1 - Firm2
                 if self.firm2_mode == "heuristic":
                     self.firm2.update(metrics=m2, price_gap_mean=mean_gap)   # Firm2 - Firm1
+                    
+                # RL memory + reward shaping
+                if self.firm1_mode == "RL" and rl_step is not None:
+                    action, s_ts, logits, val = rl_step
+                    reward = (0.65 * m1.share) + (0.35 * np.tanh(m1.rev_per_request / 12.0))
+                    done = (t == timesteps_per_day - 1)
+                    self.firm1.agent.store(s_ts, action, float(reward), done, None, logits, val)
 
                 share_sum += float(m1.share)
                 revpr_sum += float(m1.rev_per_request)
@@ -324,6 +353,9 @@ class Core:
                 self.airport_rate_last = airport_rate
                 self.mean_distance_last = mean_dist
 
+            if self.firm1_mode == "RL":
+                self.firm1.agent.update(epochs=5)
+                
             # print every ~10% of days
             k = max(1, days // 10)
             if (d + 1) % k == 0 or (d + 1) == 1 or (d + 1) == days:
