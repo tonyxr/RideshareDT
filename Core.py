@@ -15,15 +15,17 @@ Defaults aim for stable learning:
 
 import argparse
 import csv
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Tuple
 import numpy as np
+import torch
 
 from MarketInteraction import MarketInteraction, RideContext
 from Market_models import CoefficientOverrides
 from GenerateAgent import GenerateAgent
 from choice_models import ParametricChoiceModel, LLMChoiceModel, ChoiceResult
-from pricing_models import FirmMetrics, FirmStaticPricer, FirmHeuristicPricer
+from pricing_models import FirmMetrics, FirmStaticPricer, FirmHeuristicPricer, FirmRLPricer
 from coeff_utils import set_coeff
+from state_encoder import build_state_vector
 
 
 def _parse_kv_floats(s: str) -> Dict[str, float]:
@@ -48,7 +50,7 @@ class Core:
         seed: int = 1000,
         choice_mode: str = "parametric",
         model_name: str = "gpt-4o-mini",
-        firm1_mode: str = "heuristic",
+        firm1_mode: str = "RL",
         firm2_mode: str = "static",
         firm1_static_values: str = "",
         firm2_static_values: str = "",
@@ -86,12 +88,98 @@ class Core:
         self.mean_distance_last = 4.0
         
         self.opt_keys = ["base_fare", "per_minute"]
+        self.firm1 = FirmRLPricer(seed=seed, opt_keys=self.opt_keys)
+        self.firm2 = FirmHeuristicPricer(seed=seed + 1)
+        
+        self.training_logs = []
+        self.evaluation_logs = []
         
 
     @staticmethod
     def estimate_duration(miles: float, hod: int) -> float:
         mph = 18.0 if (7 <= hod < 10 or 16 <= hod < 19) else 25.0
         return max(5.0, 60.0 * miles / max(8.0, mph))
+    
+    def run_experiment(self):
+        """
+        Executes the full study: 100 days of training followed by 50 days of evaluation.
+        Each day consists of 200 rides.
+        """
+        # PHASE 1: 100 Days Training (20 batches of 5 days)
+        print(">>> Starting 100-Day Training Phase (200 rides/day)...")
+        for batch_idx in range(20):
+            batch_reward = 0
+            for day in range(5):
+                # Sample environment context for the day
+                day_ctx = self.market.sample_day_context() # e.g., weather, day_of_week
+                
+                # Run the daily cycle
+                rows, m1, m2 = self.simulate_day_cycle(day_ctx, rides=200, is_training=True)
+                batch_reward += m1.share
+            
+            # Optimization step: Update RL policy using the 5-day batch data
+            metrics = self.firm1.agent.update(epochs=5)
+            
+            avg_reward = batch_reward / 5
+            self.training_logs.append({
+                "batch": batch_idx, 
+                "avg_reward": avg_reward,
+                "loss": metrics.get("loss", 0)
+            })
+            print(f"Batch {batch_idx+1}/20 complete. Avg Share: {avg_reward:.2f}")
+
+        # PHASE 2: 50 Days Competitive Evaluation (No learning)
+        print("\n>>> Starting 50-Day Competitive Evaluation...")
+        for day in range(50):
+            day_ctx = self.market.sample_day_context()
+            rows, m1, m2 = self.simulate_day_cycle(day_ctx, rides=200, is_training=False)
+            
+            self.evaluation_logs.append({
+                "day": 100 + day,
+                "rl_share": m1.share,
+                "heuristic_share": m2.share,
+                "rl_revenue": m1.rev_per_request
+            })
+
+        print("Experiment Complete.")
+        return self.training_logs, self.evaluation_logs
+
+    def simulate_day_cycle(self, day_ctx, rides, is_training):
+        """Runs a 200-ride cycle for a single day."""
+        # 1. Encode Market State
+        s_vec = build_state_vector(
+            base=self.market.curr_market,
+            ov_firm1=self.firm1.overrides,
+            opt_keys=self.opt_keys,
+            day_of_week=day_ctx.day_of_week,
+            hour=12, # Noon reference
+            weather=day_ctx.weather,
+            airport_rate_last=0.15,
+            mean_distance_last=4.0,
+            firm2_ema_share=self.firm2.ema_share,
+            firm2_ema_gap=0.0,
+            firm2_cooldown=0.0
+        )
+        
+        # 2. RL Agent Action (Firm 1)
+        action, s_ts, logits, val = self.firm1.agent.act(s_vec)
+        self.firm1.apply_action(action)
+        
+        # 3. Heuristic Action (Firm 2)
+        self.firm2.act(self.market.curr_market) 
+
+        # 4. Run the simulation batch
+        results, m1, m2, gap, air, dist = self.simulate_batch(
+            day_ctx.day_of_week, day_ctx.weather, 12, rides
+        )
+        
+        # 5. Reward & Storage (If training)
+        if is_training:
+            # Formula: R = w1*Share + w2*Revenue
+            reward = (0.5 * m1.share) + (0.5 * (m1.rev_per_request / 10.0))
+            self.firm1.agent.store(s_ts, action, reward, False, None, logits, val)
+            
+        return results, m1, m2
 
     def simulate_batch(
         self,

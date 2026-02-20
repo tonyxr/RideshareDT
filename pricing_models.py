@@ -11,16 +11,22 @@ Firm2: Heuristic dynamic pricing (schedule + competitive response + guardrails)
 """
 
 from dataclasses import dataclass
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 import numpy as np
 
+from WPOAgent import WassersteinWPOAgent
 from Market_models import CoefficientOverrides
+from optim_config import default_specs_for
 
 @dataclass
 class FirmMetrics:
     revenue: float = 0.0
     wins: int = 0
     total: int = 0
+    
+    def __init__(self, share: float, rev_per_request: float):
+        self.share = share
+        self.rev_per_request = rev_per_request
 
     @property
     def share(self) -> float:
@@ -38,7 +44,6 @@ class FirmStaticPricer:
     def act(self, **kwargs) -> None:
         # no-op: coefficients remain fixed
         return
-
 
 class FirmHeuristicPricer:
     """
@@ -130,3 +135,38 @@ class FirmHeuristicPricer:
     def update(self, metrics: FirmMetrics, price_gap_mean: float):
         self.ema_share = self._ema(metrics.share, self.ema_share, self.alpha)
         self.ema_gap = self._ema(price_gap_mean, self.ema_gap, self.alpha)
+        
+class FirmRLPricer:
+    def __init__(self, seed: Optional[int], opt_keys: List[str]):
+        self.opt_keys = opt_keys
+        self.config = default_specs_for(opt_keys)
+        self.overrides = CoefficientOverrides()
+        
+        # State: 11 context features + length of optimized coefficients
+        state_dim = 11 + len(opt_keys)
+        action_dim = 3 # 0: Decrease, 1: No-op, 2: Increase
+        
+        # Initialize Agent
+        self.agent = WassersteinWPOAgent(
+            state_dim=state_dim, 
+            action_dim=action_dim, 
+            cost_matrix=np.eye(action_dim)
+        )
+        
+        def apply_action(self, action: int):
+            """Maps the discrete RL action to coefficient updates."""
+            for key in self.opt_keys:
+                current_val = getattr(self.overrides, key) or 1.0 
+                step = self.config.step[key]
+                
+                if action == 0: # Decrease
+                    new_val = current_val - step
+                elif action == 2: # Increase
+                    new_val = current_val + step
+                else: # No-op
+                    new_val = current_val
+                    
+                # Keep within specified bounds
+                setattr(self.overrides, key, np.clip(new_val, *self.config.bounds[key]))
+        
+        
