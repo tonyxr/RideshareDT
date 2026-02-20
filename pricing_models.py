@@ -152,20 +152,18 @@ class FirmRLPricer:
             cost_matrix=np.eye(action_dim)
         )
         
-        def apply_action(self, action: int):
-            """Maps the discrete RL action to coefficient updates."""
-            for key in self.opt_keys:
-                current_val = getattr(self.overrides, key) or 1.0 
-                step = self.config.step[key]
-                
-                if action == 0: # Decrease
-                    new_val = current_val - step
-                elif action == 2: # Increase
-                    new_val = current_val + step
-                else: # No-op
-                    new_val = current_val
-                    
-                # Keep within specified bounds
-                setattr(self.overrides, key, np.clip(new_val, *self.config.bounds[key]))
+    def apply_action(self, action: int):
+        """Maps the discrete RL action to coefficient updates."""
+        for key in self.opt_keys:
+            current_val = getattr(self.overrides, key) or 1.0 
+            step = self.config.step[key]
+            
+            if action == 0: # Decrease
+                new_val = current_val - step
+            elif action == 2: # Increase
+                new_val = current_val + step
+            else: # No-op
+                new_val = current_val
         
-        
+            # Keep within specified bounds
+            setattr(self.overrides, key, np.clip(new_val, *self.config.bounds[key]))

@@ -74,6 +74,25 @@ class Core:
         self.firm1_mode = firm1_mode
         self.firm2_mode = firm2_mode
 
+        if self.firm1_mode not in {"RL", "heuristic", "static"}:
+            raise ValueError("firm1_mode must be one of: RL, heuristic, static")
+        if self.firm2_mode not in {"heuristic", "static"}:
+            raise ValueError("firm2_mode must be one of: heuristic, static")
+
+        self.opt_keys = ["base_fare", "per_minute"]
+
+        if self.firm1_mode == "RL":
+            self.firm1 = FirmRLPricer(seed=seed, opt_keys=self.opt_keys)
+        elif self.firm1_mode == "heuristic":
+            self.firm1 = FirmHeuristicPricer(seed=seed)
+        else:
+            self.firm1 = FirmStaticPricer()
+
+        if self.firm2_mode == "heuristic":
+            self.firm2 = FirmHeuristicPricer(seed=seed + 1)
+        else:
+            self.firm2 = FirmStaticPricer()
+
         # apply static overrides (if any)
         f1_vals = _parse_kv_floats(firm1_static_values)
         f2_vals = _parse_kv_floats(firm2_static_values)
@@ -86,20 +105,6 @@ class Core:
         # last batch summaries (optional; can be logged)
         self.airport_rate_last = self.market.airport_prob
         self.mean_distance_last = 4.0
-        
-        self.opt_keys = ["base_fare", "per_minute"]
-        
-        if firm1_mode == "RL":
-            self.firm1 = FirmRLPricer(seed = seed, opt_keys = self.opt_keys)
-        elif firm1_mode == "heuristic":
-            self.firm1 = FirmHeuristicPricer(seed = seed)
-        else:
-            self.firm1 = FirmStaticPricer()
-            
-        if firm2_mode == "heuristic":
-            self.firm2 = FirmHeuristicPricer(seed=seed + 1)
-        else:
-            self.firm2 = FirmStaticPricer()
         
         self.training_logs = []
         self.evaluation_logs = []
@@ -355,7 +360,7 @@ def main():
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--out", type=str, default="market_runs.csv")
 
-    parser.add_argument("--firm1_mode", type=str, default="heuristic", choices=["heuristic", "static"])
+    parser.add_argument("--firm1_mode", type=str, default="heuristic", choices=["RL", "heuristic", "static"])
     parser.add_argument("--firm2_mode", type=str, default="static", choices=["heuristic", "static"])
 
     parser.add_argument("--firm1_static_values", type=str, default="")
