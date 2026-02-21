@@ -20,6 +20,13 @@ import numpy as np
 
 from Market_models import MarketCoefficients, CoefficientOverrides
 
+# Approximate long-run weather-state frequencies by city
+CITY_WEATHER_HISTORY: Dict[str, Dict[str, float]] = {
+    "General": {"clear": 0.60, "rain": 0.28, "snow": 0.12},
+    "Seattle": {"clear": 0.56, "rain": 0.36, "snow": 0.08},
+    "New York City": {"clear": 0.58, "rain": 0.29, "snow": 0.13},
+    "Chicago": {"clear": 0.54, "rain": 0.27, "snow": 0.19},
+}
 
 @dataclass(frozen=True)
 class DayContext:
@@ -46,14 +53,18 @@ class MarketInteraction:
         self.rng = np.random.default_rng(seed)
         self.market_list: Dict[str, MarketCoefficients] = {}
         self._init_markets()
-        self.curr_market: MarketCoefficients = self.market_list.get(city_name, self.market_list["General"])
+        self.current_city = city_name if city_name in self.market_list else "General"
+        self.curr_market: MarketCoefficients = self.market_list[self.current_city]
 
         # scenario priors (can be city-conditioned later)
         self.airport_prob = 0.12
         self.service_probs = {"economy": 0.85, "premium": 0.15}
+        self.weather_probs = self._weather_probs_for_city(self.current_city)
 
     def set_market(self, name: str) -> None:
-        self.curr_market = self.market_list.get(name, self.market_list["General"])
+        self.current_city = name if name in self.market_list else "General"
+        self.curr_market = self.market_list[self.current_city]
+        self.weather_probs = self._weather_probs_for_city(self.current_city)
 
     def _init_markets(self) -> None:
         self.market_list["General"] = MarketCoefficients(
@@ -93,11 +104,23 @@ class MarketInteraction:
             weather_multiplier={"clear": 1.0, "rain": 1.18, "snow": 1.35},
             service_multiplier={"economy": 1.0, "premium": 1.65},
         )
+        
+    def _weather_probs_for_city(self, city: str) -> Dict[str, float]:
+        base = CITY_WEATHER_HISTORY.get(city, CITY_WEATHER_HISTORY["General"])
+        keys = list(self.curr_market.weather_multiplier.keys())
+        vals = np.array([float(base.get(k, 0.0)) for k in keys], dtype=float)
+        if vals.sum() <= 0:
+            vals = np.ones(len(keys), dtype=float)
+        vals = vals / vals.sum()
+        return {k: float(v) for k, v in zip(keys, vals)}
 
     # ---------- Scenario sampling ----------
     def sample_day_context(self) -> DayContext:
         day = int(self.rng.integers(0, 7))
-        weather = str(self.rng.choice(list(self.curr_market.weather_multiplier.keys())))
+        keys = list(self.weather_probs.keys())
+        probs = np.array([self.weather_probs[k] for k in keys], dtype=float)
+        probs = probs / probs.sum()
+        weather = str(self.rng.choice(keys, p=probs))
         return DayContext(day_of_week=day, weather=weather)
 
     def sample_timestep_hour(self) -> TimeContext:

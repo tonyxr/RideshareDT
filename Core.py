@@ -65,7 +65,7 @@ class Core:
         self.market.set_market(market_name)
         self.market_name = market_name
 
-        self.agent_gen = GenerateAgent(seed=seed, total_customers=total_customers_pool)
+        self.agent_gen = GenerateAgent(seed=seed, total_customers=total_customers_pool, city_name = market_name)
 
         # choice model
         self.choice_mode = choice_mode
@@ -96,6 +96,12 @@ class Core:
             self.firm2 = FirmHeuristicPricer(seed=seed + 1)
         else:
             self.firm2 = FirmStaticPricer()
+
+        # RL starts at city baseline so no-op means "hold market default" (not extreme values)
+        if self.firm1_mode == "RL":
+            self.firm1.overrides.base_fare = float(self.market.curr_market.base_fare)
+            self.firm1.overrides.per_minute = float(self.market.curr_market.per_minute)
+
 
         # apply static overrides (if any)
         f1_vals = _parse_kv_floats(firm1_static_values)
@@ -168,8 +174,7 @@ class Core:
         return self.training_logs, self.evaluation_logs
 
     def simulate_day_cycle(self, day_ctx, rides, is_training):
-        """Runs a 200-ride cycle for a single day."""
-        # 1. Encode Market State
+        """Runs one 200-ride cycle. Primarily used by run_experiment."""
         hour = 12
         base = self.market.curr_market
 
@@ -189,7 +194,12 @@ class Core:
 
         if is_training and self.firm1_mode == "RL" and rl_step is not None:
             action, s_ts, logits, val = rl_step
-            reward = (0.65 * m1.share) + (0.35 * np.tanh(m1.rev_per_request / 12.0))
+            base = self.market.curr_market
+            dev_penalty = (
+                abs(float(self.firm1.overrides.base_fare) - float(base.base_fare)) / max(1e-6, float(base.base_fare))
+                + abs(float(self.firm1.overrides.per_minute) - float(base.per_minute)) / max(1e-6, float(base.per_minute))
+            )
+            reward = (0.65 * m1.share) + (0.35 * np.tanh(m1.rev_per_request / 12.0)) - (0.12 * dev_penalty)
             self.firm1.agent.store(s_ts, action, float(reward), True, None, logits, val)
 
         self.airport_rate_last = air
@@ -365,7 +375,7 @@ class Core:
 
             if self.firm1_mode == "RL":
                 self.firm1.agent.update(epochs=5)
-            
+
             avg_share = share_sum / max(1, timesteps_per_day)
             avg_revpr = revpr_sum / max(1, timesteps_per_day)
             avg_gap = gap_sum / max(1, timesteps_per_day)
