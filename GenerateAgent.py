@@ -10,7 +10,7 @@ Customer profile sampler (city-conditioned extension can be added later).
 """
 
 import numpy as np
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 class GenerateAgent:
     # Approximate city demographic priors (can be replaced by external data source later)
@@ -52,15 +52,14 @@ class GenerateAgent:
             "p_new": 0.31,
         },
     }
-    
+
     def __init__(
         self,
         seed: Optional[int] = 42,
         total_customers: int = 20000,
-        city_name: str = "General",
+        city_name: str = "Seattle",
         loyalty_strength_range: tuple[float, float] = (0.4, 1.0),
     ):
-        
         
         self.rng = np.random.default_rng(seed)
         self.total_customers = int(total_customers)
@@ -68,9 +67,7 @@ class GenerateAgent:
 
         self.income_names = ['<50k', '50k-100k', '100k-200k', '200k+']
         
-
         self.marital_names = ['Single', 'Married', 'Divorced', 'Widowed']
-        
 
         self.gender_names = ['Male', 'Female']
         

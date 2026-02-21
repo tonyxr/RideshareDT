@@ -165,6 +165,6 @@ class FirmRLPricer:
                 new_val = current_val + step
             else: # No-op
                 new_val = current_val
-        
+                
             # Keep within specified bounds
             setattr(self.overrides, key, np.clip(new_val, *self.config.bounds[key]))

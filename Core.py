@@ -97,10 +97,8 @@ class Core:
         else:
             self.firm2 = FirmStaticPricer()
 
-        # RL starts at city baseline so no-op means "hold market default" (not extreme values)
-        if self.firm1_mode == "RL":
-            self.firm1.overrides.base_fare = float(self.market.curr_market.base_fare)
-            self.firm1.overrides.per_minute = float(self.market.curr_market.per_minute)
+        # initialize both firms with arbitrary starting coefficients on optimized dimensions
+        self._initialize_arbitrary_starting_coefficients()
 
 
         # apply static overrides (if any)
@@ -120,12 +118,64 @@ class Core:
         self.evaluation_logs = []
         
         self.run_logs = []
-        
+        self.rl_reward_ema = 0.0
 
     @staticmethod
     def estimate_duration(miles: float, hod: int) -> float:
         mph = 18.0 if (7 <= hod < 10 or 16 <= hod < 19) else 25.0
         return max(5.0, 60.0 * miles / max(8.0, mph))
+    
+    def _initialize_arbitrary_starting_coefficients(self) -> None:
+        """Set both firms to arbitrary (seeded-random) initial values for optimized coefficients."""
+        base = self.market.curr_market
+        lo, hi = 0.85, 1.15
+
+        f1_base = float(base.base_fare) * float(self.rng.uniform(lo, hi))
+        f1_pmin = float(base.per_minute) * float(self.rng.uniform(lo, hi))
+        f2_base = float(base.base_fare) * float(self.rng.uniform(lo, hi))
+        f2_pmin = float(base.per_minute) * float(self.rng.uniform(lo, hi))
+
+        self.firm1.overrides.base_fare = max(0.1, f1_base)
+        self.firm1.overrides.per_minute = max(0.01, f1_pmin)
+        self.firm2.overrides.base_fare = max(0.1, f2_base)
+        self.firm2.overrides.per_minute = max(0.01, f2_pmin)
+        
+    def _reward_base(
+        self,
+        share: float,
+        rev_per_request: float,
+        price_gap_f2_minus_f1: float = 0.0,
+        dev_penalty: float = 0.0,
+    ) -> float:
+        """Instantaneous shaped reward before smoothing."""
+        share_term = float(np.clip(share, 0.0, 1.0))
+        rev_term = float(np.tanh((float(rev_per_request) - 10.0) / 8.0))
+        competitiveness_term = float(np.tanh(float(price_gap_f2_minus_f1) / 3.0))
+        collapse_penalty = max(0.0, 0.20 - share_term)
+
+        raw = (
+            (0.60 * share_term)
+            + (0.20 * rev_term)
+            + (0.15 * competitiveness_term)
+            - (0.05 * float(dev_penalty))
+            - (0.20 * collapse_penalty)
+        )
+        return float(np.clip(raw, -1.0, 1.0))
+
+    def _compute_rl_reward(self, m1: FirmMetrics, base, mean_gap: float) -> float:
+        """Lower-variance RL reward with EMA smoothing."""
+        dev_penalty = (
+            abs(float(self.firm1.overrides.base_fare) - float(base.base_fare)) / max(1e-6, float(base.base_fare))
+            + abs(float(self.firm1.overrides.per_minute) - float(base.per_minute)) / max(1e-6, float(base.per_minute))
+        )
+        instant = self._reward_base(
+            share=m1.share,
+            rev_per_request=m1.rev_per_request,
+            price_gap_f2_minus_f1=mean_gap,
+            dev_penalty=dev_penalty,
+        )
+        self.rl_reward_ema = 0.85 * float(self.rl_reward_ema) + 0.15 * float(instant)
+        return float(self.rl_reward_ema)
     
     def run_experiment(self):
         """
@@ -134,6 +184,7 @@ class Core:
         """
         # PHASE 1: 100 Days Training (20 batches of 5 days)
         print(">>> Starting 100-Day Training Phase (200 rides/day)...")
+        self.rl_reward_ema = 0.0
         for batch_idx in range(20):
             batch_reward = 0
             for day in range(5):
@@ -142,7 +193,7 @@ class Core:
                 
                 # Run the daily cycle
                 rows, m1, m2 = self.simulate_day_cycle(day_ctx, rides=200, is_training=True)
-                batch_reward += m1.share
+                batch_reward += self._reward_base(m1.share, m1.rev_per_request, dev_penalty=0.0)
             
             # Optimization step: Update RL policy using the 5-day batch data
             metrics = {"loss": 0.0}
@@ -155,7 +206,7 @@ class Core:
                 "avg_reward": avg_reward,
                 "loss": metrics.get("loss", 0.0)
             })
-            print(f"Batch {batch_idx+1}/20 complete. Avg Share: {avg_reward:.2f}")
+            print(f"Batch {batch_idx+1}/20 complete. Avg Reward: {avg_reward:.2f}")
 
         # PHASE 2: 50 Days Competitive Evaluation (No learning)
         print("\n>>> Starting 50-Day Competitive Evaluation...")
@@ -195,17 +246,14 @@ class Core:
         if is_training and self.firm1_mode == "RL" and rl_step is not None:
             action, s_ts, logits, val = rl_step
             base = self.market.curr_market
-            dev_penalty = (
-                abs(float(self.firm1.overrides.base_fare) - float(base.base_fare)) / max(1e-6, float(base.base_fare))
-                + abs(float(self.firm1.overrides.per_minute) - float(base.per_minute)) / max(1e-6, float(base.per_minute))
-            )
-            reward = (0.65 * m1.share) + (0.35 * np.tanh(m1.rev_per_request / 12.0)) - (0.12 * dev_penalty)
+            reward = self._compute_rl_reward(m1, base, gap)
             self.firm1.agent.store(s_ts, action, float(reward), True, None, logits, val)
 
         self.airport_rate_last = air
         self.mean_distance_last = dist
 
         return results, m1, m2
+
     
     def _build_rl_state(self, day_of_week: int, hour: int, weather: str) -> np.ndarray:
         """Build state vector for Firm1 RL controller from current market + recent summaries."""
@@ -313,6 +361,7 @@ class Core:
 
     def run(self, days: int, timesteps_per_day: int, customers_per_step: int) -> List[Dict[str, Any]]:
         all_rows: List[Dict[str, Any]] = []
+        self.rl_reward_ema = 0.0
 
         for d in range(days):
             day_ctx = self.market.sample_day_context()
@@ -334,9 +383,9 @@ class Core:
                     action, s_ts, logits, val = self.firm1.agent.act(s_vec)
                     self.firm1.apply_action(action)
                     rl_step = (action, s_ts, logits, val)
-                elif self.firm1_mode == "heuristic":                
+                elif self.firm1_mode == "heuristic":
                     self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
-                
+
                 # Firm 2 action
                 if self.firm2_mode == "heuristic":
                     self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
@@ -358,11 +407,7 @@ class Core:
                 # RL memory + reward shaping
                 if self.firm1_mode == "RL" and rl_step is not None:
                     action, s_ts, logits, val = rl_step
-                    dev_penalty = (
-                        abs(float(self.firm1.overrides.base_fare) - float(base.base_fare)) / max(1e-6, float(base.base_fare))
-                        + abs(float(self.firm1.overrides.per_minute) - float(base.per_minute)) / max(1e-6, float(base.per_minute))
-                    )
-                    reward = (0.65 * m1.share) + (0.35 * np.tanh(m1.rev_per_request / 12.0)) - (0.12 * dev_penalty)
+                    reward = self._compute_rl_reward(m1, base, mean_gap)
                     done = (t == timesteps_per_day - 1)
                     self.firm1.agent.store(s_ts, action, float(reward), done, None, logits, val)
 
@@ -379,7 +424,7 @@ class Core:
             avg_share = share_sum / max(1, timesteps_per_day)
             avg_revpr = revpr_sum / max(1, timesteps_per_day)
             avg_gap = gap_sum / max(1, timesteps_per_day)
-            avg_reward = (0.65 * avg_share) + (0.35 * np.tanh(avg_revpr / 12.0))
+            avg_reward = self._reward_base(avg_share, avg_revpr, price_gap_f2_minus_f1=avg_gap, dev_penalty=0.0)
             self.run_logs.append({
                 "day": d + 1,
                 "avg_share": float(avg_share),
@@ -500,12 +545,13 @@ def _plot_reports(
         else:
             xs = sorted(c.keys())
 
-        ys = [c[x] for x in xs]
+        total = max(1, sum(c.values()))
+        ys = [100.0 * c[x] / total for x in xs]
         plt.figure(figsize=(8, 4))
         plt.bar(xs, ys)
         plt.title(f"Ride Distribution by {p}")
         plt.xlabel(p)
-        plt.ylabel("Count")
+        plt.ylabel("% of rides")
         plt.tight_layout()
         out = f"{prefix}_dist_{p}.png"
         _ensure_parent_dir(out)
@@ -515,11 +561,12 @@ def _plot_reports(
     # 2) Distance histogram
     if rows:
         dvals = [float(r.get("TravelDistance", 0.0)) for r in rows]
+        weights = np.ones(len(dvals), dtype=float) * (100.0 / max(1, len(dvals)))
         plt.figure(figsize=(8, 4))
-        plt.hist(dvals, bins=20)
+        plt.hist(dvals, bins=20, weights=weights)
         plt.title("Ride Distance Distribution")
         plt.xlabel("TravelDistance")
-        plt.ylabel("Count")
+        plt.ylabel("% of rides")
         plt.tight_layout()
         out = f"{prefix}_dist_TravelDistance.png"
         _ensure_parent_dir(out)
@@ -559,7 +606,10 @@ def _plot_reports(
     # 5) evaluation trajectory (run_experiment)
     if evaluation_logs:
         xs = [int(r["day"]) for r in evaluation_logs]
-        ys = [0.65 * float(r["rl_share"]) + 0.35 * np.tanh(float(r["rl_revenue"]) / 12.0) for r in evaluation_logs]
+        ys = [
+            float(np.clip((0.60 * np.clip(float(r["rl_share"]), 0.0, 1.0)) + (0.20 * np.tanh((float(r["rl_revenue"]) - 10.0) / 8.0)), -1.0, 1.0))
+            for r in evaluation_logs
+        ]
         plt.figure(figsize=(9, 4))
         plt.plot(xs, ys)
         plt.title("Evaluation Reward Trajectory")
@@ -570,7 +620,6 @@ def _plot_reports(
         _ensure_parent_dir(out)
         plt.savefig(out, dpi=150)
         plt.close()
-
 
 
 def main():
@@ -629,7 +678,6 @@ def main():
         evaluation_logs=core.evaluation_logs,
         prefix=args.report_prefix,
     )
-
 
 if __name__ == "__main__":
     main()

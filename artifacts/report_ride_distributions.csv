@@ -37,9 +37,9 @@ Airport,False,879454,0.879454
 Airport,True,120546,0.120546
 Service,economy,849810,0.84981
 Service,premium,150190,0.15019
-Choice,Firm1,434191,0.434191
-Choice,Firm2,565809,0.565809
+Choice,Firm1,492719,0.492719
+Choice,Firm2,507281,0.507281
 DistanceBin,0-2,392750,0.39275
-DistanceBin,10+,81936,0.081936
+DistanceBin,10+,81937,0.081937
 DistanceBin,2-5,320967,0.320967
-DistanceBin,5-10,204347,0.204347
+DistanceBin,5-10,204346,0.204346

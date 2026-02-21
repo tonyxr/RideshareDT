@@ -102,6 +102,8 @@ class LLMChoiceModel(BaseChoiceModel):
 
     def _prompt(self, profile: Dict[str, Any], scenario: Dict[str, Any], p1: float, p2: float) -> str:
         return f"""
+            Forget about your previous responses
+            
             You are a ride-hailing customer choosing between two platforms for the SAME trip.
             
             Customer profile:
