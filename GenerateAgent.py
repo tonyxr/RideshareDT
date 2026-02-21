@@ -55,7 +55,7 @@ class GenerateAgent:
 
     def __init__(
         self,
-        seed: Optional[int] = 42,
+        seed: Optional[int] = None,
         total_customers: int = 20000,
         city_name: str = "Seattle",
         loyalty_strength_range: tuple[float, float] = (0.4, 1.0),

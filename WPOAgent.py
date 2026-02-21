@@ -93,6 +93,8 @@ class WassersteinWPOAgent:
         v_coeff: float = 0.5,
         epsilon: float = 0.1,
         max_grad_norm: float = 1.0,
+        advantage_scale: float = 1.35,
+        advantage_clip: float = 4.0,
         device: Optional[str] = None,
     ):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -106,6 +108,8 @@ class WassersteinWPOAgent:
         self.v_coeff = v_coeff
         self.epsilon = epsilon
         self.max_grad_norm = max_grad_norm
+        self.advantage_scale = advantage_scale
+        self.advantage_clip = advantage_clip
 
         self.C = torch.tensor(cost_matrix, dtype=torch.float32, device=self.device)
         self.buf: List[Transition] = []
@@ -162,6 +166,7 @@ class WassersteinWPOAgent:
             ret[t] = adv[t] + v_t
 
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        adv = torch.clamp(adv * self.advantage_scale, -self.advantage_clip, self.advantage_clip)
         return adv, ret
 
     def update(self, epochs: int = 5, batch_size: int = 256) -> dict:

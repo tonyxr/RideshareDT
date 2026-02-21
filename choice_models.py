@@ -38,7 +38,7 @@ class ParametricChoiceModel(BaseChoiceModel):
     - loyalty only helps the rider's LoyaltyFirm (static)
     """
 
-    def __init__(self, seed: int = 0):
+    def __init__(self, seed: Optional[int] = None):
         self.rng = np.random.default_rng(seed)
         self.base_price_beta = 0.35
         self.loyalty_bias = 0.80

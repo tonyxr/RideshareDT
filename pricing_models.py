@@ -136,15 +136,34 @@ class FirmHeuristicPricer:
         self.ema_gap = self._ema(price_gap_mean, self.ema_gap, self.alpha)
         
 class FirmRLPricer:
+    MAX_MANIPULATED_COEFFS = 2
+
+    def _ensure_internal_state(self) -> None:
+        """Backstop against partially initialized objects from stale environments."""
+        if not hasattr(self, "opt_keys"):
+            self.opt_keys = ["base_fare", "per_minute"]
+        if len(self.opt_keys) > self.MAX_MANIPULATED_COEFFS:
+            self.opt_keys = list(self.opt_keys[: self.MAX_MANIPULATED_COEFFS])
+        if not hasattr(self, "config"):
+            self.config = default_specs_for(self.opt_keys)
+    
     def __init__(self, seed: Optional[int], opt_keys: List[str]):
-        self.opt_keys = opt_keys
-        self.config = default_specs_for(opt_keys)
+        # Keep action semantics simple and stable: one shared action can only
+        # manipulate up to two coefficients per step.
+        self.opt_keys = list(opt_keys[: self.MAX_MANIPULATED_COEFFS])
+        if len(opt_keys) > self.MAX_MANIPULATED_COEFFS:
+            print(
+                f"[FirmRLPricer] Received {len(opt_keys)} opt_keys; "
+                f"limiting to first {self.MAX_MANIPULATED_COEFFS}: {self.opt_keys}"
+            )
+        self.config = default_specs_for(self.opt_keys)
         self.overrides = CoefficientOverrides()
         
         self.step_scale = 0.5
         # State: 10 context features + length of optimized coefficients
-        state_dim = 10 + len(opt_keys)
-        action_dim = 3 # 0: Decrease, 1: No-op, 2: Increase
+        state_dim = 10 + len(self.opt_keys)
+        # Action space: no-op + (decrease/increase) per managed coefficient
+        action_dim = 5
         
         # Initialize Agent
         self.agent = WassersteinWPOAgent(
@@ -154,17 +173,21 @@ class FirmRLPricer:
         )
         
     def apply_action(self, action: int):
-        """Maps the discrete RL action to coefficient updates."""
-        for key in self.opt_keys:
-            current_val = getattr(self.overrides, key) or 1.0 
-            step = self.config.step[key] * self.step_scale
-            
-            if action == 0: # Decrease
-                new_val = current_val - step
-            elif action == 2: # Increase
-                new_val = current_val + step
-            else: # No-op
-                new_val = current_val
-                
-            # Keep within specified bounds
-            setattr(self.overrides, key, np.clip(new_val, *self.config.bounds[key]))
+        """Maps the discrete RL action to coefficient updates.
+
+        action=0: no-op
+        action=1..2*K: for coefficient i=(action-1)//2, odd=decrease, even=increase
+        """
+        if action == 4:
+            return
+
+        key = "base_fare" if action in (0, 1) else "per_minute"
+        direction = -1.0 if action in (0, 2) else 1.0
+
+        current_val = getattr(self.overrides, key)
+        if current_val is None:
+            current_val = 1.0
+
+        step = self.config.step[key] * self.step_scale
+        new_val = float(current_val) + direction * step
+        setattr(self.overrides, key, float(np.clip(new_val, *self.config.bounds[key])))

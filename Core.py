@@ -15,7 +15,7 @@ Defaults aim for stable learning:
 
 import argparse
 import csv
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 import numpy as np
 import torch
 
@@ -51,7 +51,7 @@ class Core:
     def __init__(
         self,
         market_name: str,
-        seed: int = 1000,
+        seed: Optional[int] = None,
         choice_mode: str = "parametric",
         model_name: str = "gpt-4o-mini",
         firm1_mode: str = "RL",
@@ -62,17 +62,22 @@ class Core:
     ):
         self.rng = np.random.default_rng(seed)
         self.market = MarketInteraction(city_name=market_name, seed=seed)
+        self.seed = int(seed) if seed is not None else int(np.random.SeedSequence().generate_state(1)[0])
+
+        self.rng = np.random.default_rng(self.seed)
+        self.market = MarketInteraction(city_name=market_name, seed=self.seed)
+        
         self.market.set_market(market_name)
         self.market_name = market_name
 
-        self.agent_gen = GenerateAgent(seed=seed, total_customers=total_customers_pool, city_name = market_name)
+        self.agent_gen = GenerateAgent(seed=self.seed, total_customers=total_customers_pool, city_name = market_name)
 
         # choice model
         self.choice_mode = choice_mode
         if choice_mode == "llm":
             self.choice_model = LLMChoiceModel(model_name=model_name)
         else:
-            self.choice_model = ParametricChoiceModel(seed=seed)
+            self.choice_model = ParametricChoiceModel(seed=self.seed)
 
         # firms
         self.firm1_mode = firm1_mode
@@ -86,16 +91,18 @@ class Core:
         self.opt_keys = ["base_fare", "per_minute"]
 
         if self.firm1_mode == "RL":
-            self.firm1 = FirmRLPricer(seed=seed, opt_keys=self.opt_keys)
+            self.firm1 = FirmRLPricer(seed=self.seed, opt_keys=self.opt_keys)
         elif self.firm1_mode == "heuristic":
-            self.firm1 = FirmHeuristicPricer(seed=seed)
+            self.firm1 = FirmHeuristicPricer(seed=self.seed)
         else:
             self.firm1 = FirmStaticPricer()
 
         if self.firm2_mode == "heuristic":
-            self.firm2 = FirmHeuristicPricer(seed=seed + 1)
+            self.firm2 = FirmHeuristicPricer(seed=self.seed + 1)
         else:
             self.firm2 = FirmStaticPricer()
+            
+        print(f"Using random seed: {self.seed}")
 
         # initialize both firms with arbitrary starting coefficients on optimized dimensions
         self._initialize_arbitrary_starting_coefficients()
@@ -119,7 +126,15 @@ class Core:
         
         self.run_logs = []
         self.rl_reward_ema = 0.0
+        
+        self.rev_ema = 0.0
+        self.share_ema = 0.5
+        self.revpr_ema = 0.0
 
+    @staticmethod
+    def _ema(curr: float, prev: float, alpha: float = 0.2) -> float:
+        return (1.0 - alpha) * float(prev) + alpha * float(curr)
+    
     @staticmethod
     def estimate_duration(miles: float, hod: int) -> float:
         mph = 18.0 if (7 <= hod < 10 or 16 <= hod < 19) else 25.0
@@ -147,18 +162,22 @@ class Core:
         price_gap_f2_minus_f1: float = 0.0,
         dev_penalty: float = 0.0,
     ) -> float:
-        """Instantaneous shaped reward before smoothing."""
+        """Share-first reward shaping with strong anti-collapse signal."""
         share_term = float(np.clip(share, 0.0, 1.0))
-        rev_term = float(np.tanh((float(rev_per_request) - 10.0) / 8.0))
-        competitiveness_term = float(np.tanh(float(price_gap_f2_minus_f1) / 3.0))
-        collapse_penalty = max(0.0, 0.20 - share_term)
+        rev_term = float(np.tanh((float(rev_per_request) - 10.0) / 7.0))
+        competitiveness_term = float(np.tanh(float(price_gap_f2_minus_f1) / 2.5))
+
+        # Encourage beating parity (0.5 share) and strongly punish sustained loss.
+        share_advantage = float(np.clip(share_term - 0.5, -0.5, 0.5))
+        collapse_penalty = max(0.0, 0.35 - share_term)
 
         raw = (
-            (0.60 * share_term)
-            + (0.20 * rev_term)
-            + (0.15 * competitiveness_term)
-            - (0.05 * float(dev_penalty))
-            - (0.20 * collapse_penalty)
+            (0.58 * share_term)
+            + (0.22 * share_advantage)
+            + (0.14 * rev_term)
+            + (0.10 * competitiveness_term)
+            - (0.08 * float(dev_penalty))
+            - (0.32 * collapse_penalty)
         )
         return float(np.clip(raw, -1.0, 1.0))
 
@@ -168,13 +187,28 @@ class Core:
             abs(float(self.firm1.overrides.base_fare) - float(base.base_fare)) / max(1e-6, float(base.base_fare))
             + abs(float(self.firm1.overrides.per_minute) - float(base.per_minute)) / max(1e-6, float(base.per_minute))
         )
+        # Backward-compatible EMA state in case objects were created before these attrs existed.
+        self.share_ema = self._ema(m1.share, float(getattr(self, "share_ema", 0.5)), alpha=0.2)
+        prev_rev_ema = float(getattr(self, "rev_ema", getattr(self, "revpr_ema", 0.0)))
+        self.rev_ema = self._ema(m1.rev_per_request, prev_rev_ema, alpha=0.2)
+        self.revpr_ema = self.rev_ema
+
+        # Robustness terms: reward maintaining non-collapsed share and improving trend.
+        share_floor_penalty = max(0.0, 0.35 - float(m1.share))
+        trend_bonus = 0.10 * np.tanh((float(m1.share) - float(self.share_ema)) / 0.08)
+        rev_trend_bonus = 0.05 * np.tanh((float(m1.rev_per_request) - float(self.rev_ema)) / 1.5)
+        
         instant = self._reward_base(
             share=m1.share,
             rev_per_request=m1.rev_per_request,
             price_gap_f2_minus_f1=mean_gap,
             dev_penalty=dev_penalty,
         )
-        self.rl_reward_ema = 0.85 * float(self.rl_reward_ema) + 0.15 * float(instant)
+        instant = float(np.clip(instant + trend_bonus + rev_trend_bonus - 0.25 * share_floor_penalty, -1.0, 1.0))
+        
+        self.rl_reward_ema = 0.80 * float(self.rl_reward_ema) + 0.20 * float(instant)
+        self.share_ema = 0.90 * float(self.share_ema) + 0.10 * float(m1.share)
+        self.revpr_ema = 0.90 * float(self.revpr_ema) + 0.10 * float(m1.rev_per_request)
         return float(self.rl_reward_ema)
     
     def run_experiment(self):
@@ -185,6 +219,8 @@ class Core:
         # PHASE 1: 100 Days Training (20 batches of 5 days)
         print(">>> Starting 100-Day Training Phase (200 rides/day)...")
         self.rl_reward_ema = 0.0
+        self.share_ema = 0.5
+        self.revpr_ema = 0.0
         for batch_idx in range(20):
             batch_reward = 0
             for day in range(5):
@@ -362,6 +398,8 @@ class Core:
     def run(self, days: int, timesteps_per_day: int, customers_per_step: int) -> List[Dict[str, Any]]:
         all_rows: List[Dict[str, Any]] = []
         self.rl_reward_ema = 0.0
+        self.share_ema = 0.5
+        self.revpr_ema = 0.0
 
         for d in range(days):
             day_ctx = self.market.sample_day_context()
@@ -630,7 +668,7 @@ def main():
     parser.add_argument("--customers", type=int, default=500)
     parser.add_argument("--choice_mode", type=str, default="parametric", choices=["parametric", "llm"])
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
-    parser.add_argument("--seed", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=None, help="Optional random seed. If omitted, a new seed is generated each run.")
     parser.add_argument("--out", type=str, default="market_runs.csv")
 
     parser.add_argument("--firm1_mode", type=str, default="heuristic", choices=["RL", "heuristic", "static"])

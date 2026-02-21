@@ -21,7 +21,7 @@ class ComputeUtility:
                  avg_speed_mph: float, 
                  priceElasticity: float,
                  taste: float,
-                 random_seed: int | None = 42,
+                 random_seed: int | None = None,
                  ):
         
         self.base_fare = base_fare
