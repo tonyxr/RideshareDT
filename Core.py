@@ -126,10 +126,6 @@ class Core:
         
         self.run_logs = []
         self.rl_reward_ema = 0.0
-        
-        self.rev_ema = 0.0
-        self.share_ema = 0.5
-        self.revpr_ema = 0.0
 
     @staticmethod
     def _ema(curr: float, prev: float, alpha: float = 0.2) -> float:
@@ -164,22 +160,10 @@ class Core:
     ) -> float:
         """Share-first reward shaping with strong anti-collapse signal."""
         share_term = float(np.clip(share, 0.0, 1.0))
-        rev_term = float(np.tanh((float(rev_per_request) - 10.0) / 7.0))
-        competitiveness_term = float(np.tanh(float(price_gap_f2_minus_f1) / 2.5))
-
-        # Encourage beating parity (0.5 share) and strongly punish sustained loss.
-        share_advantage = float(np.clip(share_term - 0.5, -0.5, 0.5))
-        collapse_penalty = max(0.0, 0.35 - share_term)
-
-        raw = (
-            (0.58 * share_term)
-            + (0.22 * share_advantage)
-            + (0.14 * rev_term)
-            + (0.10 * competitiveness_term)
-            - (0.08 * float(dev_penalty))
-            - (0.32 * collapse_penalty)
-        )
-        return float(np.clip(raw, -1.0, 1.0))
+        
+        rev_term = float(np.tanh((float(rev_per_request) - 8.0) / 8.0))
+        raw = (0.75 * share_term) + (0.25 * rev_term)
+        return float(np.clip(raw - 0.05 * float(dev_penalty), -1.0, 1.0))
 
     def _compute_rl_reward(self, m1: FirmMetrics, base, mean_gap: float) -> float:
         """Lower-variance RL reward with EMA smoothing."""
@@ -187,16 +171,6 @@ class Core:
             abs(float(self.firm1.overrides.base_fare) - float(base.base_fare)) / max(1e-6, float(base.base_fare))
             + abs(float(self.firm1.overrides.per_minute) - float(base.per_minute)) / max(1e-6, float(base.per_minute))
         )
-        # Backward-compatible EMA state in case objects were created before these attrs existed.
-        self.share_ema = self._ema(m1.share, float(getattr(self, "share_ema", 0.5)), alpha=0.2)
-        prev_rev_ema = float(getattr(self, "rev_ema", getattr(self, "revpr_ema", 0.0)))
-        self.rev_ema = self._ema(m1.rev_per_request, prev_rev_ema, alpha=0.2)
-        self.revpr_ema = self.rev_ema
-
-        # Robustness terms: reward maintaining non-collapsed share and improving trend.
-        share_floor_penalty = max(0.0, 0.35 - float(m1.share))
-        trend_bonus = 0.10 * np.tanh((float(m1.share) - float(self.share_ema)) / 0.08)
-        rev_trend_bonus = 0.05 * np.tanh((float(m1.rev_per_request) - float(self.rev_ema)) / 1.5)
         
         instant = self._reward_base(
             share=m1.share,
@@ -204,11 +178,7 @@ class Core:
             price_gap_f2_minus_f1=mean_gap,
             dev_penalty=dev_penalty,
         )
-        instant = float(np.clip(instant + trend_bonus + rev_trend_bonus - 0.25 * share_floor_penalty, -1.0, 1.0))
-        
-        self.rl_reward_ema = 0.80 * float(self.rl_reward_ema) + 0.20 * float(instant)
-        self.share_ema = 0.90 * float(self.share_ema) + 0.10 * float(m1.share)
-        self.revpr_ema = 0.90 * float(self.revpr_ema) + 0.10 * float(m1.rev_per_request)
+        self.rl_reward_ema = 0.85 * float(self.rl_reward_ema) + 0.15 * float(instant)
         return float(self.rl_reward_ema)
     
     def run_experiment(self):
@@ -219,8 +189,6 @@ class Core:
         # PHASE 1: 100 Days Training (20 batches of 5 days)
         print(">>> Starting 100-Day Training Phase (200 rides/day)...")
         self.rl_reward_ema = 0.0
-        self.share_ema = 0.5
-        self.revpr_ema = 0.0
         for batch_idx in range(20):
             batch_reward = 0
             for day in range(5):
@@ -398,8 +366,6 @@ class Core:
     def run(self, days: int, timesteps_per_day: int, customers_per_step: int) -> List[Dict[str, Any]]:
         all_rows: List[Dict[str, Any]] = []
         self.rl_reward_ema = 0.0
-        self.share_ema = 0.5
-        self.revpr_ema = 0.0
 
         for d in range(days):
             day_ctx = self.market.sample_day_context()

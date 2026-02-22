@@ -161,9 +161,9 @@ class FirmRLPricer:
         
         self.step_scale = 0.5
         # State: 10 context features + length of optimized coefficients
-        state_dim = 10 + len(self.opt_keys)
+        state_dim = 6 + len(self.opt_keys)
         # Action space: no-op + (decrease/increase) per managed coefficient
-        action_dim = 5
+        action_dim = 3
         
         # Initialize Agent
         self.agent = WassersteinWPOAgent(
@@ -175,19 +175,22 @@ class FirmRLPricer:
     def apply_action(self, action: int):
         """Maps the discrete RL action to coefficient updates.
 
-        action=0: no-op
-        action=1..2*K: for coefficient i=(action-1)//2, odd=decrease, even=increase
+        action=0: decrease all managed coefficients
+        action=1: hold
+        action=2: increase all managed coefficients
         """
-        if action == 4:
+        if action == 1:
             return
 
-        key = "base_fare" if action in (0, 1) else "per_minute"
-        direction = -1.0 if action in (0, 2) else 1.0
+        direction = -1.0 if action == 0 else 1.0
+        for key in self.opt_keys:
+            current_val = getattr(self.overrides, key)
+            if current_val is None:
+                # conservative fallback near lower bound to avoid large jumps
+                lb, ub = self.config.bounds[key]
+                current_val = float(lb + 0.25 * (ub - lb))
 
-        current_val = getattr(self.overrides, key)
-        if current_val is None:
-            current_val = 1.0
+            step = self.config.step[key] * self.step_scale
+            new_val = float(current_val) + direction * step
+            setattr(self.overrides, key, float(np.clip(new_val, *self.config.bounds[key])))
 
-        step = self.config.step[key] * self.step_scale
-        new_val = float(current_val) + direction * step
-        setattr(self.overrides, key, float(np.clip(new_val, *self.config.bounds[key])))

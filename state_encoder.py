@@ -9,7 +9,10 @@ Created on Sun Feb  8 19:47:22 2026
 
 """
 State encoder:
-fixed context + competitor memory + last-batch summaries + selected coefficient deltas.
+compact context + last-batch summaries + selected coefficient deltas.
+
+The state intentionally keeps only low-variance signals so the policy is easier to
+learn and less sensitive to transient competitor behavior.
 """
 
 from typing import List
@@ -34,21 +37,20 @@ def build_state_vector(
     firm2_ema_gap: float,
     firm2_cooldown: float,
 ) -> np.ndarray:
-    w_keys = ["clear", "rain", "snow"]
-    w_onehot = [1.0 if weather == k else 0.0 for k in w_keys]
-    if sum(w_onehot) == 0:
-        w_onehot = [0.0, 0.0, 0.0]
+    # Compact fixed features (stable and low-noise):
+    #  - weekend flag instead of full day-of-week
+    #  - bad-weather indicator instead of full one-hot weather
+    is_weekend = 1.0 if int(day_of_week) >= 5 else 0.0
+    is_bad_weather = 1.0 if weather in ("rain", "snow") else 0.0
 
     # Fixed features (stable, Markov-ish)
     fixed = [
-        day_of_week / 6.0,
         hour / 23.0,
-        *w_onehot,
+        is_weekend,
+        is_bad_weather,
         float(np.clip(airport_rate_last, 0.0, 1.0)),
-        float(np.clip(mean_distance_last / 20.0, 0.0, 1.0)),  # normalize ~ [0,20] miles
-        float(firm2_ema_share),
-        float(np.clip(firm2_ema_gap / 5.0, -2.0, 2.0)),       # scale price gap
-        float(np.clip(firm2_cooldown / 5.0, 0.0, 1.0)),
+        float(np.clip(mean_distance_last / 20.0, 0.0, 1.0)),
+        float(np.clip(firm2_ema_share, 0.0, 1.0)),
     ]
 
     # Coefficient features: normalized relative deltas vs base
