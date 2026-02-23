@@ -142,21 +142,73 @@ class LLMChoiceModel(BaseChoiceModel):
               "short_reason": "one sentence"
             }}
             """.strip()
-
-    def _fallback(self, p1: float, p2: float) -> ChoiceResult:
+    
+    @staticmethod
+    def _income_score(income: str) -> float:
+        return {"<50k": 0.0, "50k-100k": 0.3, "100k-200k": 0.7, "200k+": 1.0}.get(income, 0.3)
+    
+    def _fallback(self, profile: Dict[str, Any], scenario: Dict[str, Any], p1: float, p2: float) -> ChoiceResult:
         if not self._warned_unavailable:
             reason = f" ({self._unavailable_reason})" if self._unavailable_reason else ""
             print(f"[LLMChoiceModel] OpenAI client unavailable{reason}; falling back to deterministic price-based choices.")
             self._warned_unavailable = True
+            
+        # 1) price signal (Firm1 better when p1 < p2)
+        price_gap = float(p2 - p1)
+        income_score = self._income_score(str(profile.get("IncomeBracket", "50k-100k")))
+        price_beta = 0.42 * (1.30 - 0.60 * income_score)
+
+        # 2) loyalty / habit signal
+        loyalty_firm = profile.get("LoyaltyFirm")
+        loyalty_strength = float(profile.get("LoyaltyStrength", 0.0) or 0.0)
+        loyalty_term = 0.0
+        if loyalty_firm == "Firm1":
+            loyalty_term = +0.70 * loyalty_strength
+        elif loyalty_firm == "Firm2":
+            loyalty_term = -0.70 * loyalty_strength
+
+        # 3) urgency/risk: in bad weather / airport / rush hour riders are less price-sensitive
+        hour = int(scenario.get("Hour", 12) or 12)
+        weather = str(scenario.get("Weather", "Clear"))
+        airport = bool(scenario.get("Airport", False))
+        rush = (7 <= hour < 10) or (16 <= hour < 19)
+        bad_weather = weather in {"Rain", "Storm", "Snow"}
+
+        urgency = 1.0 if (rush or bad_weather or airport) else 0.0
+        price_term = price_beta * price_gap * (1.0 - 0.35 * urgency)
+
+        # Mild incumbency inertia in close-call situations to avoid hard flips on tiny price gaps
+        if abs(price_gap) < 0.35 and loyalty_firm is None:
+            habit_term = -0.08
+        else:
+            habit_term = 0.0
+
+        score = price_term + loyalty_term + habit_term
+        choice = "Firm1" if score >= 0.0 else "Firm2"
+
+        reasons: List[str] = []
+        if abs(price_gap) >= 0.75:
+            reasons.append("PRICE")
+        if loyalty_firm is not None and loyalty_strength > 0.20:
+            reasons.append("LOYALTY")
+        if urgency > 0:
+            reasons.append("URGENCY")
+        if bad_weather:
+            reasons.append("WEATHER")
+        if habit_term != 0.0:
+            reasons.append("HABIT")
+        if not reasons:
+            reasons = ["RISK"]
+
         return ChoiceResult(
-            choice="Firm1" if p1 <= p2 else "Firm2",
-            reason_codes=["FALLBACK_PRICE"],
-            short_reason="Fallback (LLM unavailable).",
+            choice=choice,
+            reason_codes=[f"FALLBACK_{r}" for r in reasons],
+            short_reason="Fallback (deterministic utility: price + loyalty + context).",
         )
 
     def choose(self, profile: Dict[str, Any], scenario: Dict[str, Any], price1: float, price2: float) -> ChoiceResult:
         if self.client is None:
-            return self._fallback(price1, price2)
+            return self._fallback(profile, scenario, price1, price2)
 
         prompt = self._prompt(profile, scenario, price1, price2)
         try:
@@ -171,7 +223,7 @@ class LLMChoiceModel(BaseChoiceModel):
 
             choice = obj.get("choice", "Firm1")
             if choice not in ("Firm1", "Firm2"):
-                return self._fallback(price1, price2)
+                return self._fallback(profile, scenario, price1, price2)
 
             reason_codes = obj.get("reason_codes", [])
             if not isinstance(reason_codes, list):
