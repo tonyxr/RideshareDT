@@ -19,9 +19,9 @@ import json
 class LLMCustomerAgent:
     def __init__(self, model_name: str = "gpt-4", api_key: Optional[str] = None):
         self.model_name = model_name
-        self.api_key = api_key or os.getenv("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")
-        self.client = OpenAI(api_key=self.api_key) if self.api_key else None
-
+        resolved_key = api_key or os.getenv("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")
+        self.client = OpenAI(api_key=resolved_key) if resolved_key else None
+        
     def build_choice_prompt(self, profile: Dict[str, Any], scenario: Dict[str, Any], offer_a: float, offer_b: float) -> str:
        return f""" You are a ride-hailing customer deciding between two platforms for ONE trip.
        
