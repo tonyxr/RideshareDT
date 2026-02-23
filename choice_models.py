@@ -85,7 +85,7 @@ class LLMChoiceModel(BaseChoiceModel):
 
     def __init__(self, model_name: str = "gpt-4o-mini", api_key: Optional[str] = None):
         self.model_name = model_name
-        self.api_key = api_key or os.getenv("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")
+        self.api_key = api_key or os.getenv("")
         self.client = None
         self._warned_unavailable = False
 
