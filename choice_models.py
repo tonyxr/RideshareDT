@@ -8,7 +8,6 @@ from __future__ import annotations
 - Rewritten again on Feb 8, 2026
 """
 from typing import List, Dict, Any, Optional
-from openai import OpenAI
 import pandas as pd
 from dataclasses import dataclass
 import numpy as np
@@ -85,9 +84,13 @@ class LLMChoiceModel(BaseChoiceModel):
 
     def __init__(self, model_name: str = "gpt-4o-mini", api_key: Optional[str] = None):
         self.model_name = model_name
-        self.api_key = api_key or os.getenv("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")
+        # Priority order:
+        # 1) explicit constructor argument
+        # 2) OPENAI_API_KEY environment variable
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")        
         self.client = None
         self._warned_unavailable = False
+        self._unavailable_reason = ""
 
         if not self.api_key:
             return
@@ -95,8 +98,9 @@ class LLMChoiceModel(BaseChoiceModel):
         try:
             from openai import OpenAI  # lazy import
             self.client = OpenAI(api_key=self.api_key)
-        except Exception:
+        except Exception as exc:
             self.client = None
+            self._unavailable_reason = f"OpenAI client init failed: {type(exc).__name__}"
 
     def _prompt(self, profile: Dict[str, Any], scenario: Dict[str, Any], p1: float, p2: float) -> str:
         return f"""
@@ -141,7 +145,8 @@ class LLMChoiceModel(BaseChoiceModel):
 
     def _fallback(self, p1: float, p2: float) -> ChoiceResult:
         if not self._warned_unavailable:
-            print("[LLMChoiceModel] OpenAI client unavailable; falling back to deterministic price-based choices.")
+            reason = f" ({self._unavailable_reason})" if self._unavailable_reason else ""
+            print(f"[LLMChoiceModel] OpenAI client unavailable{reason}; falling back to deterministic price-based choices.")
             self._warned_unavailable = True
         return ChoiceResult(
             choice="Firm1" if p1 <= p2 else "Firm2",
@@ -177,7 +182,8 @@ class LLMChoiceModel(BaseChoiceModel):
                 short_reason = ""
 
             return ChoiceResult(choice=choice, reason_codes=reason_codes, short_reason=short_reason)
-        except Exception:
+        except Exception as exc:
+            self._unavailable_reason = f"OpenAI API call failed: {type(exc).__name__}"
             return self._fallback(price1, price2)
         
         

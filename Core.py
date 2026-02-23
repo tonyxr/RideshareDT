@@ -55,6 +55,7 @@ class Core:
         seed: Optional[int] = None,
         choice_mode: str = "llm",
         model_name: str = "gpt-4o-mini",
+        openai_api_key: Optional[str] = None,
         firm1_mode: str = "RL",
         firm2_mode: str = "static",
         firm1_static_values: str = "",
@@ -78,7 +79,7 @@ class Core:
         # choice model
         self.choice_mode = choice_mode
         if choice_mode == "llm":
-            self.choice_model = LLMChoiceModel(model_name=model_name)
+            self.choice_model = LLMChoiceModel(model_name=model_name, api_key=openai_api_key)
         else:
             self.choice_model = ParametricChoiceModel(seed=self.seed)
 
@@ -652,6 +653,7 @@ def main():
     parser.add_argument("--customers", type=int, default=500)
     parser.add_argument("--choice_mode", type=str, default="llm", choices=["parametric", "llm"])
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
+    parser.add_argument("--openai_api_key", type=str, default=None, help="Optional OpenAI API key override. If omitted, OPENAI_API_KEY env var is used.")
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed. If omitted, a new seed is generated each run.")
     parser.add_argument("--out", type=str, default="market_runs.csv")
 
