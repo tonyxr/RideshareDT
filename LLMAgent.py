@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -9,15 +11,16 @@ from typing import Literal, Dict, Any, Optional
 import openai
 import pandas as pd
 from openai import OpenAI
-from __future__ import annotations
+
 
 import os
 import json
 
 class LLMCustomerAgent:
-    def __init__(self, model_name: str = "gpt-4", api_key: str = "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"):
+    def __init__(self, model_name: str = "gpt-4", api_key: Optional[str] = None):
         self.model_name = model_name
-        self.client = OpenAI(api_key=api_key)
+        self.api_key = api_key or os.getenv("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")
+        self.client = OpenAI(api_key=self.api_key) if self.api_key else None
 
     def build_choice_prompt(self, profile: Dict[str, Any], scenario: Dict[str, Any], offer_a: float, offer_b: float) -> str:
        return f""" You are a ride-hailing customer deciding between two platforms for ONE trip.

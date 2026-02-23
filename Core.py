@@ -18,6 +18,7 @@ import csv
 from typing import Dict, Any, List, Tuple, Optional
 import numpy as np
 import torch
+import random
 
 import importlib.util
 import os
@@ -59,11 +60,13 @@ class Core:
         firm1_static_values: str = "",
         firm2_static_values: str = "",
         total_customers_pool: int = 20000,
+        deterministic_torch: bool = False,
     ):
         self.rng = np.random.default_rng(seed)
         self.market = MarketInteraction(city_name=market_name, seed=seed)
         self.seed = int(seed) if seed is not None else int(np.random.SeedSequence().generate_state(1)[0])
-
+        
+        self._seed_all_rngs(self.seed, deterministic_torch=deterministic_torch)
         self.rng = np.random.default_rng(self.seed)
         self.market = MarketInteraction(city_name=market_name, seed=self.seed)
         
@@ -126,6 +129,21 @@ class Core:
         
         self.run_logs = []
         self.rl_reward_ema = 0.0
+        
+    @staticmethod
+    def _seed_all_rngs(seed: int, deterministic_torch: bool = False) -> None:
+        """Seed Python/NumPy/Torch RNGs for reproducible simulations."""
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+        # Optional stricter mode for deterministic Torch kernels.
+        if deterministic_torch:
+            torch.use_deterministic_algorithms(True)
+            if hasattr(torch.backends, "cudnn"):
+                torch.backends.cudnn.benchmark = False
 
     @staticmethod
     def _ema(curr: float, prev: float, alpha: float = 0.2) -> float:
@@ -644,6 +662,11 @@ def main():
     parser.add_argument("--firm2_static_values", type=str, default="")
 
     parser.add_argument("--pool", type=int, default=20000, help="Static customer pool size.")
+    parser.add_argument(
+        "--deterministic_torch",
+        action="store_true",
+        help="Use deterministic Torch kernels where available (may reduce performance).",
+    )
     
     parser.add_argument("--report_prefix", type=str, default="artifacts/report")
     parser.add_argument("--run_experiment", action="store_true", help="Run 100-day train + 50-day eval study")
@@ -660,6 +683,7 @@ def main():
         firm1_static_values=args.firm1_static_values,
         firm2_static_values=args.firm2_static_values,
         total_customers_pool=args.pool,
+        deterministic_torch=args.deterministic_torch,
     )
 
     if args.run_experiment:

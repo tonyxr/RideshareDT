@@ -16,9 +16,6 @@ import numpy as np
 import os
 import json
 
-OpenAI.api_key = "sk-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"  # <-- Replace this with your actual key before use
-client = OpenAI(api_key = "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")
-
 @dataclass(frozen=True)
 class ChoiceResult:
     choice: str                  # "Firm1" or "Firm2"
@@ -88,8 +85,9 @@ class LLMChoiceModel(BaseChoiceModel):
 
     def __init__(self, model_name: str = "gpt-4o-mini", api_key: Optional[str] = None):
         self.model_name = model_name
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.api_key = "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"
         self.client = None
+        self._warned_unavailable = False
 
         if not self.api_key:
             return
@@ -142,6 +140,9 @@ class LLMChoiceModel(BaseChoiceModel):
             """.strip()
 
     def _fallback(self, p1: float, p2: float) -> ChoiceResult:
+        if not self._warned_unavailable:
+            print("[LLMChoiceModel] OpenAI client unavailable; falling back to deterministic price-based choices.")
+            self._warned_unavailable = True
         return ChoiceResult(
             choice="Firm1" if p1 <= p2 else "Firm2",
             reason_codes=["FALLBACK_PRICE"],
