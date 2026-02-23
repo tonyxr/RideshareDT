@@ -53,7 +53,7 @@ class Core:
         self,
         market_name: str,
         seed: Optional[int] = None,
-        choice_mode: str = "parametric",
+        choice_mode: str = "llm",
         model_name: str = "gpt-4o-mini",
         firm1_mode: str = "RL",
         firm2_mode: str = "static",
@@ -650,7 +650,7 @@ def main():
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--timesteps", type=int, default=8)
     parser.add_argument("--customers", type=int, default=500)
-    parser.add_argument("--choice_mode", type=str, default="parametric", choices=["parametric", "llm"])
+    parser.add_argument("--choice_mode", type=str, default="llm", choices=["parametric", "llm"])
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed. If omitted, a new seed is generated each run.")
     parser.add_argument("--out", type=str, default="market_runs.csv")
