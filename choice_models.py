@@ -11,7 +11,7 @@ from typing import List, Dict, Any, Optional
 import pandas as pd
 from dataclasses import dataclass
 import numpy as np
-
+from openai import OpenAI
 import os
 import json
 
@@ -82,26 +82,28 @@ class LLMChoiceModel(BaseChoiceModel):
     Intended for small-scale evaluation, not large simulation runs.
     """
 
-    def __init__(self, model_name: str = "gpt-4o-mini", api_key: Optional[str] = None):
+    def __init__(self, model_name: str = "gpt-5.2", api_key = "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"):
         self.model_name = model_name
         # Priority order:
         # 1) explicit constructor argument
         # 2) OPENAI_API_KEY environment variable
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")        
+        self.api_key = "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"
+        
         self.client = None
         self._warned_unavailable = False
         self._unavailable_reason = ""
-
-        if not self.api_key:
-            return
-
+        
         try:
-            from openai import OpenAI  # lazy import
+            print(self.api_key)
             self.client = OpenAI(api_key=self.api_key)
+            print(self.client)
+        
         except Exception as exc:
+            print("Cannot reach API")
             self.client = None
-            self._unavailable_reason = f"OpenAI client init failed: {type(exc).__name__}"
-
+            self._unavailable_reason = f"OpenAI client init failed: {type(exc).__name__}: {exc}"
+            print(self._unavailable_reason)
+        
     def _prompt(self, profile: Dict[str, Any], scenario: Dict[str, Any], p1: float, p2: float) -> str:
         return f"""
             Forget about your previous responses
@@ -133,7 +135,7 @@ class LLMChoiceModel(BaseChoiceModel):
             - Firm1 price: ${p1}
             - Firm2 price: ${p2}
             
-            Choose ONE firm. Consider context and profile, not only price.
+            Choose ONE firm. Consider context and profile, commit the choice cognitively, not only price.
             
             Return STRICT JSON ONLY:
             {{
@@ -212,13 +214,31 @@ class LLMChoiceModel(BaseChoiceModel):
 
         prompt = self._prompt(profile, scenario, price1, price2)
         try:
-            resp = self.client.responses.create(
-                model=self.model_name,
-                input=prompt,
-                temperature=0.0,
-                max_output_tokens=250,
-            )
-            text = getattr(resp, "output_text", "") or ""
+            text = ""
+
+            # Preferred path for newer OpenAI SDKs.
+            if hasattr(self.client, "responses"):
+                resp = self.client.responses.create(
+                    model=self.model_name,
+                    input=prompt,
+                    temperature=0.0,
+                    max_output_tokens=250,
+                )
+                text = getattr(resp, "output_text", "") or ""
+
+            # Compatibility path for SDKs / deployments that only expose chat completions.
+            if not text and hasattr(self.client, "chat"):
+                chat_resp = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=250,
+                )
+                text = (chat_resp.choices[0].message.content or "").strip()
+
+            if not text:
+                raise ValueError("OpenAI returned empty response text")
+
             obj = json.loads(text)
 
             choice = obj.get("choice", "Firm1")
@@ -236,6 +256,6 @@ class LLMChoiceModel(BaseChoiceModel):
             return ChoiceResult(choice=choice, reason_codes=reason_codes, short_reason=short_reason)
         except Exception as exc:
             self._unavailable_reason = f"OpenAI API call failed: {type(exc).__name__}"
-            return self._fallback(price1, price2)
+            return self._fallback(profile, scenario, price1, price2)
         
         
