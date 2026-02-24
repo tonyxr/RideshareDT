@@ -202,6 +202,7 @@ class Core:
         dev_penalty: float = 0.0,
     ) -> float:
         """Share-first reward shaping with strong anti-collapse signal."""
+        
         share_term = float(np.clip(share, 0.0, 1.0))
         
         rev_term = float(np.tanh((float(rev_per_request) - 10.0) / 6.0))
@@ -492,6 +493,9 @@ class Core:
 
             if self.firm1_mode == "RL":
                 self.firm1.agent.update(epochs=5)
+                
+            print("revenue per request sum", str(revpr_sum))
+            print("firm market share sum", str(share_sum))
 
             avg_share = share_sum / max(1, timesteps_per_day)
             avg_revpr = revpr_sum / max(1, timesteps_per_day)

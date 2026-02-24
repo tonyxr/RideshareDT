@@ -82,19 +82,20 @@ class LLMChoiceModel(BaseChoiceModel):
     Intended for small-scale evaluation, not large simulation runs.
     """
 
-    def __init__(self, model_name: str = "gpt-5.2", api_key = ""):
+    def __init__(self, model_name: str = "gpt-5.2", api_key: Optional[str] = None):
         self.model_name = model_name
         # Priority order:
         # 1) explicit constructor argument
         # 2) OPENAI_API_KEY environment variable
-        self.api_key = ""
+        self.api_key = (api_key or os.getenv("OPENAI_API_KEY") or "").strip()
         
         self.client = None
         self._warned_unavailable = False
         self._unavailable_reason = ""
         
         try:
-            print(self.api_key)
+            if not self.api_key:
+                raise ValueError("missing API key (pass --openai_api_key or set OPENAI_API_KEY)")
             self.client = OpenAI(api_key=self.api_key)
             print(self.client)
         
