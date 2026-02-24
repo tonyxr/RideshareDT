@@ -15,7 +15,7 @@ rewritten Feb 6, 2026
 """
 
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 import numpy as np
 
 from Market_models import MarketCoefficients, CoefficientOverrides
@@ -196,3 +196,41 @@ class MarketInteraction:
         price += float(extra_fees)
         return round(max(price, 0.0), 2)
     
+    def flatten_ride_context(self, ctx: RideContext) -> np.ndarray:
+        """Numerical encoding of a RideContext for RL state construction."""
+        weather_keys = list(self.curr_market.weather_multiplier.keys())
+        service_keys = list(self.curr_market.service_multiplier.keys())
+
+        weather_one_hot = [1.0 if ctx.weather == k else 0.0 for k in weather_keys]
+        service_one_hot = [1.0 if ctx.service == k else 0.0 for k in service_keys]
+        weekend = 1.0 if int(ctx.day_of_week) >= 5 else 0.0
+
+        feats: List[float] = [
+            float(np.clip(ctx.hour / 23.0, 0.0, 1.0)),
+            float(np.clip(ctx.day_of_week / 6.0, 0.0, 1.0)),
+            weekend,
+            1.0 if bool(ctx.airport) else 0.0,
+            *weather_one_hot,
+            *service_one_hot,
+        ]
+        return np.array(feats, dtype=np.float32)
+
+    def apply_step_actions_to_overrides(
+        self,
+        overrides: CoefficientOverrides,
+        action_steps: Dict[str, int],
+        step_size: Dict[str, float],
+        bounds: Dict[str, Tuple[float, float]],
+    ) -> None:
+        """Map discrete coefficient steps {-1,0,1} to concrete market override updates."""
+        for key, step_dir in action_steps.items():
+            if step_dir == 0:
+                continue
+
+            current = getattr(overrides, key)
+            if current is None:
+                current = float(getattr(self.curr_market, key))
+
+            delta = float(step_size[key]) * float(np.sign(step_dir))
+            lb, ub = bounds[key]
+            setattr(overrides, key, float(np.clip(float(current) + delta, lb, ub)))

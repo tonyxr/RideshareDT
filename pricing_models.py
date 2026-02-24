@@ -11,7 +11,7 @@ Firm2: Heuristic dynamic pricing (schedule + competitive response + guardrails)
 """
 
 from dataclasses import dataclass
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 import numpy as np
 
 from WPOAgent import WassersteinWPOAgent
@@ -173,16 +173,40 @@ class FirmRLPricer:
         self.max_relative_dev = 0.30
         self.recovery_share_threshold = 0.12
         self.recovery_gap_threshold = -0.35
-        # State: 10 context features + length of optimized coefficients
-        state_dim = 6 + len(self.opt_keys)
-        # Action space: no-op + (decrease/increase) per managed coefficient
+        
+        
+        # Action space: no-op + (down/up) per managed coefficient.
+        # The 5-action layout is fixed for stability and for Wasserstein costs.
         action_dim = 5
+        
+        self.action_to_steps: Dict[int, Dict[str, int]] = {
+            0: {"base_fare": 0, "per_minute": 0},
+            1: {"base_fare": -1, "per_minute": 0},
+            2: {"base_fare": +1, "per_minute": 0},
+            3: {"base_fare": 0, "per_minute": -1},
+            4: {"base_fare": 0, "per_minute": +1},
+        }
+        self.action_vectors = {
+            a: np.array([d["base_fare"], d["per_minute"]], dtype=float)
+            for a, d in self.action_to_steps.items()
+        }
+
+        # State: flattened RideContext + market summaries + coeff deltas.
+        state_dim = 16
+
+        # Wasserstein geometry: penalize large policy moves in coefficient-step space.
+        self.cost_matrix = self._build_action_cost_matrix(action_dim)
         
         # Initialize Agent
         self.agent = WassersteinWPOAgent(
             state_dim=state_dim,
             action_dim=action_dim,
-            cost_matrix=np.eye(action_dim),
+            cost_matrix=self.cost_matrix,
+            w_coeff=0.70,
+            epsilon=0.08,
+            max_grad_norm=0.8,
+            advantage_scale=1.20,
+            advantage_clip=3.0,
             ent_coeff_start=0.03,
             ent_coeff_end=0.005,
             ent_decay_updates=400,
@@ -191,6 +215,14 @@ class FirmRLPricer:
             temperature_decay_steps=3000,
         )
         
+    def _build_action_cost_matrix(self, action_dim: int) -> np.ndarray:
+        C = np.zeros((action_dim, action_dim), dtype=np.float32)
+        for i in range(action_dim):
+            for j in range(action_dim):
+                vi = self.action_vectors[i]
+                vj = self.action_vectors[j]
+                C[i, j] = float(np.linalg.norm(vi - vj, ord=1))
+        return C
     
     @staticmethod
     def _bounded_relative_move(value: float, anchor: float, max_relative_dev: float, lb: float, ub: float) -> float:
@@ -219,36 +251,23 @@ class FirmRLPricer:
                 self._bounded_relative_move(nudged, anchor, self.max_relative_dev, lb, ub),
             )
         
-    def apply_action(self, action: int):
-        """Apply one-key-at-a-time updates to reduce coupled-action oscillation."""
-        if action == 0:
+    def apply_action(self, action: int, market_interaction) -> None:
+        """Map discrete steps back into concrete market coefficient overrides."""
+        if action not in self.action_to_steps:
             return
         
-        key = None
-        direction = 0.0
-        if action == 1:
-            key, direction = "base_fare", -1.0
-        elif action == 2:
-            key, direction = "base_fare", +1.0
-        elif action == 3:
-            key, direction = "per_minute", -1.0
-        elif action == 4:
-            key, direction = "per_minute", +1.0
-        else:
+        step_map = {
+            k: v for k, v in self.action_to_steps[action].items() if k in self.opt_keys
+        }
+        if not step_map:
             return
-
-        if key not in self.opt_keys:
-            return
-
-        current_val = getattr(self.overrides, key)
-        if current_val is None:
-            lb, ub = self.config.bounds[key]
-            current_val = float(lb + 0.25 * (ub - lb))
-
-        step = self.config.step[key] * self.step_scale
-        new_val = float(current_val) + direction * step
-        lb, ub = self.config.bounds[key]
-        anchor = 3.0 if key == "base_fare" else 0.45
-        bounded = self._bounded_relative_move(new_val, anchor, self.max_relative_dev, lb, ub)
-        setattr(self.overrides, key, bounded)
+        
+        scaled_steps = {k: self.config.step[k] * self.step_scale for k in step_map.keys()}
+        bounds = {k: self.config.bounds[k] for k in step_map.keys()}
+        market_interaction.apply_step_actions_to_overrides(
+            overrides=self.overrides,
+            action_steps=step_map,
+            step_size=scaled_steps,
+            bounds=bounds,
+        )
 

@@ -28,29 +28,23 @@ def build_state_vector(
     base: MarketCoefficients,
     ov_firm1: CoefficientOverrides,
     opt_keys: List[CoeffKey],
-    day_of_week: int,
-    hour: int,
-    weather: str,
+    ride_ctx_vec: np.ndarray,
     airport_rate_last: float,
     mean_distance_last: float,
     firm2_ema_share: float,
     firm2_ema_gap: float,
     firm2_cooldown: float,
 ) -> np.ndarray:
-    # Compact fixed features (stable and low-noise):
-    #  - weekend flag instead of full day-of-week
-    #  - bad-weather indicator instead of full one-hot weather
-    is_weekend = 1.0 if int(day_of_week) >= 5 else 0.0
-    is_bad_weather = 1.0 if weather in ("rain", "snow") else 0.0
-
-    # Fixed features (stable, Markov-ish)
+    # Flattened RideContext from market + recent market summaries.
+    ctx_feats = list(np.asarray(ride_ctx_vec, dtype=np.float32))
+    
     fixed = [
-        hour / 23.0,
-        is_weekend,
-        is_bad_weather,
+        *ctx_feats,
         float(np.clip(airport_rate_last, 0.0, 1.0)),
         float(np.clip(mean_distance_last / 20.0, 0.0, 1.0)),
         float(np.clip(firm2_ema_share, 0.0, 1.0)),
+        float(np.clip((firm2_ema_gap + 10.0) / 20.0, 0.0, 1.0)),
+        float(np.clip(firm2_cooldown / 5.0, 0.0, 1.0)),
     ]
 
     # Coefficient features: normalized relative deltas vs base

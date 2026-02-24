@@ -208,11 +208,9 @@ class Core:
 
         # Penalize only clear overpricing (Firm1 more expensive), avoid extra oscillatory penalties.
         overprice_penalty = float(np.clip(-price_gap_f2_minus_f1 / 3.0, 0.0, 1.0))
-        dev_term = float(np.clip(dev_penalty, 0.0, 2.0))
 
         raw = (0.70 * rev_term) + (0.30 * share_term)
         raw -= (0.15 * overprice_penalty)
-        raw -= (0.06 * dev_term)
         return float(np.clip(raw, -1.0, 1.0))
 
     def _compute_rl_reward(self, m1: FirmMetrics, base, mean_gap: float) -> float:
@@ -285,7 +283,7 @@ class Core:
         if self.firm1_mode == "RL":
             s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
             action, s_ts, logits, val = self.firm1.agent.act(s_vec)
-            self.firm1.apply_action(action)
+            self.firm1.apply_action(action, self.market)
             rl_step = (action, s_ts, logits, val)
         elif self.firm1_mode == "heuristic":
             self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
@@ -318,13 +316,21 @@ class Core:
         f2_ema_share = getattr(self.firm2, "ema_share", 0.5)
         f2_ema_gap = getattr(self.firm2, "ema_gap", 0.0)
         f2_cooldown = float(getattr(self.firm2, "cooldown", 0.0))
+        
+        rep_ctx = RideContext(
+            day_of_week=int(day_of_week),
+            weather=str(weather),
+            hour=int(hour),
+            airport=bool(self.airport_rate_last >= self.market.airport_prob),
+            service="economy",
+        )
+        ride_ctx_vec = self.market.flatten_ride_context(rep_ctx)
+        
         return build_state_vector(
             base=self.market.curr_market,
             ov_firm1=self.firm1.overrides,
             opt_keys=self.opt_keys,
-            day_of_week=day_of_week,
-            hour=hour,
-            weather=weather,
+            ride_ctx_vec=ride_ctx_vec,
             airport_rate_last=self.airport_rate_last,
             mean_distance_last=self.mean_distance_last,
             firm2_ema_share=float(f2_ema_share),
@@ -439,7 +445,7 @@ class Core:
                 if self.firm1_mode == "RL":
                     s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
                     action, s_ts, logits, val = self.firm1.agent.act(s_vec)
-                    self.firm1.apply_action(action)
+                    self.firm1.apply_action(action, self.market)
                     rl_step = (action, s_ts, logits, val)
                 elif self.firm1_mode == "heuristic":
                     self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
