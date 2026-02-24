@@ -95,6 +95,12 @@ class WassersteinWPOAgent:
         max_grad_norm: float = 1.0,
         advantage_scale: float = 1.35,
         advantage_clip: float = 4.0,
+        ent_coeff_start: float = 0.03,
+        ent_coeff_end: float = 0.005,
+        ent_decay_updates: int = 400,
+        temperature_start: float = 1.20,
+        temperature_end: float = 1.00,
+        temperature_decay_steps: int = 5000,
         device: Optional[str] = None,
     ):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -110,6 +116,14 @@ class WassersteinWPOAgent:
         self.max_grad_norm = max_grad_norm
         self.advantage_scale = advantage_scale
         self.advantage_clip = advantage_clip
+        self.ent_coeff_start = float(max(0.0, ent_coeff_start))
+        self.ent_coeff_end = float(np.clip(ent_coeff_end, 0.0, self.ent_coeff_start))
+        self.ent_decay_updates = int(max(1, ent_decay_updates))
+        self.temperature_start = float(max(0.5, temperature_start))
+        self.temperature_end = float(np.clip(temperature_end, 0.5, self.temperature_start))
+        self.temperature_decay_steps = int(max(1, temperature_decay_steps))
+        self.act_calls = 0
+        self.update_calls = 0
 
         self.C = torch.tensor(cost_matrix, dtype=torch.float32, device=self.device)
         self.buf: List[Transition] = []
@@ -121,7 +135,13 @@ class WassersteinWPOAgent:
         if s.shape[-1] != expected_dim:
             raise ValueError(f"State dim mismatch: got {s.shape[-1]}, expected {expected_dim}")
         logits, value = self.net(s)
-        dist = torch.distributions.Categorical(logits=logits)
+        
+        # On-policy exploration via temperature: high early, annealed later.
+        frac = min(1.0, float(self.act_calls) / float(self.temperature_decay_steps))
+        temp = float(self.temperature_start + frac * (self.temperature_end - self.temperature_start))
+        self.act_calls += 1
+
+        dist = torch.distributions.Categorical(logits=(logits / temp))
         a = dist.sample()
         return int(a.item()), s.squeeze(0), logits.squeeze(0), value.squeeze(0)
 
@@ -212,7 +232,9 @@ class WassersteinWPOAgent:
                 # critic
                 value_loss = ((v - ret_b) ** 2).mean()
 
-                loss = policy_loss + self.w_coeff * wdist + self.v_coeff * value_loss - self.ent_coeff * entropy
+                ent_frac = min(1.0, float(self.update_calls) / float(self.ent_decay_updates))
+                ent_coeff_now = float(self.ent_coeff_start + ent_frac * (self.ent_coeff_end - self.ent_coeff_start))
+                loss = policy_loss + self.w_coeff * wdist + self.v_coeff * value_loss - ent_coeff_now * entropy
 
                 self.opt.zero_grad()
                 loss.backward()
@@ -226,6 +248,7 @@ class WassersteinWPOAgent:
                 last_entropy = float(entropy.item())
 
         self.buf.clear()
+        self.update_calls += 1
         return {
             "loss": last_loss,
             "policy_loss": last_policy,

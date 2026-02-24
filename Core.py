@@ -93,16 +93,17 @@ class Core:
             raise ValueError("firm2_mode must be one of: heuristic, static")
 
         self.opt_keys = ["base_fare", "per_minute"]
+        self.shared_edit_keys = list(self.opt_keys)
 
         if self.firm1_mode == "RL":
-            self.firm1 = FirmRLPricer(seed=self.seed, opt_keys=self.opt_keys)
+            self.firm1 = FirmRLPricer(seed=self.seed, opt_keys=self.shared_edit_keys)
         elif self.firm1_mode == "heuristic":
-            self.firm1 = FirmHeuristicPricer(seed=self.seed)
+            self.firm1 = FirmHeuristicPricer(seed=self.seed, managed_keys=self.shared_edit_keys)
         else:
             self.firm1 = FirmStaticPricer()
 
         if self.firm2_mode == "heuristic":
-            self.firm2 = FirmHeuristicPricer(seed=self.seed + 1)
+            self.firm2 = FirmHeuristicPricer(seed=self.seed + 1, managed_keys=self.shared_edit_keys)
         else:
             self.firm2 = FirmStaticPricer()
             
@@ -115,6 +116,8 @@ class Core:
         # apply static overrides (if any)
         f1_vals = _parse_kv_floats(firm1_static_values)
         f2_vals = _parse_kv_floats(firm2_static_values)
+        f1_vals, f2_vals = self._restrict_static_overrides(f1_vals, f2_vals, self.shared_edit_keys)
+
 
         for k, v in f1_vals.items():
             set_coeff(self.market.curr_market, self.firm1.overrides, k, v)
@@ -129,8 +132,29 @@ class Core:
         self.evaluation_logs = []
         
         self.run_logs = []
-        self.rl_reward_ema = 0.0
-        
+    
+    @staticmethod
+    def _restrict_static_overrides(
+        f1_vals: Dict[str, float],
+        f2_vals: Dict[str, float],
+        shared_keys: List[str],
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """Force both firms to edit the same coefficient set and cap Firm2 to Firm1 scope."""
+        allowed = set(shared_keys)
+
+        f1_filtered = {k: v for k, v in f1_vals.items() if k in allowed}
+        dropped_f1 = [k for k in f1_vals.keys() if k not in allowed]
+        if dropped_f1:
+            print(f"[Core] Ignoring Firm1 static keys outside shared edit set: {dropped_f1}")
+
+        f2_allowed = set(f1_filtered.keys())
+        f2_filtered = {k: v for k, v in f2_vals.items() if k in f2_allowed}
+        dropped_f2 = [k for k in f2_vals.keys() if k not in f2_allowed]
+        if dropped_f2:
+            print(f"[Core] Ignoring Firm2 static keys not edited by Firm1: {dropped_f2}")
+
+        return f1_filtered, f2_filtered
+    
     @staticmethod
     def _seed_all_rngs(seed: int, deterministic_torch: bool = False) -> None:
         """Seed Python/NumPy/Torch RNGs for reproducible simulations."""
@@ -180,9 +204,16 @@ class Core:
         """Share-first reward shaping with strong anti-collapse signal."""
         share_term = float(np.clip(share, 0.0, 1.0))
         
-        rev_term = float(np.tanh((float(rev_per_request) - 8.0) / 8.0))
-        raw = (0.75 * share_term) + (0.25 * rev_term)
-        return float(np.clip(raw - 0.05 * float(dev_penalty), -1.0, 1.0))
+        rev_term = float(np.tanh((float(rev_per_request) - 10.0) / 6.0))
+
+        # Penalize only clear overpricing (Firm1 more expensive), avoid extra oscillatory penalties.
+        overprice_penalty = float(np.clip(-price_gap_f2_minus_f1 / 3.0, 0.0, 1.0))
+        dev_term = float(np.clip(dev_penalty, 0.0, 2.0))
+
+        raw = (0.70 * rev_term) + (0.30 * share_term)
+        raw -= (0.15 * overprice_penalty)
+        raw -= (0.06 * dev_term)
+        return float(np.clip(raw, -1.0, 1.0))
 
     def _compute_rl_reward(self, m1: FirmMetrics, base, mean_gap: float) -> float:
         """Lower-variance RL reward with EMA smoothing."""
@@ -191,14 +222,13 @@ class Core:
             + abs(float(self.firm1.overrides.per_minute) - float(base.per_minute)) / max(1e-6, float(base.per_minute))
         )
         
-        instant = self._reward_base(
-            share=m1.share,
-            rev_per_request=m1.rev_per_request,
-            price_gap_f2_minus_f1=mean_gap,
-            dev_penalty=dev_penalty,
+        return self._reward_base(
+            share=float(m1.share),
+            rev_per_request=float(m1.rev_per_request),
+            price_gap_f2_minus_f1=float(mean_gap),
+            dev_penalty=float(dev_penalty),
         )
-        self.rl_reward_ema = 0.85 * float(self.rl_reward_ema) + 0.15 * float(instant)
-        return float(self.rl_reward_ema)
+        
     
     def run_experiment(self):
         """
@@ -207,7 +237,6 @@ class Core:
         """
         # PHASE 1: 100 Days Training (20 batches of 5 days)
         print(">>> Starting 100-Day Training Phase (200 rides/day)...")
-        self.rl_reward_ema = 0.0
         for batch_idx in range(20):
             batch_reward = 0
             for day in range(5):
@@ -215,8 +244,8 @@ class Core:
                 day_ctx = self.market.sample_day_context() # e.g., weather, day_of_week
                 
                 # Run the daily cycle
-                rows, m1, m2 = self.simulate_day_cycle(day_ctx, rides=200, is_training=True)
-                batch_reward += self._reward_base(m1.share, m1.rev_per_request, dev_penalty=0.0)
+                rows, m1, m2, reward = self.simulate_day_cycle(day_ctx, rides=200, is_training=True)
+                batch_reward += float(reward)
             
             # Optimization step: Update RL policy using the 5-day batch data
             metrics = {"loss": 0.0}
@@ -235,7 +264,7 @@ class Core:
         print("\n>>> Starting 50-Day Competitive Evaluation...")
         for day in range(50):
             day_ctx = self.market.sample_day_context()
-            rows, m1, m2 = self.simulate_day_cycle(day_ctx, rides=200, is_training=False)
+            rows, m1, m2, _ = self.simulate_day_cycle(day_ctx, rides=200, is_training=False)
             
             self.evaluation_logs.append({
                 "day": 100 + day,
@@ -265,17 +294,23 @@ class Core:
             self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
         results, m1, m2, gap, air, dist = self.simulate_batch(day_ctx.day_of_week, day_ctx.weather, hour, rides)
+        
+        reward = self._compute_rl_reward(m1, self.market.curr_market, gap)
 
         if is_training and self.firm1_mode == "RL" and rl_step is not None:
             action, s_ts, logits, val = rl_step
-            base = self.market.curr_market
-            reward = self._compute_rl_reward(m1, base, gap)
             self.firm1.agent.store(s_ts, action, float(reward), True, None, logits, val)
+            self.firm1.stabilize_after_batch(
+                share=float(m1.share),
+                price_gap_f2_minus_f1=float(gap),
+                city_base=float(self.market.curr_market.base_fare),
+                city_pmin=float(self.market.curr_market.per_minute),
+            )
 
         self.airport_rate_last = air
         self.mean_distance_last = dist
 
-        return results, m1, m2
+        return results, m1, m2, float(reward)
 
     
     def _build_rl_state(self, day_of_week: int, hour: int, weather: str) -> np.ndarray:
@@ -384,7 +419,6 @@ class Core:
 
     def run(self, days: int, timesteps_per_day: int, customers_per_step: int) -> List[Dict[str, Any]]:
         all_rows: List[Dict[str, Any]] = []
-        self.rl_reward_ema = 0.0
 
         for d in range(days):
             day_ctx = self.market.sample_day_context()
@@ -394,6 +428,7 @@ class Core:
             share_sum = 0.0
             revpr_sum = 0.0
             gap_sum = 0.0
+            reward_sum = 0.0
 
             for t in range(timesteps_per_day):
                 hour = hours[t]
@@ -433,6 +468,14 @@ class Core:
                     reward = self._compute_rl_reward(m1, base, mean_gap)
                     done = (t == timesteps_per_day - 1)
                     self.firm1.agent.store(s_ts, action, float(reward), done, None, logits, val)
+                    if done:
+                        self.firm1.stabilize_after_batch(
+                            share=float(m1.share),
+                            price_gap_f2_minus_f1=float(mean_gap),
+                            city_base=float(base.base_fare),
+                            city_pmin=float(base.per_minute),
+                        )
+                    reward_sum += float(reward)
 
                 share_sum += float(m1.share)
                 revpr_sum += float(m1.rev_per_request)
@@ -447,7 +490,7 @@ class Core:
             avg_share = share_sum / max(1, timesteps_per_day)
             avg_revpr = revpr_sum / max(1, timesteps_per_day)
             avg_gap = gap_sum / max(1, timesteps_per_day)
-            avg_reward = self._reward_base(avg_share, avg_revpr, price_gap_f2_minus_f1=avg_gap, dev_penalty=0.0)
+            avg_reward = (reward_sum / max(1, timesteps_per_day)) if self.firm1_mode == "RL" else self._reward_base(avg_share, avg_revpr, price_gap_f2_minus_f1=avg_gap, dev_penalty=0.0)
             self.run_logs.append({
                 "day": d + 1,
                 "avg_share": float(avg_share),
@@ -680,6 +723,7 @@ def main():
         seed=args.seed,
         choice_mode=args.choice_mode,
         model_name=args.model,
+        openai_api_key=args.openai_api_key,
         firm1_mode=args.firm1_mode,
         firm2_mode=args.firm2_mode,
         firm1_static_values=args.firm1_static_values,
