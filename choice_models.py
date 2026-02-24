@@ -82,12 +82,12 @@ class LLMChoiceModel(BaseChoiceModel):
     Intended for small-scale evaluation, not large simulation runs.
     """
 
-    def __init__(self, model_name: str = "gpt-5.2", api_key = "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"):
+    def __init__(self, model_name: str = "gpt-5.2", api_key = ""):
         self.model_name = model_name
         # Priority order:
         # 1) explicit constructor argument
         # 2) OPENAI_API_KEY environment variable
-        self.api_key = "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"
+        self.api_key = ""
         
         self.client = None
         self._warned_unavailable = False

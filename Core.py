@@ -53,7 +53,7 @@ class Core:
         self,
         market_name: str,
         seed: Optional[int] = None,
-        choice_mode: str = "llm",
+        choice_mode: str = "parametric",
         model_name: str = "gpt-4o-mini",
         openai_api_key: Optional[str] = None,
         firm1_mode: str = "RL",
