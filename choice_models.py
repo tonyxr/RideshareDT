@@ -87,7 +87,7 @@ class LLMChoiceModel(BaseChoiceModel):
         # Priority order:
         # 1) explicit constructor argument
         # 2) OPENAI_API_KEY environment variable
-        self.api_key = "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"
+        self.api_key = "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"
         
         self.client = None
         self._warned_unavailable = False
@@ -117,7 +117,7 @@ class LLMChoiceModel(BaseChoiceModel):
             - Marital status: {profile["MaritalStatus"]}
             - Employment: {profile["EmploymentStatus"]}
             - Gender: {profile["Gender"]}
-            - Loyalty: {profile["Loyalty"]}
+            - Loyalty: {profile.get("Loyalty", profile.get("LoyaltyType", "Unknown"))}
             - Loyalty firm (if any): {profile.get("LoyaltyFirm")}
             - Loyalty strength (0..1): {profile.get("LoyaltyStrength")}
             
@@ -240,8 +240,10 @@ class LLMChoiceModel(BaseChoiceModel):
                 raise ValueError("OpenAI returned empty response text")
 
             obj = json.loads(text)
+            
 
             choice = obj.get("choice", "Firm1")
+            print("choice:", choice)
             if choice not in ("Firm1", "Firm2"):
                 return self._fallback(profile, scenario, price1, price2)
 
