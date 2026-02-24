@@ -34,6 +34,10 @@ def build_state_vector(
     firm2_ema_share: float,
     firm2_ema_gap: float,
     firm2_cooldown: float,
+    firm1_last_share: float,
+    firm1_last_revpr: float,
+    firm1_last_gap: float,
+    firm1_last_reward: float,
 ) -> np.ndarray:
     # Flattened RideContext from market + recent market summaries.
     ctx_feats = list(np.asarray(ride_ctx_vec, dtype=np.float32))
@@ -45,6 +49,10 @@ def build_state_vector(
         float(np.clip(firm2_ema_share, 0.0, 1.0)),
         float(np.clip((firm2_ema_gap + 10.0) / 20.0, 0.0, 1.0)),
         float(np.clip(firm2_cooldown / 5.0, 0.0, 1.0)),
+        float(np.clip(firm1_last_share, 0.0, 1.0)),
+        float(np.clip((firm1_last_revpr - 8.0) / 16.0, -1.0, 1.0)),
+        float(np.clip((firm1_last_gap + 6.0) / 12.0, 0.0, 1.0)),
+        float(np.clip((firm1_last_reward + 1.0) / 2.0, 0.0, 1.0)),
     ]
 
     # Coefficient features: normalized relative deltas vs base

@@ -192,7 +192,7 @@ class FirmRLPricer:
         }
 
         # State: flattened RideContext + market summaries + coeff deltas.
-        state_dim = 16
+        state_dim = 20
 
         # Wasserstein geometry: penalize large policy moves in coefficient-step space.
         self.cost_matrix = self._build_action_cost_matrix(action_dim)

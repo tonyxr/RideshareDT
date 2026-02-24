@@ -201,17 +201,30 @@ class Core:
         price_gap_f2_minus_f1: float = 0.0,
         dev_penalty: float = 0.0,
     ) -> float:
-        """Share-first reward shaping with strong anti-collapse signal."""
-        
-        share_term = float(np.clip(share, 0.0, 1.0))
-        
-        rev_term = float(np.tanh((float(rev_per_request) - 10.0) / 6.0))
+        """Balanced reward: revenue floor + share target + anti-overpricing + smoothness."""
 
-        # Penalize only clear overpricing (Firm1 more expensive), avoid extra oscillatory penalties.
-        overprice_penalty = float(np.clip(-price_gap_f2_minus_f1 / 3.0, 0.0, 1.0))
+        share_f = float(np.clip(share, 0.0, 1.0))
+        rev_f = float(max(0.0, rev_per_request))
 
-        raw = (0.70 * rev_term) + (0.30 * share_term)
-        raw -= (0.15 * overprice_penalty)
+        # Keep revenue healthy but avoid chasing extreme tails.
+        rev_term = float(np.tanh((rev_f - 8.0) / 5.0))
+
+        # Encourage competitive share around a realistic target band.
+        share_target = 0.42
+        share_band = 0.20
+        share_term = float(1.0 - min(1.0, abs(share_f - share_target) / share_band))
+
+        # Gap > 0 means Firm2 is more expensive; gap < 0 means Firm1 is more expensive.
+        # Penalize meaningful overpricing only.
+        overprice_penalty = float(np.clip((-price_gap_f2_minus_f1 - 0.20) / 2.0, 0.0, 1.0))
+        
+        # Collapse risk guard when share gets too low.
+        collapse_penalty = float(np.clip((0.30 - share_f) / 0.30, 0.0, 1.0))
+        
+        raw = (0.50 * rev_term) + (0.35 * share_term)
+        raw -= (0.20 * overprice_penalty)
+        raw -= (0.10 * collapse_penalty)
+        raw -= (0.05 * float(np.clip(dev_penalty, 0.0, 1.0)))
         return float(np.clip(raw, -1.0, 1.0))
 
     def _compute_rl_reward(self, m1: FirmMetrics, base, mean_gap: float) -> float:
@@ -221,12 +234,15 @@ class Core:
             + abs(float(self.firm1.overrides.per_minute) - float(base.per_minute)) / max(1e-6, float(base.per_minute))
         )
         
-        return self._reward_base(
+        inst_reward = self._reward_base(
             share=float(m1.share),
             rev_per_request=float(m1.rev_per_request),
             price_gap_f2_minus_f1=float(mean_gap),
             dev_penalty=float(dev_penalty),
         )
+        smooth = self._ema(curr=float(inst_reward), prev=float(self.last_reward), alpha=0.35)
+        self.last_reward = float(smooth)
+        return float(smooth)
         
     
     def run_experiment(self):
@@ -305,7 +321,11 @@ class Core:
                 city_base=float(self.market.curr_market.base_fare),
                 city_pmin=float(self.market.curr_market.per_minute),
             )
-
+        
+        self.last_share = float(m1.share)
+        self.last_revpr = float(m1.rev_per_request)
+        self.last_gap = float(gap)
+        
         self.airport_rate_last = air
         self.mean_distance_last = dist
 
@@ -337,6 +357,10 @@ class Core:
             firm2_ema_share=float(f2_ema_share),
             firm2_ema_gap=float(f2_ema_gap),
             firm2_cooldown=f2_cooldown,
+            firm1_last_share=float(self.last_share),
+            firm1_last_revpr=float(self.last_revpr),
+            firm1_last_gap=float(self.last_gap),
+            firm1_last_reward=float(self.last_reward),
         )
 
     def simulate_batch(
@@ -436,6 +460,9 @@ class Core:
             revpr_sum = 0.0
             gap_sum = 0.0
             reward_sum = 0.0
+            
+            share_sum_two = 0.0
+            revpr_sum_two = 0.0
 
             for t in range(timesteps_per_day):
                 hour = hours[t]
@@ -487,15 +514,24 @@ class Core:
                 share_sum += float(m1.share)
                 revpr_sum += float(m1.rev_per_request)
                 gap_sum += float(mean_gap)
-
+                
+                share_sum_two += float(m2.share)
+                revpr_sum_two += float(m2.rev_per_request)
+                
+                self.last_share = float(m1.share)
+                self.last_revpr = float(m1.rev_per_request)
+                self.last_gap = float(mean_gap)
                 self.airport_rate_last = airport_rate
                 self.mean_distance_last = mean_dist
 
             if self.firm1_mode == "RL":
                 self.firm1.agent.update(epochs=5)
                 
-            print("revenue per request sum", str(revpr_sum))
-            print("firm market share sum", str(share_sum))
+            print("firm 1 revenue per request sum", str(revpr_sum))
+            print("firm 1 market share sum", str(share_sum))
+            
+            print("firm 2 revenue per request sum", str(revpr_sum_two))
+            print("firm 2 market share sum", str(share_sum_two))
 
             avg_share = share_sum / max(1, timesteps_per_day)
             avg_revpr = revpr_sum / max(1, timesteps_per_day)
