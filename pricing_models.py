@@ -5,7 +5,7 @@ from __future__ import annotations
 @author: Xiaoru Shi
 Firm Pricing controllers
 
-Firm1: RL (with WPO/Actor-Critic)
+Firm1: RL (with PPO/Actor-Critic)
 Firm2: Heuristic dynamic pricing (schedule + competitive response + guardrails)
 
 """
@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 import numpy as np
 
-from WPOAgent import WassersteinWPOAgent
+from WPOAgent import PPOAgent
 from Market_models import CoefficientOverrides
 from optim_config import default_specs_for
 
@@ -191,38 +191,20 @@ class FirmRLPricer:
             for a, d in self.action_to_steps.items()
         }
 
-        # State: flattened RideContext + market summaries + coeff deltas.
-        state_dim = 20
+        # Keep state compact and below 10 features.
+        state_dim = 9
 
         # Wasserstein geometry: penalize large policy moves in coefficient-step space.
         self.cost_matrix = self._build_action_cost_matrix(action_dim)
         
-        # Initialize Agent
-        self.agent = WassersteinWPOAgent(
+        # Initialize PPO agent.
+        self.agent = PPOAgent(
             state_dim=state_dim,
             action_dim=action_dim,
-            cost_matrix=self.cost_matrix,
-            w_coeff=0.70,
-            epsilon=0.08,
+            clip_eps=0.2,
             max_grad_norm=0.8,
-            advantage_scale=1.20,
-            advantage_clip=3.0,
-            ent_coeff_start=0.03,
-            ent_coeff_end=0.005,
-            ent_decay_updates=400,
-            temperature_start=1.20,
-            temperature_end=1.00,
-            temperature_decay_steps=3000,
+            ent_coeff=0.01,
         )
-        
-    def _build_action_cost_matrix(self, action_dim: int) -> np.ndarray:
-        C = np.zeros((action_dim, action_dim), dtype=np.float32)
-        for i in range(action_dim):
-            for j in range(action_dim):
-                vi = self.action_vectors[i]
-                vj = self.action_vectors[j]
-                C[i, j] = float(np.linalg.norm(vi - vj, ord=1))
-        return C
     
     @staticmethod
     def _bounded_relative_move(value: float, anchor: float, max_relative_dev: float, lb: float, ub: float) -> float:

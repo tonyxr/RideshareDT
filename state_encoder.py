@@ -39,29 +39,26 @@ def build_state_vector(
     firm1_last_gap: float,
     firm1_last_reward: float,
 ) -> np.ndarray:
-    # Flattened RideContext from market + recent market summaries.
-    ctx_feats = list(np.asarray(ride_ctx_vec, dtype=np.float32))
     
-    fixed = [
-        *ctx_feats,
-        float(np.clip(airport_rate_last, 0.0, 1.0)),
-        float(np.clip(mean_distance_last / 20.0, 0.0, 1.0)),
-        float(np.clip(firm2_ema_share, 0.0, 1.0)),
-        float(np.clip((firm2_ema_gap + 10.0) / 20.0, 0.0, 1.0)),
-        float(np.clip(firm2_cooldown / 5.0, 0.0, 1.0)),
-        float(np.clip(firm1_last_share, 0.0, 1.0)),
-        float(np.clip((firm1_last_revpr - 8.0) / 16.0, -1.0, 1.0)),
-        float(np.clip((firm1_last_gap + 6.0) / 12.0, 0.0, 1.0)),
-        float(np.clip((firm1_last_reward + 1.0) / 2.0, 0.0, 1.0)),
-    ]
 
     # Coefficient features: normalized relative deltas vs base
-    coef_feats = []
     base_empty = CoefficientOverrides()
-    for k in opt_keys:
+    coef_feats = []
+    for k in opt_keys[:2]:
         cur = get_coeff(base, ov_firm1, k)
         base_val = get_coeff(base, base_empty, k)
-        denom = abs(base_val) + 1e-6
-        coef_feats.append((cur - base_val) / denom)
+        coef_feats.append((cur - base_val) / (abs(base_val) + 1e-6))
 
+    while len(coef_feats) < 2:
+        coef_feats.append(0.0)
+
+    fixed = [
+        float(np.clip(firm1_last_share, 0.0, 1.0)),
+        float(np.clip(firm2_ema_share, 0.0, 1.0)),
+        float(np.clip((firm1_last_gap + 4.0) / 8.0, 0.0, 1.0)),
+        float(np.clip((firm2_ema_gap + 4.0) / 8.0, 0.0, 1.0)),
+        float(np.clip(firm1_last_revpr / 30.0, 0.0, 1.0)),
+        float(np.clip((firm1_last_reward + 1.0) / 2.0, 0.0, 1.0)),
+        float(np.clip(airport_rate_last, 0.0, 1.0)),
+    ]
     return np.array(fixed + coef_feats, dtype=np.float32)

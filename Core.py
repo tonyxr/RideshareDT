@@ -127,6 +127,10 @@ class Core:
         # last batch summaries (optional; can be logged)
         self.airport_rate_last = self.market.airport_prob
         self.mean_distance_last = 4.0
+        self.last_share = 0.5
+        self.last_revpr = 0.0
+        self.last_gap = 0.0
+        self.last_reward = 0.0
         
         self.training_logs = []
         self.evaluation_logs = []
@@ -201,48 +205,27 @@ class Core:
         price_gap_f2_minus_f1: float = 0.0,
         dev_penalty: float = 0.0,
     ) -> float:
-        """Balanced reward: revenue floor + share target + anti-overpricing + smoothness."""
-
+        """Simplified reward: market share + revenue with light overpricing penalty."""
+        
+        
         share_f = float(np.clip(share, 0.0, 1.0))
-        rev_f = float(max(0.0, rev_per_request))
-
-        # Keep revenue healthy but avoid chasing extreme tails.
-        rev_term = float(np.tanh((rev_f - 8.0) / 5.0))
-
-        # Encourage competitive share around a realistic target band.
-        share_target = 0.42
-        share_band = 0.20
-        share_term = float(1.0 - min(1.0, abs(share_f - share_target) / share_band))
-
-        # Gap > 0 means Firm2 is more expensive; gap < 0 means Firm1 is more expensive.
-        # Penalize meaningful overpricing only.
-        overprice_penalty = float(np.clip((-price_gap_f2_minus_f1 - 0.20) / 2.0, 0.0, 1.0))
+        rev_term = float(np.clip(rev_per_request / 25.0, 0.0, 1.0))
+        overprice_penalty = float(np.clip((-price_gap_f2_minus_f1) / 3.0, 0.0, 1.0))
         
-        # Collapse risk guard when share gets too low.
-        collapse_penalty = float(np.clip((0.30 - share_f) / 0.30, 0.0, 1.0))
-        
-        raw = (0.50 * rev_term) + (0.35 * share_term)
-        raw -= (0.20 * overprice_penalty)
-        raw -= (0.10 * collapse_penalty)
-        raw -= (0.05 * float(np.clip(dev_penalty, 0.0, 1.0)))
+        raw = (0.6 * share_f) + (0.4 * rev_term) - (0.2 * overprice_penalty)
         return float(np.clip(raw, -1.0, 1.0))
 
     def _compute_rl_reward(self, m1: FirmMetrics, base, mean_gap: float) -> float:
-        """Lower-variance RL reward with EMA smoothing."""
-        dev_penalty = (
-            abs(float(self.firm1.overrides.base_fare) - float(base.base_fare)) / max(1e-6, float(base.base_fare))
-            + abs(float(self.firm1.overrides.per_minute) - float(base.per_minute)) / max(1e-6, float(base.per_minute))
-        )
-        
-        inst_reward = self._reward_base(
+        """Simplified reward without additional shaping terms."""
+        del base
+        reward = self._reward_base(
             share=float(m1.share),
             rev_per_request=float(m1.rev_per_request),
             price_gap_f2_minus_f1=float(mean_gap),
-            dev_penalty=float(dev_penalty),
         )
-        smooth = self._ema(curr=float(inst_reward), prev=float(self.last_reward), alpha=0.35)
-        self.last_reward = float(smooth)
-        return float(smooth)
+
+        self.last_reward = float(reward)
+        return float(reward)
         
     
     def run_experiment(self):
