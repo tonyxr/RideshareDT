@@ -66,6 +66,8 @@ class Core:
         reward_revenue_weight: float = 0.40,
         reward_overprice_weight: float = 0.20,
         reward_rev_scale: float = 25.0,
+        reward_competitive_weight: float = 0.12,
+        reward_trend_weight: float = 0.08,
     ):
         self.rng = np.random.default_rng(seed)
         self.market = MarketInteraction(city_name=market_name, seed=seed)
@@ -147,6 +149,8 @@ class Core:
         self.reward_revenue_weight = float(max(0.0, reward_revenue_weight))
         self.reward_overprice_weight = float(max(0.0, reward_overprice_weight))
         self.reward_rev_scale = float(max(1e-6, reward_rev_scale))
+        self.reward_competitive_weight = float(max(0.0, reward_competitive_weight))
+        self.reward_trend_weight = float(max(0.0, reward_trend_weight))
 
         denom = self.reward_share_weight + self.reward_revenue_weight
         if denom <= 0.0:
@@ -162,29 +166,9 @@ class Core:
             f"share={self.reward_share_weight:.2f}, "
             f"revenue={self.reward_revenue_weight:.2f}, "
             f"overprice_penalty={self.reward_overprice_weight:.2f}, "
-            f"rev_scale={self.reward_rev_scale:.2f}"
-        )
-        
-        self.reward_share_weight = float(max(0.0, reward_share_weight))
-        self.reward_revenue_weight = float(max(0.0, reward_revenue_weight))
-        self.reward_overprice_weight = float(max(0.0, reward_overprice_weight))
-        self.reward_rev_scale = float(max(1e-6, reward_rev_scale))
-
-        denom = self.reward_share_weight + self.reward_revenue_weight
-        if denom <= 0.0:
-            self.reward_share_weight = 0.6
-            self.reward_revenue_weight = 0.4
-            denom = 1.0
-
-        self.reward_share_weight /= denom
-        self.reward_revenue_weight /= denom
-
-        print(
-            "[RewardConfig] "
-            f"share={self.reward_share_weight:.2f}, "
-            f"revenue={self.reward_revenue_weight:.2f}, "
-            f"overprice_penalty={self.reward_overprice_weight:.2f}, "
-            f"rev_scale={self.reward_rev_scale:.2f}"
+            f"rev_scale={self.reward_rev_scale:.2f}, "
+            f"competitive={self.reward_competitive_weight:.2f}, "
+            f"trend={self.reward_trend_weight:.2f}"
         )
     
     @staticmethod
@@ -270,13 +254,30 @@ class Core:
         return float(np.clip(raw, -1.0, 1.0))
 
     def _compute_rl_reward(self, m1: FirmMetrics, base, mean_gap: float) -> float:
-        """Simplified reward without additional shaping terms."""
-        del base
-        reward = self._reward_base(
+        """Low-complexity reward shaping for better PPO learning signal."""
+        
+        base_reward = self._reward_base(
             share=float(m1.share),
             rev_per_request=float(m1.rev_per_request),
             price_gap_f2_minus_f1=float(mean_gap),
         )
+        share = float(np.clip(m1.share, 0.0, 1.0))
+        revpr = float(max(0.0, m1.rev_per_request))
+
+        # Encourage beating the 50% share mark (dense, centered around 0).
+        competitive_term = float(np.clip((share - 0.5) / 0.5, -1.0, 1.0))
+
+        # Reward local improvement to reduce variance and speed up adaptation.
+        share_delta = float(np.clip(share - self.last_share, -0.20, 0.20) / 0.20)
+        rev_delta = float(np.clip((revpr - self.last_revpr) / self.reward_rev_scale, -0.20, 0.20) / 0.20)
+        trend_term = 0.5 * (share_delta + rev_delta)
+
+        reward = (
+            base_reward
+            + self.reward_competitive_weight * competitive_term
+            + self.reward_trend_weight * trend_term
+        )
+        reward = float(np.clip(reward, -1.0, 1.0))
 
         self.last_reward = float(reward)
         return float(reward)
@@ -802,6 +803,8 @@ def main():
     parser.add_argument("--reward_revenue_weight", type=float, default=0.40)
     parser.add_argument("--reward_overprice_weight", type=float, default=0.20)
     parser.add_argument("--reward_rev_scale", type=float, default=25.0)
+    parser.add_argument("--reward_competitive_weight", type=float, default=0.12)
+    parser.add_argument("--reward_trend_weight", type=float, default=0.08)
     
     args = parser.parse_args()
 
@@ -821,6 +824,8 @@ def main():
         reward_revenue_weight=args.reward_revenue_weight,
         reward_overprice_weight=args.reward_overprice_weight,
         reward_rev_scale=args.reward_rev_scale,
+        reward_competitive_weight=args.reward_competitive_weight,
+        reward_trend_weight=args.reward_trend_weight,
     )
 
     if args.run_experiment:
