@@ -53,7 +53,7 @@ class Core:
         self,
         market_name: str,
         seed: Optional[int] = None,
-        choice_mode: str = "parametric",
+        choice_mode: str = "cognitive",
         model_name: str = "gpt-4o-mini",
         openai_api_key: Optional[str] = None,
         firm1_mode: str = "RL",
@@ -62,6 +62,10 @@ class Core:
         firm2_static_values: str = "",
         total_customers_pool: int = 20000,
         deterministic_torch: bool = False,
+        reward_share_weight: float = 0.60,
+        reward_revenue_weight: float = 0.40,
+        reward_overprice_weight: float = 0.20,
+        reward_rev_scale: float = 25.0,
     ):
         self.rng = np.random.default_rng(seed)
         self.market = MarketInteraction(city_name=market_name, seed=seed)
@@ -78,8 +82,10 @@ class Core:
 
         # choice model
         self.choice_mode = choice_mode
-        if choice_mode == "llm":
-            self.choice_model = LLMChoiceModel(model_name=model_name, api_key=openai_api_key)
+        if choice_mode in {"llm", "cognitive"}:
+            self.choice_model = LLMChoiceModel(model_name=model_name, api_key=openai_api_key, seed=self.seed)
+            if openai_api_key:
+                print("[Core] --openai_api_key is ignored; API integration is retired.")
         else:
             self.choice_model = ParametricChoiceModel(seed=self.seed)
 
@@ -136,6 +142,50 @@ class Core:
         self.evaluation_logs = []
         
         self.run_logs = []
+        
+        self.reward_share_weight = float(max(0.0, reward_share_weight))
+        self.reward_revenue_weight = float(max(0.0, reward_revenue_weight))
+        self.reward_overprice_weight = float(max(0.0, reward_overprice_weight))
+        self.reward_rev_scale = float(max(1e-6, reward_rev_scale))
+
+        denom = self.reward_share_weight + self.reward_revenue_weight
+        if denom <= 0.0:
+            self.reward_share_weight = 0.6
+            self.reward_revenue_weight = 0.4
+            denom = 1.0
+
+        self.reward_share_weight /= denom
+        self.reward_revenue_weight /= denom
+
+        print(
+            "[RewardConfig] "
+            f"share={self.reward_share_weight:.2f}, "
+            f"revenue={self.reward_revenue_weight:.2f}, "
+            f"overprice_penalty={self.reward_overprice_weight:.2f}, "
+            f"rev_scale={self.reward_rev_scale:.2f}"
+        )
+        
+        self.reward_share_weight = float(max(0.0, reward_share_weight))
+        self.reward_revenue_weight = float(max(0.0, reward_revenue_weight))
+        self.reward_overprice_weight = float(max(0.0, reward_overprice_weight))
+        self.reward_rev_scale = float(max(1e-6, reward_rev_scale))
+
+        denom = self.reward_share_weight + self.reward_revenue_weight
+        if denom <= 0.0:
+            self.reward_share_weight = 0.6
+            self.reward_revenue_weight = 0.4
+            denom = 1.0
+
+        self.reward_share_weight /= denom
+        self.reward_revenue_weight /= denom
+
+        print(
+            "[RewardConfig] "
+            f"share={self.reward_share_weight:.2f}, "
+            f"revenue={self.reward_revenue_weight:.2f}, "
+            f"overprice_penalty={self.reward_overprice_weight:.2f}, "
+            f"rev_scale={self.reward_rev_scale:.2f}"
+        )
     
     @staticmethod
     def _restrict_static_overrides(
@@ -209,10 +259,14 @@ class Core:
         
         
         share_f = float(np.clip(share, 0.0, 1.0))
-        rev_term = float(np.clip(rev_per_request / 25.0, 0.0, 1.0))
+        rev_term = float(np.clip(rev_per_request / self.reward_rev_scale, 0.0, 1.0))
         overprice_penalty = float(np.clip((-price_gap_f2_minus_f1) / 3.0, 0.0, 1.0))
         
-        raw = (0.6 * share_f) + (0.4 * rev_term) - (0.2 * overprice_penalty)
+        raw = (
+            (self.reward_share_weight * share_f)
+            + (self.reward_revenue_weight * rev_term)
+            - (self.reward_overprice_weight * overprice_penalty)
+        )
         return float(np.clip(raw, -1.0, 1.0))
 
     def _compute_rl_reward(self, m1: FirmMetrics, base, mean_gap: float) -> float:
@@ -723,7 +777,7 @@ def main():
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--timesteps", type=int, default=8)
     parser.add_argument("--customers", type=int, default=500)
-    parser.add_argument("--choice_mode", type=str, default="llm", choices=["parametric", "llm"])
+    parser.add_argument("--choice_mode", type=str, default="cognitive", choices=["parametric", "cognitive", "llm"])
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
     parser.add_argument("--openai_api_key", type=str, default=None, help="Optional OpenAI API key override. If omitted, OPENAI_API_KEY env var is used.")
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed. If omitted, a new seed is generated each run.")
@@ -744,6 +798,10 @@ def main():
     
     parser.add_argument("--report_prefix", type=str, default="artifacts/report")
     parser.add_argument("--run_experiment", action="store_true", help="Run 100-day train + 50-day eval study")
+    parser.add_argument("--reward_share_weight", type=float, default=0.60)
+    parser.add_argument("--reward_revenue_weight", type=float, default=0.40)
+    parser.add_argument("--reward_overprice_weight", type=float, default=0.20)
+    parser.add_argument("--reward_rev_scale", type=float, default=25.0)
     
     args = parser.parse_args()
 
@@ -759,6 +817,10 @@ def main():
         firm2_static_values=args.firm2_static_values,
         total_customers_pool=args.pool,
         deterministic_torch=args.deterministic_torch,
+        reward_share_weight=args.reward_share_weight,
+        reward_revenue_weight=args.reward_revenue_weight,
+        reward_overprice_weight=args.reward_overprice_weight,
+        reward_rev_scale=args.reward_rev_scale,
     )
 
     if args.run_experiment:

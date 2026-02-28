@@ -74,6 +74,7 @@ class PPOAgent:
         self.v_coeff = v_coeff
         self.ent_coeff = ent_coeff
         self.max_grad_norm = max_grad_norm
+        self.update_calls = 0
 
         self.buf: List[Transition] = []
 

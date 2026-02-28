@@ -157,6 +157,24 @@ class FirmRLPricer:
         if not hasattr(self, "config"):
             self.config = default_specs_for(self.opt_keys)
     
+    
+    def _build_action_cost_matrix(self, action_dim: int) -> np.ndarray:
+        """Build a symmetric Wasserstein ground-cost matrix over discrete actions."""
+        if action_dim <= 0:
+            raise ValueError("action_dim must be positive")
+
+        vectors = [
+            self.action_vectors.get(i, np.zeros(2, dtype=float))
+            for i in range(action_dim)
+        ]
+        cost = np.zeros((action_dim, action_dim), dtype=np.float32)
+        for i in range(action_dim):
+            for j in range(i + 1, action_dim):
+                d = float(np.linalg.norm(vectors[i] - vectors[j], ord=2))
+                cost[i, j] = d
+                cost[j, i] = d
+        return cost
+    
     def __init__(self, seed: Optional[int], opt_keys: List[str]):
         # Keep action semantics simple and stable: one shared action can only
         # manipulate up to two coefficients per step.

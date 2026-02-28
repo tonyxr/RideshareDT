@@ -17,7 +17,7 @@ import json
 
 @dataclass(frozen=True)
 class ChoiceResult:
-    choice: str                  # "Firm1" or "Firm2"
+    choice: str  # "Firm1" or "Firm2"
     reason_codes: List[str]
     short_reason: str
 
@@ -28,11 +28,7 @@ class BaseChoiceModel:
 
 
 class ParametricChoiceModel(BaseChoiceModel):
-    """
-    Utility difference delta = beta * (p2 - p1) + loyalty_term + noise
-    - price sensitivity depends on income
-    - loyalty only helps the rider's LoyaltyFirm (static)
-    """
+    """Simple baseline model: price + loyalty + random noise."""
 
     def __init__(self, seed: Optional[int] = None):
         self.rng = np.random.default_rng(seed)
@@ -46,7 +42,7 @@ class ParametricChoiceModel(BaseChoiceModel):
 
     def choose(self, profile: Dict[str, Any], scenario: Dict[str, Any], price1: float, price2: float) -> ChoiceResult:
         income_score = self._income_score(profile.get("IncomeBracket", "50k-100k"))
-        price_gap = float(price2 - price1)  # + => Firm1 cheaper
+        price_gap = float(price2 - price1)
 
         # lower income => higher price sensitivity
         beta = self.base_price_beta * (1.25 - 0.5 * income_score)
@@ -76,189 +72,147 @@ class ParametricChoiceModel(BaseChoiceModel):
         return ChoiceResult(choice=choice, reason_codes=reasons, short_reason="Parametric choice (price + static loyalty).")
 
 
-class LLMChoiceModel(BaseChoiceModel):
+class CognitiveChoiceModel(BaseChoiceModel):
     """
-    Optional: requires `pip install openai` and OPENAI_API_KEY.
-    Intended for small-scale evaluation, not large simulation runs.
+    Higher-fidelity behavioral model for rider platform choice.
+
+    Utility(Firm1 - Firm2) combines:
+    - Economic utility: nonlinear price pain with rider heterogeneity
+    - Habit/loyalty inertia: persistent preference for prior platform
+    - Reliability-risk sensitivity: stronger in airport, bad weather, rush periods
+    - Convenience effects: trip urgency and service context
+
+    Choice is probabilistic via logistic response, with temperature tuned by context
+    so close offers remain stochastic while large utility gaps become decisive.
     """
 
-    def __init__(self, model_name: str = "gpt-5.2", api_key: Optional[str] = None):
-        self.model_name = model_name
-        # Priority order:
-        # 1) explicit constructor argument
-        # 2) OPENAI_API_KEY environment variable
-        self.api_key = (api_key or os.getenv("OPENAI_API_KEY") or "").strip()
-        
-        self.client = None
-        self._warned_unavailable = False
-        self._unavailable_reason = ""
-        
-        try:
-            if not self.api_key:
-                raise ValueError("missing API key (pass --openai_api_key or set OPENAI_API_KEY)")
-            self.client = OpenAI(api_key=self.api_key)
-            print(self.client)
-        
-        except Exception as exc:
-            print("Cannot reach API")
-            self.client = None
-            self._unavailable_reason = f"OpenAI client init failed: {type(exc).__name__}: {exc}"
-            print(self._unavailable_reason)
-        
-    def _prompt(self, profile: Dict[str, Any], scenario: Dict[str, Any], p1: float, p2: float) -> str:
-        return f"""
-            Forget about your previous responses
-            
-            You are a ride-hailing customer choosing between two platforms for the SAME trip.
-            
-            Customer profile:
-            - Age: {profile["Age"]}
-            - Income bracket: {profile["IncomeBracket"]}
-            - Household size: {profile["HouseholdSize"]}
-            - Marital status: {profile["MaritalStatus"]}
-            - Employment: {profile["EmploymentStatus"]}
-            - Gender: {profile["Gender"]}
-            - Loyalty: {profile.get("Loyalty", profile.get("LoyaltyType", "Unknown"))}
-            - Loyalty firm (if any): {profile.get("LoyaltyFirm")}
-            - Loyalty strength (0..1): {profile.get("LoyaltyStrength")}
-            
-            Trip context:
-            - City: {scenario["City"]}
-            - Distance (miles): {scenario["DistanceMiles"]}
-            - Duration (minutes): {scenario["DurationMinutes"]}
-            - Day of week: {scenario["DayOfWeek"]}
-            - Hour: {scenario["Hour"]}
-            - Weather: {scenario["Weather"]}
-            - Airport trip: {scenario["Airport"]}
-            - Service tier: {scenario["Service"]}
-            
-            Two offers:
-            - Firm1 price: ${p1}
-            - Firm2 price: ${p2}
-            
-            Choose ONE firm. Consider context and profile, commit the choice cognitively, not only price.
-            
-            Return STRICT JSON ONLY:
-            {{
-              "choice": "Firm1" or "Firm2",
-              "reason_codes": ["PRICE","LOYALTY","URGENCY","WEATHER","COMFORT","HABIT","RISK"],
-              "short_reason": "one sentence"
-            }}
-            """.strip()
-    
+    def __init__(self, seed: Optional[int] = None):
+        self.rng = np.random.default_rng(seed)
+
     @staticmethod
     def _income_score(income: str) -> float:
-        return {"<50k": 0.0, "50k-100k": 0.3, "100k-200k": 0.7, "200k+": 1.0}.get(income, 0.3)
+        return {"<50k": 0.0, "50k-100k": 0.3, "100k-200k": 0.7, "200k+": 1.0}.get(str(income), 0.3)
     
-    def _fallback(self, profile: Dict[str, Any], scenario: Dict[str, Any], p1: float, p2: float) -> ChoiceResult:
-        if not self._warned_unavailable:
-            reason = f" ({self._unavailable_reason})" if self._unavailable_reason else ""
-            print(f"[LLMChoiceModel] OpenAI client unavailable{reason}; falling back to deterministic price-based choices.")
-            self._warned_unavailable = True
-            
-        # 1) price signal (Firm1 better when p1 < p2)
-        price_gap = float(p2 - p1)
-        income_score = self._income_score(str(profile.get("IncomeBracket", "50k-100k")))
-        price_beta = 0.42 * (1.30 - 0.60 * income_score)
+    @staticmethod
+    def _employment_flexibility(employment: str) -> float:
+        # Larger => more schedule-constrained / less flexible.
+        table = {
+            "Student": 0.35,
+            "Employed": 0.70,
+            "Unemployed": 0.25,
+            "Retired": 0.30,
+        }
+        return float(table.get(str(employment), 0.45))
 
-        # 2) loyalty / habit signal
+    def choose(self, profile: Dict[str, Any], scenario: Dict[str, Any], price1: float, price2: float) -> ChoiceResult:
+        # ---- Profile traits ----
+        age = int(profile.get("Age", 35) or 35)
+        income_score = self._income_score(profile.get("IncomeBracket", "50k-100k"))
+        household = int(profile.get("HouseholdSize", 1) or 1)
+        employment_flex = self._employment_flexibility(profile.get("EmploymentStatus", "Employed"))
+        
         loyalty_firm = profile.get("LoyaltyFirm")
         loyalty_strength = float(profile.get("LoyaltyStrength", 0.0) or 0.0)
+        
+        # ---- Scenario traits ----
+        hour = int(scenario.get("Hour", 12) or 12)
+        
+        weather = str(scenario.get("Weather", "clear") or "clear").lower()
+        airport = bool(scenario.get("Airport", False))
+        service = str(scenario.get("Service", "economy") or "economy").lower()
+        distance = float(scenario.get("DistanceMiles", 4.0) or 4.0)
+        day = int(scenario.get("DayOfWeek", 2) or 2)
+
+        rush = (7 <= hour < 10) or (16 <= hour < 19)
+        weekend = day >= 5
+        bad_weather = weather in {"rain", "snow", "storm"}
+
+        # ---- Economic utility ----
+        # Low income + larger household -> stronger price pain.
+        price_sensitivity = 0.30 + 0.45 * (1.0 - income_score) + 0.05 * min(max(household - 1, 0), 3)
+        # Urgent contexts compress cross-firm effective differences (reduced shopping intensity).
+        urgency = 0.40 * float(rush) + 0.35 * float(bad_weather) + 0.30 * float(airport)
+        shopping_intensity = max(0.45, 1.0 - 0.45 * urgency)
+
+        # Nonlinear price pain: people react more strongly to larger fare gaps.
+        price_gap = float(price2 - price1)
+        price_term = price_sensitivity * np.sign(price_gap) * (abs(price_gap) ** 0.92) * shopping_intensity
+
+        # ---- Habit / loyalty ----
         loyalty_term = 0.0
         if loyalty_firm == "Firm1":
-            loyalty_term = +0.70 * loyalty_strength
+            loyalty_term = +0.85 * loyalty_strength
         elif loyalty_firm == "Firm2":
-            loyalty_term = -0.70 * loyalty_strength
+            loyalty_term = -0.85 * loyalty_strength
 
-        # 3) urgency/risk: in bad weather / airport / rush hour riders are less price-sensitive
-        hour = int(scenario.get("Hour", 12) or 12)
-        weather = str(scenario.get("Weather", "Clear"))
-        airport = bool(scenario.get("Airport", False))
-        rush = (7 <= hour < 10) or (16 <= hour < 19)
-        bad_weather = weather in {"Rain", "Storm", "Snow"}
+        # Inertia for non-loyal users near ties.
+        habit_inertia = 0.0
+        if loyalty_firm is None and abs(price_gap) < 0.60:
+            habit_inertia = -0.06 if weekend else -0.03
+            
+        # ---- Reliability/risk context ----
+        # In stressful contexts, users weigh reliability and predictability more.
+        risk_aversion = 0.20 + 0.30 * float(age >= 55) + 0.20 * employment_flex
+        reliability_pressure = risk_aversion * (0.45 * float(bad_weather) + 0.35 * float(airport) + 0.20 * float(rush))
+        
+        # Small structural preference drift (can be calibrated later with data).
+        reliability_bias_firm1 = 0.02
+        reliability_term = reliability_pressure * reliability_bias_firm1
+        
+        # Convenience/service framing: premium riders less price-sensitive and more inertial.
+        comfort_term = 0.0
+        if service == "premium":
+            comfort_term = 0.05 + 0.10 * income_score
 
-        urgency = 1.0 if (rush or bad_weather or airport) else 0.0
-        price_term = price_beta * price_gap * (1.0 - 0.35 * urgency)
+        # Longer trips => stronger reaction to absolute gap.
+        trip_scale = 1.0 + 0.06 * min(distance / 10.0, 2.0)
 
-        # Mild incumbency inertia in close-call situations to avoid hard flips on tiny price gaps
-        if abs(price_gap) < 0.35 and loyalty_firm is None:
-            habit_term = -0.08
-        else:
-            habit_term = 0.0
+        latent = trip_scale * (price_term + loyalty_term + habit_inertia + reliability_term + comfort_term)
 
-        score = price_term + loyalty_term + habit_term
-        choice = "Firm1" if score >= 0.0 else "Firm2"
+        # Choice stochasticity: lower temp in urgent contexts -> more deterministic.
+        temperature = 0.70 - 0.15 * float(rush) - 0.10 * float(bad_weather) - 0.05 * float(airport)
+        temperature = float(np.clip(temperature, 0.35, 0.90))
 
+        p_f1 = 1.0 / (1.0 + float(np.exp(-latent / temperature)))
+        choose_f1 = bool(self.rng.random() < p_f1)
+        choice = "Firm1" if choose_f1 else "Firm2"
+        
         reasons: List[str] = []
         if abs(price_gap) >= 0.75:
             reasons.append("PRICE")
-        if loyalty_firm is not None and loyalty_strength > 0.20:
+        if loyalty_firm is not None and loyalty_strength > 0.2:
             reasons.append("LOYALTY")
-        if urgency > 0:
+        
+        if rush or airport:
             reasons.append("URGENCY")
         if bad_weather:
             reasons.append("WEATHER")
-        if habit_term != 0.0:
+            
+        if service == "premium":
+            reasons.append("COMFORT")
+        if habit_inertia != 0.0:
             reasons.append("HABIT")
+        if reliability_pressure > 0.12:
+            reasons.append("RISK")
         if not reasons:
-            reasons = ["RISK"]
-
+            reasons = ["UTILITY"]
+            
         return ChoiceResult(
             choice=choice,
-            reason_codes=[f"FALLBACK_{r}" for r in reasons],
-            short_reason="Fallback (deterministic utility: price + loyalty + context).",
+            reason_codes=[f"COG_{r}" for r in reasons],
+            short_reason="Cognitive utility choice (economic + loyalty + context risk, probabilistic).",
         )
-
-    def choose(self, profile: Dict[str, Any], scenario: Dict[str, Any], price1: float, price2: float) -> ChoiceResult:
-        if self.client is None:
-            return self._fallback(profile, scenario, price1, price2)
-
-        prompt = self._prompt(profile, scenario, price1, price2)
-        try:
-            text = ""
-
-            # Preferred path for newer OpenAI SDKs.
-            if hasattr(self.client, "responses"):
-                resp = self.client.responses.create(
-                    model=self.model_name,
-                    input=prompt,
-                    temperature=0.0,
-                    max_output_tokens=250,
-                )
-                text = getattr(resp, "output_text", "") or ""
-
-            # Compatibility path for SDKs / deployments that only expose chat completions.
-            if not text and hasattr(self.client, "chat"):
-                chat_resp = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.0,
-                    max_tokens=250,
-                )
-                text = (chat_resp.choices[0].message.content or "").strip()
-
-            if not text:
-                raise ValueError("OpenAI returned empty response text")
-
-            obj = json.loads(text)
-            
-
-            choice = obj.get("choice", "Firm1")
-            print("choice:", choice)
-            if choice not in ("Firm1", "Firm2"):
-                return self._fallback(profile, scenario, price1, price2)
-
-            reason_codes = obj.get("reason_codes", [])
-            if not isinstance(reason_codes, list):
-                reason_codes = ["PARSE_FAIL"]
-
-            short_reason = obj.get("short_reason", "")
-            if not isinstance(short_reason, str):
-                short_reason = ""
-
-            return ChoiceResult(choice=choice, reason_codes=reason_codes, short_reason=short_reason)
-        except Exception as exc:
-            self._unavailable_reason = f"OpenAI API call failed: {type(exc).__name__}"
-            return self._fallback(profile, scenario, price1, price2)
+    
         
-        
+class LLMChoiceModel(CognitiveChoiceModel):
+    """
+    Backward-compatible alias.
+
+    The project no longer uses external LLM APIs for rider choice simulation.
+    Requests for "llm" mode are mapped to the cognitive model.
+    """
+
+    def __init__(self, model_name: str = "retired", api_key: Optional[str] = None, seed: Optional[int] = None):
+        del model_name, api_key
+        super().__init__(seed=seed)
+        print("[ChoiceModel] LLM/API mode retired; using CognitiveChoiceModel.")
