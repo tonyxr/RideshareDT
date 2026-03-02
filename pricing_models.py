@@ -222,6 +222,8 @@ class FirmRLPricer:
             clip_eps=0.2,
             max_grad_norm=0.8,
             ent_coeff=0.01,
+            min_ent_coeff=0.002,
+            ent_decay=0.99,
         )
     
     @staticmethod

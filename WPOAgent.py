@@ -61,6 +61,8 @@ class PPOAgent:
         clip_eps: float = 0.2,
         v_coeff: float = 0.5,
         ent_coeff: float = 0.01,
+        min_ent_coeff: float = 0.001,
+        ent_decay: float = 0.995,
         max_grad_norm: float = 1.0,
         device: Optional[str] = None,
     ):
@@ -73,6 +75,9 @@ class PPOAgent:
         self.clip_eps = clip_eps
         self.v_coeff = v_coeff
         self.ent_coeff = ent_coeff
+        self.min_ent_coeff = float(max(0.0, min_ent_coeff))
+        self.ent_decay = float(np.clip(ent_decay, 0.90, 1.0))
+        
         self.max_grad_norm = max_grad_norm
         self.update_calls = 0
 
@@ -147,7 +152,16 @@ class PPOAgent:
         old_logp_all = torch.stack([tr.old_logp for tr in self.buf], dim=0)
         
         n = s_all.size(0)
-        last = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
+        last = {
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "entropy": 0.0,
+            "approx_kl": 0.0,
+            "clipfrac": 0.0,
+            "ent_coeff": float(self.ent_coeff),
+        }
+
 
         for _ in range(epochs):
             idx = torch.randperm(n, device=self.device)
@@ -169,6 +183,9 @@ class PPOAgent:
                 policy_loss = -torch.min(unclipped, clipped).mean()
                 value_loss = ((v - ret_b) ** 2).mean()
                 entropy = dist.entropy().mean()
+                approx_kl = (old_logp_b - logp).mean()
+                clipfrac = ((ratio - 1.0).abs() > self.clip_eps).float().mean()
+
 
                 loss = policy_loss + self.v_coeff * value_loss - self.ent_coeff * entropy
 
@@ -182,8 +199,13 @@ class PPOAgent:
                     "policy_loss": float(policy_loss.item()),
                     "value_loss": float(value_loss.item()),
                     "entropy": float(entropy.item()),
+                    "approx_kl": float(approx_kl.item()),
+                    "clipfrac": float(clipfrac.item()),
+                    "ent_coeff": float(self.ent_coeff),
                 }
 
         self.buf.clear()
         self.update_calls += 1
+        self.ent_coeff = max(self.min_ent_coeff, self.ent_coeff * self.ent_decay)
+        last["ent_coeff"] = float(self.ent_coeff)
         return last

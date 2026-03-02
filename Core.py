@@ -62,8 +62,8 @@ class Core:
         firm2_static_values: str = "",
         total_customers_pool: int = 20000,
         deterministic_torch: bool = False,
-        reward_share_weight: float = 0.60,
-        reward_revenue_weight: float = 0.40,
+        reward_share_weight: float = 0.550,
+        reward_revenue_weight: float = 0.45,
         reward_overprice_weight: float = 0.20,
         reward_rev_scale: float = 25.0,
         reward_competitive_weight: float = 0.12,
@@ -161,6 +161,11 @@ class Core:
         self.reward_share_weight /= denom
         self.reward_revenue_weight /= denom
 
+        # Reward shaping calibration (reduce clipping saturation; improve action-reward signal).
+        self.reward_competitive_scale = 0.75
+        self.reward_trend_scale = 0.75
+        self.reward_softsign_temp = 1.25
+        
         print(
             "[RewardConfig] "
             f"share={self.reward_share_weight:.2f}, "
@@ -253,7 +258,7 @@ class Core:
         )
         return float(np.clip(raw, -1.0, 1.0))
 
-    def _compute_rl_reward(self, m1: FirmMetrics, base, mean_gap: float) -> float:
+    def _compute_rl_reward(self, m1: FirmMetrics, mean_gap: float) -> float:
         """Low-complexity reward shaping for better PPO learning signal."""
         
         base_reward = self._reward_base(
@@ -272,12 +277,13 @@ class Core:
         rev_delta = float(np.clip((revpr - self.last_revpr) / self.reward_rev_scale, -0.20, 0.20) / 0.20)
         trend_term = 0.5 * (share_delta + rev_delta)
 
-        reward = (
+        raw_reward = (
             base_reward
-            + self.reward_competitive_weight * competitive_term
-            + self.reward_trend_weight * trend_term
+            + self.reward_competitive_weight * self.reward_competitive_scale * competitive_term
+            + self.reward_trend_weight * self.reward_trend_scale * trend_term
         )
-        reward = float(np.clip(reward, -1.0, 1.0))
+        # Softsign-like compression keeps gradients informative while avoiding hard clipping saturation.
+        reward = float(np.tanh(raw_reward / self.reward_softsign_temp))
 
         self.last_reward = float(reward)
         return float(reward)
@@ -348,7 +354,8 @@ class Core:
 
         results, m1, m2, gap, air, dist = self.simulate_batch(day_ctx.day_of_week, day_ctx.weather, hour, rides)
         
-        reward = self._compute_rl_reward(m1, self.market.curr_market, gap)
+        reward = self._compute_rl_reward(m1, gap)
+
 
         if is_training and self.firm1_mode == "RL" and rl_step is not None:
             action, s_ts, logits, val = rl_step
@@ -374,31 +381,21 @@ class Core:
         """Build state vector for Firm1 RL controller from current market + recent summaries."""
         f2_ema_share = getattr(self.firm2, "ema_share", 0.5)
         f2_ema_gap = getattr(self.firm2, "ema_gap", 0.0)
-        f2_cooldown = float(getattr(self.firm2, "cooldown", 0.0))
-        
-        rep_ctx = RideContext(
-            day_of_week=int(day_of_week),
-            weather=str(weather),
-            hour=int(hour),
-            airport=bool(self.airport_rate_last >= self.market.airport_prob),
-            service="economy",
-        )
-        ride_ctx_vec = self.market.flatten_ride_context(rep_ctx)
         
         return build_state_vector(
             base=self.market.curr_market,
             ov_firm1=self.firm1.overrides,
             opt_keys=self.opt_keys,
-            ride_ctx_vec=ride_ctx_vec,
             airport_rate_last=self.airport_rate_last,
-            mean_distance_last=self.mean_distance_last,
             firm2_ema_share=float(f2_ema_share),
             firm2_ema_gap=float(f2_ema_gap),
-            firm2_cooldown=f2_cooldown,
             firm1_last_share=float(self.last_share),
             firm1_last_revpr=float(self.last_revpr),
             firm1_last_gap=float(self.last_gap),
             firm1_last_reward=float(self.last_reward),
+            ride_ctx_vec=ride_ctx_vec,
+            mean_distance_last=self.mean_distance_last,
+            firm2_cooldown=f2_cooldown,
         )
 
     def simulate_batch(
@@ -537,7 +534,7 @@ class Core:
                 # RL memory + reward shaping
                 if self.firm1_mode == "RL" and rl_step is not None:
                     action, s_ts, logits, val = rl_step
-                    reward = self._compute_rl_reward(m1, base, mean_gap)
+                    reward = self._compute_rl_reward(m1, mean_gap)
                     done = (t == timesteps_per_day - 1)
                     self.firm1.agent.store(s_ts, action, float(reward), done, None, logits, val)
                     if done:
@@ -561,15 +558,16 @@ class Core:
                 self.last_gap = float(mean_gap)
                 self.airport_rate_last = airport_rate
                 self.mean_distance_last = mean_dist
-
-            if self.firm1_mode == "RL":
-                self.firm1.agent.update(epochs=5)
-                
-            print("firm 1 revenue per request sum", str(revpr_sum))
-            print("firm 1 market share sum", str(share_sum))
             
-            print("firm 2 revenue per request sum", str(revpr_sum_two))
-            print("firm 2 market share sum", str(share_sum_two))
+            ppo_metrics = {"loss": 0.0, "approx_kl": 0.0, "clipfrac": 0.0, "ent_coeff": 0.0}
+            if self.firm1_mode == "RL":
+                ppo_metrics = self.firm1.agent.update(epochs=5)
+                
+            #print("firm 1 revenue per request sum", str(revpr_sum))
+            #print("firm 1 market share sum", str(share_sum))
+            
+            #print("firm 2 revenue per request sum", str(revpr_sum_two))
+            #print("firm 2 market share sum", str(share_sum_two))
 
             avg_share = share_sum / max(1, timesteps_per_day)
             avg_revpr = revpr_sum / max(1, timesteps_per_day)
@@ -581,6 +579,10 @@ class Core:
                 "avg_revpr": float(avg_revpr),
                 "avg_gap": float(avg_gap),
                 "avg_reward": float(avg_reward),
+                "ppo_approx_kl": float(ppo_metrics.get("approx_kl", 0.0)),
+                "ppo_clipfrac": float(ppo_metrics.get("clipfrac", 0.0)),
+                "ppo_entropy": float(ppo_metrics.get("entropy", 0.0)),
+                "ppo_ent_coeff": float(ppo_metrics.get("ent_coeff", 0.0)),
             })
             
             # print every ~10% of days
@@ -591,6 +593,14 @@ class Core:
                     f"[Day {d+1}/{days}] avg_share(F1)={avg_share:.3f} avg_revPR(F1)=${avg_revpr:.2f} "
                     f"avg_gap(F2-F1)=${avg_gap:.2f}"
                 )
+                if self.firm1_mode == "RL":
+                    print(
+                        f"  [PPO] KL={float(ppo_metrics.get('approx_kl', 0.0)):.4f} "
+                        f"clipfrac={float(ppo_metrics.get('clipfrac', 0.0)):.3f} "
+                        f"ent={float(ppo_metrics.get('entropy', 0.0)):.3f} "
+                        f"ent_coeff={float(ppo_metrics.get('ent_coeff', 0.0)):.4f}"
+                    )
+
 
         return all_rows
 
