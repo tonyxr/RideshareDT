@@ -276,11 +276,16 @@ class Core:
         share_delta = float(np.clip(share - self.last_share, -0.20, 0.20) / 0.20)
         rev_delta = float(np.clip((revpr - self.last_revpr) / self.reward_rev_scale, -0.20, 0.20) / 0.20)
         trend_term = 0.5 * (share_delta + rev_delta)
+        
+        # Simple action-linked signal: reward outcomes that improve share/revenue
+        # while not drifting too far into uncompetitive pricing (large negative gap).
+        pricing_discipline = float(np.clip(mean_gap / 2.0, -1.0, 1.0))
+        efficiency_term = 0.5 * trend_term + 0.5 * pricing_discipline
 
         raw_reward = (
             base_reward
             + self.reward_competitive_weight * self.reward_competitive_scale * competitive_term
-            + self.reward_trend_weight * self.reward_trend_scale * trend_term
+            + self.reward_trend_weight * self.reward_trend_scale * efficiency_term
         )
         # Softsign-like compression keeps gradients informative while avoiding hard clipping saturation.
         reward = float(np.tanh(raw_reward / self.reward_softsign_temp))
@@ -382,20 +387,33 @@ class Core:
         f2_ema_share = getattr(self.firm2, "ema_share", 0.5)
         f2_ema_gap = getattr(self.firm2, "ema_gap", 0.0)
         
+        f2_cooldown = float(getattr(self.firm2, "cooldown", 0))
+
+        # Keep contextual encoding compact and low-variance.
+        weather_code = {"clear": 0.0, "cloudy": 0.33, "rain": 0.66, "snow": 1.0}.get(str(weather).lower(), 0.0)
+        ride_ctx_vec = np.array(
+            [
+                float(np.clip(day_of_week / 6.0, 0.0, 1.0)),
+                float(np.clip(hour / 23.0, 0.0, 1.0)),
+                weather_code,
+            ],
+            dtype=np.float32,
+        )
+        
         return build_state_vector(
             base=self.market.curr_market,
             ov_firm1=self.firm1.overrides,
             opt_keys=self.opt_keys,
+            ride_ctx_vec=ride_ctx_vec,
             airport_rate_last=self.airport_rate_last,
+            mean_distance_last=self.mean_distance_last,
             firm2_ema_share=float(f2_ema_share),
             firm2_ema_gap=float(f2_ema_gap),
+            firm2_cooldown=f2_cooldown,
             firm1_last_share=float(self.last_share),
             firm1_last_revpr=float(self.last_revpr),
             firm1_last_gap=float(self.last_gap),
             firm1_last_reward=float(self.last_reward),
-            ride_ctx_vec=ride_ctx_vec,
-            mean_distance_last=self.mean_distance_last,
-            firm2_cooldown=f2_cooldown,
         )
 
     def simulate_batch(
