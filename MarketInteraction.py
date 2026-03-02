@@ -60,11 +60,13 @@ class MarketInteraction:
         self.airport_prob = 0.12
         self.service_probs = {"economy": 0.85, "premium": 0.15}
         self.weather_probs = self._weather_probs_for_city(self.current_city)
+        self._apply_probability_variation()
 
     def set_market(self, name: str) -> None:
         self.current_city = name if name in self.market_list else "General"
         self.curr_market = self.market_list[self.current_city]
         self.weather_probs = self._weather_probs_for_city(self.current_city)
+        self._apply_probability_variation()
 
     def _init_markets(self) -> None:
         self.market_list["General"] = MarketCoefficients(
@@ -104,7 +106,39 @@ class MarketInteraction:
             weather_multiplier={"clear": 1.0, "rain": 1.18, "snow": 1.35},
             service_multiplier={"economy": 1.0, "premium": 1.65},
         )
-        
+    
+    
+    @staticmethod
+    def _normalize_probs(vals: np.ndarray) -> np.ndarray:
+        arr = np.clip(np.array(vals, dtype=float), 1e-6, None)
+        s = float(arr.sum())
+        if s <= 0.0:
+            return np.ones_like(arr, dtype=float) / float(len(arr))
+        return arr / s
+
+    def _apply_probability_variation(self, jitter_scale: float = 0.05) -> None:
+        """Apply slight run-level perturbations to weather/ride nature priors."""
+        j = float(max(0.0, jitter_scale))
+
+        base_weather = CITY_WEATHER_HISTORY.get(self.current_city, CITY_WEATHER_HISTORY["General"])
+        weather_keys = list(self.curr_market.weather_multiplier.keys())
+        weather_vals = np.array([float(base_weather.get(k, 0.0)) for k in weather_keys], dtype=float)
+        weather_vals = weather_vals + self.rng.normal(0.0, j, size=len(weather_vals))
+        weather_vals = self._normalize_probs(weather_vals)
+        self.weather_probs = {k: float(v) for k, v in zip(weather_keys, weather_vals)}
+
+        airport_base = 0.12
+        self.airport_prob = float(np.clip(airport_base + self.rng.normal(0.0, 0.05 * j), 0.03, 0.35))
+
+        service_keys = list(self.curr_market.service_multiplier.keys())
+        base_service = np.array([0.85 if k == "economy" else 0.15 for k in service_keys], dtype=float)
+        service_vals = self._normalize_probs(base_service + self.rng.normal(0.0, j, size=len(service_keys)))
+        self.service_probs = {k: float(v) for k, v in zip(service_keys, service_vals)}
+
+    def refresh_run_probabilities(self, jitter_scale: float = 0.05) -> None:
+        """Public wrapper to refresh run-level weather/ride priors with slight perturbation."""
+        self._apply_probability_variation(jitter_scale=jitter_scale)
+
     def _weather_probs_for_city(self, city: str) -> Dict[str, float]:
         base = CITY_WEATHER_HISTORY.get(city, CITY_WEATHER_HISTORY["General"])
         keys = list(self.curr_market.weather_multiplier.keys())

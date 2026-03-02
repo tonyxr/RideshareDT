@@ -72,6 +72,7 @@ class Core:
         self.rng = np.random.default_rng(seed)
         self.market = MarketInteraction(city_name=market_name, seed=seed)
         self.seed = int(seed) if seed is not None else int(np.random.SeedSequence().generate_state(1)[0])
+        self.total_customers_pool = int(total_customers_pool)
         
         self._seed_all_rngs(self.seed, deterministic_torch=deterministic_torch)
         self.rng = np.random.default_rng(self.seed)
@@ -81,7 +82,10 @@ class Core:
         self.market_name = market_name
 
         self.agent_gen = GenerateAgent(seed=self.seed, total_customers=total_customers_pool, city_name = market_name)
-
+        self.profile_pool_multiplier = 2
+        self.training_stable_window = 20
+        self.training_stable_tol = 0.015
+        
         # choice model
         self.choice_mode = choice_mode
         if choice_mode in {"llm", "cognitive"}:
@@ -242,7 +246,6 @@ class Core:
         share: float,
         rev_per_request: float,
         price_gap_f2_minus_f1: float = 0.0,
-        dev_penalty: float = 0.0,
     ) -> float:
         """Simplified reward: market share + revenue with light overpricing penalty."""
         
@@ -294,52 +297,176 @@ class Core:
         return float(reward)
         
     
-    def run_experiment(self):
-        """
-        Executes the full study: 100 days of training followed by 50 days of evaluation.
-        Each day consists of 200 rides.
-        """
-        # PHASE 1: 100 Days Training (20 batches of 5 days)
-        print(">>> Starting 100-Day Training Phase (200 rides/day)...")
-        for batch_idx in range(20):
-            batch_reward = 0
-            for day in range(5):
-                # Sample environment context for the day
-                day_ctx = self.market.sample_day_context() # e.g., weather, day_of_week
-                
-                # Run the daily cycle
-                rows, m1, m2, reward = self.simulate_day_cycle(day_ctx, rides=200, is_training=True)
-                batch_reward += float(reward)
-            
-            # Optimization step: Update RL policy using the 5-day batch data
-            metrics = {"loss": 0.0}
-            if self.firm1_mode == "RL":
-                metrics = self.firm1.agent.update(epochs=5)
-            
-            avg_reward = batch_reward / 5
-            self.training_logs.append({
-                "batch": batch_idx, 
-                "avg_reward": avg_reward,
-                "loss": metrics.get("loss", 0.0)
-            })
-            print(f"Batch {batch_idx+1}/20 complete. Avg Reward: {avg_reward:.2f}")
+    def _initialize_run_distributions(self) -> None:
+        """Run-level slight variations to demographics/weather/ride nature priors."""
+        self.agent_gen.apply_probability_variation(jitter_scale=0.05)
+        self.market.refresh_run_probabilities(jitter_scale=0.05)
 
-        # PHASE 2: 50 Days Competitive Evaluation (No learning)
-        print("\n>>> Starting 50-Day Competitive Evaluation...")
-        for day in range(50):
+    def _refresh_profile_pool(self, rides_per_timestep: int) -> None:
+        """Generate synthetic customer profiles at t=0 with minimum 2x timestep demand."""
+        min_pool = int(max(self.total_customers_pool, self.profile_pool_multiplier * int(rides_per_timestep)))
+        if self.agent_gen.total_customers != min_pool:
+            self.agent_gen.total_customers = min_pool
+        self.agent_gen.apply_probability_variation(jitter_scale=0.05)
+
+    def run_experiment(
+        self,
+        train_timesteps: int = 1000,
+        train_customers_per_step: int = 5000,
+        eval_timesteps: int = 200,
+        eval_customers_per_step: int = 1000,
+        profiles_out: Optional[str] = None,
+        profiles_log_limit: int = 200000,
+    ):
+        """Run workflow: synthetic generation summary, on-the-fly RL training, then evaluation."""
+        self._initialize_run_distributions()
+        self._refresh_profile_pool(rides_per_timestep=train_customers_per_step)
+
+        print(
+            f">>> Synthetic setup: profile_pool={self.agent_gen.total_customers}, "
+            f"train timesteps={train_timesteps} x {train_customers_per_step} rides, "
+            f"eval timesteps={eval_timesteps} x {eval_customers_per_step} rides"
+        )
+        
+        print(">>> Training RL agent on-the-fly (early exploration prioritized)...")
+        reward_history: List[float] = []
+        stable_count = 0
+        sampled_profile_rows: List[Dict[str, Any]] = []
+        profile_limit_reached = False
+
+        for t in range(train_timesteps):
             day_ctx = self.market.sample_day_context()
-            rows, m1, m2, _ = self.simulate_day_cycle(day_ctx, rides=200, is_training=False)
-            
-            self.evaluation_logs.append({
-                "day": 100 + day,
-                "rl_share": m1.share,
-                "heuristic_share": m2.share,
-                "rl_revenue": m1.rev_per_request
-            })
+            hour = self.market.sample_timestep_hour().hour
+            sampled_profiles = self.agent_gen.sample_profiles(train_customers_per_step)
+            if profiles_out and not profile_limit_reached:
+                remaining = int(max(0, profiles_log_limit - len(sampled_profile_rows)))
+                if remaining > 0:
+                    sampled_profile_rows.extend({"Phase": "train", "Timestep": int(t), **p} for p in sampled_profiles[:remaining])
+                profile_limit_reached = len(sampled_profile_rows) >= int(max(0, profiles_log_limit))
 
+            base = self.market.curr_market
+            rl_step = None
+            if self.firm1_mode == "RL":
+                s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
+                action, s_ts, logits, val = self.firm1.agent.act(s_vec)
+                self.firm1.apply_action(action, self.market)
+                rl_step = (action, s_ts, logits, val)
+            elif self.firm1_mode == "heuristic":
+                self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+
+            if self.firm2_mode == "heuristic":
+                self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+
+            _, m1, _, mean_gap, _, _ = self.simulate_batch(
+                day_of_week=day_ctx.day_of_week,
+                weather=day_ctx.weather,
+                hour=hour,
+                customers_per_step=train_customers_per_step,
+                sampled_profiles=sampled_profiles,
+            )
+            
+            reward = self._compute_rl_reward(m1, mean_gap)
+            if self.firm1_mode == "RL" and rl_step is not None:
+                action, s_ts, logits, val = rl_step
+                self.firm1.agent.store(s_ts, action, float(reward), False, None, logits, val)
+                ppo_metrics = self.firm1.agent.update(epochs=5)
+            else:
+                ppo_metrics = {"loss": 0.0}
+                
+            reward_history.append(float(reward))
+            if len(reward_history) >= self.training_stable_window:
+                recent = reward_history[-self.training_stable_window:]
+                if float(np.std(recent)) <= self.training_stable_tol:
+                    stable_count += 1
+                else:
+                    stable_count = 0
+                    
+            self.training_logs.append({
+                "batch": t,
+                "avg_reward": float(reward),
+                "loss": float(ppo_metrics.get("loss", 0.0)),
+            })
+            
+            if (t + 1) % max(1, train_timesteps // 10) == 0:
+                window = reward_history[-min(len(reward_history), 20):]
+                moving_avg = float(np.mean(window)) if window else 0.0
+                print(f"  [train {t+1}/{train_timesteps}] reward={float(reward):.3f} moving_avg20={moving_avg:.3f}")
+
+            if stable_count >= 3:
+                print(f">>> Reward stabilized at timestep {t+1}; ending training early.")
+                break
+
+            self.last_share = float(m1.share)
+            self.last_revpr = float(m1.rev_per_request)
+            self.last_gap = float(mean_gap)
+        
+        print(">>> Evaluating RL agent against static/heuristic opponent with shared profile pool...")
+        eval_rewards: List[float] = []
+        for t in range(eval_timesteps):
+            day_ctx = self.market.sample_day_context()
+            hour = self.market.sample_timestep_hour().hour
+            sampled_profiles = self.agent_gen.sample_profiles(eval_customers_per_step)
+            if profiles_out and not profile_limit_reached:
+                remaining = int(max(0, profiles_log_limit - len(sampled_profile_rows)))
+                if remaining > 0:
+                    sampled_profile_rows.extend({"Phase": "eval", "Timestep": int(t), **p} for p in sampled_profiles[:remaining])
+                profile_limit_reached = len(sampled_profile_rows) >= int(max(0, profiles_log_limit))
+
+            base = self.market.curr_market
+            if self.firm1_mode == "RL":
+                s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
+                action, *_ = self.firm1.agent.act(s_vec)
+                self.firm1.apply_action(action, self.market)
+            elif self.firm1_mode == "heuristic":
+                self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+
+            if self.firm2_mode == "heuristic":
+                self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+
+            _, m1, m2, mean_gap, _, _ = self.simulate_batch(
+                day_of_week=day_ctx.day_of_week,
+                weather=day_ctx.weather,
+                hour=hour,
+                customers_per_step=eval_customers_per_step,
+                sampled_profiles=sampled_profiles,
+            )
+            eval_reward = self._reward_base(
+                share=float(m1.share),
+                rev_per_request=float(m1.rev_per_request),
+                price_gap_f2_minus_f1=float(mean_gap),
+            )
+            eval_rewards.append(float(eval_reward))
+            self.evaluation_logs.append({
+                "day": t,
+                "rl_share": float(m1.share),
+                "heuristic_share": float(m2.share),
+                "rl_revenue": float(m1.rev_per_request),
+                "reward": float(eval_reward),
+            })
+            self.last_share = float(m1.share)
+            self.last_revpr = float(m1.rev_per_request)
+            self.last_gap = float(mean_gap)
+
+            if (t + 1) % max(1, eval_timesteps // 10) == 0:
+                window = eval_rewards[-min(len(eval_rewards), 20):]
+                moving_avg = float(np.mean(window)) if window else 0.0
+                print(f"  [eval {t+1}/{eval_timesteps}] reward={float(eval_reward):.3f} moving_avg20={moving_avg:.3f}")
+
+        if profiles_out:
+            _ensure_parent_dir(profiles_out)
+            _write_csv(profiles_out, sampled_profile_rows)
+            print(f">>> Saved sampled profiles -> {profiles_out} (rows={len(sampled_profile_rows)})")
+            if profile_limit_reached:
+                print(f">>> Profile export capped at profiles_log_limit={profiles_log_limit} rows.")
+
+        if reward_history:
+            print(f">>> Training reward trajectory summary: min={float(np.min(reward_history)):.3f}, max={float(np.max(reward_history)):.3f}, final={float(reward_history[-1]):.3f}")
+        if eval_rewards:
+            print(f">>> Testing reward trajectory summary: min={float(np.min(eval_rewards)):.3f}, max={float(np.max(eval_rewards)):.3f}, final={float(eval_rewards[-1]):.3f}")
+            
         print("Experiment Complete.")
         return self.training_logs, self.evaluation_logs
-
+    
     def simulate_day_cycle(self, day_ctx, rides, is_training):
         """Runs one 200-ride cycle. Primarily used by run_experiment."""
         hour = 12
@@ -422,6 +549,7 @@ class Core:
         weather: str,
         hour: int,
         customers_per_step: int,
+        sampled_profiles: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[List[Dict[str, Any]], FirmMetrics, FirmMetrics, float, float, float]:
         rows: List[Dict[str, Any]] = []
         firm1 = FirmMetrics()
@@ -430,10 +558,10 @@ class Core:
 
         airport_count = 0
         dist_sum = 0.0
+        
+        profiles = sampled_profiles if sampled_profiles is not None else self.agent_gen.sample_profiles(customers_per_step)
 
-        for _ in range(customers_per_step):
-            profile = self.agent_gen.sample_profile()
-
+        for profile in profiles:
             # trip-specific distance (scenario-side)
             travel_distance = round(float(self.rng.exponential(4.0)), 2)
 
@@ -504,6 +632,9 @@ class Core:
     def run(self, days: int, timesteps_per_day: int, customers_per_step: int) -> List[Dict[str, Any]]:
         all_rows: List[Dict[str, Any]] = []
 
+        self._initialize_run_distributions()
+        self._refresh_profile_pool(rides_per_timestep=customers_per_step)
+        
         for d in range(days):
             day_ctx = self.market.sample_day_context()
             hours = [self.market.sample_timestep_hour().hour for _ in range(timesteps_per_day)]
@@ -534,12 +665,14 @@ class Core:
                 # Firm 2 action
                 if self.firm2_mode == "heuristic":
                     self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
-
+                
+                sampled_profiles = self.agent_gen.sample_profiles(customers_per_step)
                 rows, m1, m2, mean_gap, airport_rate, mean_dist = self.simulate_batch(
                     day_of_week=day_ctx.day_of_week,
                     weather=day_ctx.weather,
                     hour=hour,
                     customers_per_step=customers_per_step,
+                    sampled_profiles=sampled_profiles,
                 )
                 all_rows.extend(rows)
 
@@ -590,7 +723,7 @@ class Core:
             avg_share = share_sum / max(1, timesteps_per_day)
             avg_revpr = revpr_sum / max(1, timesteps_per_day)
             avg_gap = gap_sum / max(1, timesteps_per_day)
-            avg_reward = (reward_sum / max(1, timesteps_per_day)) if self.firm1_mode == "RL" else self._reward_base(avg_share, avg_revpr, price_gap_f2_minus_f1=avg_gap, dev_penalty=0.0)
+            avg_reward = (reward_sum / max(1, timesteps_per_day)) if self.firm1_mode == "RL" else self._reward_base(avg_share, avg_revpr, price_gap_f2_minus_f1=avg_gap)
             self.run_logs.append({
                 "day": d + 1,
                 "avg_share": float(avg_share),
@@ -826,7 +959,13 @@ def main():
     )
     
     parser.add_argument("--report_prefix", type=str, default="artifacts/report")
-    parser.add_argument("--run_experiment", action="store_true", help="Run 100-day train + 50-day eval study")
+    parser.add_argument("--run_experiment", action="store_true", help="Run workflow-aligned training/eval experiment")
+    parser.add_argument("--train_timesteps", type=int, default=1000)
+    parser.add_argument("--train_customers", type=int, default=5000)
+    parser.add_argument("--eval_timesteps", type=int, default=200)
+    parser.add_argument("--eval_customers", type=int, default=1000)
+    parser.add_argument("--profiles_out", type=str, default="artifacts/sampled_profiles.csv")
+    parser.add_argument("--profiles_log_limit", type=int, default=200000)
     parser.add_argument("--reward_share_weight", type=float, default=0.60)
     parser.add_argument("--reward_revenue_weight", type=float, default=0.40)
     parser.add_argument("--reward_overprice_weight", type=float, default=0.20)
@@ -857,7 +996,14 @@ def main():
     )
 
     if args.run_experiment:
-        core.run_experiment()
+        core.run_experiment(
+            train_timesteps=args.train_timesteps,
+            train_customers_per_step=args.train_customers,
+            eval_timesteps=args.eval_timesteps,
+            eval_customers_per_step=args.eval_customers,
+            profiles_out=args.profiles_out,
+            profiles_log_limit=args.profiles_log_limit,
+        )
         rows = []
     else:
         rows = core.run(days=args.days, timesteps_per_day=args.timesteps, customers_per_step=args.customers)

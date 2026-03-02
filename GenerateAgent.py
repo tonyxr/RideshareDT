@@ -84,6 +84,36 @@ class GenerateAgent:
 
         # Create a static “population” pool so loyalty is fixed per rider across timesteps
         self._population = [self._draw_profile_static(i) for i in range(self.total_customers)]
+    
+    @staticmethod
+    def _normalize_probs(probs: np.ndarray) -> np.ndarray:
+        clipped = np.clip(np.array(probs, dtype=float), 1e-6, None)
+        total = float(np.sum(clipped))
+        if total <= 0.0:
+            return np.ones_like(clipped, dtype=float) / float(len(clipped))
+        return clipped / total
+
+    def apply_probability_variation(self, jitter_scale: float = 0.05) -> None:
+        """Apply slight run-level variation to demographic priors, then rebuild pool."""
+        j = float(max(0.0, jitter_scale))
+        base = self.CITY_DEMOGRAPHICS[self.city_name]
+
+        self.age_mean = float(base["age_mean"] + self.rng.normal(0.0, 1.0 * j))
+        self.age_std = float(max(5.0, base["age_std"] * (1.0 + self.rng.normal(0.0, 0.15 * j))))
+        self.income_probs = self._normalize_probs(
+            np.array(base["income_probs"], dtype=float) + self.rng.normal(0.0, j, len(base["income_probs"]))
+        )
+        self.marital_probs = self._normalize_probs(
+            np.array(base["marital_probs"], dtype=float) + self.rng.normal(0.0, j, len(base["marital_probs"]))
+        )
+        self.gender_probs = self._normalize_probs(
+            np.array(base["gender_probs"], dtype=float) + self.rng.normal(0.0, j, len(base["gender_probs"]))
+        )
+        self.household_lambda = float(max(1.1, base["household_lambda"] * (1.0 + self.rng.normal(0.0, 0.1 * j))))
+        self.p_new = float(np.clip(base["p_new"] + self.rng.normal(0.0, 0.08 * j), 0.05, 0.95))
+
+        self._population = [self._draw_profile_static(i) for i in range(self.total_customers)]
+
 
     def _draw_profile_static(self, _i: int) -> Dict[str, Any]:
         age = int(np.clip(self.rng.normal(self.age_mean, self.age_std), 18, 80))
@@ -120,8 +150,10 @@ class GenerateAgent:
             "LoyaltyStrength": loyalty_strength,
         }
 
-    def sample_profile(self) -> Dict[str, Any]:
-        # sample a rider from the static population pool
-        idx = int(self.rng.integers(0, self.total_customers))
-        return dict(self._population[idx])  
+    def sample_profiles(self, n: int) -> list[Dict[str, Any]]:
+        count = int(max(0, n))
+        if count == 0:
+            return []
+        idxs = self.rng.integers(0, self.total_customers, size=count)
+        return [dict(self._population[int(i)]) for i in idxs]
         
