@@ -280,6 +280,13 @@ class Core:
         rev_delta = float(np.clip((revpr - self.last_revpr) / self.reward_rev_scale, -0.20, 0.20) / 0.20)
         trend_term = 0.5 * (share_delta + rev_delta)
         
+        # Add long-horizon improvement signal to reduce short-term oscillations.
+        self.long_share_ema = self._ema(share, self.long_share_ema, alpha=self.reward_long_horizon_alpha)
+        self.long_revpr_ema = self._ema(revpr, self.long_revpr_ema, alpha=self.reward_long_horizon_alpha)
+        long_share_delta = float(np.clip((share - self.long_share_ema) / 0.25, -1.0, 1.0))
+        long_rev_delta = float(np.clip((revpr - self.long_revpr_ema) / (0.5 * self.reward_rev_scale), -1.0, 1.0))
+        long_horizon_term = 0.5 * (long_share_delta + long_rev_delta)
+        
         # Simple action-linked signal: reward outcomes that improve share/revenue
         # while not drifting too far into uncompetitive pricing (large negative gap).
         pricing_discipline = float(np.clip(mean_gap / 2.0, -1.0, 1.0))
@@ -289,6 +296,7 @@ class Core:
             base_reward
             + self.reward_competitive_weight * self.reward_competitive_scale * competitive_term
             + self.reward_trend_weight * self.reward_trend_scale * efficiency_term
+            + self.reward_long_horizon_weight * long_horizon_term
         )
         # Softsign-like compression keeps gradients informative while avoiding hard clipping saturation.
         reward = float(np.tanh(raw_reward / self.reward_softsign_temp))
@@ -368,7 +376,7 @@ class Core:
             if self.firm1_mode == "RL" and rl_step is not None:
                 action, s_ts, logits, val = rl_step
                 self.firm1.agent.store(s_ts, action, float(reward), False, None, logits, val)
-                ppo_metrics = self.firm1.agent.update(epochs=5)
+                ppo_metrics = self.firm1.agent.update(epochs=self.ppo_update_epochs, batch_size=self.ppo_batch_size)
             else:
                 ppo_metrics = {"loss": 0.0}
                 
@@ -711,7 +719,7 @@ class Core:
             
             ppo_metrics = {"loss": 0.0, "approx_kl": 0.0, "clipfrac": 0.0, "ent_coeff": 0.0}
             if self.firm1_mode == "RL":
-                ppo_metrics = self.firm1.agent.update(epochs=5)
+                ppo_metrics = self.firm1.agent.update(epochs=self.ppo_update_epochs, batch_size=self.ppo_batch_size)
                 
             #print("firm 1 revenue per request sum", str(revpr_sum))
             #print("firm 1 market share sum", str(share_sum))
