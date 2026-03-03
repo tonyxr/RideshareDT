@@ -82,8 +82,8 @@ class GenerateAgent:
         self.household_lambda = float(self.demographics["household_lambda"])
         self.p_new = float(self.demographics["p_new"])
 
-        # Create a static “population” pool so loyalty is fixed per rider across timesteps
-        self._population = [self._draw_profile_static(i) for i in range(self.total_customers)]
+        # Create a compact static “population” pool so loyalty is fixed per rider across timesteps
+        self._build_population()
     
     @staticmethod
     def _normalize_probs(probs: np.ndarray) -> np.ndarray:
@@ -112,48 +112,62 @@ class GenerateAgent:
         self.household_lambda = float(max(1.1, base["household_lambda"] * (1.0 + self.rng.normal(0.0, 0.1 * j))))
         self.p_new = float(np.clip(base["p_new"] + self.rng.normal(0.0, 0.08 * j), 0.05, 0.95))
 
-        self._population = [self._draw_profile_static(i) for i in range(self.total_customers)]
+        self._build_population()
 
 
-    def _draw_profile_static(self, _i: int) -> Dict[str, Any]:
-        age = int(np.clip(self.rng.normal(self.age_mean, self.age_std), 18, 80))
-        income = str(self.rng.choice(self.income_names, p=self.income_probs))
-        household = int(np.clip(self.rng.poisson(self.household_lambda), 1, 6))
-        marital = str(self.rng.choice(self.marital_names, p=self.marital_probs))
+    def _build_population(self) -> None:
+        """Build a compact vectorized customer pool to reduce RAM usage."""
+        n = int(max(0, self.total_customers))
+        self._ages = np.clip(self.rng.normal(self.age_mean, self.age_std, size=n), 18, 80).astype(np.int8)
+        self._income_idx = self.rng.choice(len(self.income_names), size=n, p=self.income_probs).astype(np.int8)
+        self._household = np.clip(self.rng.poisson(self.household_lambda, size=n), 1, 6).astype(np.int8)
+        self._marital_idx = self.rng.choice(len(self.marital_names), size=n, p=self.marital_probs).astype(np.int8)
 
-        if age < 22:
-            employment = str(self.rng.choice(['Student', 'Employed'], p=[0.7, 0.3]))
-        elif age < 65:
-            employment = str(self.rng.choice(['Employed', 'Unemployed'], p=[0.9, 0.1]))
-        else:
-            employment = str(self.rng.choice(['Retired', 'Employed'], p=[0.75, 0.25]))
+        self._employment_idx = np.empty(n, dtype=np.int8)
+        young_mask = self._ages < 22
+        working_mask = (self._ages >= 22) & (self._ages < 65)
+        senior_mask = self._ages >= 65
 
-        gender = str(self.rng.choice(self.gender_names, p=self.gender_probs))
-        loyalty_type = str(self.rng.choice(['New', 'Returning'], p=[self.p_new, 1.0 - self.p_new]))
+        self._employment_idx[young_mask] = self.rng.choice(
+            [0, 1], size=int(np.sum(young_mask)), p=[0.7, 0.3]
+        ).astype(np.int8)
+        self._employment_idx[working_mask] = self.rng.choice(
+            [1, 2], size=int(np.sum(working_mask)), p=[0.9, 0.1]
+        ).astype(np.int8)
+        self._employment_idx[senior_mask] = self.rng.choice(
+            [3, 1], size=int(np.sum(senior_mask)), p=[0.75, 0.25]
+        ).astype(np.int8)
 
-        loyalty_firm = None
-        loyalty_strength = 0.0
-        if loyalty_type == "Returning":
-            # uniform split across firm1/firm2
-            loyalty_firm = "Firm1" if (self.rng.random() < 0.5) else "Firm2"
-            loyalty_strength = float(self.rng.uniform(self.loy_lo, self.loy_hi))
+        self._gender_idx = self.rng.choice(len(self.gender_names), size=n, p=self.gender_probs).astype(np.int8)
 
-        return {
-            "Age": age,
-            "IncomeBracket": income,
-            "HouseholdSize": household,
-            "MaritalStatus": marital,
-            "EmploymentStatus": employment,
-            "Gender": gender,
-            "LoyaltyType": loyalty_type,
-            "LoyaltyFirm": loyalty_firm,
-            "LoyaltyStrength": loyalty_strength,
-        }
+        is_returning = self.rng.random(n) >= self.p_new
+        self._is_returning = is_returning
+        self._loyalty_firm_idx = np.full(n, -1, dtype=np.int8)
+        self._loyalty_firm_idx[is_returning] = self.rng.integers(0, 2, size=int(np.sum(is_returning)), dtype=np.int8)
+        self._loyalty_strength = np.zeros(n, dtype=np.float32)
+        self._loyalty_strength[is_returning] = self.rng.uniform(
+            self.loy_lo, self.loy_hi, size=int(np.sum(is_returning))
+        ).astype(np.float32)
 
     def sample_profiles(self, n: int) -> list[Dict[str, Any]]:
         count = int(max(0, n))
         if count == 0:
             return []
         idxs = self.rng.integers(0, self.total_customers, size=count)
-        return [dict(self._population[int(i)]) for i in idxs]
+        employment_names = ["Student", "Employed", "Unemployed", "Retired"]
+        loyalty_firms = ["Firm1", "Firm2"]
+        return [
+            {
+                "Age": int(self._ages[int(i)]),
+                "IncomeBracket": self.income_names[int(self._income_idx[int(i)])],
+                "HouseholdSize": int(self._household[int(i)]),
+                "MaritalStatus": self.marital_names[int(self._marital_idx[int(i)])],
+                "EmploymentStatus": employment_names[int(self._employment_idx[int(i)])],
+                "Gender": self.gender_names[int(self._gender_idx[int(i)])],
+                "LoyaltyType": "Returning" if bool(self._is_returning[int(i)]) else "New",
+                "LoyaltyFirm": loyalty_firms[int(self._loyalty_firm_idx[int(i)])] if self._loyalty_firm_idx[int(i)] >= 0 else None,
+                "LoyaltyStrength": float(self._loyalty_strength[int(i)]),
+            }
+            for i in idxs
+        ]
         
