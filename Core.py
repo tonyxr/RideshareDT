@@ -987,7 +987,7 @@ def _plot_reports(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--market", type=str, default="Seattle")
+    parser.add_argument("--market", type=str, default="New York City")
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--timesteps", type=int, default=8)
     parser.add_argument("--customers", type=int, default=500)
@@ -1026,7 +1026,8 @@ def main():
     parser.add_argument("--reward_trend_weight", type=float, default=0.08)
     parser.add_argument("--calibration_csv", type=str, default="", help="Optional historical CSV used to calibrate priors and choice sensitivity.")
     parser.add_argument("--calibration_city", type=str, default="", help="Optional city filter for --calibration_csv; defaults to --market if omitted.")
-    parser.add_argument("--calibration_preset", type=str, default="", choices=["", "nyc_public"], help="Optional built-in preset calibration (e.g., nyc_public from NYC TLC + ACS public data).")
+    parser.add_argument("--calibration_preset", type=str, default="nyc_public", choices=["", "nyc_public"], help="Built-in preset calibration. Defaults to nyc_public (NYC TLC + ACS + weather priors).")
+    
     
     args = parser.parse_args()
 
