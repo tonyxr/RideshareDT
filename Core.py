@@ -18,6 +18,7 @@ import csv
 from typing import Dict, Any, List, Tuple, Optional
 import numpy as np
 import torch
+import json
 import random
 
 import importlib.util
@@ -31,6 +32,7 @@ from choice_models import ParametricChoiceModel, LLMChoiceModel, ChoiceResult
 from pricing_models import FirmMetrics, FirmStaticPricer, FirmHeuristicPricer, FirmRLPricer
 from coeff_utils import set_coeff
 from state_encoder import build_state_vector
+from calibration_utils import derive_calibration, load_calibration_preset
 
 
 def _parse_kv_floats(s: str) -> Dict[str, float]:
@@ -181,6 +183,55 @@ class Core:
             f"competitive={self.reward_competitive_weight:.2f}, "
             f"trend={self.reward_trend_weight:.2f}"
         )
+        
+    
+    def apply_calibration(self, calibration: Dict[str, Any]) -> None:
+        """Apply calibration outputs to market priors, agent priors, and choice sensitivity scales."""
+        market_cal = calibration.get("market", {}) if isinstance(calibration, dict) else {}
+        agent_cal = calibration.get("agent", {}) if isinstance(calibration, dict) else {}
+        choice_cal = calibration.get("choice", {}) if isinstance(calibration, dict) else {}
+
+        weather_probs = market_cal.get("weather_probs")
+        if isinstance(weather_probs, dict) and weather_probs:
+            keys = list(self.market.curr_market.weather_multiplier.keys())
+            vals = np.array([float(weather_probs.get(k, 0.0)) for k in keys], dtype=float)
+            s = float(vals.sum())
+            if s > 0:
+                vals = vals / s
+                self.market.weather_probs = {k: float(v) for k, v in zip(keys, vals)}
+
+        service_probs = market_cal.get("service_probs")
+        if isinstance(service_probs, dict) and service_probs:
+            keys = list(self.market.curr_market.service_multiplier.keys())
+            vals = np.array([float(service_probs.get(k, 0.0)) for k in keys], dtype=float)
+            s = float(vals.sum())
+            if s > 0:
+                vals = vals / s
+                self.market.service_probs = {k: float(v) for k, v in zip(keys, vals)}
+
+        airport_prob = market_cal.get("airport_prob")
+        if airport_prob is not None:
+            self.market.airport_prob = float(np.clip(float(airport_prob), 0.01, 0.60))
+
+        if isinstance(agent_cal, dict) and agent_cal:
+            if "age_mean" in agent_cal:
+                self.agent_gen.age_mean = float(agent_cal["age_mean"])
+            if "age_std" in agent_cal:
+                self.agent_gen.age_std = float(max(5.0, float(agent_cal["age_std"])))
+            if "household_lambda" in agent_cal:
+                self.agent_gen.household_lambda = float(max(1.1, float(agent_cal["household_lambda"])))
+            if "p_new" in agent_cal:
+                self.agent_gen.p_new = float(np.clip(float(agent_cal["p_new"]), 0.05, 0.95))
+            if "income_probs" in agent_cal and isinstance(agent_cal["income_probs"], dict):
+                keys = list(self.agent_gen.income_names)
+                vals = np.array([float(agent_cal["income_probs"].get(k, 0.0)) for k in keys], dtype=float)
+                s = float(vals.sum())
+                if s > 0:
+                    self.agent_gen.income_probs = vals / s
+            self.agent_gen._build_population()
+
+        if hasattr(self.choice_model, "apply_calibration") and isinstance(choice_cal, dict):
+            self.choice_model.apply_calibration(choice_cal)
     
     @staticmethod
     def _restrict_static_overrides(
@@ -973,6 +1024,9 @@ def main():
     parser.add_argument("--reward_rev_scale", type=float, default=25.0)
     parser.add_argument("--reward_competitive_weight", type=float, default=0.12)
     parser.add_argument("--reward_trend_weight", type=float, default=0.08)
+    parser.add_argument("--calibration_csv", type=str, default="", help="Optional historical CSV used to calibrate priors and choice sensitivity.")
+    parser.add_argument("--calibration_city", type=str, default="", help="Optional city filter for --calibration_csv; defaults to --market if omitted.")
+    parser.add_argument("--calibration_preset", type=str, default="", choices=["", "nyc_public"], help="Optional built-in preset calibration (e.g., nyc_public from NYC TLC + ACS public data).")
     
     args = parser.parse_args()
 
@@ -995,6 +1049,20 @@ def main():
         reward_competitive_weight=args.reward_competitive_weight,
         reward_trend_weight=args.reward_trend_weight,
     )
+    
+    if args.calibration_preset:
+        calibration = load_calibration_preset(args.calibration_preset)
+        core.apply_calibration(calibration)
+        print(f"[Calibration] Applied preset={args.calibration_preset} for market={args.market}.")
+        print(f"[Calibration] {json.dumps(calibration, indent=2)}")
+
+    if args.calibration_csv:
+        city_filter = args.calibration_city if args.calibration_city else args.market
+        calibration = derive_calibration(args.calibration_csv, city=city_filter)
+        core.apply_calibration(calibration)
+        print(f"[Calibration] Applied using {calibration['sample_size']} rows from {args.calibration_csv} (city={city_filter}).")
+        print(f"[Calibration] {json.dumps(calibration, indent=2)}")
+
 
     if args.run_experiment:
         core.run_experiment(

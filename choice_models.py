@@ -25,7 +25,10 @@ class ChoiceResult:
 class BaseChoiceModel:
     def choose(self, profile: Dict[str, Any], scenario: Dict[str, Any], price1: float, price2: float) -> ChoiceResult:
         raise NotImplementedError
-
+        
+    def apply_calibration(self, params: Dict[str, float]) -> None:
+        del params
+        return None
 
 class ParametricChoiceModel(BaseChoiceModel):
     """Simple baseline model: price + loyalty + random noise."""
@@ -35,6 +38,12 @@ class ParametricChoiceModel(BaseChoiceModel):
         self.base_price_beta = 0.35
         self.loyalty_bias = 0.80
         self.noise_std = 0.20
+        
+    def apply_calibration(self, params: Dict[str, float]) -> None:
+        ps = float(params.get("price_sensitivity_scale", 1.0))
+        ls = float(params.get("loyalty_scale", 1.0))
+        self.base_price_beta = float(np.clip(0.35 * ps, 0.05, 1.20))
+        self.loyalty_bias = float(np.clip(0.80 * ls, 0.10, 2.00))
 
     @staticmethod
     def _income_score(income: str) -> float:
@@ -88,6 +97,14 @@ class CognitiveChoiceModel(BaseChoiceModel):
 
     def __init__(self, seed: Optional[int] = None):
         self.rng = np.random.default_rng(seed)
+        self.price_sensitivity_scale = 1.0
+        self.loyalty_scale = 1.0
+        self.reliability_scale = 1.0
+
+    def apply_calibration(self, params: Dict[str, float]) -> None:
+        self.price_sensitivity_scale = float(np.clip(params.get("price_sensitivity_scale", 1.0), 0.30, 2.80))
+        self.loyalty_scale = float(np.clip(params.get("loyalty_scale", 1.0), 0.30, 2.80))
+        self.reliability_scale = float(np.clip(params.get("reliability_scale", 1.0), 0.30, 2.80))
 
     @staticmethod
     def _income_score(income: str) -> float:
@@ -129,7 +146,7 @@ class CognitiveChoiceModel(BaseChoiceModel):
 
         # ---- Economic utility ----
         # Low income + larger household -> stronger price pain.
-        price_sensitivity = 0.30 + 0.45 * (1.0 - income_score) + 0.05 * min(max(household - 1, 0), 3)
+        price_sensitivity = (0.30 + 0.45 * (1.0 - income_score) + 0.05 * min(max(household - 1, 0), 3)) * self.price_sensitivity_scale
         # Urgent contexts compress cross-firm effective differences (reduced shopping intensity).
         urgency = 0.40 * float(rush) + 0.35 * float(bad_weather) + 0.30 * float(airport)
         shopping_intensity = max(0.45, 1.0 - 0.45 * urgency)
@@ -141,9 +158,9 @@ class CognitiveChoiceModel(BaseChoiceModel):
         # ---- Habit / loyalty ----
         loyalty_term = 0.0
         if loyalty_firm == "Firm1":
-            loyalty_term = +0.85 * loyalty_strength
+            loyalty_term = +0.85 * self.loyalty_scale * loyalty_strength
         elif loyalty_firm == "Firm2":
-            loyalty_term = -0.85 * loyalty_strength
+            loyalty_term = -0.85 * self.loyalty_scale * loyalty_strength
 
         # Inertia for non-loyal users near ties.
         habit_inertia = 0.0
@@ -157,7 +174,7 @@ class CognitiveChoiceModel(BaseChoiceModel):
         
         # Small structural preference drift (can be calibrated later with data).
         reliability_bias_firm1 = 0.02
-        reliability_term = reliability_pressure * reliability_bias_firm1
+        reliability_term = reliability_pressure * reliability_bias_firm1 * self.reliability_scale
         
         # Convenience/service framing: premium riders less price-sensitive and more inertial.
         comfort_term = 0.0
