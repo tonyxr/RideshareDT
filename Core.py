@@ -681,8 +681,17 @@ class Core:
         mean_dist = float(dist_sum / max(1, customers_per_step))
         return rows, firm1, firm2, mean_gap, airport_rate, mean_dist
 
-    def run(self, days: int, timesteps_per_day: int, customers_per_step: int) -> List[Dict[str, Any]]:
+    def run(
+        self,
+        days: int,
+        timesteps_per_day: int,
+        customers_per_step: int,
+        profiles_out: Optional[str] = None,
+        profiles_log_limit: int = 200000,
+    ) -> List[Dict[str, Any]]:
         all_rows: List[Dict[str, Any]] = []
+        sampled_profile_rows: List[Dict[str, Any]] = []
+        profile_limit_reached = False
 
         self._initialize_run_distributions()
         self._refresh_profile_pool(rides_per_timestep=customers_per_step)
@@ -719,6 +728,20 @@ class Core:
                     self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
                 
                 sampled_profiles = self.agent_gen.sample_profiles(customers_per_step)
+                if profiles_out and not profile_limit_reached:
+                    remaining = int(max(0, profiles_log_limit - len(sampled_profile_rows)))
+                    if remaining > 0:
+                        sampled_profile_rows.extend(
+                            {
+                                "Phase": "run",
+                                "Day": int(d),
+                                "Timestep": int(t),
+                                **p,
+                            }
+                            for p in sampled_profiles[:remaining]
+                        )
+                    profile_limit_reached = len(sampled_profile_rows) >= int(max(0, profiles_log_limit))
+
                 rows, m1, m2, mean_gap, airport_rate, mean_dist = self.simulate_batch(
                     day_of_week=day_ctx.day_of_week,
                     weather=day_ctx.weather,
@@ -804,6 +827,12 @@ class Core:
                         f"ent_coeff={float(ppo_metrics.get('ent_coeff', 0.0)):.4f}"
                     )
 
+        if profiles_out:
+            _ensure_parent_dir(profiles_out)
+            _write_csv(profiles_out, sampled_profile_rows)
+            print(f">>> Saved sampled profiles -> {profiles_out} (rows={len(sampled_profile_rows)})")
+            if profile_limit_reached:
+                print(f">>> Profile export capped at profiles_log_limit={profiles_log_limit} rows.")
 
         return all_rows
 
@@ -1076,7 +1105,13 @@ def main():
         )
         rows = []
     else:
-        rows = core.run(days=args.days, timesteps_per_day=args.timesteps, customers_per_step=args.customers)
+        rows = core.run(
+            days=args.days,
+            timesteps_per_day=args.timesteps,
+            customers_per_step=args.customers,
+            profiles_out=args.profiles_out,
+            profiles_log_limit=args.profiles_log_limit,
+        )
         _write_csv(args.out, rows)
         print(f"Saved -> {args.out}")
 

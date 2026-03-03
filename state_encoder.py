@@ -40,6 +40,10 @@ def build_state_vector(
     firm1_last_reward: float,
 ) -> np.ndarray:
     
+    ride_ctx = np.asarray(ride_ctx_vec, dtype=np.float32).reshape(-1)
+    if ride_ctx.size < 3:
+        ride_ctx = np.pad(ride_ctx, (0, 3 - ride_ctx.size), mode="constant")
+    ride_ctx = ride_ctx[:3]
 
     # Coefficient features: normalized relative deltas vs base
     base_empty = CoefficientOverrides()
@@ -53,6 +57,9 @@ def build_state_vector(
         coef_feats.append(0.0)
 
     fixed = [
+        float(np.clip(ride_ctx[0], 0.0, 1.0)),
+        float(np.clip(ride_ctx[1], 0.0, 1.0)),
+        float(np.clip(ride_ctx[2], 0.0, 1.0)),
         float(np.clip(firm1_last_share, 0.0, 1.0)),
         float(np.clip(firm2_ema_share, 0.0, 1.0)),
         float(np.clip((firm1_last_gap + 4.0) / 8.0, 0.0, 1.0)),
@@ -60,5 +67,7 @@ def build_state_vector(
         float(np.clip(firm1_last_revpr / 30.0, 0.0, 1.0)),
         float(np.clip((firm1_last_reward + 1.0) / 2.0, 0.0, 1.0)),
         float(np.clip(airport_rate_last, 0.0, 1.0)),
+        float(np.clip(mean_distance_last / 12.0, 0.0, 1.0)),
+        float(np.clip(firm2_cooldown / 5.0, 0.0, 1.0)),
     ]
     return np.array(fixed + coef_feats, dtype=np.float32)

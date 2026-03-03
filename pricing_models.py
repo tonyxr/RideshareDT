@@ -192,10 +192,8 @@ class FirmRLPricer:
         self.recovery_share_threshold = 0.12
         self.recovery_gap_threshold = -0.35
         
-        
-        # Action space: no-op + (down/up) per managed coefficient.
-        # The 5-action layout is fixed for stability and for Wasserstein costs.
-        action_dim = 5
+        # Action space includes coordinated and aggressive coefficient moves.
+        # This lets RL respond faster to heuristic schedule/cooldown behavior.
         
         self.action_to_steps: Dict[int, Dict[str, int]] = {
             0: {"base_fare": 0, "per_minute": 0},
@@ -203,14 +201,23 @@ class FirmRLPricer:
             2: {"base_fare": +1, "per_minute": 0},
             3: {"base_fare": 0, "per_minute": -1},
             4: {"base_fare": 0, "per_minute": +1},
+            5: {"base_fare": -1, "per_minute": -1},
+            6: {"base_fare": +1, "per_minute": +1},
+            7: {"base_fare": -1, "per_minute": +1},
+            8: {"base_fare": +1, "per_minute": -1},
+            9: {"base_fare": -2, "per_minute": -1},
+            10: {"base_fare": -1, "per_minute": -2},
+            11: {"base_fare": +2, "per_minute": +1},
+            12: {"base_fare": +1, "per_minute": +2},
         }
+        action_dim = len(self.action_to_steps)
         self.action_vectors = {
             a: np.array([d["base_fare"], d["per_minute"]], dtype=float)
             for a, d in self.action_to_steps.items()
         }
 
-        # Keep state compact and below 10 features.
-        state_dim = 9
+        # Expanded state includes context, competitor memory, and coefficient deltas.
+        state_dim = 14
 
         # Wasserstein geometry: penalize large policy moves in coefficient-step space.
         self.cost_matrix = self._build_action_cost_matrix(action_dim)
