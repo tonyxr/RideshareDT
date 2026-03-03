@@ -143,6 +143,8 @@ class Core:
         self.last_revpr = 0.0
         self.last_gap = 0.0
         self.last_reward = 0.0
+        self.reward_ema = 0.0
+        self.training_progress = 0.0
         
         self.training_logs = []
         self.evaluation_logs = []
@@ -284,18 +286,38 @@ class Core:
         # while not drifting too far into uncompetitive pricing (large negative gap).
         pricing_discipline = float(np.clip(mean_gap / 2.0, -1.0, 1.0))
         efficiency_term = 0.5 * trend_term + 0.5 * pricing_discipline
+        
+        progress = float(np.clip(self.training_progress, 0.0, 1.0))
+        adaptive_competitive = self._blend(1.20, 0.85, progress)
+        adaptive_trend = self._blend(1.10, 0.75, progress)
+        adaptive_temp = self._blend(1.45, self.reward_softsign_temp, progress)
 
         raw_reward = (
             base_reward
-            + self.reward_competitive_weight * self.reward_competitive_scale * competitive_term
-            + self.reward_trend_weight * self.reward_trend_scale * efficiency_term
+            + self.reward_competitive_weight * adaptive_competitive * self.reward_competitive_scale * competitive_term
+            + self.reward_trend_weight * adaptive_trend * self.reward_trend_scale * efficiency_term
         )
-        # Softsign-like compression keeps gradients informative while avoiding hard clipping saturation.
-        reward = float(np.tanh(raw_reward / self.reward_softsign_temp))
+        # Early on, keep broader reward gradients; later, gently compress for stability.
+        reward = float(np.tanh(raw_reward / adaptive_temp))
+
+        # Long-horizon stability shaping: reduce oscillation as training progresses.
+        self.reward_ema = self._ema(reward, self.reward_ema, alpha=0.10)
+        volatility = abs(reward - self.reward_ema)
+        stability_penalty_weight = self._blend(0.0, 0.12, progress)
+        reward -= stability_penalty_weight * float(np.clip(volatility, 0.0, 0.5))
+
+        # Late-stage anchoring toward the smoothed trajectory for convergent behavior.
+        anchor_weight = self._blend(0.0, 0.25, max(0.0, (progress - 0.5) / 0.5))
+        reward = (1.0 - anchor_weight) * reward + anchor_weight * self.reward_ema
+        reward = float(np.clip(reward, -1.0, 1.0))
 
         self.last_reward = float(reward)
         return float(reward)
-        
+    
+    @staticmethod
+    def _blend(start: float, end: float, progress: float) -> float:
+        p = float(np.clip(progress, 0.0, 1.0))
+        return float((1.0 - p) * start + p * end)
     
     def _initialize_run_distributions(self) -> None:
         """Run-level slight variations to demographics/weather/ride nature priors."""
@@ -335,6 +357,7 @@ class Core:
         profile_limit_reached = False
 
         for t in range(train_timesteps):
+            self.training_progress = float((t + 1) / max(1, train_timesteps))
             day_ctx = self.market.sample_day_context()
             hour = self.market.sample_timestep_hour().hour
             sampled_profiles = self.agent_gen.sample_profiles(train_customers_per_step)
@@ -369,14 +392,15 @@ class Core:
             if self.firm1_mode == "RL" and rl_step is not None:
                 action, s_ts, logits, val = rl_step
                 self.firm1.agent.store(s_ts, action, float(reward), False, None, logits, val)
-                ppo_metrics = self.firm1.agent.update(epochs=5)
+                ppo_metrics = self.firm1.agent.update(epochs=5, progress=self.training_progress)
             else:
                 ppo_metrics = {"loss": 0.0}
                 
             reward_history.append(float(reward))
             if len(reward_history) >= self.training_stable_window:
                 recent = reward_history[-self.training_stable_window:]
-                if float(np.std(recent)) <= self.training_stable_tol:
+                warmup_guard = self.training_progress >= 0.35
+                if warmup_guard and float(np.std(recent)) <= self.training_stable_tol:
                     stable_count += 1
                 else:
                     stable_count = 0
@@ -712,7 +736,7 @@ class Core:
             
             ppo_metrics = {"loss": 0.0, "approx_kl": 0.0, "clipfrac": 0.0, "ent_coeff": 0.0}
             if self.firm1_mode == "RL":
-                ppo_metrics = self.firm1.agent.update(epochs=5)
+                ppo_metrics = self.firm1.agent.update(epochs=5, progress=self.training_progress)
                 
             #print("firm 1 revenue per request sum", str(revpr_sum))
             #print("firm 1 market share sum", str(share_sum))

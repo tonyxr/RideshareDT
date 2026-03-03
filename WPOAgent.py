@@ -64,6 +64,12 @@ class PPOAgent:
         min_ent_coeff: float = 0.001,
         ent_decay: float = 0.995,
         max_grad_norm: float = 1.0,
+        entropy_boost: float = 1.15,
+        entropy_boost_patience: int = 12,
+        entropy_boost_cap: float = 0.03,
+        entropy_boost_max_progress: float = 0.65,
+        entropy_cooldown_updates: int = 8,
+        final_ent_coeff: float = 0.0015,
         device: Optional[str] = None,
     ):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -75,11 +81,22 @@ class PPOAgent:
         self.clip_eps = clip_eps
         self.v_coeff = v_coeff
         self.ent_coeff = ent_coeff
+        self.base_ent_coeff = float(max(0.0, ent_coeff))
         self.min_ent_coeff = float(max(0.0, min_ent_coeff))
         self.ent_decay = float(np.clip(ent_decay, 0.90, 1.0))
+        self.entropy_boost = float(np.clip(entropy_boost, 1.0, 2.0))
+        self.entropy_boost_patience = int(max(2, entropy_boost_patience))
+        self.entropy_boost_cap = float(max(self.min_ent_coeff, entropy_boost_cap))
+        self.entropy_boost_max_progress = float(np.clip(entropy_boost_max_progress, 0.0, 1.0))
+        self.entropy_cooldown_updates = int(max(0, entropy_cooldown_updates))
+        self.final_ent_coeff = float(min(self.min_ent_coeff, max(0.0, final_ent_coeff)))
         
         self.max_grad_norm = max_grad_norm
         self.update_calls = 0
+        self.no_improve_updates = 0
+        self.best_loss = float("inf")
+        self.loss_ema: Optional[float] = None
+        self.boost_cooldown = 0
 
         self.buf: List[Transition] = []
 
@@ -141,7 +158,7 @@ class PPOAgent:
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         return adv, ret
 
-    def update(self, epochs: int = 5, batch_size: int = 256) -> dict:
+    def update(self, epochs: int = 5, batch_size: int = 256, progress: float = 0.0) -> dict:
         if not self.buf:
             return {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
 
@@ -206,6 +223,36 @@ class PPOAgent:
 
         self.buf.clear()
         self.update_calls += 1
-        self.ent_coeff = max(self.min_ent_coeff, self.ent_coeff * self.ent_decay)
+        
+        # Adaptive entropy schedule:
+        # - decay for late-stage stability
+        # - temporary boosts if optimization stalls to escape local optima
+        progress_f = float(np.clip(progress, 0.0, 1.0))
+        curr_loss = float(last["loss"])
+        if self.loss_ema is None:
+            self.loss_ema = curr_loss
+        else:
+            self.loss_ema = 0.9 * self.loss_ema + 0.1 * curr_loss
+
+        tracked_loss = float(self.loss_ema)
+        if tracked_loss < (self.best_loss - 1e-4):
+            self.best_loss = tracked_loss
+            self.no_improve_updates = 0
+        else:
+            self.no_improve_updates += 1
+
+        # Decay entropy toward a lower final floor to ensure long-term convergence stability.
+        curr_floor = float((1.0 - progress_f) * self.min_ent_coeff + progress_f * self.final_ent_coeff)
+        self.ent_coeff = max(curr_floor, self.ent_coeff * self.ent_decay)
+
+        can_boost = (progress_f <= self.entropy_boost_max_progress) and (self.boost_cooldown == 0)
+        if can_boost and self.no_improve_updates >= self.entropy_boost_patience:
+            boosted = self.ent_coeff * self.entropy_boost
+            self.ent_coeff = float(min(self.entropy_boost_cap, max(self.base_ent_coeff, boosted)))
+            self.no_improve_updates = 0
+            self.boost_cooldown = self.entropy_cooldown_updates
+        elif self.boost_cooldown > 0:
+            self.boost_cooldown -= 1
+
         last["ent_coeff"] = float(self.ent_coeff)
         return last
