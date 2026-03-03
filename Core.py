@@ -164,6 +164,10 @@ class Core:
 
         self.reward_share_weight /= denom
         self.reward_revenue_weight /= denom
+        
+        self.reward_competitive_scale = 0.75
+        self.reward_trend_scale = 0.75
+        self.reward_softsign_temp = 1.25
 
         self.ppo_update_epochs = 5
         self.ppo_batch_size = 256
