@@ -165,19 +165,8 @@ class Core:
         self.reward_share_weight /= denom
         self.reward_revenue_weight /= denom
 
-        # Reward shaping calibration (reduce clipping saturation; improve action-reward signal).
-        self.reward_competitive_scale = 0.75
-        self.reward_trend_scale = 0.75
-        self.reward_softsign_temp = 1.25
-        
-        self.reward_long_horizon_weight = 0.10
-        self.reward_long_horizon_alpha = 0.05
-        self.long_share_ema = 0.5
-        self.long_revpr_ema = max(1.0, self.reward_rev_scale * 0.35)
-
-        # Slightly more aggressive PPO updates to improve adaptation speed.
-        self.ppo_update_epochs = 8
-        self.ppo_batch_size = 128
+        self.ppo_update_epochs = 5
+        self.ppo_batch_size = 256
         
         print(
             "[RewardConfig] "

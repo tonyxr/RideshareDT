@@ -187,8 +187,8 @@ class FirmRLPricer:
         self.config = default_specs_for(self.opt_keys)
         self.overrides = CoefficientOverrides()
         
-        self.step_scale = 0.5
-        self.max_relative_dev = 0.30
+        self.step_scale = 0.9
+        self.max_relative_dev = 0.40
         self.recovery_share_threshold = 0.12
         self.recovery_gap_threshold = -0.35
         
@@ -221,9 +221,9 @@ class FirmRLPricer:
             action_dim=action_dim,
             clip_eps=0.2,
             max_grad_norm=0.8,
-            ent_coeff=0.01,
-            min_ent_coeff=0.002,
-            ent_decay=0.99,
+            ent_coeff=0.03,
+            min_ent_coeff=0.0015,
+            ent_decay=0.996,
         )
     
     @staticmethod
