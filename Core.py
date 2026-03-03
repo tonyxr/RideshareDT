@@ -278,13 +278,6 @@ class Core:
         rev_delta = float(np.clip((revpr - self.last_revpr) / self.reward_rev_scale, -0.20, 0.20) / 0.20)
         trend_term = 0.5 * (share_delta + rev_delta)
         
-        # Add long-horizon improvement signal to reduce short-term oscillations.
-        self.long_share_ema = self._ema(share, self.long_share_ema, alpha=self.reward_long_horizon_alpha)
-        self.long_revpr_ema = self._ema(revpr, self.long_revpr_ema, alpha=self.reward_long_horizon_alpha)
-        long_share_delta = float(np.clip((share - self.long_share_ema) / 0.25, -1.0, 1.0))
-        long_rev_delta = float(np.clip((revpr - self.long_revpr_ema) / (0.5 * self.reward_rev_scale), -1.0, 1.0))
-        long_horizon_term = 0.5 * (long_share_delta + long_rev_delta)
-        
         # Simple action-linked signal: reward outcomes that improve share/revenue
         # while not drifting too far into uncompetitive pricing (large negative gap).
         pricing_discipline = float(np.clip(mean_gap / 2.0, -1.0, 1.0))
@@ -294,7 +287,6 @@ class Core:
             base_reward
             + self.reward_competitive_weight * self.reward_competitive_scale * competitive_term
             + self.reward_trend_weight * self.reward_trend_scale * efficiency_term
-            + self.reward_long_horizon_weight * long_horizon_term
         )
         # Softsign-like compression keeps gradients informative while avoiding hard clipping saturation.
         reward = float(np.tanh(raw_reward / self.reward_softsign_temp))
