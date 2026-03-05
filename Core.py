@@ -30,7 +30,7 @@ from Market_models import CoefficientOverrides
 from GenerateAgent import GenerateAgent
 from choice_models import ParametricChoiceModel, LLMChoiceModel, ChoiceResult
 from pricing_models import FirmMetrics, FirmStaticPricer, FirmHeuristicPricer, FirmRLPricer
-from coeff_utils import set_coeff
+from coeff_utils import get_coeff, set_coeff
 from state_encoder import build_state_vector
 from calibration_utils import derive_calibration, load_calibration_preset
 
@@ -835,6 +835,18 @@ class Core:
                 print(f">>> Profile export capped at profiles_log_limit={profiles_log_limit} rows.")
 
         return all_rows
+    
+    def get_final_manipulated_coefficients(self) -> Dict[str, Dict[str, float]]:
+        """Return final values for the shared manipulated coefficient set for each firm."""
+        base = self.market.curr_market
+        return {
+            "firm1": {
+                k: float(get_coeff(base, self.firm1.overrides, k)) for k in self.shared_edit_keys
+            },
+            "firm2": {
+                k: float(get_coeff(base, self.firm2.overrides, k)) for k in self.shared_edit_keys
+            },
+        }
 
 
 def _write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
@@ -1111,6 +1123,12 @@ def main():
             customers_per_step=args.customers,
             profiles_out=args.profiles_out,
             profiles_log_limit=args.profiles_log_limit,
+        )
+        final_coeffs = core.get_final_manipulated_coefficients()
+        print(
+            f"[Final Coefficients after {args.days} days] "
+            f"Firm1={json.dumps(final_coeffs['firm1'], sort_keys=True)} "
+            f"Firm2={json.dumps(final_coeffs['firm2'], sort_keys=True)}"
         )
         _write_csv(args.out, rows)
         print(f"Saved -> {args.out}")
