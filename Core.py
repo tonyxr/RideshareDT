@@ -34,6 +34,13 @@ from coeff_utils import get_coeff, set_coeff
 from state_encoder import build_state_vector
 from calibration_utils import derive_calibration, load_calibration_preset
 
+import kagglehub
+
+# Download latest version
+path = kagglehub.dataset_download("aaronweymouth/nyc-rideshare-raw-data")
+
+print("Path to dataset files:", path)
+
 
 def _parse_kv_floats(s: str) -> Dict[str, float]:
     out: Dict[str, float] = {}
