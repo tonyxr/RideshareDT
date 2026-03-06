@@ -15,6 +15,8 @@ Defaults aim for stable learning:
 
 import argparse
 import csv
+import glob
+from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 import numpy as np
 import torch
@@ -40,6 +42,92 @@ import kagglehub
 path = kagglehub.dataset_download("aaronweymouth/nyc-rideshare-raw-data")
 
 print("Path to dataset files:", path)
+
+def _is_missing(v: Any) -> bool:
+    if v is None:
+        return True
+    s = str(v).strip().lower()
+    return s in {"", "nan", "none", "null", "na"}
+
+
+def _to_float(v: Any) -> Optional[float]:
+    if _is_missing(v):
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _to_int(v: Any) -> Optional[int]:
+    fv = _to_float(v)
+    if fv is None:
+        return None
+    return int(fv)
+
+
+def _pick_value(row: Dict[str, Any], names: List[str]) -> Any:
+    for k in names:
+        if k in row and not _is_missing(row[k]):
+            return row[k]
+    return None
+
+
+def _infer_service_level(row: Dict[str, Any]) -> str:
+    service_text = str(_pick_value(row, ["service", "name", "cab_type", "product_name", "product_id"]) or "").lower()
+    premium_markers = ["black", "lux", "luxury", "prem", "premium", "select", "suv"]
+    return "premium" if any(tok in service_text for tok in premium_markers) else "economy"
+
+
+def _infer_weather(row: Dict[str, Any]) -> str:
+    text = str(_pick_value(row, ["weather", "icon", "short_summary", "long_summary", "summary"]) or "").lower()
+    if "snow" in text or "sleet" in text or "blizzard" in text:
+        return "snow"
+    if "rain" in text or "storm" in text or "drizzle" in text:
+        return "rain"
+    return "clear"
+
+
+def _infer_airport_trip(row: Dict[str, Any]) -> bool:
+    text = " ".join(
+        str(_pick_value(row, ["source", "destination", "pickup", "dropoff", "pickup_zone", "dropoff_zone"]) or "").lower().split()
+    )
+    airport_tokens = ["airport", "jfk", "lga", "ewr", "laguardia", "newark"]
+    return any(tok in text for tok in airport_tokens)
+
+
+def _infer_hour_day(row: Dict[str, Any]) -> Tuple[int, int]:
+    hour = _to_int(_pick_value(row, ["hour", "pickup_hour"]))
+    day = _to_int(_pick_value(row, ["day_of_week", "weekday", "day"]))
+
+    dt_raw = _pick_value(row, ["datetime", "pickup_datetime", "time_stamp", "timestamp", "date"])
+    dt: Optional[datetime] = None
+    if dt_raw is not None:
+        txt = str(dt_raw).strip()
+        if txt.isdigit():
+            sec = int(txt)
+            if sec > 1_000_000_000_000:
+                sec = sec // 1000
+            try:
+                dt = datetime.fromtimestamp(sec)
+            except Exception:
+                dt = None
+        if dt is None:
+            try:
+                dt = datetime.fromisoformat(txt.replace("Z", "+00:00"))
+            except Exception:
+                dt = None
+
+    if dt is not None:
+        if hour is None:
+            hour = int(dt.hour)
+        if day is None:
+            day = int(dt.weekday())
+
+    if day is not None and day >= 1 and day <= 7:
+        day = (day - 1) % 7
+
+    return int(hour if hour is not None else 12), int(day if day is not None else 2)
 
 
 def _parse_kv_floats(s: str) -> Dict[str, float]:
@@ -525,6 +613,132 @@ class Core:
             
         print("Experiment Complete.")
         return self.training_logs, self.evaluation_logs
+    
+    def compare_trained_rl_to_dataset(
+       self,
+       dataset_root: str,
+       dataset_glob: str = "*.csv",
+       out_csv: Optional[str] = None,
+       max_rows: int = 50000,
+   ) -> Dict[str, Any]:
+       """Score real rides with trained Firm1 coefficients and compare against paid prices."""
+       patterns = [os.path.join(dataset_root, dataset_glob)]
+       if "**" not in dataset_glob:
+           patterns.append(os.path.join(dataset_root, "**", dataset_glob))
+
+       files: List[str] = []
+       for pat in patterns:
+           files.extend(glob.glob(pat, recursive=True))
+       files = sorted({f for f in files if os.path.isfile(f) and f.lower().endswith('.csv')})
+
+       if not files:
+           raise FileNotFoundError(f"No CSV files found under dataset_root={dataset_root!r} with glob={dataset_glob!r}")
+
+       rows_out: List[Dict[str, Any]] = []
+       abs_err: List[float] = []
+       sq_err: List[float] = []
+       signed_err: List[float] = []
+       abs_pct: List[float] = []
+
+       processed = 0
+       kept = 0
+
+       actual_price_cols = [
+           "price", "fare", "fare_amount", "total_amount", "final_price", "paid", "cost",
+       ]
+       distance_cols = [
+           "distance", "distance_miles", "trip_miles", "miles", "trip_distance", "DistanceMiles", "TravelDistance",
+       ]
+       duration_cols = [
+           "duration", "duration_minutes", "trip_duration", "trip_time", "duration_secs", "DurationMinutes",
+       ]
+
+       for fpath in files:
+           with open(fpath, "r", encoding="utf-8", newline="") as f:
+               try:
+                   reader = csv.DictReader(f)
+               except Exception:
+                   continue
+
+               if not reader.fieldnames:
+                   continue
+
+               for raw in reader:
+                   processed += 1
+                   if kept >= max_rows:
+                       break
+
+                   actual_paid = _to_float(_pick_value(raw, actual_price_cols))
+                   distance = _to_float(_pick_value(raw, distance_cols))
+                   if actual_paid is None or distance is None:
+                       continue
+
+                   hour, day_of_week = _infer_hour_day(raw)
+                   duration = _to_float(_pick_value(raw, duration_cols))
+                   if duration is None:
+                       duration = float(self.estimate_duration(float(distance), hour))
+
+                   weather = _infer_weather(raw)
+                   airport = _infer_airport_trip(raw)
+                   service = _infer_service_level(raw)
+
+                   ctx = RideContext(
+                       day_of_week=int(np.clip(day_of_week, 0, 6)),
+                       weather=weather,
+                       hour=int(np.clip(hour, 0, 23)),
+                       airport=bool(airport),
+                       service=service,
+                   )
+                   rl_price = self.market.quote_price(
+                       distance_miles=float(max(0.0, distance)),
+                       duration_minutes=float(max(0.0, duration)),
+                       ctx=ctx,
+                       overrides=self.firm1.overrides,
+                   )
+
+                   err = float(rl_price - actual_paid)
+                   ae = float(abs(err))
+                   abs_err.append(ae)
+                   sq_err.append(float(err * err))
+                   signed_err.append(err)
+                   if actual_paid > 1e-6:
+                       abs_pct.append(float(ae / actual_paid))
+
+                   rows_out.append({
+                       "source_file": os.path.basename(fpath),
+                       "actual_paid": float(actual_paid),
+                       "rl_predicted_price": float(rl_price),
+                       "price_error": err,
+                       "abs_error": ae,
+                       "distance_miles": float(distance),
+                       "duration_minutes": float(duration),
+                       "hour": int(ctx.hour),
+                       "day_of_week": int(ctx.day_of_week),
+                       "weather": str(ctx.weather),
+                       "airport": bool(ctx.airport),
+                       "service": str(ctx.service),
+                   })
+                   kept += 1
+
+               if kept >= max_rows:
+                   break
+
+       if out_csv:
+           _ensure_parent_dir(out_csv)
+           _write_csv(out_csv, rows_out)
+
+       summary = {
+           "dataset_root": dataset_root,
+           "files_scanned": len(files),
+           "rows_processed": int(processed),
+           "rows_compared": int(kept),
+           "mae": float(np.mean(abs_err)) if abs_err else None,
+           "rmse": float(np.sqrt(np.mean(sq_err))) if sq_err else None,
+           "mape": float(np.mean(abs_pct)) if abs_pct else None,
+           "bias": float(np.mean(signed_err)) if signed_err else None,
+           "out_csv": out_csv,
+       }
+       return summary
     
     def simulate_day_cycle(self, day_ctx, rides, is_training):
         """Runs one 200-ride cycle. Primarily used by run_experiment."""
@@ -1075,7 +1289,11 @@ def main():
     parser.add_argument("--calibration_csv", type=str, default="", help="Optional historical CSV used to calibrate priors and choice sensitivity.")
     parser.add_argument("--calibration_city", type=str, default="", help="Optional city filter for --calibration_csv; defaults to --market if omitted.")
     parser.add_argument("--calibration_preset", type=str, default="nyc_public", choices=["", "nyc_public"], help="Built-in preset calibration. Defaults to nyc_public (NYC TLC + ACS + weather priors).")
-    
+    parser.add_argument("--compare_with_dataset", action="store_true", help="After training/run, compare RL-implied prices against actual paid prices in the Kaggle CSV files.")
+    parser.add_argument("--dataset_glob", type=str, default="*.csv", help="Glob for dataset CSV discovery under kagglehub download path.")
+    parser.add_argument("--comparison_out", type=str, default="artifacts/rl_dataset_price_comparison.csv", help="Output CSV for row-level RL-vs-actual comparison.")
+    parser.add_argument("--comparison_limit", type=int, default=50000, help="Max number of dataset rows to score during RL-vs-actual comparison.")
+
     
     args = parser.parse_args()
 
@@ -1152,6 +1370,15 @@ def main():
         evaluation_logs=core.evaluation_logs,
         prefix=args.report_prefix,
     )
+    
+    if args.compare_with_dataset:
+        summary = core.compare_trained_rl_to_dataset(
+            dataset_root=path,
+            dataset_glob=args.dataset_glob,
+            out_csv=args.comparison_out,
+            max_rows=args.comparison_limit,
+        )
+        print(f"[RL vs Actual] {json.dumps(summary, indent=2)}")
 
 if __name__ == "__main__":
     main()
