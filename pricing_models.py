@@ -187,10 +187,16 @@ class FirmRLPricer:
         self.config = default_specs_for(self.opt_keys)
         self.overrides = CoefficientOverrides()
         
-        self.step_scale = 0.9
-        self.max_relative_dev = 0.40
-        self.recovery_share_threshold = 0.12
-        self.recovery_gap_threshold = -0.35
+        self.base_step_scale = 0.9
+        self.converged_step_scale = 0.5
+        self.step_scale = self.base_step_scale
+        self.base_max_relative_dev = 0.35
+        self.converged_max_relative_dev = 0.25
+        self.max_relative_dev = self.base_max_relative_dev
+        self.recovery_share_threshold = 0.30
+        self.recovery_gap_threshold = -0.05
+        self.aggressive_actions = {11, 12}
+        self.allow_aggressive_actions = True
         
         # Action space includes coordinated and aggressive coefficient moves.
         # This lets RL respond faster to heuristic schedule/cooldown behavior.
@@ -232,6 +238,16 @@ class FirmRLPricer:
             min_ent_coeff=0.0015,
             ent_decay=0.996,
         )
+        
+    def configure_training_controls(self, progress: float, reward_converged: bool, reward_std: float) -> None:
+        """Adapt exploration and action aggressiveness across training phases."""
+        p = float(np.clip(progress, 0.0, 1.0))
+        stable = bool(reward_converged or (p > 0.70 and reward_std <= 0.04))
+
+        self.allow_aggressive_actions = not stable
+        self.step_scale = self.converged_step_scale if stable else self.base_step_scale
+        self.max_relative_dev = self.converged_max_relative_dev if stable else self.base_max_relative_dev
+        self.agent.adapt_entropy(progress=p, reward_converged=stable)
     
     @staticmethod
     def _bounded_relative_move(value: float, anchor: float, max_relative_dev: float, lb: float, ub: float) -> float:
@@ -264,6 +280,10 @@ class FirmRLPricer:
         """Map discrete steps back into concrete market coefficient overrides."""
         if action not in self.action_to_steps:
             return
+        
+        
+        if (not self.allow_aggressive_actions) and action in self.aggressive_actions:
+            action = 6
         
         step_map = {
             k: v for k, v in self.action_to_steps[action].items() if k in self.opt_keys

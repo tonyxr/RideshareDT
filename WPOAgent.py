@@ -75,6 +75,7 @@ class PPOAgent:
         self.clip_eps = clip_eps
         self.v_coeff = v_coeff
         self.ent_coeff = ent_coeff
+        self.max_ent_coeff = float(max(ent_coeff, min_ent_coeff))
         self.min_ent_coeff = float(max(0.0, min_ent_coeff))
         self.ent_decay = float(np.clip(ent_decay, 0.90, 1.0))
         
@@ -82,6 +83,19 @@ class PPOAgent:
         self.update_calls = 0
 
         self.buf: List[Transition] = []
+        
+    def adapt_entropy(self, progress: float, reward_converged: bool) -> None:
+        """Keep exploration high early, then tighten as training converges."""
+        p = float(np.clip(progress, 0.0, 1.0))
+        if p <= 0.25 and not reward_converged:
+            self.ent_coeff = float(max(self.ent_coeff, 0.60 * self.max_ent_coeff))
+            return
+
+        target = self.min_ent_coeff + (self.max_ent_coeff - self.min_ent_coeff) * max(0.0, 1.0 - p)
+        if reward_converged:
+            target = max(self.min_ent_coeff, 0.6 * target)
+        self.ent_coeff = float(np.clip(min(self.ent_coeff, target), self.min_ent_coeff, self.max_ent_coeff))
+
 
     @torch.no_grad()
     def act(self, s_np: np.ndarray) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:

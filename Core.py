@@ -38,10 +38,11 @@ from calibration_utils import derive_calibration, load_calibration_preset
 
 import kagglehub
 
-# Download latest version
-path = kagglehub.dataset_download("aaronweymouth/nyc-rideshare-raw-data")
-
-print("Path to dataset files:", path)
+def _resolve_dataset_path() -> str:
+    """Download the Kaggle dataset only when explicitly needed."""
+    dataset_path = kagglehub.dataset_download("aaronweymouth/nyc-rideshare-raw-data")
+    print("Path to dataset files:", dataset_path)
+    return dataset_path
 
 def _is_missing(v: Any) -> bool:
     if v is None:
@@ -161,7 +162,7 @@ class Core:
         deterministic_torch: bool = False,
         reward_share_weight: float = 0.550,
         reward_revenue_weight: float = 0.45,
-        reward_overprice_weight: float = 0.20,
+        reward_overprice_weight: float = 0.35,
         reward_rev_scale: float = 25.0,
         reward_competitive_weight: float = 0.12,
         reward_trend_weight: float = 0.08,
@@ -182,6 +183,8 @@ class Core:
         self.profile_pool_multiplier = 2
         self.training_stable_window = 20
         self.training_stable_tol = 0.015
+        self.reward_convergence_window = 40
+        self.reward_convergence_tol = 0.025
         
         # choice model
         self.choice_mode = choice_mode
@@ -400,7 +403,8 @@ class Core:
         
         share_f = float(np.clip(share, 0.0, 1.0))
         rev_term = float(np.clip(rev_per_request / self.reward_rev_scale, 0.0, 1.0))
-        overprice_penalty = float(np.clip((-price_gap_f2_minus_f1) / 3.0, 0.0, 1.0))
+        overprice_gap = float(max(0.0, -price_gap_f2_minus_f1))
+        overprice_penalty = float(np.clip((overprice_gap / 2.5) ** 2, 0.0, 1.0))
         
         raw = (
             (self.reward_share_weight * share_f)
@@ -907,12 +911,20 @@ class Core:
         days: int,
         timesteps_per_day: int,
         customers_per_step: int,
+        out_path: Optional[str] = None,
         profiles_out: Optional[str] = None,
         profiles_log_limit: int = 200000,
     ) -> List[Dict[str, Any]]:
         all_rows: List[Dict[str, Any]] = []
+        stream_rows = bool(out_path)
+        csv_file = None
+        csv_writer: Optional[csv.DictWriter] = None
         sampled_profile_rows: List[Dict[str, Any]] = []
         profile_limit_reached = False
+        
+        if stream_rows:
+            _ensure_parent_dir(out_path)
+            csv_file = open(out_path, "w", newline="", encoding="utf-8")
 
         self._initialize_run_distributions()
         self._refresh_profile_pool(rides_per_timestep=customers_per_step)
@@ -970,7 +982,14 @@ class Core:
                     customers_per_step=customers_per_step,
                     sampled_profiles=sampled_profiles,
                 )
-                all_rows.extend(rows)
+                if stream_rows:
+                    if rows and csv_writer is None:
+                        csv_writer = csv.DictWriter(csv_file, fieldnames=list(rows[0].keys()))
+                        csv_writer.writeheader()
+                    if rows:
+                        csv_writer.writerows(rows)
+                else:
+                    all_rows.extend(rows)
 
                 # update heuristic memory (only if heuristic)
                 if self.firm1_mode == "heuristic":
@@ -1047,6 +1066,20 @@ class Core:
                         f"ent={float(ppo_metrics.get('entropy', 0.0)):.3f} "
                         f"ent_coeff={float(ppo_metrics.get('ent_coeff', 0.0)):.4f}"
                     )
+                    
+        if self.firm1_mode == "RL":
+                recent_rewards = [float(x["avg_reward"]) for x in self.run_logs[-self.reward_convergence_window:]]
+                reward_std = float(np.std(recent_rewards)) if recent_rewards else 1.0
+                reward_converged = (
+                    len(recent_rewards) >= self.reward_convergence_window
+                    and reward_std <= self.reward_convergence_tol
+                )
+                progress = float((d + 1) / max(1, days))
+                self.firm1.configure_training_controls(
+                    progress=progress,
+                    reward_converged=reward_converged,
+                    reward_std=reward_std,
+                )
 
         if profiles_out:
             _ensure_parent_dir(profiles_out)
@@ -1054,6 +1087,10 @@ class Core:
             print(f">>> Saved sampled profiles -> {profiles_out} (rows={len(sampled_profile_rows)})")
             if profile_limit_reached:
                 print(f">>> Profile export capped at profiles_log_limit={profiles_log_limit} rows.")
+                
+        if csv_file is not None:
+            csv_file.close()
+            print(f"Saved -> {out_path}")
 
         return all_rows
     
@@ -1282,7 +1319,7 @@ def main():
     parser.add_argument("--profiles_log_limit", type=int, default=200000)
     parser.add_argument("--reward_share_weight", type=float, default=0.60)
     parser.add_argument("--reward_revenue_weight", type=float, default=0.40)
-    parser.add_argument("--reward_overprice_weight", type=float, default=0.20)
+    parser.add_argument("--reward_overprice_weight", type=float, default=0.35)
     parser.add_argument("--reward_rev_scale", type=float, default=25.0)
     parser.add_argument("--reward_competitive_weight", type=float, default=0.12)
     parser.add_argument("--reward_trend_weight", type=float, default=0.08)
@@ -1342,10 +1379,20 @@ def main():
         )
         rows = []
     else:
+        estimated_rows = int(args.days) * int(args.timesteps) * int(args.customers)
+        stream_threshold = 1_000_000
+        stream_to_disk = estimated_rows > stream_threshold
+        if stream_to_disk:
+            print(
+                f"[Run] Large output detected ({estimated_rows:,} rows). "
+                f"Streaming rows directly to {args.out} to avoid high memory usage."
+            )
+            
         rows = core.run(
             days=args.days,
             timesteps_per_day=args.timesteps,
             customers_per_step=args.customers,
+            out_path=args.out if stream_to_disk else None,
             profiles_out=args.profiles_out,
             profiles_log_limit=args.profiles_log_limit,
         )
@@ -1355,8 +1402,9 @@ def main():
             f"Firm1={json.dumps(final_coeffs['firm1'], sort_keys=True)} "
             f"Firm2={json.dumps(final_coeffs['firm2'], sort_keys=True)}"
         )
-        _write_csv(args.out, rows)
-        print(f"Saved -> {args.out}")
+        if not stream_to_disk:
+            _write_csv(args.out, rows)
+            print(f"Saved -> {args.out}")
 
     if rows:
         dist_csv = f"{args.report_prefix}_ride_distributions.csv"
@@ -1373,7 +1421,7 @@ def main():
     
     if args.compare_with_dataset:
         summary = core.compare_trained_rl_to_dataset(
-            dataset_root=path,
+            dataset_root=_resolve_dataset_path(),
             dataset_glob=args.dataset_glob,
             out_csv=args.comparison_out,
             max_rows=args.comparison_limit,
