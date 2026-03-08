@@ -185,6 +185,7 @@ class Core:
         self.training_stable_tol = 0.015
         self.reward_convergence_window = 40
         self.reward_convergence_tol = 0.025
+        self.reward_trend_tol = 0.01
         
         # choice model
         self.choice_mode = choice_mode
@@ -248,6 +249,7 @@ class Core:
         self.evaluation_logs = []
         
         self.run_logs = []
+        self.convergence_day: Optional[int] = None
         
         self.reward_share_weight = float(max(0.0, reward_share_weight))
         self.reward_revenue_weight = float(max(0.0, reward_revenue_weight))
@@ -928,6 +930,7 @@ class Core:
 
         self._initialize_run_distributions()
         self._refresh_profile_pool(rides_per_timestep=customers_per_step)
+        self.convergence_day = None
         
         for d in range(days):
             day_ctx = self.market.sample_day_context()
@@ -1051,6 +1054,28 @@ class Core:
                 "ppo_ent_coeff": float(ppo_metrics.get("ent_coeff", 0.0)),
             })
             
+            recent_rewards = [float(x["avg_reward"]) for x in self.run_logs[-self.reward_convergence_window:]]
+            reward_std = float(np.std(recent_rewards)) if recent_rewards else 1.0
+            reward_delta = (
+                float(abs(recent_rewards[-1] - recent_rewards[0]) / max(1, len(recent_rewards) - 1))
+                if len(recent_rewards) >= 2
+                else 1.0
+            )
+            reward_converged = (
+                len(recent_rewards) >= self.reward_convergence_window
+                and reward_std <= self.reward_convergence_tol
+                and reward_delta <= self.reward_trend_tol
+            )
+            self.run_logs[-1]["reward_window_std"] = float(reward_std)
+            self.run_logs[-1]["reward_window_delta"] = float(reward_delta)
+            self.run_logs[-1]["reward_converged"] = bool(reward_converged)
+            if reward_converged and self.convergence_day is None:
+                self.convergence_day = int(d + 1)
+                print(
+                    f"[Convergence] Optimization converged at day {self.convergence_day} "
+                    f"(window_std={reward_std:.4f}, delta/day={reward_delta:.4f})."
+                )
+            
             # print every ~10% of days
             k = max(1, days // 10)
             if (d + 1) % k == 0 or (d + 1) == 1 or (d + 1) == days:
@@ -1067,20 +1092,23 @@ class Core:
                         f"ent_coeff={float(ppo_metrics.get('ent_coeff', 0.0)):.4f}"
                     )
                     
-        if self.firm1_mode == "RL":
-                recent_rewards = [float(x["avg_reward"]) for x in self.run_logs[-self.reward_convergence_window:]]
-                reward_std = float(np.std(recent_rewards)) if recent_rewards else 1.0
-                reward_converged = (
-                    len(recent_rewards) >= self.reward_convergence_window
-                    and reward_std <= self.reward_convergence_tol
-                )
+            if self.firm1_mode == "RL":
                 progress = float((d + 1) / max(1, days))
                 self.firm1.configure_training_controls(
                     progress=progress,
                     reward_converged=reward_converged,
                     reward_std=reward_std,
                 )
-
+        
+        if self.run_logs:
+            final = self.run_logs[-1]
+            print(
+                "[Convergence Summary] "
+                f"converged_day={self.convergence_day if self.convergence_day is not None else 'not reached'} "
+                f"window_std={float(final.get('reward_window_std', 0.0)):.4f} "
+                f"delta/day={float(final.get('reward_window_delta', 0.0)):.4f}"
+            )
+            
         if profiles_out:
             _ensure_parent_dir(profiles_out)
             _write_csv(profiles_out, sampled_profile_rows)
@@ -1235,20 +1263,54 @@ def _plot_reports(
         plt.savefig(out, dpi=150)
         plt.close()
 
-    # 3) run reward trajectory
+    # 3) run reward trajectory + convergence diagnostics
     if run_logs:
         xs = [int(r["day"]) for r in run_logs]
         ys = [float(r["avg_reward"]) for r in run_logs]
+        converged_days = [int(r["day"]) for r in run_logs if bool(r.get("reward_converged", False))]
         plt.figure(figsize=(9, 4))
-        plt.plot(xs, ys)
+        plt.plot(xs, ys, label="avg_reward")
+        if converged_days:
+            conv_day = int(converged_days[0])
+            conv_reward = float(next((r["avg_reward"] for r in run_logs if int(r["day"]) == conv_day), ys[-1]))
+            plt.axvline(conv_day, color="tab:green", linestyle="--", linewidth=1.2, label=f"converged day={conv_day}")
+            plt.scatter([conv_day], [conv_reward], color="tab:green", zorder=3)
         plt.title("Run Reward Trajectory")
         plt.xlabel("Day")
         plt.ylabel("Reward")
+        plt.legend(loc="best")
         plt.tight_layout()
         out = f"{prefix}_reward_run.png"
         _ensure_parent_dir(out)
         plt.savefig(out, dpi=150)
         plt.close()
+        
+        stds = [float(r.get("reward_window_std", np.nan)) for r in run_logs]
+        deltas = [float(r.get("reward_window_delta", np.nan)) for r in run_logs]
+        if any(np.isfinite(v) for v in stds) or any(np.isfinite(v) for v in deltas):
+            fig, ax1 = plt.subplots(figsize=(9, 4))
+            ax1.plot(xs, stds, color="tab:blue", label="window std")
+            ax1.set_xlabel("Day")
+            ax1.set_ylabel("Reward window std", color="tab:blue")
+            ax1.tick_params(axis="y", labelcolor="tab:blue")
+
+            ax2 = ax1.twinx()
+            ax2.plot(xs, deltas, color="tab:orange", label="|delta| per day")
+            ax2.set_ylabel("Reward trend magnitude", color="tab:orange")
+            ax2.tick_params(axis="y", labelcolor="tab:orange")
+
+            if converged_days:
+                ax1.axvline(converged_days[0], color="tab:green", linestyle="--", linewidth=1.2)
+
+            lines1, labels1 = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
+            plt.title("Optimization Convergence Diagnostics")
+            plt.tight_layout()
+            out = f"{prefix}_convergence_run.png"
+            _ensure_parent_dir(out)
+            plt.savefig(out, dpi=150)
+            plt.close(fig)
 
     # 4) training trajectory (run_experiment)
     if training_logs:
