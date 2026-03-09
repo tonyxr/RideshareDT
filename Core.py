@@ -128,7 +128,6 @@ def _to_minutes(v: Any) -> Optional[float]:
         return None
 
 
-
 def _pick_value(row: Dict[str, Any], names: List[str]) -> Any:
     for k in names:
         if k in row and not _is_missing(row[k]):
@@ -225,7 +224,7 @@ def _iter_tabular_rows(fpath: str):
 
 
 def _infer_service_level(row: Dict[str, Any]) -> str:
-    service_text = str(_pick_value(row, ["service", "name", "cab_type", "product_name", "product_id"]) or "").lower()
+    service_text = str(_pick_value(row, ["service", "name", "cab_type", "product_name", "product_id", "business", "Business"]) or "").lower()
     premium_markers = ["black", "lux", "luxury", "prem", "premium", "select", "suv"]
     return "premium" if any(tok in service_text for tok in premium_markers) else "economy"
 
@@ -785,7 +784,19 @@ class Core:
        preview_rows: int = 5,
    ) -> Dict[str, Any]:
        """Validate trained RL pricing on raw NYC rides by predicting trip time + paid price."""
-       files = _discover_dataset_files(dataset_root=dataset_root, dataset_glob=dataset_glob)
+       patterns = [os.path.join(dataset_root, dataset_glob)]
+       if "**" not in dataset_glob:
+           patterns.append(os.path.join(dataset_root, "**", dataset_glob))
+
+       files: List[str] = []
+       for pat in patterns:
+           files.extend(glob.glob(pat, recursive=True))
+       files = sorted({f for f in files if os.path.isfile(f) and f.lower().endswith(('.csv', '.parquet'))})
+
+       if not files:
+           raise FileNotFoundError(
+               f"No CSV/Parquet files found under dataset_root={dataset_root!r} with glob={dataset_glob!r}"
+           )
 
        rows_out: List[Dict[str, Any]] = []
        abs_err: List[float] = []
@@ -802,17 +813,18 @@ class Core:
        actual_price_cols = [
            "price", "fare", "fare_amount", "total_amount", "final_price", "paid", "cost",
            "estimated_price", "trip_price", "amount", "total_fare", "price_usd",
-           "avg_price", "avg_fare", "fare_usd", "price_estimate", "estimate", "usd",
+           "avg_price", "avg_fare", "fare_usd", "price_estimate", "estimate", "passenger_fare", "Passenger Fare",
        ]
        lower_price_cols = ["low_estimate", "minimum", "min_estimate", "fare_low"]
        upper_price_cols = ["high_estimate", "maximum", "max_estimate", "fare_high"]
        distance_cols = [
            "distance", "distance_miles", "trip_miles", "miles", "trip_distance", "DistanceMiles", "TravelDistance",
-           "distance_km", "trip_distance_km", "kilometers", "km",
+           "trip_length", "Trip Length",
        ]
        duration_cols = [
            "duration", "duration_minutes", "trip_duration", "trip_time", "duration_secs", "DurationMinutes",
-           "trip_duration_minutes", "duration_min", "travel_time",
+           "trip_duration_minutes", "duration_min", "travel_time", "total_ride_time", "Total Ride Time",
+           "on_scene_to_dropoff", "On Scene to Dropoff", "request_to_dropoff", "Request to Dropoff",
        ]
        duration_seconds_cols = ["duration_secs", "duration_seconds", "trip_duration_seconds", "eta_seconds"]
        dropoff_time_cols = ["dropoff_datetime", "tpep_dropoff_datetime", "lpep_dropoff_datetime"]
