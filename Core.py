@@ -49,6 +49,11 @@ from calibration_utils import derive_calibration, load_calibration_preset
 
 import kagglehub
 
+try:
+    import pyarrow.parquet as pq
+except Exception:
+    pq = None
+
 def _resolve_dataset_path() -> str:
     """Download the Kaggle dataset only when explicitly needed."""
     dataset_path = kagglehub.dataset_download("aaronweymouth/nyc-rideshare-raw-data")
@@ -97,6 +102,31 @@ def _to_int(v: Any) -> Optional[int]:
     if fv is None:
         return None
     return int(fv)
+
+def _to_minutes(v: Any) -> Optional[float]:
+    if _is_missing(v):
+        return None
+    if isinstance(v, np.timedelta64):
+        return float(v / np.timedelta64(1, "m"))
+    fv = _to_numeric(v)
+    if fv is not None:
+        val = float(fv)
+        # Heuristic: very large values are likely stored in ns/us/ms or sec.
+        if val > 1e12:
+            return val / 60_000_000_000.0
+        if val > 1e9:
+            return val / 60_000_000.0
+        if val > 10000:
+            return val / 60.0
+        return val
+
+    try:
+        import pandas as pd
+        td = pd.to_timedelta(v)
+        return float(td.total_seconds() / 60.0)
+    except Exception:
+        return None
+
 
 
 def _pick_value(row: Dict[str, Any], names: List[str]) -> Any:
@@ -748,7 +778,7 @@ class Core:
     def compare_trained_rl_to_dataset(
        self,
        dataset_root: str,
-       dataset_glob: str = "*.csv",
+       dataset_glob: str = "*.parquet",
        out_csv: Optional[str] = None,
        out_plot_prefix: Optional[str] = None,
        max_rows: int = 50000,
