@@ -100,11 +100,15 @@ class PPOAgent:
     @torch.no_grad()
     def act(self, s_np: np.ndarray) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         s = torch.tensor(s_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+        s = torch.nan_to_num(s, nan=0.0, posinf=1e3, neginf=-1e3)
         expected_dim = self.net.trunk[0].in_features
         if s.shape[-1] != expected_dim:
             raise ValueError(f"State dim mismatch: got {s.shape[-1]}, expected {expected_dim}")
         
         logits, value = self.net(s)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+        if not torch.isfinite(logits).all():
+            logits = torch.zeros_like(logits)
         dist = torch.distributions.Categorical(logits=logits)
         a = dist.sample()
         logp = dist.log_prob(a)
@@ -152,7 +156,15 @@ class PPOAgent:
             ret[t] = adv[t] + v_t
             next_v = v_t
 
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        adv_mean = adv.mean()
+        adv_std = adv.std(unbiased=False)
+        if torch.isfinite(adv_std) and float(adv_std.item()) > 1e-8:
+            adv = (adv - adv_mean) / (adv_std + 1e-8)
+        else:
+            adv = adv - adv_mean
+
+        adv = torch.nan_to_num(adv, nan=0.0, posinf=0.0, neginf=0.0)
+        ret = torch.nan_to_num(ret, nan=0.0, posinf=0.0, neginf=0.0)
         return adv, ret
 
     def update(self, epochs: int = 5, batch_size: int = 256) -> dict:
@@ -162,8 +174,10 @@ class PPOAgent:
         adv, ret = self._gae()
 
         s_all = torch.stack([tr.s for tr in self.buf], dim=0)
+        s_all = torch.nan_to_num(s_all, nan=0.0, posinf=1e3, neginf=-1e3)
         a_all = torch.stack([tr.a for tr in self.buf], dim=0)
         old_logp_all = torch.stack([tr.old_logp for tr in self.buf], dim=0)
+        old_logp_all = torch.nan_to_num(old_logp_all, nan=0.0, posinf=20.0, neginf=-20.0)
         
         n = s_all.size(0)
         last = {
@@ -188,10 +202,14 @@ class PPOAgent:
                 old_logp_b = old_logp_all[j].detach()
 
                 logits, v = self.net(s_b)
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+                if not torch.isfinite(logits).all():
+                    continue
                 dist = torch.distributions.Categorical(logits=logits)
                 logp = dist.log_prob(a_b)
                 
                 ratio = torch.exp(logp - old_logp_b)
+                ratio = torch.nan_to_num(ratio, nan=1.0, posinf=1.0 + self.clip_eps, neginf=1.0 - self.clip_eps)
                 unclipped = ratio * adv_b
                 clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv_b
                 policy_loss = -torch.min(unclipped, clipped).mean()
@@ -202,6 +220,8 @@ class PPOAgent:
 
 
                 loss = policy_loss + self.v_coeff * value_loss - self.ent_coeff * entropy
+                if not torch.isfinite(loss):
+                    continue
 
                 self.opt.zero_grad()
                 loss.backward()

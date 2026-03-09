@@ -16,16 +16,23 @@ Defaults aim for stable learning:
 import argparse
 import csv
 import glob
+import importlib.util
+import json
+import os
+import random
+import sys
+from collections import Counter
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
+
+
+# Suppress Intel oneMKL CPU deprecation warning on legacy (non-AVX) machines unless
+# the user has already chosen an instruction policy in the environment.
+os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "SSE4_2")
+
 import numpy as np
 import torch
-import json
-import random
 
-import importlib.util
-import os
-from collections import Counter
 
 from MarketInteraction import MarketInteraction, RideContext
 from Market_models import CoefficientOverrides
@@ -484,6 +491,7 @@ class Core:
         print(">>> Training RL agent on-the-fly (early exploration prioritized)...")
         reward_history: List[float] = []
         stable_count = 0
+        stability_notice_emitted = False
         sampled_profile_rows: List[Dict[str, Any]] = []
         profile_limit_reached = False
 
@@ -546,8 +554,12 @@ class Core:
                 print(f"  [train {t+1}/{train_timesteps}] reward={float(reward):.3f} moving_avg20={moving_avg:.3f}")
 
             if stable_count >= 3:
-                print(f">>> Reward stabilized at timestep {t+1}; ending training early.")
-                break
+                if not stability_notice_emitted:
+                    print(
+                        f">>> Reward stabilized at timestep {t+1}; "
+                        "continuing training to complete all requested timesteps."
+                    )
+                    stability_notice_emitted = True
 
             self.last_share = float(m1.share)
             self.last_revpr = float(m1.rev_per_request)
@@ -625,9 +637,10 @@ class Core:
        dataset_root: str,
        dataset_glob: str = "*.csv",
        out_csv: Optional[str] = None,
+       out_plot_prefix: Optional[str] = None,
        max_rows: int = 50000,
    ) -> Dict[str, Any]:
-       """Score real rides with trained Firm1 coefficients and compare against paid prices."""
+       """Validate trained RL pricing on raw NYC rides by predicting trip time + paid price."""
        patterns = [os.path.join(dataset_root, dataset_glob)]
        if "**" not in dataset_glob:
            patterns.append(os.path.join(dataset_root, "**", dataset_glob))
@@ -645,6 +658,9 @@ class Core:
        sq_err: List[float] = []
        signed_err: List[float] = []
        abs_pct: List[float] = []
+       dur_abs_err: List[float] = []
+       dur_sq_err: List[float] = []
+       dur_abs_pct: List[float] = []
 
        processed = 0
        kept = 0
@@ -680,9 +696,17 @@ class Core:
                        continue
 
                    hour, day_of_week = _infer_hour_day(raw)
-                   duration = _to_float(_pick_value(raw, duration_cols))
-                   if duration is None:
-                       duration = float(self.estimate_duration(float(distance), hour))
+                   actual_duration = _to_float(_pick_value(raw, duration_cols))
+                   predicted_duration = float(self.estimate_duration(float(distance), hour))
+                   duration = float(actual_duration) if actual_duration is not None else predicted_duration
+
+                   if actual_duration is not None:
+                       d_err = float(predicted_duration - float(actual_duration))
+                       dae = float(abs(d_err))
+                       dur_abs_err.append(dae)
+                       dur_sq_err.append(float(d_err * d_err))
+                       if float(actual_duration) > 1e-6:
+                           dur_abs_pct.append(float(dae / float(actual_duration)))
 
                    weather = _infer_weather(raw)
                    airport = _infer_airport_trip(raw)
@@ -717,7 +741,9 @@ class Core:
                        "price_error": err,
                        "abs_error": ae,
                        "distance_miles": float(distance),
-                       "duration_minutes": float(duration),
+                       "actual_duration_minutes": float(actual_duration) if actual_duration is not None else None,
+                       "predicted_duration_minutes": float(predicted_duration),
+                       "duration_minutes_used_for_price": float(duration),
                        "hour": int(ctx.hour),
                        "day_of_week": int(ctx.day_of_week),
                        "weather": str(ctx.weather),
@@ -732,6 +758,9 @@ class Core:
        if out_csv:
            _ensure_parent_dir(out_csv)
            _write_csv(out_csv, rows_out)
+           
+       if out_plot_prefix and rows_out:
+           self._plot_dataset_validation(rows_out=rows_out, out_plot_prefix=out_plot_prefix)
 
        summary = {
            "dataset_root": dataset_root,
@@ -742,10 +771,64 @@ class Core:
            "rmse": float(np.sqrt(np.mean(sq_err))) if sq_err else None,
            "mape": float(np.mean(abs_pct)) if abs_pct else None,
            "bias": float(np.mean(signed_err)) if signed_err else None,
+           "duration_mae_minutes": float(np.mean(dur_abs_err)) if dur_abs_err else None,
+           "duration_rmse_minutes": float(np.sqrt(np.mean(dur_sq_err))) if dur_sq_err else None,
+           "duration_mape": float(np.mean(dur_abs_pct)) if dur_abs_pct else None,
            "out_csv": out_csv,
+           "out_plot_prefix": out_plot_prefix,
        }
        return summary
-    
+   
+    @staticmethod
+    def _plot_dataset_validation(rows_out: List[Dict[str, Any]], out_plot_prefix: str) -> None:
+        if importlib.util.find_spec("matplotlib") is None:
+            print("[WARN] matplotlib not installed; skipping RL dataset validation graphs.")
+            return
+
+        import matplotlib.pyplot as plt
+
+        prices_actual = [float(r["actual_paid"]) for r in rows_out if r.get("actual_paid") is not None]
+        prices_pred = [float(r["rl_predicted_price"]) for r in rows_out if r.get("rl_predicted_price") is not None]
+
+        if prices_actual and prices_pred:
+            plt.figure(figsize=(7, 5))
+            plt.scatter(prices_actual, prices_pred, s=10, alpha=0.35)
+            lo = float(min(prices_actual + prices_pred))
+            hi = float(max(prices_actual + prices_pred))
+            plt.plot([lo, hi], [lo, hi], "r--", linewidth=1.2, label="ideal match")
+            plt.title("RL Predicted Price vs Actual Customer Price")
+            plt.xlabel("Actual customer price")
+            plt.ylabel("RL predicted price")
+            plt.legend(loc="best")
+            plt.tight_layout()
+            out = f"{out_plot_prefix}_price_match_scatter.png"
+            _ensure_parent_dir(out)
+            plt.savefig(out, dpi=150)
+            plt.close()
+
+        duration_pairs = [
+            (float(r["actual_duration_minutes"]), float(r["predicted_duration_minutes"]))
+            for r in rows_out
+            if r.get("actual_duration_minutes") is not None and r.get("predicted_duration_minutes") is not None
+        ]
+        if duration_pairs:
+            actual_dur = [a for a, _ in duration_pairs]
+            pred_dur = [p for _, p in duration_pairs]
+            plt.figure(figsize=(7, 5))
+            plt.scatter(actual_dur, pred_dur, s=10, alpha=0.35, color="tab:orange")
+            lo = float(min(actual_dur + pred_dur))
+            hi = float(max(actual_dur + pred_dur))
+            plt.plot([lo, hi], [lo, hi], "k--", linewidth=1.2, label="ideal match")
+            plt.title("Predicted Total Time vs Actual Duration")
+            plt.xlabel("Actual trip duration (minutes)")
+            plt.ylabel("Predicted total time (minutes)")
+            plt.legend(loc="best")
+            plt.tight_layout()
+            out = f"{out_plot_prefix}_duration_match_scatter.png"
+            _ensure_parent_dir(out)
+            plt.savefig(out, dpi=150)
+            plt.close()
+            
     def simulate_day_cycle(self, day_ctx, rides, is_training):
         """Runs one 200-ride cycle. Primarily used by run_experiment."""
         hour = 12
@@ -1390,11 +1473,27 @@ def main():
     parser.add_argument("--calibration_preset", type=str, default="nyc_public", choices=["", "nyc_public"], help="Built-in preset calibration. Defaults to nyc_public (NYC TLC + ACS + weather priors).")
     parser.add_argument("--compare_with_dataset", action="store_true", help="After training/run, compare RL-implied prices against actual paid prices in the Kaggle CSV files.")
     parser.add_argument("--dataset_glob", type=str, default="*.csv", help="Glob for dataset CSV discovery under kagglehub download path.")
-    parser.add_argument("--comparison_out", type=str, default="artifacts/rl_dataset_price_comparison.csv", help="Output CSV for row-level RL-vs-actual comparison.")
+    parser.add_argument(
+        "--comparison_out", "--comparison-out",
+        type=str,
+        nargs="?",
+        const="artifacts/rl_dataset_price_comparison.csv",
+        default="artifacts/rl_dataset_price_comparison.csv",
+        help="Output CSV for row-level RL-vs-actual comparison. If provided without a value, defaults to artifacts/rl_dataset_price_comparison.csv.",
+    )
+    parser.add_argument(
+        "--comparison_plot_prefix", "--comparison-plot-prefix",
+        type=str,
+        nargs="?",
+        const="artifacts/rl_dataset_validation",
+        default="artifacts/rl_dataset_validation",
+        help="Prefix for validation graphs (price/time match) against dataset. If provided without a value, defaults to artifacts/rl_dataset_validation.",
+    )
     parser.add_argument("--comparison_limit", type=int, default=50000, help="Max number of dataset rows to score during RL-vs-actual comparison.")
 
-    
-    args = parser.parse_args()
+    args, unknown_args = parser.parse_known_args()
+    if unknown_args:
+        print(f"[WARN] Ignoring unrecognized CLI args: {unknown_args}")
 
     core = Core(
         market_name=args.market,
@@ -1486,6 +1585,7 @@ def main():
             dataset_root=_resolve_dataset_path(),
             dataset_glob=args.dataset_glob,
             out_csv=args.comparison_out,
+            out_plot_prefix=args.comparison_plot_prefix,
             max_rows=args.comparison_limit,
         )
         print(f"[RL vs Actual] {json.dumps(summary, indent=2)}")
