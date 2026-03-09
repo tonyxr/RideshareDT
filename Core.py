@@ -80,6 +80,16 @@ def _pick_value(row: Dict[str, Any], names: List[str]) -> Any:
             return row[k]
     return None
 
+def _normalize_row_keys(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a row view that supports loose key matching across datasets."""
+    out = dict(row)
+    for k, v in row.items():
+        kn = str(k).strip()
+        out.setdefault(kn, v)
+        out.setdefault(kn.lower(), v)
+        out.setdefault(kn.replace(" ", "_"), v)
+        out.setdefault(kn.lower().replace(" ", "_"), v)
+    return out
 
 def _infer_service_level(row: Dict[str, Any]) -> str:
     service_text = str(_pick_value(row, ["service", "name", "cab_type", "product_name", "product_id"]) or "").lower()
@@ -667,15 +677,23 @@ class Core:
 
        actual_price_cols = [
            "price", "fare", "fare_amount", "total_amount", "final_price", "paid", "cost",
+           "estimated_price", "trip_price", "amount", "total_fare", "price_usd",
        ]
        distance_cols = [
            "distance", "distance_miles", "trip_miles", "miles", "trip_distance", "DistanceMiles", "TravelDistance",
+           "trip_distance_miles", "distance_mi", "distance_km",
        ]
        duration_cols = [
            "duration", "duration_minutes", "trip_duration", "trip_time", "duration_secs", "DurationMinutes",
+           "trip_duration_minutes", "duration_min", "travel_time",
        ]
+       
+       skipped_missing_price = 0
+       skipped_missing_distance = 0
+       files_with_rows = 0
 
        for fpath in files:
+           file_kept = 0
            with open(fpath, "r", encoding="utf-8", newline="") as f:
                try:
                    reader = csv.DictReader(f)
@@ -689,10 +707,16 @@ class Core:
                    processed += 1
                    if kept >= max_rows:
                        break
+                   
+                   raw = _normalize_row_keys(raw)
 
                    actual_paid = _to_float(_pick_value(raw, actual_price_cols))
                    distance = _to_float(_pick_value(raw, distance_cols))
-                   if actual_paid is None or distance is None:
+                   if actual_paid is None:
+                       skipped_missing_price += 1
+                       continue
+                   if distance is None:
+                       skipped_missing_distance += 1
                        continue
 
                    hour, day_of_week = _infer_hour_day(raw)
@@ -751,9 +775,12 @@ class Core:
                        "service": str(ctx.service),
                    })
                    kept += 1
+                   file_kept += 1
 
                if kept >= max_rows:
                    break
+           if file_kept > 0:
+               files_with_rows += 1
 
        if out_csv:
            _ensure_parent_dir(out_csv)
@@ -767,6 +794,9 @@ class Core:
            "files_scanned": len(files),
            "rows_processed": int(processed),
            "rows_compared": int(kept),
+           "rows_skipped_missing_price": int(skipped_missing_price),
+           "rows_skipped_missing_distance": int(skipped_missing_distance),
+           "files_with_comparable_rows": int(files_with_rows),
            "mae": float(np.mean(abs_err)) if abs_err else None,
            "rmse": float(np.sqrt(np.mean(sq_err))) if sq_err else None,
            "mape": float(np.mean(abs_pct)) if abs_pct else None,
@@ -1301,7 +1331,7 @@ def _plot_reports(
         return
 
     import matplotlib.pyplot as plt
-
+    from matplotlib.ticker import MultipleLocator, FormatStrFormatter
     _ensure_parent_dir(prefix + "_dummy")
 
     # 1) Ride parameter distributions
@@ -1401,6 +1431,25 @@ def _plot_reports(
         ys = [float(r["avg_reward"]) for r in training_logs]
         plt.figure(figsize=(9, 4))
         plt.plot(xs, ys)
+        
+        y_min, y_max = float(min(ys)), float(max(ys))
+        y_span = max(1e-6, y_max - y_min)
+        y_pad = max(0.02, 0.10 * y_span)
+        y_lo, y_hi = y_min - y_pad, y_max + y_pad
+
+        # Use denser major ticks (with minor ticks in-between) so reward movements are easier to inspect.
+        tick_candidates = [0.01, 0.02, 0.05, 0.10, 0.20, 0.50]
+        y_total = max(1e-6, y_hi - y_lo)
+        major_step = next((step for step in tick_candidates if (y_total / step) <= 12), tick_candidates[-1])
+
+        ax = plt.gca()
+        ax.set_ylim(y_lo, y_hi)
+        ax.yaxis.set_major_locator(MultipleLocator(major_step))
+        ax.yaxis.set_minor_locator(MultipleLocator(max(major_step / 2.0, 0.005)))
+        ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+        ax.grid(axis="y", which="major", linestyle="--", alpha=0.35)
+        ax.grid(axis="y", which="minor", linestyle=":", alpha=0.20)
+        
         plt.title("Training Reward Trajectory")
         plt.xlabel("Batch")
         plt.ylabel("Avg Reward")
