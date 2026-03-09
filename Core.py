@@ -21,6 +21,7 @@ import json
 import os
 import random
 import sys
+import re
 from collections import Counter
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
@@ -65,6 +66,27 @@ def _to_float(v: Any) -> Optional[float]:
         return float(v)
     except Exception:
         return None
+    
+def _to_numeric(v: Any) -> Optional[float]:
+    """Best-effort numeric parser for noisy dataset fields (currency, ranges, units)."""
+    fv = _to_float(v)
+    if fv is not None:
+        return fv
+    if _is_missing(v):
+        return None
+
+    text = str(v).strip().lower().replace(",", "")
+    if not text:
+        return None
+
+    nums = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", text)]
+    if not nums:
+        return None
+
+    # Fields like "$12-16" or "12 to 16" should map to a single usable value.
+    if len(nums) >= 2 and ("-" in text or " to " in text):
+        return float(sum(nums[:2]) / 2.0)
+    return float(nums[0])
 
 
 def _to_int(v: Any) -> Optional[int]:
@@ -79,6 +101,26 @@ def _pick_value(row: Dict[str, Any], names: List[str]) -> Any:
         if k in row and not _is_missing(row[k]):
             return row[k]
     return None
+
+
+def _pick_first_numeric(row: Dict[str, Any], names: List[str]) -> Optional[float]:
+    for k in names:
+        if k not in row or _is_missing(row[k]):
+            continue
+        val = _to_numeric(row[k])
+        if val is not None:
+            return val
+    return None
+
+
+def _pick_first_numeric_with_key(row: Dict[str, Any], names: List[str]) -> Tuple[Optional[float], Optional[str]]:
+    for k in names:
+        if k not in row or _is_missing(row[k]):
+            continue
+        val = _to_numeric(row[k])
+        if val is not None:
+            return val, k
+    return None, None
 
 def _normalize_row_keys(row: Dict[str, Any]) -> Dict[str, Any]:
     """Return a row view that supports loose key matching across datasets."""
@@ -649,6 +691,7 @@ class Core:
        out_csv: Optional[str] = None,
        out_plot_prefix: Optional[str] = None,
        max_rows: int = 50000,
+       preview_rows: int = 5,
    ) -> Dict[str, Any]:
        """Validate trained RL pricing on raw NYC rides by predicting trip time + paid price."""
        patterns = [os.path.join(dataset_root, dataset_glob)]
@@ -678,19 +721,24 @@ class Core:
        actual_price_cols = [
            "price", "fare", "fare_amount", "total_amount", "final_price", "paid", "cost",
            "estimated_price", "trip_price", "amount", "total_fare", "price_usd",
+           "avg_price", "avg_fare", "fare_usd", "price_estimate", "estimate",
        ]
+       lower_price_cols = ["low_estimate", "minimum", "min_estimate", "fare_low"]
+       upper_price_cols = ["high_estimate", "maximum", "max_estimate", "fare_high"]
        distance_cols = [
            "distance", "distance_miles", "trip_miles", "miles", "trip_distance", "DistanceMiles", "TravelDistance",
-           "trip_distance_miles", "distance_mi", "distance_km",
+           "trip_duration_minutes", "duration_min", "travel_time", "eta_seconds", "estimated_duration",
        ]
        duration_cols = [
            "duration", "duration_minutes", "trip_duration", "trip_time", "duration_secs", "DurationMinutes",
            "trip_duration_minutes", "duration_min", "travel_time",
        ]
+       duration_seconds_cols = ["duration_secs", "duration_seconds", "trip_duration_seconds", "eta_seconds"]
        
        skipped_missing_price = 0
        skipped_missing_distance = 0
        files_with_rows = 0
+       preview_printed = False
 
        for fpath in files:
            file_kept = 0
@@ -703,15 +751,38 @@ class Core:
                if not reader.fieldnames:
                    continue
 
-               for raw in reader:
+               if (not preview_printed) and preview_rows > 0:
+                   print(f"[Dataset Preview] file={fpath}")
+                   print(f"[Dataset Preview] columns={reader.fieldnames}")
+
+               for idx, raw in enumerate(reader):
+                   if (not preview_printed) and preview_rows > 0 and idx < preview_rows:
+                       sample_keys = list(raw.keys())[:12]
+                       sample = {k: raw.get(k) for k in sample_keys}
+                       print(f"[Dataset Preview] row_{idx}: {json.dumps(sample, ensure_ascii=False)}")
+                   if (not preview_printed) and preview_rows > 0 and idx + 1 >= preview_rows:
+                       preview_printed = True
                    processed += 1
                    if kept >= max_rows:
                        break
                    
                    raw = _normalize_row_keys(raw)
 
-                   actual_paid = _to_float(_pick_value(raw, actual_price_cols))
-                   distance = _to_float(_pick_value(raw, distance_cols))
+                   actual_paid = _pick_first_numeric(raw, actual_price_cols)
+                   if actual_paid is None:
+                       low = _pick_first_numeric(raw, lower_price_cols)
+                       high = _pick_first_numeric(raw, upper_price_cols)
+                       if low is not None and high is not None:
+                           actual_paid = float((low + high) / 2.0)
+                       elif low is not None:
+                           actual_paid = float(low)
+                       elif high is not None:
+                           actual_paid = float(high)
+
+                   distance, distance_key = _pick_first_numeric_with_key(raw, distance_cols)
+                   if distance is not None and distance_key == "distance_km":
+                       distance = float(distance) * 0.621371
+
                    if actual_paid is None:
                        skipped_missing_price += 1
                        continue
@@ -720,7 +791,13 @@ class Core:
                        continue
 
                    hour, day_of_week = _infer_hour_day(raw)
-                   actual_duration = _to_float(_pick_value(raw, duration_cols))
+                   actual_duration = _pick_first_numeric(raw, duration_cols)
+                   if actual_duration is not None:
+                       # Normalize common second-based fields to minutes.
+                       if any((k in raw and not _is_missing(raw.get(k))) for k in duration_seconds_cols):
+                           actual_duration = float(actual_duration) / 60.0
+                       elif actual_duration > 300.0:
+                           actual_duration = float(actual_duration) / 60.0
                    predicted_duration = float(self.estimate_duration(float(distance), hour))
                    duration = float(actual_duration) if actual_duration is not None else predicted_duration
 
@@ -1539,6 +1616,7 @@ def main():
         help="Prefix for validation graphs (price/time match) against dataset. If provided without a value, defaults to artifacts/rl_dataset_validation.",
     )
     parser.add_argument("--comparison_limit", type=int, default=50000, help="Max number of dataset rows to score during RL-vs-actual comparison.")
+    parser.add_argument("--dataset_preview_rows", type=int, default=5, help="How many raw dataset rows to print once as format preview during RL-vs-actual comparison.")
 
     args, unknown_args = parser.parse_known_args()
     if unknown_args:
@@ -1636,6 +1714,7 @@ def main():
             out_csv=args.comparison_out,
             out_plot_prefix=args.comparison_plot_prefix,
             max_rows=args.comparison_limit,
+            preview_rows=args.dataset_preview_rows,
         )
         print(f"[RL vs Actual] {json.dumps(summary, indent=2)}")
 
