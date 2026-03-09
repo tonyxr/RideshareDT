@@ -16,12 +16,15 @@ Defaults aim for stable learning:
 import argparse
 import csv
 import glob
+import gzip
+import io
 import importlib.util
 import json
 import os
 import random
 import sys
 import re
+import zipfile
 from collections import Counter
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
@@ -126,12 +129,70 @@ def _normalize_row_keys(row: Dict[str, Any]) -> Dict[str, Any]:
     """Return a row view that supports loose key matching across datasets."""
     out = dict(row)
     for k, v in row.items():
-        kn = str(k).strip()
+        kn = str(k).replace("\ufeff", "").strip()
         out.setdefault(kn, v)
         out.setdefault(kn.lower(), v)
         out.setdefault(kn.replace(" ", "_"), v)
         out.setdefault(kn.lower().replace(" ", "_"), v)
+        out.setdefault(kn.replace("-", "_"), v)
+        out.setdefault(kn.lower().replace("-", "_"), v)
     return out
+
+
+def _discover_dataset_files(dataset_root: str, dataset_glob: str) -> List[str]:
+    """Discover tabular files for dataset comparison; tolerate compressed variants."""
+    base_patterns = [dataset_glob]
+    g = dataset_glob.lower()
+    if g == "*.csv":
+        base_patterns.extend(["*.csv.gz", "*.zip"])
+    elif g.endswith(".csv"):
+        base_patterns.extend([dataset_glob + ".gz", dataset_glob + ".zip"])
+
+    patterns: List[str] = []
+    for pat in base_patterns:
+        patterns.append(os.path.join(dataset_root, pat))
+        if "**" not in pat:
+            patterns.append(os.path.join(dataset_root, "**", pat))
+
+    files: List[str] = []
+    for pat in patterns:
+        files.extend(glob.glob(pat, recursive=True))
+    keep_ext = (".csv", ".csv.gz", ".zip")
+    return sorted({f for f in files if os.path.isfile(f) and f.lower().endswith(keep_ext)})
+
+
+def _iter_tabular_rows(fpath: str):
+    """Yield rows from .csv, .csv.gz, or .zip archives containing csv files."""
+    lower = fpath.lower()
+    if lower.endswith(".csv"):
+        with open(fpath, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                return
+            yield reader.fieldnames, reader
+        return
+
+    if lower.endswith(".csv.gz"):
+        with gzip.open(fpath, "rt", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                return
+            yield reader.fieldnames, reader
+        return
+
+    if lower.endswith(".zip"):
+        with zipfile.ZipFile(fpath, "r") as zf:
+            for member in zf.namelist():
+                if not member.lower().endswith(".csv"):
+                    continue
+                with zf.open(member, "r") as raw:
+                    text_stream = io.TextIOWrapper(raw, encoding="utf-8", newline="")
+                    reader = csv.DictReader(text_stream)
+                    if not reader.fieldnames:
+                        continue
+                    yield reader.fieldnames, reader
+
+
 
 def _infer_service_level(row: Dict[str, Any]) -> str:
     service_text = str(_pick_value(row, ["service", "name", "cab_type", "product_name", "product_id"]) or "").lower()
@@ -694,17 +755,7 @@ class Core:
        preview_rows: int = 5,
    ) -> Dict[str, Any]:
        """Validate trained RL pricing on raw NYC rides by predicting trip time + paid price."""
-       patterns = [os.path.join(dataset_root, dataset_glob)]
-       if "**" not in dataset_glob:
-           patterns.append(os.path.join(dataset_root, "**", dataset_glob))
-
-       files: List[str] = []
-       for pat in patterns:
-           files.extend(glob.glob(pat, recursive=True))
-       files = sorted({f for f in files if os.path.isfile(f) and f.lower().endswith('.csv')})
-
-       if not files:
-           raise FileNotFoundError(f"No CSV files found under dataset_root={dataset_root!r} with glob={dataset_glob!r}")
+       files = _discover_dataset_files(dataset_root=dataset_root, dataset_glob=dataset_glob)
 
        rows_out: List[Dict[str, Any]] = []
        abs_err: List[float] = []
@@ -721,19 +772,21 @@ class Core:
        actual_price_cols = [
            "price", "fare", "fare_amount", "total_amount", "final_price", "paid", "cost",
            "estimated_price", "trip_price", "amount", "total_fare", "price_usd",
-           "avg_price", "avg_fare", "fare_usd", "price_estimate", "estimate",
+           "avg_price", "avg_fare", "fare_usd", "price_estimate", "estimate", "usd",
        ]
        lower_price_cols = ["low_estimate", "minimum", "min_estimate", "fare_low"]
        upper_price_cols = ["high_estimate", "maximum", "max_estimate", "fare_high"]
        distance_cols = [
            "distance", "distance_miles", "trip_miles", "miles", "trip_distance", "DistanceMiles", "TravelDistance",
-           "trip_duration_minutes", "duration_min", "travel_time", "eta_seconds", "estimated_duration",
+           "distance_km", "trip_distance_km", "kilometers", "km",
        ]
        duration_cols = [
            "duration", "duration_minutes", "trip_duration", "trip_time", "duration_secs", "DurationMinutes",
            "trip_duration_minutes", "duration_min", "travel_time",
        ]
        duration_seconds_cols = ["duration_secs", "duration_seconds", "trip_duration_seconds", "eta_seconds"]
+       dropoff_time_cols = ["dropoff_datetime", "tpep_dropoff_datetime", "lpep_dropoff_datetime"]
+       pickup_time_cols = ["pickup_datetime", "tpep_pickup_datetime", "lpep_pickup_datetime"]
        
        skipped_missing_price = 0
        skipped_missing_distance = 0
@@ -742,120 +795,130 @@ class Core:
 
        for fpath in files:
            file_kept = 0
-           with open(fpath, "r", encoding="utf-8", newline="") as f:
-               try:
-                   reader = csv.DictReader(f)
-               except Exception:
-                   continue
+           try:
+               for fieldnames, reader in _iter_tabular_rows(fpath):
+                   if (not preview_printed) and preview_rows > 0:
+                       print(f"[Dataset Preview] file={fpath}")
+                       print(f"[Dataset Preview] columns={fieldnames}")
 
-               if not reader.fieldnames:
-                   continue
+                   for idx, raw in enumerate(reader):
+                       if (not preview_printed) and preview_rows > 0 and idx < preview_rows:
+                           sample_keys = list(raw.keys())[:12]
+                           sample = {k: raw.get(k) for k in sample_keys}
+                           print(f"[Dataset Preview] row_{idx}: {json.dumps(sample, ensure_ascii=False)}")
+                       if (not preview_printed) and preview_rows > 0 and idx + 1 >= preview_rows:
+                           preview_printed = True
+                       processed += 1
+                       if kept >= max_rows:
+                           break
+                       
+                       raw = _normalize_row_keys(raw)
 
-               if (not preview_printed) and preview_rows > 0:
-                   print(f"[Dataset Preview] file={fpath}")
-                   print(f"[Dataset Preview] columns={reader.fieldnames}")
+                       actual_paid = _pick_first_numeric(raw, actual_price_cols)
+                       if actual_paid is None:
+                           low = _pick_first_numeric(raw, lower_price_cols)
+                           high = _pick_first_numeric(raw, upper_price_cols)
+                           if low is not None and high is not None:
+                               actual_paid = float((low + high) / 2.0)
+                           elif low is not None:
+                               actual_paid = float(low)
+                           elif high is not None:
+                               actual_paid = float(high)
 
-               for idx, raw in enumerate(reader):
-                   if (not preview_printed) and preview_rows > 0 and idx < preview_rows:
-                       sample_keys = list(raw.keys())[:12]
-                       sample = {k: raw.get(k) for k in sample_keys}
-                       print(f"[Dataset Preview] row_{idx}: {json.dumps(sample, ensure_ascii=False)}")
-                   if (not preview_printed) and preview_rows > 0 and idx + 1 >= preview_rows:
-                       preview_printed = True
-                   processed += 1
+                       distance, distance_key = _pick_first_numeric_with_key(raw, distance_cols)
+                       if distance is not None and distance_key == "distance_km":
+                           distance = float(distance) * 0.621371
+
+                       if actual_paid is None:
+                           skipped_missing_price += 1
+                           continue
+                       if distance is None:
+                           skipped_missing_distance += 1
+                           continue
+
+                       hour, day_of_week = _infer_hour_day(raw)
+                       actual_duration = _pick_first_numeric(raw, duration_cols)
+                       if actual_duration is None:
+                           pickup_raw = _pick_value(raw, pickup_time_cols)
+                           dropoff_raw = _pick_value(raw, dropoff_time_cols)
+                           if pickup_raw is not None and dropoff_raw is not None:
+                               try:
+                                   pickup_dt = datetime.fromisoformat(str(pickup_raw).replace("Z", "+00:00"))
+                                   dropoff_dt = datetime.fromisoformat(str(dropoff_raw).replace("Z", "+00:00"))
+                                   secs = (dropoff_dt - pickup_dt).total_seconds()
+                                   if secs > 0:
+                                       actual_duration = float(secs / 60.0)
+                               except Exception:
+                                   pass
+                       if actual_duration is not None:
+                           # Normalize common second-based fields to minutes.
+                           if any((k in raw and not _is_missing(raw.get(k))) for k in duration_seconds_cols):
+                               actual_duration = float(actual_duration) / 60.0
+                           elif actual_duration > 300.0:
+                               actual_duration = float(actual_duration) / 60.0
+                       predicted_duration = float(self.estimate_duration(float(distance), hour))
+                       duration = float(actual_duration) if actual_duration is not None else predicted_duration
+
+                       if actual_duration is not None:
+                           d_err = float(predicted_duration - float(actual_duration))
+                           dae = float(abs(d_err))
+                           dur_abs_err.append(dae)
+                           dur_sq_err.append(float(d_err * d_err))
+                           if float(actual_duration) > 1e-6:
+                               dur_abs_pct.append(float(dae / float(actual_duration)))
+
+                       weather = _infer_weather(raw)
+                       airport = _infer_airport_trip(raw)
+                       service = _infer_service_level(raw)
+
+                       ctx = RideContext(
+                           day_of_week=int(np.clip(day_of_week, 0, 6)),
+                           weather=weather,
+                           hour=int(np.clip(hour, 0, 23)),
+                           airport=bool(airport),
+                           service=service,
+                       )
+                       rl_price = self.market.quote_price(
+                           distance_miles=float(max(0.0, distance)),
+                           duration_minutes=float(max(0.0, duration)),
+                           ctx=ctx,
+                           overrides=self.firm1.overrides,
+                       )
+
+                       err = float(rl_price - actual_paid)
+                       ae = float(abs(err))
+                       abs_err.append(ae)
+                       sq_err.append(float(err * err))
+                       signed_err.append(err)
+                       if actual_paid > 1e-6:
+                           abs_pct.append(float(ae / actual_paid))
+
+                       rows_out.append({
+                           "source_file": os.path.basename(fpath),
+                           "actual_paid": float(actual_paid),
+                           "rl_predicted_price": float(rl_price),
+                           "price_error": err,
+                           "abs_error": ae,
+                           "distance_miles": float(distance),
+                           "actual_duration_minutes": float(actual_duration) if actual_duration is not None else None,
+                           "predicted_duration_minutes": float(predicted_duration),
+                           "duration_minutes_used_for_price": float(duration),
+                           "hour": int(ctx.hour),
+                           "day_of_week": int(ctx.day_of_week),
+                           "weather": str(ctx.weather),
+                           "airport": bool(ctx.airport),
+                           "service": str(ctx.service),
+                       })
+                       kept += 1
+                       file_kept += 1
+
                    if kept >= max_rows:
                        break
                    
-                   raw = _normalize_row_keys(raw)
-
-                   actual_paid = _pick_first_numeric(raw, actual_price_cols)
-                   if actual_paid is None:
-                       low = _pick_first_numeric(raw, lower_price_cols)
-                       high = _pick_first_numeric(raw, upper_price_cols)
-                       if low is not None and high is not None:
-                           actual_paid = float((low + high) / 2.0)
-                       elif low is not None:
-                           actual_paid = float(low)
-                       elif high is not None:
-                           actual_paid = float(high)
-
-                   distance, distance_key = _pick_first_numeric_with_key(raw, distance_cols)
-                   if distance is not None and distance_key == "distance_km":
-                       distance = float(distance) * 0.621371
-
-                   if actual_paid is None:
-                       skipped_missing_price += 1
-                       continue
-                   if distance is None:
-                       skipped_missing_distance += 1
-                       continue
-
-                   hour, day_of_week = _infer_hour_day(raw)
-                   actual_duration = _pick_first_numeric(raw, duration_cols)
-                   if actual_duration is not None:
-                       # Normalize common second-based fields to minutes.
-                       if any((k in raw and not _is_missing(raw.get(k))) for k in duration_seconds_cols):
-                           actual_duration = float(actual_duration) / 60.0
-                       elif actual_duration > 300.0:
-                           actual_duration = float(actual_duration) / 60.0
-                   predicted_duration = float(self.estimate_duration(float(distance), hour))
-                   duration = float(actual_duration) if actual_duration is not None else predicted_duration
-
-                   if actual_duration is not None:
-                       d_err = float(predicted_duration - float(actual_duration))
-                       dae = float(abs(d_err))
-                       dur_abs_err.append(dae)
-                       dur_sq_err.append(float(d_err * d_err))
-                       if float(actual_duration) > 1e-6:
-                           dur_abs_pct.append(float(dae / float(actual_duration)))
-
-                   weather = _infer_weather(raw)
-                   airport = _infer_airport_trip(raw)
-                   service = _infer_service_level(raw)
-
-                   ctx = RideContext(
-                       day_of_week=int(np.clip(day_of_week, 0, 6)),
-                       weather=weather,
-                       hour=int(np.clip(hour, 0, 23)),
-                       airport=bool(airport),
-                       service=service,
-                   )
-                   rl_price = self.market.quote_price(
-                       distance_miles=float(max(0.0, distance)),
-                       duration_minutes=float(max(0.0, duration)),
-                       ctx=ctx,
-                       overrides=self.firm1.overrides,
-                   )
-
-                   err = float(rl_price - actual_paid)
-                   ae = float(abs(err))
-                   abs_err.append(ae)
-                   sq_err.append(float(err * err))
-                   signed_err.append(err)
-                   if actual_paid > 1e-6:
-                       abs_pct.append(float(ae / actual_paid))
-
-                   rows_out.append({
-                       "source_file": os.path.basename(fpath),
-                       "actual_paid": float(actual_paid),
-                       "rl_predicted_price": float(rl_price),
-                       "price_error": err,
-                       "abs_error": ae,
-                       "distance_miles": float(distance),
-                       "actual_duration_minutes": float(actual_duration) if actual_duration is not None else None,
-                       "predicted_duration_minutes": float(predicted_duration),
-                       "duration_minutes_used_for_price": float(duration),
-                       "hour": int(ctx.hour),
-                       "day_of_week": int(ctx.day_of_week),
-                       "weather": str(ctx.weather),
-                       "airport": bool(ctx.airport),
-                       "service": str(ctx.service),
-                   })
-                   kept += 1
-                   file_kept += 1
-
-               if kept >= max_rows:
-                   break
+           except Exception:
+               continue
+           if kept >= max_rows:
+               break        
            if file_kept > 0:
                files_with_rows += 1
 
