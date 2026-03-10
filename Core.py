@@ -22,10 +22,9 @@ import importlib.util
 import json
 import os
 import random
-import sys
 import re
 import zipfile
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -157,10 +156,6 @@ def _pick_first_numeric(row: Dict[str, Any], names: List[str]) -> Optional[float
 def _pick_first_minutes(row: Dict[str, Any], names: List[str]) -> Optional[float]:
     return _pick_first_parsed(row, names, _to_minutes)
 
-def _pick_first_minutes_with_key(row: Dict[str, Any], names: List[str]) -> Tuple[Optional[float], Optional[str]]:
-    val, key = _pick_first_parsed(row, names, _to_minutes, with_key=True)
-    return val, key
-
 def _pick_first_numeric_with_key(row: Dict[str, Any], names: List[str]) -> Tuple[Optional[float], Optional[str]]:
     val, key = _pick_first_parsed(row, names, _to_numeric, with_key=True)
     return val, key
@@ -277,23 +272,10 @@ def _infer_airport_trip(row: Dict[str, Any]) -> bool:
 
 
 def _infer_hour_day(row: Dict[str, Any]) -> Tuple[int, int]:
-    hour = _to_int(_pick_value(row, ["hour", "hour_of_day", "pickup_hour", "ride_hour", "request_hour"]))
+    hour = _to_int(_pick_value(row, ["hour", "pickup_hour"]))
     day = _to_int(_pick_value(row, ["day_of_week", "weekday", "day"]))
 
-    dt_raw = _pick_value(
-        row,
-        [
-            "datetime",
-            "pickup_datetime",
-            "time_stamp",
-            "timestamp",
-            "date",
-            "ride_datetime",
-            "request_datetime",
-            "pickup_time",
-            "time",
-        ],
-    )
+    dt_raw = _pick_value(row, ["datetime", "pickup_datetime", "time_stamp", "timestamp", "date"])
     dt: Optional[datetime] = None
     if dt_raw is not None:
         txt = str(dt_raw).strip()
@@ -310,17 +292,6 @@ def _infer_hour_day(row: Dict[str, Any]) -> Tuple[int, int]:
                 dt = datetime.fromisoformat(txt.replace("Z", "+00:00"))
             except Exception:
                 dt = None
-                
-    # Some exports split date and time across different columns.
-    if dt is None:
-        date_raw = _pick_value(row, ["date", "ride_date", "pickup_date", "request_date"])
-        time_raw = _pick_value(row, ["time", "ride_time", "pickup_time", "request_time"])
-        if date_raw is not None:
-            combo = f"{str(date_raw).strip()} {str(time_raw).strip()}" if time_raw is not None else str(date_raw).strip()
-            try:
-                dt = datetime.fromisoformat(combo.replace("Z", "+00:00"))
-            except Exception:
-                dt = None
 
     if dt is not None:
         if hour is None:
@@ -332,37 +303,6 @@ def _infer_hour_day(row: Dict[str, Any]) -> Tuple[int, int]:
         day = (day - 1) % 7
 
     return int(hour if hour is not None else 12), int(day if day is not None else 2)
-
-def _duration_minutes_from_value(value: float, duration_key: Optional[str], duration_minutes_cols: List[str],
-                                 duration_seconds_cols: List[str], row: Optional[Dict[str, Any]] = None) -> float:
-    raw_val = float(value)
-    dkey = str(duration_key or "").strip().lower()
-
-    if (
-        dkey in duration_seconds_cols
-        or dkey.endswith("_seconds")
-        or dkey.endswith("_secs")
-        or ("to_" in dkey and dkey not in duration_minutes_cols)
-    ):
-        return raw_val / 60.0
-
-    if dkey in {"total_ride_time", "total ride time"}:
-        second_like_cols = [
-            "request_to_dropoff", "on_scene_to_dropoff", "request_to_pickup", "on_scene_to_pickup"
-        ]
-        if row is not None:
-            for skey in second_like_cols:
-                other = _to_float(_pick_value(row, [skey]))
-                if other is None or other <= 0:
-                    continue
-                if abs(other - raw_val) <= max(60.0, 0.20 * other):
-                    return raw_val / 60.0
-
-        # Fallback guard: values above 3 hours are usually encoded in seconds for this field.
-        if raw_val > 180.0:
-            return raw_val / 60.0
-
-    return raw_val
 
 
 def _parse_kv_floats(s: str) -> Dict[str, float]:
@@ -417,10 +357,6 @@ class Core:
         self.profile_pool_multiplier = 2
         self.training_stable_window = 20
         self.training_stable_tol = 0.015
-        self.training_stable_trend_tol = 0.01
-        self.training_stable_min_mean = 0.15
-        self.training_stable_patience = 3
-        self.freeze_ppo_after_stabilization = True
         self.reward_convergence_window = 40
         self.reward_convergence_tol = 0.025
         self.reward_trend_tol = 0.01
@@ -511,8 +447,6 @@ class Core:
 
         self.ppo_update_epochs = 5
         self.ppo_batch_size = 256
-        self.ppo_min_buffer_for_update = 32
-        self.ppo_update_interval = 8
         
         print(
             "[RewardConfig] "
@@ -720,14 +654,11 @@ class Core:
             f"train timesteps={train_timesteps} x {train_customers_per_step} rides, "
             f"eval timesteps={eval_timesteps} x {eval_customers_per_step} rides"
         )
-        self.training_logs = []
-        self.evaluation_logs = []
         
         print(">>> Training RL agent on-the-fly (early exploration prioritized)...")
         reward_history: List[float] = []
         stable_count = 0
         stability_notice_emitted = False
-        ppo_updates_frozen = False
         sampled_profile_rows: List[Dict[str, Any]] = []
         profile_limit_reached = False
 
@@ -745,7 +676,7 @@ class Core:
             rl_step = None
             if self.firm1_mode == "RL":
                 s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
-                action, s_ts, logits, val = self.firm1.agent.act(s_vec, deterministic=ppo_updates_frozen)
+                action, s_ts, logits, val = self.firm1.agent.act(s_vec)
                 self.firm1.apply_action(action, self.market)
                 rl_step = (action, s_ts, logits, val)
             elif self.firm1_mode == "heuristic":
@@ -765,59 +696,23 @@ class Core:
             reward = self._compute_rl_reward(m1, mean_gap)
             if self.firm1_mode == "RL" and rl_step is not None:
                 action, s_ts, logits, val = rl_step
-                if not ppo_updates_frozen:
-                    self.firm1.agent.store(s_ts, action, float(reward), False, None, logits, val)
-                min_buf = int(max(1, self.ppo_min_buffer_for_update))
-                interval = int(max(1, self.ppo_update_interval))
-                should_update = (
-                    (not ppo_updates_frozen)
-                    and len(self.firm1.agent.buf) >= min_buf
-                    and (((t + 1) % interval) == 0 or (t + 1) == int(train_timesteps))
-                )
-                ppo_metrics = (
-                    self.firm1.agent.update(epochs=self.ppo_update_epochs, batch_size=self.ppo_batch_size)
-                    if should_update
-                    else {"loss": 0.0}
-                )
+                self.firm1.agent.store(s_ts, action, float(reward), False, None, logits, val)
+                ppo_metrics = self.firm1.agent.update(epochs=self.ppo_update_epochs, batch_size=self.ppo_batch_size)
             else:
                 ppo_metrics = {"loss": 0.0}
                 
             reward_history.append(float(reward))
-            reward_std = 1.0
-            reward_delta = 1.0
-            reward_mean = float(reward)
             if len(reward_history) >= self.training_stable_window:
                 recent = reward_history[-self.training_stable_window:]
-                reward_std = float(np.std(recent))
-                reward_delta = float(abs(recent[-1] - recent[0]) / max(1, len(recent) - 1))
-                reward_mean = float(np.mean(recent))
-                stable_now = (
-                    reward_std <= self.training_stable_tol
-                    and reward_delta <= self.training_stable_trend_tol
-                    and reward_mean >= self.training_stable_min_mean
-                )
-                if stable_now:
+                if float(np.std(recent)) <= self.training_stable_tol:
                     stable_count += 1
                 else:
                     stable_count = 0
-            
-            if self.firm1_mode == "RL":
-                progress = float((t + 1) / max(1, train_timesteps))
-                reward_converged = stable_count >= self.training_stable_patience
-                self.firm1.configure_training_controls(
-                    progress=progress,
-                    reward_converged=reward_converged,
-                    reward_std=float(reward_std),
-                )
                     
             self.training_logs.append({
                 "batch": t,
                 "avg_reward": float(reward),
                 "loss": float(ppo_metrics.get("loss", 0.0)),
-                "reward_window_std": float(reward_std),
-                "reward_window_delta": float(reward_delta),
-                "reward_window_mean": float(reward_mean),
-                "reward_converged": bool(stable_count >= self.training_stable_patience),
             })
             
             if (t + 1) % max(1, train_timesteps // 10) == 0:
@@ -825,21 +720,13 @@ class Core:
                 moving_avg = float(np.mean(window)) if window else 0.0
                 print(f"  [train {t+1}/{train_timesteps}] reward={float(reward):.3f} moving_avg20={moving_avg:.3f}")
 
-            if stable_count >= self.training_stable_patience:
+            if stable_count >= 3:
                 if not stability_notice_emitted:
                     print(
-                        f">>> Reward stabilized at timestep {t+1} "
-                        f"(std={reward_std:.4f}, delta/day={reward_delta:.4f}, mean={reward_mean:.3f}); "
-                        "switching to deterministic actions and freezing PPO updates."
+                        f">>> Reward stabilized at timestep {t+1}; "
+                        "continuing training to complete all requested timesteps."
                     )
                     stability_notice_emitted = True
-                if (
-                    self.firm1_mode == "RL"
-                    and self.freeze_ppo_after_stabilization
-                    and not ppo_updates_frozen
-                ):
-                    ppo_updates_frozen = True
-                    self.firm1.agent.buf.clear()
 
             self.last_share = float(m1.share)
             self.last_revpr = float(m1.rev_per_request)
@@ -860,7 +747,7 @@ class Core:
             base = self.market.curr_market
             if self.firm1_mode == "RL":
                 s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
-                action, *_ = self.firm1.agent.act(s_vec, deterministic=True)
+                action, *_ = self.firm1.agent.act(s_vec)
                 self.firm1.apply_action(action, self.market)
             elif self.firm1_mode == "heuristic":
                 self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
@@ -875,14 +762,17 @@ class Core:
                 customers_per_step=eval_customers_per_step,
                 sampled_profiles=sampled_profiles,
             )
-            eval_reward = self._compute_rl_reward(m1, mean_gap)
+            eval_reward = self._reward_base(
+                share=float(m1.share),
+                rev_per_request=float(m1.rev_per_request),
+                price_gap_f2_minus_f1=float(mean_gap),
+            )
             eval_rewards.append(float(eval_reward))
             self.evaluation_logs.append({
                 "day": t,
                 "rl_share": float(m1.share),
                 "heuristic_share": float(m2.share),
                 "rl_revenue": float(m1.rev_per_request),
-                "avg_reward": float(eval_reward),
                 "reward": float(eval_reward),
             })
             self.last_share = float(m1.share)
@@ -949,18 +839,11 @@ class Core:
            "trip_length", "Trip Length",
        ]
        duration_cols = [
-           "total_ride_time", "Total Ride Time", "total_ride_time_minutes", "Total Ride Time Minutes",
            "duration", "duration_minutes", "trip_duration", "trip_time", "duration_secs", "DurationMinutes",
-           "trip_duration_minutes", "duration_min", "travel_time",
+           "trip_duration_minutes", "duration_min", "travel_time", "total_ride_time", "Total Ride Time",
            "on_scene_to_dropoff", "On Scene to Dropoff", "request_to_dropoff", "Request to Dropoff",
        ]
-       duration_seconds_cols = [
-           "duration_secs", "duration_seconds", "trip_duration_seconds", "eta_seconds",
-           "request_to_dropoff", "request_to_pickup", "on_scene_to_pickup", "on_scene_to_dropoff",
-       ]
-       duration_minutes_cols = [
-           "duration_minutes", "trip_duration_minutes", "duration_min", "total_ride_time_minutes",
-       ]
+       duration_seconds_cols = ["duration_secs", "duration_seconds", "trip_duration_seconds", "eta_seconds"]
        dropoff_time_cols = ["dropoff_datetime", "tpep_dropoff_datetime", "lpep_dropoff_datetime"]
        pickup_time_cols = ["pickup_datetime", "tpep_pickup_datetime", "lpep_pickup_datetime"]
        
@@ -1013,8 +896,7 @@ class Core:
                            continue
 
                        hour, day_of_week = _infer_hour_day(raw)
-                       # Prefer total_ride_time (minutes) from Kaggle when present.
-                       actual_duration, duration_key = _pick_first_minutes_with_key(raw, duration_cols)
+                       actual_duration = _pick_first_minutes(raw, duration_cols)
                        if actual_duration is None:
                            pickup_raw = _pick_value(raw, pickup_time_cols)
                            dropoff_raw = _pick_value(raw, dropoff_time_cols)
@@ -1027,14 +909,8 @@ class Core:
                                        actual_duration = float(secs / 60.0)
                                except Exception:
                                    pass
-                       if actual_duration is not None:
-                           actual_duration = _duration_minutes_from_value(
-                               value=float(actual_duration),
-                               duration_key=duration_key,
-                               duration_minutes_cols=duration_minutes_cols,
-                               duration_seconds_cols=duration_seconds_cols,
-                               row=raw,
-                           )
+                       if actual_duration is not None and any((k in raw and not _is_missing(raw.get(k))) for k in duration_seconds_cols):
+                           actual_duration = float(actual_duration) / 60.0
                        predicted_duration = float(self.estimate_duration(float(distance), hour))
                        duration = float(actual_duration) if actual_duration is not None else predicted_duration
 
@@ -1133,107 +1009,6 @@ class Core:
            "out_plot_prefix": out_plot_prefix,
        }
        return summary
-    
-    def _print_kaggle_analysis(self, rows_out: List[Dict[str, Any]]) -> None:
-        prices_actual = np.array([float(r["actual_paid"]) for r in rows_out], dtype=float)
-        prices_pred = np.array([float(r["rl_predicted_price"]) for r in rows_out], dtype=float)
-        errs = prices_pred - prices_actual
-
-        ratio = prices_pred / np.clip(prices_actual, 1e-6, None)
-        print("[Reality Gap]")
-        print(
-            "  price_ratio(pred/actual): "
-            f"median={float(np.median(ratio)):.3f}, p10={float(np.percentile(ratio, 10)):.3f}, p90={float(np.percentile(ratio, 90)):.3f}"
-        )
-        print(
-            "  signed_error: "
-            f"mean={float(np.mean(errs)):.3f}, median={float(np.median(errs)):.3f}, p90_abs={float(np.percentile(np.abs(errs), 90)):.3f}"
-        )
-        
-        # Linear-fit diagnostics: systematic shift often appears as non-zero intercept
-        # and/or slope that deviates from 1.0 in pred vs actual space.
-        if prices_actual.size >= 2:
-            slope, intercept = np.polyfit(prices_actual, prices_pred, deg=1)
-            print(
-                "  linear_fit(pred = slope*actual + intercept): "
-                f"slope={float(slope):.3f}, intercept={float(intercept):.3f}"
-            )
-
-        def _bucket_distance(miles: float) -> str:
-            if miles < 2:
-                return "0-2"
-            if miles < 5:
-                return "2-5"
-            if miles < 10:
-                return "5-10"
-            return "10+"
-
-        by_bucket: Dict[str, List[float]] = defaultdict(list)
-        by_hour: Dict[int, List[float]] = defaultdict(list)
-        by_service: Dict[str, List[float]] = defaultdict(list)
-        by_airport: Dict[str, List[float]] = defaultdict(list)
-        for r in rows_out:
-            err = float(r["price_error"])
-            b = _bucket_distance(float(r.get("distance_miles", 0.0)))
-            by_bucket[b].append(err)
-            by_hour[int(r.get("hour", 12))].append(err)
-            by_service[str(r.get("service", "unknown"))].append(err)
-            by_airport["airport" if bool(r.get("airport", False)) else "non_airport"].append(err)
-
-        print("[Sensitivity Analysis]")
-        print("  by distance bucket (bias / MAE):")
-        for b in ["0-2", "2-5", "5-10", "10+"]:
-            vals = by_bucket.get(b, [])
-            if not vals:
-                continue
-            arr = np.array(vals, dtype=float)
-            print(f"    {b}: bias={float(np.mean(arr)):.3f}, mae={float(np.mean(np.abs(arr))):.3f}, n={len(vals)}")
-            
-        print("  by service (bias / MAE):")
-        for svc in ["economy", "premium", "unknown"]:
-            vals = by_service.get(svc, [])
-            if not vals:
-                continue
-            arr = np.array(vals, dtype=float)
-            print(f"    {svc}: bias={float(np.mean(arr)):.3f}, mae={float(np.mean(np.abs(arr))):.3f}, n={len(vals)}")
-
-        print("  by airport flag (bias / MAE):")
-        for k in ["airport", "non_airport"]:
-            vals = by_airport.get(k, [])
-            if not vals:
-                continue
-            arr = np.array(vals, dtype=float)
-            print(f"    {k}: bias={float(np.mean(arr)):.3f}, mae={float(np.mean(np.abs(arr))):.3f}, n={len(vals)}")
-
-        print("  by hour (selected peak windows):")
-        for name, hours in [("overnight", list(range(0, 6))), ("am_peak", [7, 8, 9]), ("pm_peak", [16, 17, 18]), ("late_evening", [20, 21, 22, 23])]:
-            vals: List[float] = []
-            for h in hours:
-                vals.extend(by_hour.get(h, []))
-            if not vals:
-                continue
-            arr = np.array(vals, dtype=float)
-            print(f"    {name}: bias={float(np.mean(arr)):.3f}, mae={float(np.mean(np.abs(arr))):.3f}, n={len(vals)}")
-
-    def _print_convergence_analysis(self) -> None:
-        print("[Convergence Analysis]")
-        if self.training_logs:
-            tr = np.array([float(r.get("avg_reward", 0.0)) for r in self.training_logs], dtype=float)
-            q = max(1, len(tr) // 4)
-            early = float(np.mean(tr[:q]))
-            late = float(np.mean(tr[-q:]))
-            print(f"  training avg_reward: early={early:.3f}, late={late:.3f}, delta={late - early:.3f}")
-        else:
-            print("  training logs unavailable")
-
-        if self.evaluation_logs:
-            ev = np.array([_extract_reward(r) for r in self.evaluation_logs], dtype=float)
-            q = max(1, len(ev) // 4)
-            early = float(np.mean(ev[:q]))
-            late = float(np.mean(ev[-q:]))
-            print(f"  evaluation avg_reward: early={early:.3f}, late={late:.3f}, delta={late - early:.3f}")
-        else:
-            print("  evaluation logs unavailable")
             
     @staticmethod
     def _plot_dataset_validation(rows_out: List[Dict[str, Any]], out_plot_prefix: str) -> None:
