@@ -98,7 +98,7 @@ class PPOAgent:
 
 
     @torch.no_grad()
-    def act(self, s_np: np.ndarray) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def act(self, s_np: np.ndarray, deterministic: bool = False) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         s = torch.tensor(s_np, dtype=torch.float32, device=self.device).unsqueeze(0)
         s = torch.nan_to_num(s, nan=0.0, posinf=1e3, neginf=-1e3)
         expected_dim = self.net.trunk[0].in_features
@@ -110,7 +110,10 @@ class PPOAgent:
         if not torch.isfinite(logits).all():
             logits = torch.zeros_like(logits)
         dist = torch.distributions.Categorical(logits=logits)
-        a = dist.sample()
+        if deterministic:
+            a = torch.argmax(logits, dim=-1)
+        else:
+            a = dist.sample()
         logp = dist.log_prob(a)
         return int(a.item()), s.squeeze(0), logp.squeeze(0), value.squeeze(0)
     

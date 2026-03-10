@@ -417,6 +417,10 @@ class Core:
         self.profile_pool_multiplier = 2
         self.training_stable_window = 20
         self.training_stable_tol = 0.015
+        self.training_stable_trend_tol = 0.01
+        self.training_stable_min_mean = 0.15
+        self.training_stable_patience = 3
+        self.freeze_ppo_after_stabilization = True
         self.reward_convergence_window = 40
         self.reward_convergence_tol = 0.025
         self.reward_trend_tol = 0.01
@@ -716,11 +720,14 @@ class Core:
             f"train timesteps={train_timesteps} x {train_customers_per_step} rides, "
             f"eval timesteps={eval_timesteps} x {eval_customers_per_step} rides"
         )
+        self.training_logs = []
+        self.evaluation_logs = []
         
         print(">>> Training RL agent on-the-fly (early exploration prioritized)...")
         reward_history: List[float] = []
         stable_count = 0
         stability_notice_emitted = False
+        ppo_updates_frozen = False
         sampled_profile_rows: List[Dict[str, Any]] = []
         profile_limit_reached = False
 
@@ -738,7 +745,7 @@ class Core:
             rl_step = None
             if self.firm1_mode == "RL":
                 s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
-                action, s_ts, logits, val = self.firm1.agent.act(s_vec)
+                action, s_ts, logits, val = self.firm1.agent.act(s_vec, deterministic=ppo_updates_frozen)
                 self.firm1.apply_action(action, self.market)
                 rl_step = (action, s_ts, logits, val)
             elif self.firm1_mode == "heuristic":
@@ -758,11 +765,13 @@ class Core:
             reward = self._compute_rl_reward(m1, mean_gap)
             if self.firm1_mode == "RL" and rl_step is not None:
                 action, s_ts, logits, val = rl_step
-                self.firm1.agent.store(s_ts, action, float(reward), False, None, logits, val)
+                if not ppo_updates_frozen:
+                    self.firm1.agent.store(s_ts, action, float(reward), False, None, logits, val)
                 min_buf = int(max(1, self.ppo_min_buffer_for_update))
                 interval = int(max(1, self.ppo_update_interval))
                 should_update = (
-                    len(self.firm1.agent.buf) >= min_buf
+                    (not ppo_updates_frozen)
+                    and len(self.firm1.agent.buf) >= min_buf
                     and (((t + 1) % interval) == 0 or (t + 1) == int(train_timesteps))
                 )
                 ppo_metrics = (
@@ -774,17 +783,41 @@ class Core:
                 ppo_metrics = {"loss": 0.0}
                 
             reward_history.append(float(reward))
+            reward_std = 1.0
+            reward_delta = 1.0
+            reward_mean = float(reward)
             if len(reward_history) >= self.training_stable_window:
                 recent = reward_history[-self.training_stable_window:]
-                if float(np.std(recent)) <= self.training_stable_tol:
+                reward_std = float(np.std(recent))
+                reward_delta = float(abs(recent[-1] - recent[0]) / max(1, len(recent) - 1))
+                reward_mean = float(np.mean(recent))
+                stable_now = (
+                    reward_std <= self.training_stable_tol
+                    and reward_delta <= self.training_stable_trend_tol
+                    and reward_mean >= self.training_stable_min_mean
+                )
+                if stable_now:
                     stable_count += 1
                 else:
                     stable_count = 0
+            
+            if self.firm1_mode == "RL":
+                progress = float((t + 1) / max(1, train_timesteps))
+                reward_converged = stable_count >= self.training_stable_patience
+                self.firm1.configure_training_controls(
+                    progress=progress,
+                    reward_converged=reward_converged,
+                    reward_std=float(reward_std),
+                )
                     
             self.training_logs.append({
                 "batch": t,
                 "avg_reward": float(reward),
                 "loss": float(ppo_metrics.get("loss", 0.0)),
+                "reward_window_std": float(reward_std),
+                "reward_window_delta": float(reward_delta),
+                "reward_window_mean": float(reward_mean),
+                "reward_converged": bool(stable_count >= self.training_stable_patience),
             })
             
             if (t + 1) % max(1, train_timesteps // 10) == 0:
@@ -792,13 +825,21 @@ class Core:
                 moving_avg = float(np.mean(window)) if window else 0.0
                 print(f"  [train {t+1}/{train_timesteps}] reward={float(reward):.3f} moving_avg20={moving_avg:.3f}")
 
-            if stable_count >= 3:
+            if stable_count >= self.training_stable_patience:
                 if not stability_notice_emitted:
                     print(
-                        f">>> Reward stabilized at timestep {t+1}; "
-                        "continuing training to complete all requested timesteps."
+                        f">>> Reward stabilized at timestep {t+1} "
+                        f"(std={reward_std:.4f}, delta/day={reward_delta:.4f}, mean={reward_mean:.3f}); "
+                        "switching to deterministic actions and freezing PPO updates."
                     )
                     stability_notice_emitted = True
+                if (
+                    self.firm1_mode == "RL"
+                    and self.freeze_ppo_after_stabilization
+                    and not ppo_updates_frozen
+                ):
+                    ppo_updates_frozen = True
+                    self.firm1.agent.buf.clear()
 
             self.last_share = float(m1.share)
             self.last_revpr = float(m1.rev_per_request)
@@ -819,7 +860,7 @@ class Core:
             base = self.market.curr_market
             if self.firm1_mode == "RL":
                 s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
-                action, *_ = self.firm1.agent.act(s_vec)
+                action, *_ = self.firm1.agent.act(s_vec, deterministic=True)
                 self.firm1.apply_action(action, self.market)
             elif self.firm1_mode == "heuristic":
                 self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
@@ -842,6 +883,7 @@ class Core:
                 "heuristic_share": float(m2.share),
                 "rl_revenue": float(m1.rev_per_request),
                 "avg_reward": float(eval_reward),
+                "reward": float(eval_reward),
             })
             self.last_share = float(m1.share)
             self.last_revpr = float(m1.rev_per_request)
@@ -1185,7 +1227,7 @@ class Core:
             print("  training logs unavailable")
 
         if self.evaluation_logs:
-            ev = np.array([float(r["reward"]) for r in self.evaluation_logs], dtype=float)
+            ev = np.array([_extract_reward(r) for r in self.evaluation_logs], dtype=float)
             q = max(1, len(ev) // 4)
             early = float(np.mean(ev[:q]))
             late = float(np.mean(ev[-q:]))
@@ -1702,6 +1744,14 @@ def _write_distribution_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         w.writeheader()
         w.writerows(out_rows)
 
+def _extract_reward(log_row: Dict[str, Any]) -> float:
+    """Backwards-compatible reward accessor for historical log schemas."""
+    if "reward" in log_row:
+        return float(log_row["reward"])
+    if "avg_reward" in log_row:
+        return float(log_row["avg_reward"])
+    raise KeyError("reward")
+
 
 def _plot_reports(
     rows: List[Dict[str, Any]],
@@ -1846,7 +1896,7 @@ def _plot_reports(
     # 5) evaluation trajectory (run_experiment)
     if evaluation_logs:
         xs = [int(r["day"]) for r in evaluation_logs]
-        ys = [float(r["reward"]) for r in evaluation_logs]
+        ys = [_extract_reward(r) for r in evaluation_logs]
         plt.figure(figsize=(9, 4))
         plt.plot(xs, ys)
         plt.title("Evaluation Reward Trajectory")
