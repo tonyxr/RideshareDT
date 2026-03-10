@@ -1588,7 +1588,10 @@ def _plot_reports(
     # 3) run reward trajectory + convergence diagnostics
     if run_logs:
         xs = [int(r["day"]) for r in run_logs]
-        ys = [float(r["avg_reward"]) for r in run_logs]
+        ys = [
+            float(np.clip((0.60 * np.clip(float(r["rl_share"]), 0.0, 1.0)) + (0.20 * np.tanh((float(r["rl_revenue"]) - 10.0) / 8.0)), -1.0, 1.0))
+            for r in evaluation_logs
+        ]
         converged_days = [int(r["day"]) for r in run_logs if bool(r.get("reward_converged", False))]
         plt.figure(figsize=(9, 4))
         plt.plot(xs, ys, label="avg_reward")
