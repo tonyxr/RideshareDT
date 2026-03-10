@@ -135,24 +135,32 @@ def _pick_value(row: Dict[str, Any], names: List[str]) -> Any:
     return None
 
 
-def _pick_first_numeric(row: Dict[str, Any], names: List[str]) -> Optional[float]:
+def _pick_first_parsed(
+    row: Dict[str, Any],
+    names: List[str],
+    parser,
+    with_key: bool = False,
+) -> Any:
     for k in names:
         if k not in row or _is_missing(row[k]):
             continue
-        val = _to_numeric(row[k])
+        val = parser(row[k])
         if val is not None:
-            return val
-    return None
+            return (val, k) if with_key else val
+    return (None, None) if with_key else None
+
+
+def _pick_first_numeric(row: Dict[str, Any], names: List[str]) -> Optional[float]:
+    return _pick_first_parsed(row, names, _to_numeric)
+
+
+def _pick_first_minutes(row: Dict[str, Any], names: List[str]) -> Optional[float]:
+    return _pick_first_parsed(row, names, _to_minutes)
 
 
 def _pick_first_numeric_with_key(row: Dict[str, Any], names: List[str]) -> Tuple[Optional[float], Optional[str]]:
-    for k in names:
-        if k not in row or _is_missing(row[k]):
-            continue
-        val = _to_numeric(row[k])
-        if val is not None:
-            return val, k
-    return None, None
+    val, key = _pick_first_parsed(row, names, _to_numeric, with_key=True)
+    return val, key
 
 def _normalize_row_keys(row: Dict[str, Any]) -> Dict[str, Any]:
     """Return a row view that supports loose key matching across datasets."""
@@ -186,12 +194,12 @@ def _discover_dataset_files(dataset_root: str, dataset_glob: str) -> List[str]:
     files: List[str] = []
     for pat in patterns:
         files.extend(glob.glob(pat, recursive=True))
-    keep_ext = (".csv", ".csv.gz", ".zip")
+    keep_ext = (".csv", ".csv.gz", ".zip", ".parquet")
     return sorted({f for f in files if os.path.isfile(f) and f.lower().endswith(keep_ext)})
 
 
 def _iter_tabular_rows(fpath: str):
-    """Yield rows from .csv, .csv.gz, or .zip archives containing csv files."""
+    """Yield rows from .csv, .csv.gz, .parquet, or .zip archives containing csv files."""
     lower = fpath.lower()
     if lower.endswith(".csv"):
         with open(fpath, "r", encoding="utf-8", newline="") as f:
@@ -220,6 +228,19 @@ def _iter_tabular_rows(fpath: str):
                     if not reader.fieldnames:
                         continue
                     yield reader.fieldnames, reader
+        return
+
+    if lower.endswith(".parquet"):
+        if pq is None:
+            return
+        parquet_file = pq.ParquetFile(fpath)
+        fieldnames = parquet_file.schema.names
+        for batch in parquet_file.iter_batches(batch_size=10000):
+            records = batch.to_pylist()
+            if not records:
+                continue
+            yield fieldnames, records
+        return
 
 
 
@@ -783,19 +804,11 @@ class Core:
        max_rows: int = 50000,
        preview_rows: int = 5,
    ) -> Dict[str, Any]:
-       """Validate trained RL pricing on raw NYC rides by predicting trip time + paid price."""
-       patterns = [os.path.join(dataset_root, dataset_glob)]
-       if "**" not in dataset_glob:
-           patterns.append(os.path.join(dataset_root, "**", dataset_glob))
-
-       files: List[str] = []
-       for pat in patterns:
-           files.extend(glob.glob(pat, recursive=True))
-       files = sorted({f for f in files if os.path.isfile(f) and f.lower().endswith(('.csv', '.parquet'))})
+       files = _discover_dataset_files(dataset_root=dataset_root, dataset_glob=dataset_glob)
 
        if not files:
            raise FileNotFoundError(
-               f"No CSV/Parquet files found under dataset_root={dataset_root!r} with glob={dataset_glob!r}"
+               f"No parquet dataset files found under dataset_root={dataset_root!r} with glob={dataset_glob!r}"
            )
 
        rows_out: List[Dict[str, Any]] = []
@@ -879,7 +892,7 @@ class Core:
                            continue
 
                        hour, day_of_week = _infer_hour_day(raw)
-                       actual_duration = _pick_first_numeric(raw, duration_cols)
+                       actual_duration = _pick_first_minutes(raw, duration_cols)
                        if actual_duration is None:
                            pickup_raw = _pick_value(raw, pickup_time_cols)
                            dropoff_raw = _pick_value(raw, dropoff_time_cols)
@@ -892,12 +905,8 @@ class Core:
                                        actual_duration = float(secs / 60.0)
                                except Exception:
                                    pass
-                       if actual_duration is not None:
-                           # Normalize common second-based fields to minutes.
-                           if any((k in raw and not _is_missing(raw.get(k))) for k in duration_seconds_cols):
-                               actual_duration = float(actual_duration) / 60.0
-                           elif actual_duration > 300.0:
-                               actual_duration = float(actual_duration) / 60.0
+                       if actual_duration is not None and any((k in raw and not _is_missing(raw.get(k))) for k in duration_seconds_cols):
+                           actual_duration = float(actual_duration) / 60.0
                        predicted_duration = float(self.estimate_duration(float(distance), hour))
                        duration = float(actual_duration) if actual_duration is not None else predicted_duration
 
@@ -1702,8 +1711,8 @@ def main():
     parser.add_argument("--calibration_csv", type=str, default="", help="Optional historical CSV used to calibrate priors and choice sensitivity.")
     parser.add_argument("--calibration_city", type=str, default="", help="Optional city filter for --calibration_csv; defaults to --market if omitted.")
     parser.add_argument("--calibration_preset", type=str, default="nyc_public", choices=["", "nyc_public"], help="Built-in preset calibration. Defaults to nyc_public (NYC TLC + ACS + weather priors).")
-    parser.add_argument("--compare_with_dataset", action="store_true", help="After training/run, compare RL-implied prices against actual paid prices in the Kaggle CSV files.")
-    parser.add_argument("--dataset_glob", type=str, default="*.csv", help="Glob for dataset CSV discovery under kagglehub download path.")
+    parser.add_argument("--compare_with_dataset", action="store_true", help="After training/run, compare RL-implied prices against actual paid prices in the Kaggle rideshare dataset files.")
+    parser.add_argument("--dataset_glob", type=str, default="*.parquet", help="Glob for dataset file discovery under kagglehub download path.")
     parser.add_argument(
         "--comparison_out", "--comparison-out",
         type=str,
