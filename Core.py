@@ -734,6 +734,10 @@ class Core:
         
         print(">>> Evaluating RL agent against static/heuristic opponent with shared profile pool...")
         eval_rewards: List[float] = []
+        # Reset reward-trend baselines so evaluation reward reflects evaluation dynamics,
+        # not trailing deltas from the end of training.
+        eval_last_share = float(self.last_share)
+        eval_last_revpr = float(self.last_revpr)
         for t in range(eval_timesteps):
             day_ctx = self.market.sample_day_context()
             hour = self.market.sample_timestep_hour().hour
@@ -762,11 +766,31 @@ class Core:
                 customers_per_step=eval_customers_per_step,
                 sampled_profiles=sampled_profiles,
             )
-            eval_reward = self._reward_base(
-                share=float(m1.share),
-                rev_per_request=float(m1.rev_per_request),
+                
+            # Use the same shaped reward family as training for consistent trajectory logs.
+            # Compute with local baselines to avoid mutating training history state.
+            share = float(np.clip(m1.share, 0.0, 1.0))
+            revpr = float(max(0.0, m1.rev_per_request))
+            base_reward = self._reward_base(
+                share=share,
+                rev_per_request=revpr,
                 price_gap_f2_minus_f1=float(mean_gap),
             )
+            competitive_term = float(np.clip((share - 0.5) / 0.5, -1.0, 1.0))
+            share_delta = float(np.clip(share - eval_last_share, -0.20, 0.20) / 0.20)
+            rev_delta = float(np.clip((revpr - eval_last_revpr) / self.reward_rev_scale, -0.20, 0.20) / 0.20)
+            trend_term = 0.5 * (share_delta + rev_delta)
+            pricing_discipline = float(np.clip(mean_gap / 2.0, -1.0, 1.0))
+            efficiency_term = 0.5 * trend_term + 0.5 * pricing_discipline
+            raw_eval_reward = (
+                base_reward
+                + self.reward_competitive_weight * self.reward_competitive_scale * competitive_term
+                + self.reward_trend_weight * self.reward_trend_scale * efficiency_term
+            )
+            eval_reward = float(np.tanh(raw_eval_reward / self.reward_softsign_temp))
+
+            eval_last_share = float(share)
+            eval_last_revpr = float(revpr)
             eval_rewards.append(float(eval_reward))
             self.evaluation_logs.append({
                 "day": t,
@@ -774,6 +798,7 @@ class Core:
                 "heuristic_share": float(m2.share),
                 "rl_revenue": float(m1.rev_per_request),
                 "reward": float(eval_reward),
+                "reward_base": float(base_reward),
             })
             self.last_share = float(m1.share)
             self.last_revpr = float(m1.rev_per_request)
@@ -1009,6 +1034,60 @@ class Core:
            "out_plot_prefix": out_plot_prefix,
        }
        return summary
+   
+    
+    def _print_kaggle_analysis(self, rows_out: List[Dict[str, Any]]) -> None:
+        """Print concise dataset-vs-model diagnostics for quick sanity checks."""
+        if not rows_out:
+            print(">>> Kaggle comparison: no comparable rows available.")
+            return
+
+        price_errors = np.array([float(r.get("price_error", 0.0)) for r in rows_out], dtype=float)
+        abs_errors = np.abs(price_errors)
+        actual_prices = np.array([float(r.get("actual_paid", 0.0)) for r in rows_out], dtype=float)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ape = np.where(actual_prices > 1e-6, abs_errors / actual_prices, np.nan)
+
+        duration_errors = [
+            abs(float(r["predicted_duration_minutes"]) - float(r["actual_duration_minutes"]))
+            for r in rows_out
+            if r.get("actual_duration_minutes") is not None and r.get("predicted_duration_minutes") is not None
+        ]
+
+        print(
+            ">>> Kaggle comparison summary: "
+            f"rows={len(rows_out)}, "
+            f"price_mae={float(np.mean(abs_errors)):.3f}, "
+            f"price_rmse={float(np.sqrt(np.mean(np.square(price_errors)))):.3f}, "
+            f"price_bias={float(np.mean(price_errors)):.3f}, "
+            f"price_mape={float(np.nanmean(ape)):.3f}"
+        )
+
+        if duration_errors:
+            print(
+                ">>> Kaggle duration summary: "
+                f"duration_mae_minutes={float(np.mean(duration_errors)):.3f}, "
+                f"duration_rmse_minutes={float(np.sqrt(np.mean(np.square(duration_errors)))):.3f}"
+            )
+
+    def _print_convergence_analysis(self) -> None:
+        """Print light-weight diagnostics for training/evaluation reward trajectories."""
+        train_rewards = [float(x.get("avg_reward", 0.0)) for x in self.training_logs]
+        eval_rewards = [float(x.get("reward", 0.0)) for x in self.evaluation_logs]
+
+        if train_rewards:
+            tail = train_rewards[-min(len(train_rewards), 40):]
+            print(
+                ">>> Convergence (train): "
+                f"n={len(train_rewards)}, mean_last{len(tail)}={float(np.mean(tail)):.3f}, std_last{len(tail)}={float(np.std(tail)):.4f}"
+            )
+        if eval_rewards:
+            tail = eval_rewards[-min(len(eval_rewards), 40):]
+            print(
+                ">>> Convergence (eval): "
+                f"n={len(eval_rewards)}, mean_last{len(tail)}={float(np.mean(tail)):.3f}, std_last{len(tail)}={float(np.std(tail)):.4f}"
+            )
             
     @staticmethod
     def _plot_dataset_validation(rows_out: List[Dict[str, Any]], out_plot_prefix: str) -> None:
@@ -1518,14 +1597,6 @@ def _write_distribution_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         w = csv.DictWriter(f, fieldnames=["parameter", "value", "count", "share"])
         w.writeheader()
         w.writerows(out_rows)
-
-def _extract_reward(log_row: Dict[str, Any]) -> float:
-    """Backwards-compatible reward accessor for historical log schemas."""
-    if "reward" in log_row:
-        return float(log_row["reward"])
-    if "avg_reward" in log_row:
-        return float(log_row["avg_reward"])
-    raise KeyError("reward")
 
 
 def _plot_reports(
