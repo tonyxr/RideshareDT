@@ -277,7 +277,7 @@ def _infer_airport_trip(row: Dict[str, Any]) -> bool:
 
 
 def _infer_hour_day(row: Dict[str, Any]) -> Tuple[int, int]:
-    hour = _to_int(_pick_value(row, ["hour", "pickup_hour", "ride_hour", "request_hour"]))
+    hour = _to_int(_pick_value(row, ["hour", "hour_of_day", "pickup_hour", "ride_hour", "request_hour"]))
     day = _to_int(_pick_value(row, ["day_of_week", "weekday", "day"]))
 
     dt_raw = _pick_value(
@@ -332,6 +332,37 @@ def _infer_hour_day(row: Dict[str, Any]) -> Tuple[int, int]:
         day = (day - 1) % 7
 
     return int(hour if hour is not None else 12), int(day if day is not None else 2)
+
+def _duration_minutes_from_value(value: float, duration_key: Optional[str], duration_minutes_cols: List[str],
+                                 duration_seconds_cols: List[str], row: Optional[Dict[str, Any]] = None) -> float:
+    raw_val = float(value)
+    dkey = str(duration_key or "").strip().lower()
+
+    if (
+        dkey in duration_seconds_cols
+        or dkey.endswith("_seconds")
+        or dkey.endswith("_secs")
+        or ("to_" in dkey and dkey not in duration_minutes_cols)
+    ):
+        return raw_val / 60.0
+
+    if dkey in {"total_ride_time", "total ride time"}:
+        second_like_cols = [
+            "request_to_dropoff", "on_scene_to_dropoff", "request_to_pickup", "on_scene_to_pickup"
+        ]
+        if row is not None:
+            for skey in second_like_cols:
+                other = _to_float(_pick_value(row, [skey]))
+                if other is None or other <= 0:
+                    continue
+                if abs(other - raw_val) <= max(60.0, 0.20 * other):
+                    return raw_val / 60.0
+
+        # Fallback guard: values above 3 hours are usually encoded in seconds for this field.
+        if raw_val > 180.0:
+            return raw_val / 60.0
+
+    return raw_val
 
 
 def _parse_kv_floats(s: str) -> Dict[str, float]:
@@ -947,14 +978,13 @@ class Core:
                                except Exception:
                                    pass
                        if actual_duration is not None:
-                           dkey = str(duration_key or "").strip().lower()
-                           if (
-                               dkey in duration_seconds_cols
-                               or dkey.endswith("_seconds")
-                               or dkey.endswith("_secs")
-                               or ("to_" in dkey and dkey not in duration_minutes_cols)
-                           ):
-                               actual_duration = float(actual_duration) / 60.0
+                           actual_duration = _duration_minutes_from_value(
+                               value=float(actual_duration),
+                               duration_key=duration_key,
+                               duration_minutes_cols=duration_minutes_cols,
+                               duration_seconds_cols=duration_seconds_cols,
+                               row=raw,
+                           )
                        predicted_duration = float(self.estimate_duration(float(distance), hour))
                        duration = float(actual_duration) if actual_duration is not None else predicted_duration
 
@@ -1017,10 +1047,11 @@ class Core:
            except Exception as exc:
                print(f"[Dataset Preview] skipped file={fpath} due to read error: {exc}")
                continue
-           if kept >= max_rows:
-               break        
+              
            if file_kept > 0:
                files_with_rows += 1
+           if kept >= max_rows:
+               break
 
        if out_csv:
            _ensure_parent_dir(out_csv)
@@ -1068,6 +1099,15 @@ class Core:
             "  signed_error: "
             f"mean={float(np.mean(errs)):.3f}, median={float(np.median(errs)):.3f}, p90_abs={float(np.percentile(np.abs(errs), 90)):.3f}"
         )
+        
+        # Linear-fit diagnostics: systematic shift often appears as non-zero intercept
+        # and/or slope that deviates from 1.0 in pred vs actual space.
+        if prices_actual.size >= 2:
+            slope, intercept = np.polyfit(prices_actual, prices_pred, deg=1)
+            print(
+                "  linear_fit(pred = slope*actual + intercept): "
+                f"slope={float(slope):.3f}, intercept={float(intercept):.3f}"
+            )
 
         def _bucket_distance(miles: float) -> str:
             if miles < 2:
@@ -1080,10 +1120,15 @@ class Core:
 
         by_bucket: Dict[str, List[float]] = defaultdict(list)
         by_hour: Dict[int, List[float]] = defaultdict(list)
+        by_service: Dict[str, List[float]] = defaultdict(list)
+        by_airport: Dict[str, List[float]] = defaultdict(list)
         for r in rows_out:
+            err = float(r["price_error"])
             b = _bucket_distance(float(r.get("distance_miles", 0.0)))
-            by_bucket[b].append(float(r["price_error"]))
-            by_hour[int(r.get("hour", 12))].append(float(r["price_error"]))
+            by_bucket[b].append(err)
+            by_hour[int(r.get("hour", 12))].append(err)
+            by_service[str(r.get("service", "unknown"))].append(err)
+            by_airport["airport" if bool(r.get("airport", False)) else "non_airport"].append(err)
 
         print("[Sensitivity Analysis]")
         print("  by distance bucket (bias / MAE):")
@@ -1093,6 +1138,22 @@ class Core:
                 continue
             arr = np.array(vals, dtype=float)
             print(f"    {b}: bias={float(np.mean(arr)):.3f}, mae={float(np.mean(np.abs(arr))):.3f}, n={len(vals)}")
+            
+        print("  by service (bias / MAE):")
+        for svc in ["economy", "premium", "unknown"]:
+            vals = by_service.get(svc, [])
+            if not vals:
+                continue
+            arr = np.array(vals, dtype=float)
+            print(f"    {svc}: bias={float(np.mean(arr)):.3f}, mae={float(np.mean(np.abs(arr))):.3f}, n={len(vals)}")
+
+        print("  by airport flag (bias / MAE):")
+        for k in ["airport", "non_airport"]:
+            vals = by_airport.get(k, [])
+            if not vals:
+                continue
+            arr = np.array(vals, dtype=float)
+            print(f"    {k}: bias={float(np.mean(arr)):.3f}, mae={float(np.mean(np.abs(arr))):.3f}, n={len(vals)}")
 
         print("  by hour (selected peak windows):")
         for name, hours in [("overnight", list(range(0, 6))), ("am_peak", [7, 8, 9]), ("pm_peak", [16, 17, 18]), ("late_evening", [20, 21, 22, 23])]:
