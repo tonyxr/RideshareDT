@@ -156,6 +156,10 @@ def _pick_first_numeric(row: Dict[str, Any], names: List[str]) -> Optional[float
 def _pick_first_minutes(row: Dict[str, Any], names: List[str]) -> Optional[float]:
     return _pick_first_parsed(row, names, _to_minutes)
 
+def _pick_first_minutes_with_key(row: Dict[str, Any], names: List[str]) -> Tuple[Optional[float], Optional[str]]:
+    val, key = _pick_first_parsed(row, names, _to_minutes, with_key=True)
+    return val, key
+
 def _pick_first_numeric_with_key(row: Dict[str, Any], names: List[str]) -> Tuple[Optional[float], Optional[str]]:
     val, key = _pick_first_parsed(row, names, _to_numeric, with_key=True)
     return val, key
@@ -921,7 +925,17 @@ class Core:
                            continue
 
                        hour, day_of_week = _infer_hour_day(raw)
-                       actual_duration = _pick_first_minutes(raw, duration_cols)
+                       actual_duration, duration_key = _pick_first_minutes_with_key(raw, duration_cols)
+                       second_based_duration_keys = set(duration_seconds_cols + [
+                           "request_to_dropoff",
+                           "request_to_pickup",
+                           "on_scene_to_pickup",
+                           "on_scene_to_dropoff",
+                           "total_ride_time",
+                           "trip_time",
+                       ])
+                       if actual_duration is not None and duration_key in second_based_duration_keys:
+                           actual_duration = float(actual_duration) / 60.0
                        if actual_duration is None:
                            pickup_raw = _pick_value(raw, pickup_time_cols)
                            dropoff_raw = _pick_value(raw, dropoff_time_cols)
@@ -934,8 +948,7 @@ class Core:
                                        actual_duration = float(secs / 60.0)
                                except Exception:
                                    pass
-                       if actual_duration is not None and any((k in raw and not _is_missing(raw.get(k))) for k in duration_seconds_cols):
-                           actual_duration = float(actual_duration) / 60.0
+
                        predicted_duration = float(self.estimate_duration(float(distance), hour))
                        duration = float(actual_duration) if actual_duration is not None else predicted_duration
 
@@ -958,6 +971,10 @@ class Core:
                            airport=bool(airport),
                            service=service,
                        )
+                       if self.firm1_mode == "RL":
+                           s_vec = self._build_rl_state(day_of_week=ctx.day_of_week, hour=ctx.hour, weather=ctx.weather)
+                           action, *_ = self.firm1.agent.act(s_vec)
+                           self.firm1.apply_action(action, self.market)
                        rl_price = self.market.quote_price(
                            distance_miles=float(max(0.0, distance)),
                            duration_minutes=float(max(0.0, duration)),
@@ -1033,9 +1050,45 @@ class Core:
            "out_csv": out_csv,
            "out_plot_prefix": out_plot_prefix,
        }
+       self._print_reality_gap_check(summary)
+       self._print_sensitivity_analysis()
        return summary
    
-    
+    def _print_reality_gap_check(self, summary: Dict[str, Any]) -> None:
+        mae = summary.get("mae")
+        mape = summary.get("mape")
+        bias = summary.get("bias")
+        if mae is None:
+            print(">>> Reality gap check: insufficient comparable Kaggle rows.")
+            return
+        bias_dir = "overpricing" if (bias or 0.0) > 0 else "underpricing"
+        print(
+            ">>> Reality gap check: "
+            f"mae={float(mae):.3f}, mape={float(mape or 0.0):.3f}, bias={float(bias or 0.0):.3f} ({bias_dir})."
+        )
+
+    def _print_sensitivity_analysis(self) -> None:
+        base_ctx = RideContext(day_of_week=2, weather="clear", hour=14, airport=False, service="economy")
+        base_distance = 3.0
+        base_duration = float(self.estimate_duration(base_distance, base_ctx.hour))
+        base_price = float(self.market.quote_price(base_distance, base_duration, base_ctx, overrides=self.firm1.overrides))
+
+        def _quote(distance: float, duration: float, hour: int, weather: str, airport: bool, service: str) -> float:
+            ctx = RideContext(day_of_week=2, weather=weather, hour=int(np.clip(hour, 0, 23)), airport=airport, service=service)
+            return float(self.market.quote_price(distance, duration, ctx, overrides=self.firm1.overrides))
+
+        dist_up = _quote(base_distance * 1.2, base_duration, base_ctx.hour, base_ctx.weather, base_ctx.airport, base_ctx.service)
+        dur_up = _quote(base_distance, base_duration * 1.2, base_ctx.hour, base_ctx.weather, base_ctx.airport, base_ctx.service)
+        rush = _quote(base_distance, base_duration, 18, base_ctx.weather, base_ctx.airport, base_ctx.service)
+        rain = _quote(base_distance, base_duration, base_ctx.hour, "rain", base_ctx.airport, base_ctx.service)
+        airport = _quote(base_distance, base_duration, base_ctx.hour, base_ctx.weather, True, base_ctx.service)
+        premium = _quote(base_distance, base_duration, base_ctx.hour, base_ctx.weather, base_ctx.airport, "premium")
+
+        print(
+            ">>> Sensitivity analysis (trained RL pricing, baseline ride=3mi clear weekday 14:00): "
+            f"base={base_price:.2f}, +20%dist={dist_up:.2f}, +20%duration={dur_up:.2f}, rush18={rush:.2f}, rain={rain:.2f}, airport={airport:.2f}, premium={premium:.2f}"
+        )
+        
     def _print_kaggle_analysis(self, rows_out: List[Dict[str, Any]]) -> None:
         """Print concise dataset-vs-model diagnostics for quick sanity checks."""
         if not rows_out:
@@ -1612,6 +1665,24 @@ def _plot_reports(
 
     import matplotlib.pyplot as plt
     from matplotlib.ticker import MultipleLocator, FormatStrFormatter
+    
+    def _extract_reward(entry: Dict[str, Any]) -> float:
+        """Extract reward value from heterogeneous log schemas."""
+        if "reward" in entry:
+            return float(entry["reward"])
+        if "avg_reward" in entry:
+            return float(entry["avg_reward"])
+        if "rl_share" in entry and "rl_revenue" in entry:
+            return float(
+                np.clip(
+                    (0.60 * np.clip(float(entry["rl_share"]), 0.0, 1.0))
+                    + (0.20 * np.tanh((float(entry["rl_revenue"]) - 10.0) / 8.0)),
+                    -1.0,
+                    1.0,
+                )
+            )
+        return 0.0
+    
     _ensure_parent_dir(prefix + "_dummy")
 
     # 1) Ride parameter distributions
@@ -1659,10 +1730,7 @@ def _plot_reports(
     # 3) run reward trajectory + convergence diagnostics
     if run_logs:
         xs = [int(r["day"]) for r in run_logs]
-        ys = [
-            float(np.clip((0.60 * np.clip(float(r["rl_share"]), 0.0, 1.0)) + (0.20 * np.tanh((float(r["rl_revenue"]) - 10.0) / 8.0)), -1.0, 1.0))
-            for r in evaluation_logs
-        ]
+        ys = [_extract_reward(r) for r in run_logs]
         converged_days = [int(r["day"]) for r in run_logs if bool(r.get("reward_converged", False))]
         plt.figure(figsize=(9, 4))
         plt.plot(xs, ys, label="avg_reward")
