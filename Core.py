@@ -25,7 +25,7 @@ import random
 import sys
 import re
 import zipfile
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -157,6 +157,9 @@ def _pick_first_numeric(row: Dict[str, Any], names: List[str]) -> Optional[float
 def _pick_first_minutes(row: Dict[str, Any], names: List[str]) -> Optional[float]:
     return _pick_first_parsed(row, names, _to_minutes)
 
+def _pick_first_minutes_with_key(row: Dict[str, Any], names: List[str]) -> Tuple[Optional[float], Optional[str]]:
+    val, key = _pick_first_parsed(row, names, _to_minutes, with_key=True)
+    return val, key
 
 def _pick_first_numeric_with_key(row: Dict[str, Any], names: List[str]) -> Tuple[Optional[float], Optional[str]]:
     val, key = _pick_first_parsed(row, names, _to_numeric, with_key=True)
@@ -845,7 +848,13 @@ class Core:
            "trip_duration_minutes", "duration_min", "travel_time", "total_ride_time", "Total Ride Time",
            "on_scene_to_dropoff", "On Scene to Dropoff", "request_to_dropoff", "Request to Dropoff",
        ]
-       duration_seconds_cols = ["duration_secs", "duration_seconds", "trip_duration_seconds", "eta_seconds"]
+       duration_seconds_cols = [
+           "duration_secs", "duration_seconds", "trip_duration_seconds", "eta_seconds",
+           "request_to_dropoff", "request_to_pickup", "total_ride_time", "on_scene_to_pickup", "on_scene_to_dropoff",
+       ]
+       duration_minutes_cols = [
+           "duration_minutes", "trip_duration_minutes", "duration_min", "total_ride_time_minutes",
+       ]
        dropoff_time_cols = ["dropoff_datetime", "tpep_dropoff_datetime", "lpep_dropoff_datetime"]
        pickup_time_cols = ["pickup_datetime", "tpep_pickup_datetime", "lpep_pickup_datetime"]
        
@@ -898,7 +907,7 @@ class Core:
                            continue
 
                        hour, day_of_week = _infer_hour_day(raw)
-                       actual_duration = _pick_first_minutes(raw, duration_cols)
+                       actual_duration, duration_key = _pick_first_minutes_with_key(raw, duration_cols)
                        if actual_duration is None:
                            pickup_raw = _pick_value(raw, pickup_time_cols)
                            dropoff_raw = _pick_value(raw, dropoff_time_cols)
@@ -911,8 +920,15 @@ class Core:
                                        actual_duration = float(secs / 60.0)
                                except Exception:
                                    pass
-                       if actual_duration is not None and any((k in raw and not _is_missing(raw.get(k))) for k in duration_seconds_cols):
-                           actual_duration = float(actual_duration) / 60.0
+                       if actual_duration is not None:
+                           dkey = str(duration_key or "").strip().lower()
+                           if (
+                               dkey in duration_seconds_cols
+                               or dkey.endswith("_seconds")
+                               or dkey.endswith("_secs")
+                               or ("to_" in dkey and dkey not in duration_minutes_cols)
+                           ):
+                               actual_duration = float(actual_duration) / 60.0
                        predicted_duration = float(self.estimate_duration(float(distance), hour))
                        duration = float(actual_duration) if actual_duration is not None else predicted_duration
 
@@ -986,7 +1002,11 @@ class Core:
            
        if out_plot_prefix and rows_out:
            self._plot_dataset_validation(rows_out=rows_out, out_plot_prefix=out_plot_prefix)
+       
+       if rows_out:
+           self._print_kaggle_analysis(rows_out=rows_out)
 
+       self._print_convergence_analysis()
        summary = {
            "dataset_root": dataset_root,
            "files_scanned": len(files),
@@ -1006,7 +1026,78 @@ class Core:
            "out_plot_prefix": out_plot_prefix,
        }
        return summary
-   
+    
+    def _print_kaggle_analysis(self, rows_out: List[Dict[str, Any]]) -> None:
+        prices_actual = np.array([float(r["actual_paid"]) for r in rows_out], dtype=float)
+        prices_pred = np.array([float(r["rl_predicted_price"]) for r in rows_out], dtype=float)
+        errs = prices_pred - prices_actual
+
+        ratio = prices_pred / np.clip(prices_actual, 1e-6, None)
+        print("[Reality Gap]")
+        print(
+            "  price_ratio(pred/actual): "
+            f"median={float(np.median(ratio)):.3f}, p10={float(np.percentile(ratio, 10)):.3f}, p90={float(np.percentile(ratio, 90)):.3f}"
+        )
+        print(
+            "  signed_error: "
+            f"mean={float(np.mean(errs)):.3f}, median={float(np.median(errs)):.3f}, p90_abs={float(np.percentile(np.abs(errs), 90)):.3f}"
+        )
+
+        def _bucket_distance(miles: float) -> str:
+            if miles < 2:
+                return "0-2"
+            if miles < 5:
+                return "2-5"
+            if miles < 10:
+                return "5-10"
+            return "10+"
+
+        by_bucket: Dict[str, List[float]] = defaultdict(list)
+        by_hour: Dict[int, List[float]] = defaultdict(list)
+        for r in rows_out:
+            b = _bucket_distance(float(r.get("distance_miles", 0.0)))
+            by_bucket[b].append(float(r["price_error"]))
+            by_hour[int(r.get("hour", 12))].append(float(r["price_error"]))
+
+        print("[Sensitivity Analysis]")
+        print("  by distance bucket (bias / MAE):")
+        for b in ["0-2", "2-5", "5-10", "10+"]:
+            vals = by_bucket.get(b, [])
+            if not vals:
+                continue
+            arr = np.array(vals, dtype=float)
+            print(f"    {b}: bias={float(np.mean(arr)):.3f}, mae={float(np.mean(np.abs(arr))):.3f}, n={len(vals)}")
+
+        print("  by hour (selected peak windows):")
+        for name, hours in [("overnight", list(range(0, 6))), ("am_peak", [7, 8, 9]), ("pm_peak", [16, 17, 18]), ("late_evening", [20, 21, 22, 23])]:
+            vals: List[float] = []
+            for h in hours:
+                vals.extend(by_hour.get(h, []))
+            if not vals:
+                continue
+            arr = np.array(vals, dtype=float)
+            print(f"    {name}: bias={float(np.mean(arr)):.3f}, mae={float(np.mean(np.abs(arr))):.3f}, n={len(vals)}")
+
+    def _print_convergence_analysis(self) -> None:
+        print("[Convergence Analysis]")
+        if self.training_logs:
+            tr = np.array([float(r.get("avg_reward", 0.0)) for r in self.training_logs], dtype=float)
+            q = max(1, len(tr) // 4)
+            early = float(np.mean(tr[:q]))
+            late = float(np.mean(tr[-q:]))
+            print(f"  training avg_reward: early={early:.3f}, late={late:.3f}, delta={late - early:.3f}")
+        else:
+            print("  training logs unavailable")
+
+        if self.evaluation_logs:
+            ev = np.array([float(r.get("avg_reward", 0.0)) for r in self.evaluation_logs], dtype=float)
+            q = max(1, len(ev) // 4)
+            early = float(np.mean(ev[:q]))
+            late = float(np.mean(ev[-q:]))
+            print(f"  evaluation avg_reward: early={early:.3f}, late={late:.3f}, delta={late - early:.3f}")
+        else:
+            print("  evaluation logs unavailable")
+            
     @staticmethod
     def _plot_dataset_validation(rows_out: List[Dict[str, Any]], out_plot_prefix: str) -> None:
         if importlib.util.find_spec("matplotlib") is None:
