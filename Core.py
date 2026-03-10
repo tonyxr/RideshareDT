@@ -277,10 +277,23 @@ def _infer_airport_trip(row: Dict[str, Any]) -> bool:
 
 
 def _infer_hour_day(row: Dict[str, Any]) -> Tuple[int, int]:
-    hour = _to_int(_pick_value(row, ["hour", "pickup_hour"]))
+    hour = _to_int(_pick_value(row, ["hour", "pickup_hour", "ride_hour", "request_hour"]))
     day = _to_int(_pick_value(row, ["day_of_week", "weekday", "day"]))
 
-    dt_raw = _pick_value(row, ["datetime", "pickup_datetime", "time_stamp", "timestamp", "date"])
+    dt_raw = _pick_value(
+        row,
+        [
+            "datetime",
+            "pickup_datetime",
+            "time_stamp",
+            "timestamp",
+            "date",
+            "ride_datetime",
+            "request_datetime",
+            "pickup_time",
+            "time",
+        ],
+    )
     dt: Optional[datetime] = None
     if dt_raw is not None:
         txt = str(dt_raw).strip()
@@ -295,6 +308,17 @@ def _infer_hour_day(row: Dict[str, Any]) -> Tuple[int, int]:
         if dt is None:
             try:
                 dt = datetime.fromisoformat(txt.replace("Z", "+00:00"))
+            except Exception:
+                dt = None
+                
+    # Some exports split date and time across different columns.
+    if dt is None:
+        date_raw = _pick_value(row, ["date", "ride_date", "pickup_date", "request_date"])
+        time_raw = _pick_value(row, ["time", "ride_time", "pickup_time", "request_time"])
+        if date_raw is not None:
+            combo = f"{str(date_raw).strip()} {str(time_raw).strip()}" if time_raw is not None else str(date_raw).strip()
+            try:
+                dt = datetime.fromisoformat(combo.replace("Z", "+00:00"))
             except Exception:
                 dt = None
 
@@ -844,13 +868,14 @@ class Core:
            "trip_length", "Trip Length",
        ]
        duration_cols = [
+           "total_ride_time", "Total Ride Time", "total_ride_time_minutes", "Total Ride Time Minutes",
            "duration", "duration_minutes", "trip_duration", "trip_time", "duration_secs", "DurationMinutes",
-           "trip_duration_minutes", "duration_min", "travel_time", "total_ride_time", "Total Ride Time",
+           "trip_duration_minutes", "duration_min", "travel_time",
            "on_scene_to_dropoff", "On Scene to Dropoff", "request_to_dropoff", "Request to Dropoff",
        ]
        duration_seconds_cols = [
            "duration_secs", "duration_seconds", "trip_duration_seconds", "eta_seconds",
-           "request_to_dropoff", "request_to_pickup", "total_ride_time", "on_scene_to_pickup", "on_scene_to_dropoff",
+           "request_to_dropoff", "request_to_pickup", "on_scene_to_pickup", "on_scene_to_dropoff",
        ]
        duration_minutes_cols = [
            "duration_minutes", "trip_duration_minutes", "duration_min", "total_ride_time_minutes",
@@ -907,6 +932,7 @@ class Core:
                            continue
 
                        hour, day_of_week = _infer_hour_day(raw)
+                       # Prefer total_ride_time (minutes) from Kaggle when present.
                        actual_duration, duration_key = _pick_first_minutes_with_key(raw, duration_cols)
                        if actual_duration is None:
                            pickup_raw = _pick_value(raw, pickup_time_cols)
