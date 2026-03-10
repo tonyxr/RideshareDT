@@ -833,7 +833,7 @@ class Core:
                 "rl_share": float(m1.share),
                 "heuristic_share": float(m2.share),
                 "rl_revenue": float(m1.rev_per_request),
-                "reward": float(eval_reward),
+                "avg_reward": float(eval_reward),
             })
             self.last_share = float(m1.share)
             self.last_revpr = float(m1.rev_per_request)
@@ -1177,7 +1177,13 @@ class Core:
             print("  training logs unavailable")
 
         if self.evaluation_logs:
-            ev = np.array([float(r.get("avg_reward", 0.0)) for r in self.evaluation_logs], dtype=float)
+            ev = np.array(
+                [
+                    float(r["reward"]) if "reward" in r else float(r.get("avg_reward", 0.0))
+                    for r in self.evaluation_logs
+                ],
+                dtype=float,
+            )
             q = max(1, len(ev) // 4)
             early = float(np.mean(ev[:q]))
             late = float(np.mean(ev[-q:]))
@@ -1838,10 +1844,7 @@ def _plot_reports(
     # 5) evaluation trajectory (run_experiment)
     if evaluation_logs:
         xs = [int(r["day"]) for r in evaluation_logs]
-        ys = [
-            float(np.clip((0.60 * np.clip(float(r["rl_share"]), 0.0, 1.0)) + (0.20 * np.tanh((float(r["rl_revenue"]) - 10.0) / 8.0)), -1.0, 1.0))
-            for r in evaluation_logs
-        ]
+        ys = [float(r["reward"]) if "reward" in r else float(r.get("avg_reward", 0.0)) for r in evaluation_logs]
         plt.figure(figsize=(9, 4))
         plt.plot(xs, ys)
         plt.title("Evaluation Reward Trajectory")
