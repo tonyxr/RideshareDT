@@ -175,6 +175,12 @@ def _normalize_row_keys(row: Dict[str, Any]) -> Dict[str, Any]:
         out.setdefault(kn.lower().replace("-", "_"), v)
     return out
 
+def _json_preview(obj: Any) -> str:
+    """JSON preview helper that tolerates datetimes/timedeltas/decimals."""
+    try:
+        return json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        return str(obj)
 
 def _discover_dataset_files(dataset_root: str, dataset_glob: str) -> List[str]:
     """Discover tabular files for dataset comparison; tolerate compressed variants."""
@@ -860,7 +866,7 @@ class Core:
                        if (not preview_printed) and preview_rows > 0 and idx < preview_rows:
                            sample_keys = list(raw.keys())[:12]
                            sample = {k: raw.get(k) for k in sample_keys}
-                           print(f"[Dataset Preview] row_{idx}: {json.dumps(sample, ensure_ascii=False)}")
+                           print(f"[Dataset Preview] row_{idx}: {_json_preview(sample)}")
                        if (not preview_printed) and preview_rows > 0 and idx + 1 >= preview_rows:
                            preview_printed = True
                        processed += 1
@@ -966,7 +972,8 @@ class Core:
                    if kept >= max_rows:
                        break
                    
-           except Exception:
+           except Exception as exc:
+               print(f"[Dataset Preview] skipped file={fpath} due to read error: {exc}")
                continue
            if kept >= max_rows:
                break        
