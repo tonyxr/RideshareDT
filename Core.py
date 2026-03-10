@@ -507,6 +507,8 @@ class Core:
 
         self.ppo_update_epochs = 5
         self.ppo_batch_size = 256
+        self.ppo_min_buffer_for_update = 32
+        self.ppo_update_interval = 8
         
         print(
             "[RewardConfig] "
@@ -757,7 +759,17 @@ class Core:
             if self.firm1_mode == "RL" and rl_step is not None:
                 action, s_ts, logits, val = rl_step
                 self.firm1.agent.store(s_ts, action, float(reward), False, None, logits, val)
-                ppo_metrics = self.firm1.agent.update(epochs=self.ppo_update_epochs, batch_size=self.ppo_batch_size)
+                min_buf = int(max(1, self.ppo_min_buffer_for_update))
+                interval = int(max(1, self.ppo_update_interval))
+                should_update = (
+                    len(self.firm1.agent.buf) >= min_buf
+                    and (((t + 1) % interval) == 0 or (t + 1) == int(train_timesteps))
+                )
+                ppo_metrics = (
+                    self.firm1.agent.update(epochs=self.ppo_update_epochs, batch_size=self.ppo_batch_size)
+                    if should_update
+                    else {"loss": 0.0}
+                )
             else:
                 ppo_metrics = {"loss": 0.0}
                 
@@ -822,11 +834,7 @@ class Core:
                 customers_per_step=eval_customers_per_step,
                 sampled_profiles=sampled_profiles,
             )
-            eval_reward = self._reward_base(
-                share=float(m1.share),
-                rev_per_request=float(m1.rev_per_request),
-                price_gap_f2_minus_f1=float(mean_gap),
-            )
+            eval_reward = self._compute_rl_reward(m1, mean_gap)
             eval_rewards.append(float(eval_reward))
             self.evaluation_logs.append({
                 "day": t,
@@ -1177,13 +1185,7 @@ class Core:
             print("  training logs unavailable")
 
         if self.evaluation_logs:
-            ev = np.array(
-                [
-                    float(r["reward"]) if "reward" in r else float(r.get("avg_reward", 0.0))
-                    for r in self.evaluation_logs
-                ],
-                dtype=float,
-            )
+            ev = np.array([float(r["reward"]) for r in self.evaluation_logs], dtype=float)
             q = max(1, len(ev) // 4)
             early = float(np.mean(ev[:q]))
             late = float(np.mean(ev[-q:]))
@@ -1844,7 +1846,7 @@ def _plot_reports(
     # 5) evaluation trajectory (run_experiment)
     if evaluation_logs:
         xs = [int(r["day"]) for r in evaluation_logs]
-        ys = [float(r["reward"]) if "reward" in r else float(r.get("avg_reward", 0.0)) for r in evaluation_logs]
+        ys = [float(r["reward"]) for r in evaluation_logs]
         plt.figure(figsize=(9, 4))
         plt.plot(xs, ys)
         plt.title("Evaluation Reward Trajectory")
