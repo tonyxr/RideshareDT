@@ -12,6 +12,12 @@ Customer profile sampler (city-conditioned extension can be added later).
 import numpy as np
 from typing import Optional, Dict, Any
 
+from calibration_presets import NYC_PUBLIC_2024
+
+
+NYC_AGENT_CAL = NYC_PUBLIC_2024.get("calibration", {}).get("agent", {})
+NYC_INCOME = NYC_AGENT_CAL.get("income_probs", {}) if isinstance(NYC_AGENT_CAL, dict) else {}
+
 class GenerateAgent:
     # Approximate city demographic priors (can be replaced by external data source later)
     CITY_DEMOGRAPHICS: Dict[str, Dict[str, Any]] = {
@@ -34,13 +40,18 @@ class GenerateAgent:
             "p_new": 0.27,
         },
         "New York City": {
-            "age_mean": 36.0,
-            "age_std": 12.5,
-            "income_probs": [0.21, 0.34, 0.29, 0.16],
+            "age_mean": float(NYC_AGENT_CAL.get("age_mean", 36.0)),
+            "age_std": float(NYC_AGENT_CAL.get("age_std", 12.5)),
+            "income_probs": [
+                float(NYC_INCOME.get("<50k", 0.21)),
+                float(NYC_INCOME.get("50k-100k", 0.34)),
+                float(NYC_INCOME.get("100k-200k", 0.29)),
+                float(NYC_INCOME.get("200k+", 0.16)),
+            ],
             "marital_probs": [0.54, 0.31, 0.10, 0.05],
             "gender_probs": [0.48, 0.52],
-            "household_lambda": 1.9,
-            "p_new": 0.34,
+            "household_lambda": float(NYC_AGENT_CAL.get("household_lambda", 1.9)),
+            "p_new": float(NYC_AGENT_CAL.get("p_new", 0.34)),
         },
         "Chicago": {
             "age_mean": 38.0,

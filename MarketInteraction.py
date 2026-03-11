@@ -19,12 +19,20 @@ from typing import Dict, Any, Optional, Tuple, List
 import numpy as np
 
 from Market_models import MarketCoefficients, CoefficientOverrides
+from calibration_presets import NYC_PUBLIC_2024
 
+NYC_MARKET_CAL = NYC_PUBLIC_2024.get("calibration", {}).get("market", {})
+NYC_WEATHER_FROM_DATA = NYC_MARKET_CAL.get("weather_probs", {}) if isinstance(NYC_MARKET_CAL, dict) else {}
+NYC_SERVICE_FROM_DATA = NYC_MARKET_CAL.get("service_probs", {}) if isinstance(NYC_MARKET_CAL, dict) else {}
 # Approximate long-run weather-state frequencies by city
 CITY_WEATHER_HISTORY: Dict[str, Dict[str, float]] = {
     "General": {"clear": 0.60, "rain": 0.28, "snow": 0.12},
     "Seattle": {"clear": 0.56, "rain": 0.36, "snow": 0.08},
-    "New York City": {"clear": 0.58, "rain": 0.29, "snow": 0.13},
+    "New York City": {
+        "clear": float(NYC_WEATHER_FROM_DATA.get("clear", 0.58)),
+        "rain": float(NYC_WEATHER_FROM_DATA.get("rain", 0.29)),
+        "snow": float(NYC_WEATHER_FROM_DATA.get("snow", 0.13)),
+    },
     "Chicago": {"clear": 0.54, "rain": 0.27, "snow": 0.19},
 }
 
@@ -128,10 +136,13 @@ class MarketInteraction:
         self.weather_probs = {k: float(v) for k, v in zip(weather_keys, weather_vals)}
 
         airport_base = 0.12
-        self.airport_prob = float(np.clip(airport_base + self.rng.normal(0.0, 0.05 * j), 0.03, 0.35))
+        airport_base = float(NYC_MARKET_CAL.get("airport_prob", 0.12)) if self.current_city == "New York City" else 0.12
 
         service_keys = list(self.curr_market.service_multiplier.keys())
-        base_service = np.array([0.85 if k == "economy" else 0.15 for k in service_keys], dtype=float)
+        if self.current_city == "New York City" and NYC_SERVICE_FROM_DATA:
+            base_service = np.array([float(NYC_SERVICE_FROM_DATA.get(k, 0.0)) for k in service_keys], dtype=float)
+        else:
+            base_service = np.array([0.85 if k == "economy" else 0.15 for k in service_keys], dtype=float)
         service_vals = self._normalize_probs(base_service + self.rng.normal(0.0, j, size=len(service_keys)))
         self.service_probs = {k: float(v) for k, v in zip(service_keys, service_vals)}
 

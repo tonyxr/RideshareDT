@@ -359,11 +359,14 @@ class Core:
 
         self.agent_gen = GenerateAgent(seed=self.seed, total_customers=total_customers_pool, city_name = market_name)
         self.profile_pool_multiplier = 2
-        self.training_stable_window = 20
-        self.training_stable_tol = 0.015
-        self.reward_convergence_window = 40
-        self.reward_convergence_tol = 0.025
-        self.reward_trend_tol = 0.01
+        self.training_stable_window = 30
+        self.training_stable_tol = 0.012
+        self.reward_convergence_window = 60
+        self.reward_convergence_tol = 0.018
+        self.reward_trend_tol = 0.007
+        self.convergence_min_days = 80
+        self.convergence_required_streak = 5
+        self._convergence_streak = 0
         
         # choice model
         self.choice_mode = choice_mode
@@ -1544,11 +1547,18 @@ class Core:
             )
             reward_converged = (
                 len(recent_rewards) >= self.reward_convergence_window
+                and (d + 1) >= self.convergence_min_days
                 and reward_std <= self.reward_convergence_tol
                 and reward_delta <= self.reward_trend_tol
+                and float(ppo_metrics.get("approx_kl", 0.0)) <= 0.025
+                and float(ppo_metrics.get("clipfrac", 0.0)) <= 0.22
             )
+            
+            self._convergence_streak = int(self._convergence_streak + 1) if reward_converged else 0
+            reward_converged = bool(self._convergence_streak >= self.convergence_required_streak)
             self.run_logs[-1]["reward_window_std"] = float(reward_std)
             self.run_logs[-1]["reward_window_delta"] = float(reward_delta)
+            self.run_logs[-1]["reward_convergence_streak"] = int(self._convergence_streak)
             self.run_logs[-1]["reward_converged"] = bool(reward_converged)
             if reward_converged and self.convergence_day is None:
                 self.convergence_day = int(d + 1)

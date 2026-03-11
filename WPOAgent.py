@@ -87,13 +87,17 @@ class PPOAgent:
     def adapt_entropy(self, progress: float, reward_converged: bool) -> None:
         """Keep exploration high early, then tighten as training converges."""
         p = float(np.clip(progress, 0.0, 1.0))
-        if p <= 0.25 and not reward_converged:
-            self.ent_coeff = float(max(self.ent_coeff, 0.60 * self.max_ent_coeff))
+        if p <= 0.35 and not reward_converged:
+            self.ent_coeff = float(max(self.ent_coeff, 0.80 * self.max_ent_coeff))
+            return
+
+        if p <= 0.55 and not reward_converged:
+            self.ent_coeff = float(max(self.ent_coeff, 0.55 * self.max_ent_coeff))
             return
 
         target = self.min_ent_coeff + (self.max_ent_coeff - self.min_ent_coeff) * max(0.0, 1.0 - p)
         if reward_converged:
-            target = max(self.min_ent_coeff, 0.6 * target)
+            target = max(self.min_ent_coeff, 0.75 * target)
         self.ent_coeff = float(np.clip(min(self.ent_coeff, target), self.min_ent_coeff, self.max_ent_coeff))
 
 

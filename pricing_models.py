@@ -187,7 +187,7 @@ class FirmRLPricer:
         self.config = default_specs_for(self.opt_keys)
         self.overrides = CoefficientOverrides()
         
-        self.base_step_scale = 0.9
+        self.base_step_scale = 0.95
         self.converged_step_scale = 0.5
         self.step_scale = self.base_step_scale
         self.base_max_relative_dev = 0.35
@@ -234,15 +234,15 @@ class FirmRLPricer:
             action_dim=action_dim,
             clip_eps=0.2,
             max_grad_norm=0.8,
-            ent_coeff=0.03,
+            ent_coeff=0.045,
             min_ent_coeff=0.0015,
-            ent_decay=0.996,
+            ent_decay=0.997,
         )
         
     def configure_training_controls(self, progress: float, reward_converged: bool, reward_std: float) -> None:
         """Adapt exploration and action aggressiveness across training phases."""
         p = float(np.clip(progress, 0.0, 1.0))
-        stable = bool(reward_converged or (p > 0.70 and reward_std <= 0.04))
+        stable = bool(reward_converged or (p > 0.80 and reward_std <= 0.03))
 
         self.allow_aggressive_actions = not stable
         self.step_scale = self.converged_step_scale if stable else self.base_step_scale
