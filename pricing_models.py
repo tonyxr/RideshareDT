@@ -232,6 +232,7 @@ class FirmRLPricer:
         self.agent = PPOAgent(
             state_dim=state_dim,
             action_dim=action_dim,
+            hidden_dim=192,
             clip_eps=0.2,
             max_grad_norm=0.8,
             ent_coeff=0.045,

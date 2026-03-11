@@ -25,20 +25,46 @@ import torch.nn as nn
 import torch.optim as optim
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden: int = 128):
+    def __init__(self, state_dim: int, action_dim: int, hidden: int = 192):
         super().__init__()
         self.trunk = nn.Sequential(
             nn.Linear(state_dim, hidden),
-            nn.ReLU(),
+            nn.LayerNorm(hidden),
+            nn.SiLU(),
             nn.Linear(hidden, hidden),
-            nn.ReLU(),
+            nn.LayerNorm(hidden),
+            nn.SiLU(),
         )
-        self.pi = nn.Linear(hidden, action_dim)
-        self.v = nn.Linear(hidden, 1)
+        self.pi_head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, action_dim),
+        )
+        self.v_head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),
+        )
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Orthogonal init improves PPO stability and early optimization speed."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=np.sqrt(2.0))
+                nn.init.constant_(module.bias, 0.0)
+
+        # PPO convention: smaller final policy logits, unit-scale value head.
+        if isinstance(self.pi_head[-1], nn.Linear):
+            nn.init.orthogonal_(self.pi_head[-1].weight, gain=0.01)
+            nn.init.constant_(self.pi_head[-1].bias, 0.0)
+        if isinstance(self.v_head[-1], nn.Linear):
+            nn.init.orthogonal_(self.v_head[-1].weight, gain=1.0)
+            nn.init.constant_(self.v_head[-1].bias, 0.0)
 
     def forward(self, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         z = self.trunk(s)
-        return self.pi(z), self.v(z).squeeze(-1)
+        return self.pi_head(z), self.v_head(z).squeeze(-1)
     
 @dataclass
 class Transition:
@@ -64,10 +90,11 @@ class PPOAgent:
         min_ent_coeff: float = 0.001,
         ent_decay: float = 0.995,
         max_grad_norm: float = 1.0,
+        hidden_dim: int = 192,
         device: Optional[str] = None,
     ):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.net = ActorCritic(state_dim, action_dim).to(self.device)
+        self.net = ActorCritic(state_dim, action_dim, hidden=hidden_dim).to(self.device)
         self.opt = optim.Adam(self.net.parameters(), lr=lr)
 
         self.gamma = gamma

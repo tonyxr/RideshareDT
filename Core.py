@@ -652,6 +652,7 @@ class Core:
         profiles_out: Optional[str] = None,
         profiles_log_limit: int = 200000,
         train_steps_per_day: int = 10,
+        ppo_update_interval_days: int = 5,
         stochastic_training: bool = True,
     ):
         """Run workflow: synthetic-data RL training (day/timestep cadence), then held-out evaluation."""
@@ -675,6 +676,12 @@ class Core:
             f"train days={train_timesteps} x {train_steps_per_day} steps/day x {train_customers_per_step} rides, "
             f"eval timesteps={eval_timesteps} x {eval_customers_per_step} rides"
         )
+        if self.firm1_mode == "RL":
+            update_every = int(max(1, ppo_update_interval_days))
+            print(
+                f">>> PPO rollout/update cadence: {update_every} day(s) per optimizer step "
+                f"(~{update_every * max(1, int(train_steps_per_day))} transitions/update)."
+            )
         
         print(">>> Training RL agent on synthetic NYC-calibrated sampling (day/timestep cadence)...")
         reward_history: List[float] = []
@@ -686,6 +693,9 @@ class Core:
         if self.firm2_mode != "heuristic":
             self.firm2 = FirmHeuristicPricer(seed=self.seed + 1, managed_keys=self.shared_edit_keys)
             self.firm2_mode = "heuristic"
+        
+        update_every = int(max(1, ppo_update_interval_days))
+        last_ppo_metrics = {"loss": 0.0, "approx_kl": 0.0, "clipfrac": 0.0, "entropy": 0.0, "ent_coeff": 0.0}
 
         for d in range(train_timesteps):
             day_ctx = self.market.sample_day_context()
@@ -748,9 +758,12 @@ class Core:
                 self.last_revpr = float(m1.rev_per_request)
                 self.last_gap = float(mean_gap)
 
-            ppo_metrics = {"loss": 0.0}
+            ppo_metrics = dict(last_ppo_metrics)
             if self.firm1_mode == "RL":
-                ppo_metrics = self.firm1.agent.update(epochs=self.ppo_update_epochs, batch_size=self.ppo_batch_size)
+                should_update = ((d + 1) % update_every == 0) or ((d + 1) == train_timesteps)
+                if should_update:
+                    ppo_metrics = self.firm1.agent.update(epochs=self.ppo_update_epochs, batch_size=self.ppo_batch_size)
+                    last_ppo_metrics = dict(ppo_metrics)
                 
             
             avg_reward = float(reward_sum / max(1, len(hours))) if self.firm1_mode == "RL" else float(self._reward_base(
@@ -764,6 +777,8 @@ class Core:
                 "batch": d,
                 "avg_reward": float(avg_reward),
                 "loss": float(ppo_metrics.get("loss", 0.0)),
+                "ppo_approx_kl": float(ppo_metrics.get("approx_kl", 0.0)),
+                "ppo_clipfrac": float(ppo_metrics.get("clipfrac", 0.0)),
             })
             
             if (d + 1) % max(1, train_timesteps // 10) == 0:
@@ -1901,6 +1916,7 @@ def main():
     parser.add_argument("--train_timesteps", type=int, default=1000)
     parser.add_argument("--train_customers", type=int, default=5000)
     parser.add_argument("--train_steps_per_day", type=int, default=10, help="Synthetic training timesteps per day (run_experiment mode).")
+    parser.add_argument("--ppo_update_interval_days", type=int, default=5, help="How many synthetic training days to collect before each PPO optimizer update.")
     parser.add_argument("--deterministic_experiment_seed", action="store_true", help="If set, keep run_experiment fully deterministic with --seed.")
     parser.add_argument("--eval_timesteps", type=int, default=200)
     parser.add_argument("--eval_customers", type=int, default=1000)
@@ -1983,6 +1999,7 @@ def main():
             profiles_out=args.profiles_out,
             profiles_log_limit=args.profiles_log_limit,
             train_steps_per_day=args.train_steps_per_day,
+            ppo_update_interval_days=args.ppo_update_interval_days,
             stochastic_training=not args.deterministic_experiment_seed,
         )
         rows = []
