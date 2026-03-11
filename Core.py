@@ -1595,7 +1595,9 @@ class Core:
                         f"  [PPO] KL={float(ppo_metrics.get('approx_kl', 0.0)):.4f} "
                         f"clipfrac={float(ppo_metrics.get('clipfrac', 0.0)):.3f} "
                         f"ent={float(ppo_metrics.get('entropy', 0.0)):.3f} "
-                        f"ent_coeff={float(ppo_metrics.get('ent_coeff', 0.0)):.4f}"
+                        f"ent_coeff={float(ppo_metrics.get('ent_coeff', 0.0)):.4f} "
+                        f"lr={float(ppo_metrics.get('lr', 0.0)):.6f} "
+                        f"kl_stop={bool(ppo_metrics.get('stopped_early_kl', False))}"
                     )
                     
             if self.firm1_mode == "RL":

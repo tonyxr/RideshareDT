@@ -91,11 +91,18 @@ class PPOAgent:
         ent_decay: float = 0.995,
         max_grad_norm: float = 1.0,
         hidden_dim: int = 192,
+        target_kl: float = 0.02,
+        adv_clip: float = 4.0,
+        lr_decay_on_spike: float = 0.85,
+        min_lr: float = 5e-5,
         device: Optional[str] = None,
     ):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.net = ActorCritic(state_dim, action_dim, hidden=hidden_dim).to(self.device)
         self.opt = optim.Adam(self.net.parameters(), lr=lr)
+        self.base_lr = float(lr)
+        self.curr_lr = float(lr)
+        self.min_lr = float(max(1e-6, min_lr))
 
         self.gamma = gamma
         self.lam = lam
@@ -108,6 +115,9 @@ class PPOAgent:
         
         self.max_grad_norm = max_grad_norm
         self.update_calls = 0
+        self.target_kl = float(max(1e-4, target_kl))
+        self.adv_clip = float(max(1.0, adv_clip))
+        self.lr_decay_on_spike = float(np.clip(lr_decay_on_spike, 0.5, 0.99))
 
         self.buf: List[Transition] = []
         
@@ -219,7 +229,10 @@ class PPOAgent:
             "approx_kl": 0.0,
             "clipfrac": 0.0,
             "ent_coeff": float(self.ent_coeff),
+            "lr": float(self.curr_lr),
+            "stopped_early_kl": False,
         }
+        stop_for_kl = False
 
 
         for _ in range(epochs):
@@ -228,7 +241,7 @@ class PPOAgent:
                 j = idx[start : start + batch_size]
                 s_b = s_all[j]
                 a_b = a_all[j]
-                adv_b = adv[j].detach()
+                adv_b = adv[j].detach().clamp(-self.adv_clip, self.adv_clip)
                 ret_b = ret[j].detach()
                 old_logp_b = old_logp_all[j].detach()
 
@@ -249,7 +262,8 @@ class PPOAgent:
                 approx_kl = (old_logp_b - logp).mean()
                 clipfrac = ((ratio - 1.0).abs() > self.clip_eps).float().mean()
 
-
+                if float(approx_kl.item()) > 1.5 * self.target_kl:
+                    stop_for_kl = True
                 loss = policy_loss + self.v_coeff * value_loss - self.ent_coeff * entropy
                 if not torch.isfinite(loss):
                     continue
@@ -267,11 +281,25 @@ class PPOAgent:
                     "approx_kl": float(approx_kl.item()),
                     "clipfrac": float(clipfrac.item()),
                     "ent_coeff": float(self.ent_coeff),
+                    "lr": float(self.curr_lr),
+                    "stopped_early_kl": bool(stop_for_kl),
                 }
+                
+                if stop_for_kl:
+                    break
+            if stop_for_kl:
+                break
+
+        if float(last.get("clipfrac", 0.0)) > 0.30 or float(last.get("approx_kl", 0.0)) > self.target_kl:
+            self.curr_lr = float(max(self.min_lr, self.curr_lr * self.lr_decay_on_spike))
+            for g in self.opt.param_groups:
+                g["lr"] = self.curr_lr
 
         self.buf.clear()
         self.update_calls += 1
         self.ent_coeff = max(self.min_ent_coeff, self.ent_coeff * self.ent_decay)
 
         last["ent_coeff"] = float(self.ent_coeff)
+        last["lr"] = float(self.curr_lr)
+        last["stopped_early_kl"] = bool(stop_for_kl)
         return last
