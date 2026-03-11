@@ -8,12 +8,9 @@ from __future__ import annotations
 - Rewritten again on Feb 8, 2026
 """
 from typing import List, Dict, Any, Optional
-import pandas as pd
 from dataclasses import dataclass
 import numpy as np
-from openai import OpenAI
-import os
-import json
+
 
 @dataclass(frozen=True)
 class ChoiceResult:

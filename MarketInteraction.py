@@ -137,6 +137,7 @@ class MarketInteraction:
 
         airport_base = 0.12
         airport_base = float(NYC_MARKET_CAL.get("airport_prob", 0.12)) if self.current_city == "New York City" else 0.12
+        self.airport_prob = float(np.clip(airport_base + self.rng.normal(0.0, 0.05 * j), 0.03, 0.35))
 
         service_keys = list(self.curr_market.service_multiplier.keys())
         if self.current_city == "New York City" and NYC_SERVICE_FROM_DATA:
