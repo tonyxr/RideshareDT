@@ -140,6 +140,12 @@ class CognitiveChoiceModel(BaseChoiceModel):
         rush = (7 <= hour < 10) or (16 <= hour < 19)
         weekend = day >= 5
         bad_weather = weather in {"rain", "snow", "storm"}
+        
+        util_w = profile.get("UtilityWeights", {}) if isinstance(profile.get("UtilityWeights", {}), dict) else {}
+        w_price = float(util_w.get("price_weight", 1.0))
+        w_loyalty = float(util_w.get("loyalty_weight", 1.0))
+        w_risk = float(util_w.get("risk_weight", 1.0))
+        w_comfort = float(util_w.get("comfort_weight", 1.0))
 
         # ---- Economic utility ----
         # Low income + larger household -> stronger price pain.
@@ -150,14 +156,14 @@ class CognitiveChoiceModel(BaseChoiceModel):
 
         # Nonlinear price pain: people react more strongly to larger fare gaps.
         price_gap = float(price2 - price1)
-        price_term = price_sensitivity * np.sign(price_gap) * (abs(price_gap) ** 0.92) * shopping_intensity
+        price_term = w_price * price_sensitivity * np.sign(price_gap) * (abs(price_gap) ** 0.92) * shopping_intensity
 
         # ---- Habit / loyalty ----
         loyalty_term = 0.0
         if loyalty_firm == "Firm1":
-            loyalty_term = +0.85 * self.loyalty_scale * loyalty_strength
+            loyalty_term = +0.85 * self.loyalty_scale * loyalty_strength * w_loyalty
         elif loyalty_firm == "Firm2":
-            loyalty_term = -0.85 * self.loyalty_scale * loyalty_strength
+            loyalty_term = -0.85 * self.loyalty_scale * loyalty_strength * w_loyalty
 
         # Inertia for non-loyal users near ties.
         habit_inertia = 0.0
@@ -171,13 +177,13 @@ class CognitiveChoiceModel(BaseChoiceModel):
         
         # Small structural preference drift (can be calibrated later with data).
         reliability_bias_firm1 = 0.02
-        reliability_term = reliability_pressure * reliability_bias_firm1 * self.reliability_scale
+        reliability_term = reliability_pressure * reliability_bias_firm1 * self.reliability_scale * w_risk
         
         # Convenience/service framing: premium riders less price-sensitive and more inertial.
         comfort_term = 0.0
         if service == "premium":
-            comfort_term = 0.05 + 0.10 * income_score
-
+            comfort_term = (0.05 + 0.10 * income_score) * w_comfort
+        
         # Longer trips => stronger reaction to absolute gap.
         trip_scale = 1.0 + 0.06 * min(distance / 10.0, 2.0)
 
@@ -222,11 +228,12 @@ class LLMChoiceModel(CognitiveChoiceModel):
     """
     Backward-compatible alias.
 
-    The project no longer uses external LLM APIs for rider choice simulation.
-    Requests for "llm" mode are mapped to the cognitive model.
+    GPT-assisted rider utility generation is handled at profile bootstrap time in Core.
+    At choice time this class consumes profile-level UtilityWeights produced upstream.
     """
 
-    def __init__(self, model_name: str = "retired", api_key: Optional[str] = None, seed: Optional[int] = None):
-        del model_name, api_key
+    def __init__(self, model_name: str = "gpt-4o-mini", api_key: Optional[str] = None, seed: Optional[int] = None):
+        self.model_name = model_name
+        self.api_key = api_key
         super().__init__(seed=seed)
-        print("[ChoiceModel] LLM/API mode retired; using CognitiveChoiceModel.")
+        print("[ChoiceModel] GPT profile-utility mode enabled (weights consumed from profile).")

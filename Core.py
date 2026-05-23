@@ -21,6 +21,7 @@ import io
 import importlib.util
 import json
 import os
+import urllib.request
 import random
 import re
 import zipfile
@@ -359,6 +360,9 @@ class Core:
 
         self.agent_gen = GenerateAgent(seed=self.seed, total_customers=total_customers_pool, city_name = market_name)
         self.profile_pool_multiplier = 2
+        self.model_name = model_name
+        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+        self.synthetic_profile_pool: List[Dict[str, Any]] = []
         self.training_stable_window = 30
         self.training_stable_tol = 0.012
         self.reward_convergence_window = 60
@@ -372,8 +376,8 @@ class Core:
         self.choice_mode = choice_mode
         if choice_mode in {"llm", "cognitive"}:
             self.choice_model = LLMChoiceModel(model_name=model_name, api_key=openai_api_key, seed=self.seed)
-            if openai_api_key:
-                print("[Core] --openai_api_key is ignored; API integration is retired.")
+            if self.openai_api_key is None:
+                print("[Core] No OpenAI key found; GPT utility bootstrapping will use deterministic fallback weights.")
         else:
             self.choice_model = ParametricChoiceModel(seed=self.seed)
 
@@ -642,6 +646,64 @@ class Core:
         if self.agent_gen.total_customers != min_pool:
             self.agent_gen.total_customers = min_pool
         self.agent_gen.apply_probability_variation(jitter_scale=0.05)
+        self._bootstrap_synthetic_profiles(pool_size=min_pool)
+
+    def _build_coldstart_rides(self, n: int = 10) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for _ in range(int(max(1, n))):
+            r = self.market.generate_ride()
+            out.append({"Hour": int(r.hour), "Weather": str(r.weather), "DistanceMiles": float(r.distance_miles), "Service": str(r.service), "Airport": bool(r.airport), "DayOfWeek": int(r.day_of_week)})
+        return out
+
+    def _gpt_profile_weights(self, profile: Dict[str, Any], rides: List[Dict[str, Any]]) -> Dict[str, float]:
+        fallback = {"price_weight": 1.0, "loyalty_weight": 1.0, "risk_weight": 1.0, "comfort_weight": 1.0}
+        priced = []
+        for r in rides[:5]:
+            rc = RideContext(
+                day_of_week=int(r["DayOfWeek"]),
+                weather=str(r["Weather"]),
+                hour=int(r["Hour"]),
+                airport=bool(r["Airport"]),
+                service=str(r["Service"]),
+            )
+            p1 = float(self.market.quote_price(ride_context=rc, city_market=self.market.curr_market, overrides=self.firm1.overrides))
+            p2 = float(self.market.quote_price(ride_context=rc, city_market=self.market.curr_market, overrides=self.firm2.overrides))
+            priced.append({**r, "firm1_price": p1, "firm2_price": p2})
+        if not self.openai_api_key:
+            return fallback
+        prompt = {
+            "task": "Infer rider utility weights from profile and five coldstart rides. Return JSON with keys: price_weight, loyalty_weight, risk_weight, comfort_weight. Each in [0.6,1.6].",
+            "profile": profile,
+            "coldstart_rides": priced,
+        }
+        try:
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/responses",
+                data=json.dumps({"model": self.model_name, "input": json.dumps(prompt), "max_output_tokens": 120}).encode("utf-8"),
+                headers={"Authorization": f"Bearer {self.openai_api_key}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            text = payload.get("output", [{}])[0].get("content", [{}])[0].get("text", "{}")
+            parsed = json.loads(text)
+            return {k: float(np.clip(parsed.get(k, v), 0.6, 1.6)) for k, v in fallback.items()}
+        except Exception:
+            return fallback
+
+    def _bootstrap_synthetic_profiles(self, pool_size: int) -> None:
+        base_profiles = self.agent_gen.sample_profiles(int(max(1, pool_size)))
+        rides = self._build_coldstart_rides(n=10)
+        self.synthetic_profile_pool = []
+        for p in base_profiles:
+            w = self._gpt_profile_weights(profile=p, rides=rides)
+            self.synthetic_profile_pool.append({**p, "UtilityWeights": w})
+
+    def _sample_profiles_from_pool(self, n: int) -> List[Dict[str, Any]]:
+        if not self.synthetic_profile_pool:
+            self._bootstrap_synthetic_profiles(pool_size=max(self.total_customers_pool, n))
+        idx = self.rng.integers(0, len(self.synthetic_profile_pool), size=int(max(0, n)))
+        return [dict(self.synthetic_profile_pool[int(i)]) for i in idx]
 
     def run_experiment(
         self,
@@ -719,7 +781,7 @@ class Core:
 
                 self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
-                sampled_profiles = self.agent_gen.sample_profiles(train_customers_per_step)
+                sampled_profiles = self._sample_profiles_from_pool(train_customers_per_step)
                 if profiles_out and not profile_limit_reached:
                     remaining = int(max(0, profiles_log_limit - len(sampled_profile_rows)))
                     if remaining > 0:
@@ -798,7 +860,7 @@ class Core:
         for t in range(eval_timesteps):
             day_ctx = self.market.sample_day_context()
             hour = self.market.sample_timestep_hour().hour
-            sampled_profiles = self.agent_gen.sample_profiles(eval_customers_per_step)
+            sampled_profiles = self._sample_profiles_from_pool(eval_customers_per_step)
             if profiles_out and not profile_limit_reached:
                 remaining = int(max(0, profiles_log_limit - len(sampled_profile_rows)))
                 if remaining > 0:
@@ -1462,7 +1524,7 @@ class Core:
                 if self.firm2_mode == "heuristic":
                     self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
                 
-                sampled_profiles = self.agent_gen.sample_profiles(customers_per_step)
+                sampled_profiles = self._sample_profiles_from_pool(customers_per_step)
                 if profiles_out and not profile_limit_reached:
                     remaining = int(max(0, profiles_log_limit - len(sampled_profile_rows)))
                     if remaining > 0:
