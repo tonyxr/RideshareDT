@@ -48,12 +48,12 @@ def build_state_vector(
     # Coefficient features: normalized relative deltas vs base
     base_empty = CoefficientOverrides()
     coef_feats = []
-    for k in opt_keys[:2]:
+    for k in opt_keys[:5]:
         cur = get_coeff(base, ov_firm1, k)
         base_val = get_coeff(base, base_empty, k)
         coef_feats.append((cur - base_val) / (abs(base_val) + 1e-6))
 
-    while len(coef_feats) < 2:
+    while len(coef_feats) < 5:
         coef_feats.append(0.0)
 
     fixed = [

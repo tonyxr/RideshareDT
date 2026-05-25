@@ -390,7 +390,7 @@ class Core:
         if self.firm2_mode not in {"heuristic", "static"}:
             raise ValueError("firm2_mode must be one of: heuristic, static")
 
-        self.opt_keys = ["base_fare", "per_minute"]
+        self.opt_keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
         self.shared_edit_keys = list(self.opt_keys)
 
         if self.firm1_mode == "RL":
@@ -571,13 +571,25 @@ class Core:
 
         f1_base = float(base.base_fare) * float(self.rng.uniform(lo, hi))
         f1_pmin = float(base.per_minute) * float(self.rng.uniform(lo, hi))
+        f1_pmile = float(base.per_mile) * float(self.rng.uniform(lo, hi))
+        f1_book = float(base.booking_fee) * float(self.rng.uniform(lo, hi))
+        f1_air = float(base.airport_fee) * float(self.rng.uniform(lo, hi))
         f2_base = float(base.base_fare) * float(self.rng.uniform(lo, hi))
         f2_pmin = float(base.per_minute) * float(self.rng.uniform(lo, hi))
+        f2_pmile = float(base.per_mile) * float(self.rng.uniform(lo, hi))
+        f2_book = float(base.booking_fee) * float(self.rng.uniform(lo, hi))
+        f2_air = float(base.airport_fee) * float(self.rng.uniform(lo, hi))
 
         self.firm1.overrides.base_fare = max(0.1, f1_base)
         self.firm1.overrides.per_minute = max(0.01, f1_pmin)
+        self.firm1.overrides.per_mile = max(0.01, f1_pmile)
+        self.firm1.overrides.booking_fee = max(0.0, f1_book)
+        self.firm1.overrides.airport_fee = max(0.0, f1_air)
         self.firm2.overrides.base_fare = max(0.1, f2_base)
         self.firm2.overrides.per_minute = max(0.01, f2_pmin)
+        self.firm2.overrides.per_mile = max(0.01, f2_pmile)
+        self.firm2.overrides.booking_fee = max(0.0, f2_book)
+        self.firm2.overrides.airport_fee = max(0.0, f2_air)
         
     def _reward_base(
         self,
@@ -652,7 +664,8 @@ class Core:
         out: List[Dict[str, Any]] = []
         for _ in range(int(max(1, n))):
             r = self.market.generate_ride()
-            out.append({"Hour": int(r.hour), "Weather": str(r.weather), "DistanceMiles": float(r.distance_miles), "Service": str(r.service), "Airport": bool(r.airport), "DayOfWeek": int(r.day_of_week)})
+            out.append({"Hour": int(r.hour), "Weather": str(r.weather), "DistanceMiles": float(r.distance_miles), "DurationMinutes": float(r.duration_minutes), 
+                        "Service": str(r.service), "Airport": bool(r.airport), "DayOfWeek": int(r.day_of_week)})
         return out
 
     def _gpt_profile_weights(self, profile: Dict[str, Any], rides: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -666,8 +679,8 @@ class Core:
                 airport=bool(r["Airport"]),
                 service=str(r["Service"]),
             )
-            p1 = float(self.market.quote_price(ride_context=rc, city_market=self.market.curr_market, overrides=self.firm1.overrides))
-            p2 = float(self.market.quote_price(ride_context=rc, city_market=self.market.curr_market, overrides=self.firm2.overrides))
+            p1 = float(self.market.quote_price(float(r.get("DistanceMiles", 0.0)), float(r.get("DurationMinutes", 15.0)), rc, overrides=self.firm1.overrides))
+            p2 = float(self.market.quote_price(float(r.get("DistanceMiles", 0.0)), float(r.get("DurationMinutes", 15.0)), rc, overrides=self.firm2.overrides))
             priced.append({**r, "firm1_price": p1, "firm2_price": p2})
         if not self.openai_api_key:
             return fallback
@@ -1086,10 +1099,9 @@ class Core:
                            airport=bool(airport),
                            service=service,
                        )
-                       if self.firm1_mode == "RL":
-                           s_vec = self._build_rl_state(day_of_week=ctx.day_of_week, hour=ctx.hour, weather=ctx.weather)
-                           action, *_ = self.firm1.agent.act(s_vec)
-                           self.firm1.apply_action(action, self.market)
+                       # Keep coefficient overrides fixed during dataset comparison.
+                       # Applying sequential RL actions row-by-row introduces policy drift
+                       # unrelated to each observed ride and creates strong directional bias.
                        rl_price = self.market.quote_price(
                            distance_miles=float(max(0.0, distance)),
                            duration_minutes=float(max(0.0, duration)),

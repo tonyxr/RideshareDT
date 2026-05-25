@@ -146,7 +146,7 @@ class FirmHeuristicPricer:
         self.ema_gap = self._ema(price_gap_mean, self.ema_gap, self.alpha)
         
 class FirmRLPricer:
-    MAX_MANIPULATED_COEFFS = 2
+    MAX_MANIPULATED_COEFFS = 5
 
     def _ensure_internal_state(self) -> None:
         """Backstop against partially initialized objects from stale environments."""
@@ -176,8 +176,7 @@ class FirmRLPricer:
         return cost
     
     def __init__(self, seed: Optional[int], opt_keys: List[str]):
-        # Keep action semantics simple and stable: one shared action can only
-        # manipulate up to two coefficients per step.
+        # Shared action manipulates up to five pricing coefficients per step.
         self.opt_keys = list(opt_keys[: self.MAX_MANIPULATED_COEFFS])
         if len(opt_keys) > self.MAX_MANIPULATED_COEFFS:
             print(
@@ -195,35 +194,47 @@ class FirmRLPricer:
         self.max_relative_dev = self.base_max_relative_dev
         self.recovery_share_threshold = 0.30
         self.recovery_gap_threshold = -0.05
-        self.aggressive_actions = {11, 12}
+        self.aggressive_actions = set()
         self.allow_aggressive_actions = True
         
         # Action space includes coordinated and aggressive coefficient moves.
         # This lets RL respond faster to heuristic schedule/cooldown behavior.
         
-        self.action_to_steps: Dict[int, Dict[str, int]] = {
-            0: {"base_fare": 0, "per_minute": 0},
-            1: {"base_fare": -1, "per_minute": 0},
-            2: {"base_fare": +1, "per_minute": 0},
-            3: {"base_fare": 0, "per_minute": -1},
-            4: {"base_fare": 0, "per_minute": +1},
-            5: {"base_fare": -1, "per_minute": -1},
-            6: {"base_fare": +1, "per_minute": +1},
-            7: {"base_fare": -1, "per_minute": +1},
-            8: {"base_fare": +1, "per_minute": -1},
-            9: {"base_fare": -2, "per_minute": -1},
-            10: {"base_fare": -1, "per_minute": -2},
-            11: {"base_fare": +2, "per_minute": +1},
-            12: {"base_fare": +1, "per_minute": +2},
-        }
+        all_keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
+        active_keys = [k for k in all_keys if k in self.opt_keys]
+        self.action_to_steps: Dict[int, Dict[str, int]] = {0: {k: 0 for k in active_keys}}
+        a_idx = 1
+        for k in active_keys:
+            self.action_to_steps[a_idx] = {kk: 0 for kk in active_keys}
+            self.action_to_steps[a_idx][k] = -1
+            a_idx += 1
+            self.action_to_steps[a_idx] = {kk: 0 for kk in active_keys}
+            self.action_to_steps[a_idx][k] = +1
+            a_idx += 1
+        # Coordinated "all down / all up" steps.
+        self.action_to_steps[a_idx] = {k: -1 for k in active_keys}
+        a_idx += 1
+        self.action_to_steps[a_idx] = {k: +1 for k in active_keys}
+        a_idx += 1
+        # Mild aggressive bias on base fare + per-minute for quicker recovery.
+        if "base_fare" in active_keys and "per_minute" in active_keys:
+            self.action_to_steps[a_idx] = {k: 0 for k in active_keys}
+            self.action_to_steps[a_idx]["base_fare"] = +2
+            self.action_to_steps[a_idx]["per_minute"] = +1
+            self.aggressive_actions.add(a_idx)
+            a_idx += 1
+            self.action_to_steps[a_idx] = {k: 0 for k in active_keys}
+            self.action_to_steps[a_idx]["base_fare"] = -2
+            self.action_to_steps[a_idx]["per_minute"] = -1
+            self.aggressive_actions.add(a_idx)
         action_dim = len(self.action_to_steps)
         self.action_vectors = {
-            a: np.array([d["base_fare"], d["per_minute"]], dtype=float)
+            a: np.array([d.get(k, 0.0) for k in active_keys], dtype=float)
             for a, d in self.action_to_steps.items()
         }
 
         # Expanded state includes context, competitor memory, and coefficient deltas.
-        state_dim = 14
+        state_dim = 12 + len(active_keys)
 
         # Wasserstein geometry: penalize large policy moves in coefficient-step space.
         self.cost_matrix = self._build_action_cost_matrix(action_dim)
@@ -286,14 +297,18 @@ class FirmRLPricer:
         if (not self.allow_aggressive_actions) and action in self.aggressive_actions:
             action = 6
         
-        step_map = {
-            k: v for k, v in self.action_to_steps[action].items() if k in self.opt_keys
-        }
+        step_map = {k: v for k, v in self.action_to_steps[action].items() if k in self.opt_keys}
         if not step_map:
             return
         
         scaled_steps = {k: self.config.step[k] * self.step_scale for k in step_map.keys()}
         bounds = {k: self.config.bounds[k] for k in step_map.keys()}
+        # Detailed normalized one-unit gap per coefficient:
+        # one step => config.step[k], normalized by feasible range width.
+        self.last_action_normalized_gap = {
+            k: float(step_map[k]) * float(scaled_steps[k]) / max(1e-6, float(bounds[k][1] - bounds[k][0]))
+            for k in step_map.keys()
+        }
         market_interaction.apply_step_actions_to_overrides(
             overrides=self.overrides,
             action_steps=step_map,

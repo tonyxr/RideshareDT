@@ -48,12 +48,22 @@ class TimeContext:
 
 
 @dataclass(frozen=True)
+class SyntheticRide:
+    day_of_week: int
+    weather: str
+    hour: int
+    airport: bool
+    service: str
+    distance_miles: float
+    duration_minutes: float
+    
+@dataclass(frozen=True)
 class RideContext:
     day_of_week: int
     weather: str
     hour: int
     airport: bool
-    service: str      # economy/premium
+    service: str  
 
 
 class MarketInteraction:
@@ -280,3 +290,24 @@ class MarketInteraction:
             delta = float(step_size[key]) * float(np.sign(step_dir))
             lb, ub = bounds[key]
             setattr(overrides, key, float(np.clip(float(current) + delta, lb, ub)))
+
+    def generate_ride(self) -> SyntheticRide:
+        """Sample a synthetic ride request for bootstrapping profile cold-start scenarios."""
+        day_ctx = self.sample_day_context()
+        time_ctx = self.sample_timestep_hour()
+        airport = self.sample_airport_flag()
+        service = self.sample_service()
+
+        distance_miles = float(np.clip(self.rng.gamma(shape=2.3, scale=3.0), 0.5, 45.0))
+        avg_speed_mph = float(np.clip(self.rng.normal(loc=18.0, scale=4.0), 8.0, 35.0))
+        duration_minutes = float(np.clip((distance_miles / max(avg_speed_mph, 1e-6)) * 60.0, 5.0, 120.0))
+
+        return SyntheticRide(
+            day_of_week=int(day_ctx.day_of_week),
+            weather=str(day_ctx.weather),
+            hour=int(time_ctx.hour),
+            airport=bool(airport),
+            service=str(service),
+            distance_miles=distance_miles,
+            duration_minutes=duration_minutes,
+        )
