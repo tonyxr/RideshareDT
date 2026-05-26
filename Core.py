@@ -661,15 +661,49 @@ class Core:
         self._bootstrap_synthetic_profiles(pool_size=min_pool)
 
     def _build_coldstart_rides(self, n: int = 10) -> List[Dict[str, Any]]:
+        """Generate rider-specific cold-start rides before simulation begins."""
         out: List[Dict[str, Any]] = []
         for _ in range(int(max(1, n))):
             r = self.market.generate_ride()
-            out.append({"Hour": int(r.hour), "Weather": str(r.weather), "DistanceMiles": float(r.distance_miles), "DurationMinutes": float(r.duration_minutes), 
-                        "Service": str(r.service), "Airport": bool(r.airport), "DayOfWeek": int(r.day_of_week)})
+            out.append({
+                "Hour": int(r.hour),
+                "Weather": str(r.weather),
+                "DistanceMiles": float(r.distance_miles),
+                "DurationMinutes": float(r.duration_minutes),
+                "Service": str(r.service),
+                "Airport": bool(r.airport),
+                "DayOfWeek": int(r.day_of_week),
+            })
         return out
 
-    def _gpt_profile_weights(self, profile: Dict[str, Any], rides: List[Dict[str, Any]]) -> Dict[str, float]:
-        fallback = {"price_weight": 1.0, "loyalty_weight": 1.0, "risk_weight": 1.0, "comfort_weight": 1.0}
+    @staticmethod
+    def _extract_response_text(payload: Dict[str, Any]) -> str:
+        """Best-effort extraction from Responses API payload variants."""
+        if isinstance(payload.get("output_text"), str) and payload.get("output_text"):
+            return str(payload["output_text"])
+        output = payload.get("output")
+        if not isinstance(output, list):
+            return ""
+        chunks: List[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            for content in item.get("content", []) or []:
+                if isinstance(content, dict):
+                    txt = content.get("text")
+                    if isinstance(txt, str) and txt:
+                        chunks.append(txt)
+        return "\n".join(chunks).strip()
+
+    def _gpt_profile_utility(self, profile: Dict[str, Any], rides: List[Dict[str, Any]]) -> Dict[str, Any]:
+        fallback_weights = {"price_weight": 1.0, "loyalty_weight": 1.0, "risk_weight": 1.0, "comfort_weight": 1.0}
+        fallback = {
+            "weights": fallback_weights,
+            "utility_function": "U = w_price*price_term + w_loyalty*loyalty_term + w_risk*risk_term + w_comfort*comfort_term",
+            "rationale": "Deterministic fallback utility function (no API response).",
+            "source": "fallback",
+        }
+
         priced = []
         for r in rides[:5]:
             rc = RideContext(
@@ -685,32 +719,58 @@ class Core:
         if not self.openai_api_key:
             return fallback
         prompt = {
-            "task": "Infer rider utility weights from profile and five coldstart rides. Return JSON with keys: price_weight, loyalty_weight, risk_weight, comfort_weight. Each in [0.6,1.6].",
+            "task": (
+                "Infer a rider-level utility function from one profile and five cold-start rides. "
+                "Return JSON with keys: weights, utility_function, rationale. "
+                "weights must include price_weight, loyalty_weight, risk_weight, comfort_weight, each in [0.6,1.6]."
+            ),
             "profile": profile,
             "coldstart_rides": priced,
+            "output_constraints": {
+                "format": "json_only",
+                "weights_range": [0.6, 1.6],
+            },
         }
         try:
             req = urllib.request.Request(
                 "https://api.openai.com/v1/responses",
-                data=json.dumps({"model": self.model_name, "input": json.dumps(prompt), "max_output_tokens": 120}).encode("utf-8"),
+                data=json.dumps({"model": self.model_name, "input": json.dumps(prompt), "max_output_tokens": 260}).encode("utf-8"),
                 headers={"Authorization": f"Bearer {self.openai_api_key}", "Content-Type": "application/json"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=20) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
-            text = payload.get("output", [{}])[0].get("content", [{}])[0].get("text", "{}")
-            parsed = json.loads(text)
-            return {k: float(np.clip(parsed.get(k, v), 0.6, 1.6)) for k, v in fallback.items()}
+            
+            text = self._extract_response_text(payload)
+            parsed = json.loads(text) if text else {}
+            raw_weights = parsed.get("weights", parsed)
+            weights = {
+                k: float(np.clip(raw_weights.get(k, v), 0.6, 1.6))
+                for k, v in fallback_weights.items()
+            }
+            return {
+                "weights": weights,
+                "utility_function": str(parsed.get("utility_function", fallback["utility_function"])),
+                "rationale": str(parsed.get("rationale", "")),
+                "source": "gpt",
+            }
         except Exception:
             return fallback
 
     def _bootstrap_synthetic_profiles(self, pool_size: int) -> None:
         base_profiles = self.agent_gen.sample_profiles(int(max(1, pool_size)))
-        rides = self._build_coldstart_rides(n=10)
         self.synthetic_profile_pool = []
         for p in base_profiles:
-            w = self._gpt_profile_weights(profile=p, rides=rides)
-            self.synthetic_profile_pool.append({**p, "UtilityWeights": w})
+            coldstart_rides = self._build_coldstart_rides(n=10)
+            util = self._gpt_profile_utility(profile=p, rides=coldstart_rides)
+            self.synthetic_profile_pool.append({
+                **p,
+                "ColdstartRides": coldstart_rides,
+                "UtilityWeights": util["weights"],
+                "UtilityFunction": util["utility_function"],
+                "UtilityRationale": util.get("rationale", ""),
+                "UtilitySource": util.get("source", "fallback"),
+            })
 
     def _sample_profiles_from_pool(self, n: int) -> List[Dict[str, Any]]:
         if not self.synthetic_profile_pool:
@@ -1626,6 +1686,9 @@ class Core:
                 "ppo_entropy": float(ppo_metrics.get("entropy", 0.0)),
                 "ppo_ent_coeff": float(ppo_metrics.get("ent_coeff", 0.0)),
             })
+            for k in self.shared_edit_keys:
+                self.run_logs[-1][f"firm1_{k}"] = float(get_coeff(base, self.firm1.overrides, k))
+                self.run_logs[-1][f"firm2_{k}"] = float(get_coeff(base, self.firm2.overrides, k))
             
             recent_rewards = [float(x["avg_reward"]) for x in self.run_logs[-self.reward_convergence_window:]]
             reward_std = float(np.std(recent_rewards)) if recent_rewards else 1.0
@@ -1960,6 +2023,45 @@ def _plot_reports(
         _ensure_parent_dir(out)
         plt.savefig(out, dpi=150)
         plt.close()
+        
+    # 6) manipulated coefficient trajectories
+    if run_logs:
+        xs = [int(r["day"]) for r in run_logs]
+        coeff_keys: List[str] = sorted(
+            {
+                k[len("firm1_"):]
+                for r in run_logs
+                for k in r.keys()
+                if k.startswith("firm1_") and ("firm2_" + k[len("firm1_"):]) in r
+            }
+        )
+        for coeff in coeff_keys:
+            y1: List[float] = []
+            y2: List[float] = []
+            valid = True
+            for r in run_logs:
+                v1 = r.get(f"firm1_{coeff}")
+                v2 = r.get(f"firm2_{coeff}")
+                if v1 is None or v2 is None:
+                    valid = False
+                    break
+                y1.append(float(v1))
+                y2.append(float(v2))
+            if not valid or not y1:
+                continue
+
+            plt.figure(figsize=(9, 4))
+            plt.plot(xs, y1, label=f"Firm1 {coeff}")
+            plt.plot(xs, y2, label=f"Firm2 {coeff}")
+            plt.title(f"Coefficient Trajectory: {coeff}")
+            plt.xlabel("Day")
+            plt.ylabel("Coefficient value")
+            plt.legend(loc="best")
+            plt.tight_layout()
+            out = f"{prefix}_coeff_{coeff}_trajectory.png"
+            _ensure_parent_dir(out)
+            plt.savefig(out, dpi=150)
+            plt.close()
 
 
 def main():
