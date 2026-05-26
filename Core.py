@@ -705,7 +705,7 @@ class Core:
         }
 
         priced = []
-        for r in rides[:5]:
+        for r in rides[:10]:
             rc = RideContext(
                 day_of_week=int(r["DayOfWeek"]),
                 weather=str(r["Weather"]),
@@ -720,12 +720,12 @@ class Core:
             return fallback
         prompt = {
             "task": (
-                "Infer a rider-level utility function from one profile and five cold-start rides. "
+                "Infer a rider-level utility function from one profile and ten cold-start rides. "
                 "Return JSON with keys: weights, utility_function, rationale. "
                 "weights must include price_weight, loyalty_weight, risk_weight, comfort_weight, each in [0.6,1.6]."
             ),
             "profile": profile,
-            "coldstart_rides": priced,
+            "coldstart_rides": priced[:10],
             "output_constraints": {
                 "format": "json_only",
                 "weights_range": [0.6, 1.6],
@@ -1354,6 +1354,7 @@ class Core:
             out = f"{out_plot_prefix}_price_match_scatter.png"
             _ensure_parent_dir(out)
             plt.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
             plt.close()
 
         duration_pairs = [
@@ -1909,6 +1910,7 @@ def _plot_reports(
         out = f"{prefix}_dist_{p}.png"
         _ensure_parent_dir(out)
         plt.savefig(out, dpi=150)
+        print(f"Saved graph -> {out}")
         plt.close()
 
     # 2) Distance histogram
@@ -1924,6 +1926,7 @@ def _plot_reports(
         out = f"{prefix}_dist_TravelDistance.png"
         _ensure_parent_dir(out)
         plt.savefig(out, dpi=150)
+        print(f"Saved graph -> {out}")
         plt.close()
 
     # 3) run reward trajectory + convergence diagnostics
@@ -1946,6 +1949,7 @@ def _plot_reports(
         out = f"{prefix}_reward_run.png"
         _ensure_parent_dir(out)
         plt.savefig(out, dpi=150)
+        print(f"Saved graph -> {out}")
         plt.close()
         
         stds = [float(r.get("reward_window_std", np.nan)) for r in run_logs]
@@ -1973,6 +1977,7 @@ def _plot_reports(
             out = f"{prefix}_convergence_run.png"
             _ensure_parent_dir(out)
             plt.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
             plt.close(fig)
 
     # 4) training trajectory (run_experiment)
@@ -2007,6 +2012,7 @@ def _plot_reports(
         out = f"{prefix}_reward_training.png"
         _ensure_parent_dir(out)
         plt.savefig(out, dpi=150)
+        print(f"Saved graph -> {out}")
         plt.close()
 
     # 5) evaluation trajectory (run_experiment)
@@ -2022,6 +2028,7 @@ def _plot_reports(
         out = f"{prefix}_reward_evaluation.png"
         _ensure_parent_dir(out)
         plt.savefig(out, dpi=150)
+        print(f"Saved graph -> {out}")
         plt.close()
         
     # 6) manipulated coefficient trajectories
@@ -2061,6 +2068,7 @@ def _plot_reports(
             out = f"{prefix}_coeff_{coeff}_trajectory.png"
             _ensure_parent_dir(out)
             plt.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
             plt.close()
 
 
@@ -2133,6 +2141,26 @@ def main():
     args, unknown_args = parser.parse_known_args()
     if unknown_args:
         print(f"[WARN] Ignoring unrecognized CLI args: {unknown_args}")
+        
+    code_dir = os.path.dirname(os.path.abspath(__file__))
+
+    def _pin_graph_prefix_to_code_dir(prefix: str, flag_name: str) -> str:
+        """Force graph outputs to live beside Core.py, even when absolute prefixes are passed."""
+        normalized = os.path.normpath(prefix)
+        if os.path.isabs(normalized):
+            rewritten = os.path.join(code_dir, os.path.basename(normalized))
+            print(
+                f"[WARN] {flag_name} was absolute ({prefix}); "
+                f"rewriting to {rewritten} so graphs are generated in code folder."
+            )
+            return rewritten
+        return os.path.join(code_dir, normalized)
+
+    args.report_prefix = _pin_graph_prefix_to_code_dir(args.report_prefix, "--report_prefix")
+    args.comparison_plot_prefix = _pin_graph_prefix_to_code_dir(
+        args.comparison_plot_prefix,
+        "--comparison_plot_prefix",
+    )
 
     core = Core(
         market_name=args.market,
