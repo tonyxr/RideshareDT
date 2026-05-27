@@ -375,7 +375,7 @@ class Core:
         # choice model
         self.choice_mode = choice_mode
         if choice_mode in {"llm", "cognitive"}:
-            self.choice_model = LLMChoiceModel(model_name=model_name, api_key=openai_api_key, seed=self.seed)
+            self.choice_model = LLMChoiceModel(model_name=model_name, api_key=self.openai_api_key, seed=self.seed)
             if self.openai_api_key is None:
                 print("[Core] No OpenAI key found; GPT utility bootstrapping will use deterministic fallback weights.")
         else:
@@ -435,6 +435,8 @@ class Core:
         
         self.run_logs = []
         self.convergence_day: Optional[int] = None
+        self.convergence_window_std_at_day: Optional[float] = None
+        self.convergence_delta_per_day_at_day: Optional[float] = None
         
         self.reward_share_weight = float(max(0.0, reward_share_weight))
         self.reward_revenue_weight = float(max(0.0, reward_revenue_weight))
@@ -760,17 +762,24 @@ class Core:
     def _bootstrap_synthetic_profiles(self, pool_size: int) -> None:
         base_profiles = self.agent_gen.sample_profiles(int(max(1, pool_size)))
         self.synthetic_profile_pool = []
+        utility_source_counts: Dict[str, int] = {}
         for p in base_profiles:
             coldstart_rides = self._build_coldstart_rides(n=10)
             util = self._gpt_profile_utility(profile=p, rides=coldstart_rides)
+            src = str(util.get("source", "fallback"))
+            utility_source_counts[src] = int(utility_source_counts.get(src, 0) + 1)
             self.synthetic_profile_pool.append({
                 **p,
                 "ColdstartRides": coldstart_rides,
                 "UtilityWeights": util["weights"],
                 "UtilityFunction": util["utility_function"],
                 "UtilityRationale": util.get("rationale", ""),
-                "UtilitySource": util.get("source", "fallback"),
+                "UtilitySource": src,
             })
+        print(
+            ">>> Utility bootstrap sources: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(utility_source_counts.items()))
+        )
 
     def _sample_profiles_from_pool(self, n: int) -> List[Dict[str, Any]]:
         if not self.synthetic_profile_pool:
@@ -1565,6 +1574,9 @@ class Core:
         self._initialize_run_distributions()
         self._refresh_profile_pool(rides_per_timestep=customers_per_step)
         self.convergence_day = None
+        self.convergence_window_std_at_day = None
+        self.convergence_delta_per_day_at_day = None
+        self._convergence_streak = 0
         
         for d in range(days):
             day_ctx = self.market.sample_day_context()
@@ -1715,6 +1727,8 @@ class Core:
             self.run_logs[-1]["reward_converged"] = bool(reward_converged)
             if reward_converged and self.convergence_day is None:
                 self.convergence_day = int(d + 1)
+                self.convergence_window_std_at_day = float(reward_std)
+                self.convergence_delta_per_day_at_day = float(reward_delta)
                 print(
                     f"[Convergence] Optimization converged at day {self.convergence_day} "
                     f"(window_std={reward_std:.4f}, delta/day={reward_delta:.4f})."
@@ -1748,11 +1762,21 @@ class Core:
         
         if self.run_logs:
             final = self.run_logs[-1]
+            summary_std = (
+                float(self.convergence_window_std_at_day)
+                if self.convergence_window_std_at_day is not None
+                else float(final.get("reward_window_std", 0.0))
+            )
+            summary_delta = (
+                float(self.convergence_delta_per_day_at_day)
+                if self.convergence_delta_per_day_at_day is not None
+                else float(final.get("reward_window_delta", 0.0))
+            )
             print(
                 "[Convergence Summary] "
                 f"converged_day={self.convergence_day if self.convergence_day is not None else 'not reached'} "
-                f"window_std={float(final.get('reward_window_std', 0.0)):.4f} "
-                f"delta/day={float(final.get('reward_window_delta', 0.0)):.4f}"
+                f"window_std={summary_std:.4f} "
+                f"delta/day={summary_delta:.4f}"
             )
             
         if profiles_out:
