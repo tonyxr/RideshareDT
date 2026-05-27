@@ -56,14 +56,21 @@ class FirmHeuristicPricer:
         self.rng = np.random.default_rng(seed)
         self.overrides = CoefficientOverrides()
         keys = list(managed_keys) if managed_keys is not None else ["base_fare", "per_minute"]
-        self.managed_keys = tuple(k for k in keys if k in {"base_fare", "per_minute"})
+        editable = {"base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"}
+        self.managed_keys = tuple(k for k in keys if k in editable)
         if not self.managed_keys:
             self.managed_keys = ("base_fare", "per_minute")
 
         self.step_base_fare = 0.10
         self.step_per_minute = 0.01
+        self.step_per_mile = 0.05
+        self.step_booking_fee = 0.10
+        self.step_airport_fee = 0.10
         self.base_bounds = (1.50, 6.00)
         self.pmin_bounds = (0.10, 1.00)
+        self.pmile_bounds = (0.50, 4.00)
+        self.booking_bounds = (0.00, 6.00)
+        self.airport_bounds = (0.00, 12.00)
 
         self.target_share = 0.50
         self.share_band = 0.03
@@ -86,6 +93,12 @@ class FirmHeuristicPricer:
             self.overrides.base_fare = float(city_base)
         if "per_minute" in self.managed_keys and self.overrides.per_minute is None:
             self.overrides.per_minute = float(city_pmin)
+        if "per_mile" in self.managed_keys and self.overrides.per_mile is None:
+            self.overrides.per_mile = 1.50
+        if "booking_fee" in self.managed_keys and self.overrides.booking_fee is None:
+            self.overrides.booking_fee = 2.00
+        if "airport_fee" in self.managed_keys and self.overrides.airport_fee is None:
+            self.overrides.airport_fee = 5.00
 
         if self.cooldown > 0:
             self.cooldown -= 1
@@ -97,6 +110,9 @@ class FirmHeuristicPricer:
         # baseline targets (schedule)
         base_target = city_base + (0.20 if peak else 0.0) + (0.10 if bad_weather else 0.0)
         pmin_target = city_pmin + (0.01 if peak else 0.0) + (0.005 if bad_weather else 0.0)
+        pmile_target = 1.50 + (0.08 if peak else 0.0) + (0.05 if bad_weather else 0.0)
+        booking_target = 2.00 + (0.08 if peak else 0.0) + (0.04 if bad_weather else 0.0)
+        airport_target = 5.00 + (0.20 if peak else 0.0)
 
         losing = self.ema_share < (self.target_share - self.share_band)
         overpriced = self.ema_gap > self.price_gap_threshold
@@ -121,6 +137,15 @@ class FirmHeuristicPricer:
             elif "per_minute" in self.managed_keys and abs(float(self.overrides.per_minute) - pmin_target) > 0.02:
                 chosen = "pmin"
                 direction = +1 if float(self.overrides.per_minute) < pmin_target else -1
+            elif "per_mile" in self.managed_keys and abs(float(self.overrides.per_mile) - pmile_target) > 0.08:
+                chosen = "pmile"
+                direction = +1 if float(self.overrides.per_mile) < pmile_target else -1
+            elif "booking_fee" in self.managed_keys and abs(float(self.overrides.booking_fee) - booking_target) > 0.12:
+                chosen = "booking"
+                direction = +1 if float(self.overrides.booking_fee) < booking_target else -1
+            elif "airport_fee" in self.managed_keys and abs(float(self.overrides.airport_fee) - airport_target) > 0.20:
+                chosen = "airport"
+                direction = +1 if float(self.overrides.airport_fee) < airport_target else -1
         
         if preferred == "base" and "base_fare" not in self.managed_keys:
             chosen = "pmin" if "per_minute" in self.managed_keys else None
@@ -137,6 +162,18 @@ class FirmHeuristicPricer:
         elif chosen == "pmin" and "per_minute" in self.managed_keys:
             self.overrides.per_minute = float(np.clip(
                 float(self.overrides.per_minute) + direction * self.step_per_minute, *self.pmin_bounds
+            ))
+        elif chosen == "pmile" and "per_mile" in self.managed_keys:
+            self.overrides.per_mile = float(np.clip(
+                float(self.overrides.per_mile) + direction * self.step_per_mile, *self.pmile_bounds
+            ))
+        elif chosen == "booking" and "booking_fee" in self.managed_keys:
+            self.overrides.booking_fee = float(np.clip(
+                float(self.overrides.booking_fee) + direction * self.step_booking_fee, *self.booking_bounds
+            ))
+        elif chosen == "airport" and "airport_fee" in self.managed_keys:
+            self.overrides.airport_fee = float(np.clip(
+                float(self.overrides.airport_fee) + direction * self.step_airport_fee, *self.airport_bounds
             ))
 
         self.cooldown = self.cooldown_H
