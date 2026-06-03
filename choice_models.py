@@ -83,7 +83,7 @@ class CognitiveChoiceModel(BaseChoiceModel):
     Higher-fidelity behavioral model for rider platform choice.
 
     Utility(Firm1 - Firm2) combines:
-    - Economic utility: nonlinear price pain with rider heterogeneity
+    - Economic utility: nonlinear price pain with rider heterogeneity and rider-level price thresholds
     - Habit/loyalty inertia: persistent preference for prior platform
     - Reliability-risk sensitivity: stronger in airport, bad weather, rush periods
     - Convenience effects: trip urgency and service context
@@ -141,11 +141,7 @@ class CognitiveChoiceModel(BaseChoiceModel):
         weekend = day >= 5
         bad_weather = weather in {"rain", "snow", "storm"}
         
-        util_w = profile.get("UtilityWeights", {}) if isinstance(profile.get("UtilityWeights", {}), dict) else {}
-        w_price = float(util_w.get("price_weight", 1.0))
-        w_loyalty = float(util_w.get("loyalty_weight", 1.0))
-        w_risk = float(util_w.get("risk_weight", 1.0))
-        w_comfort = float(util_w.get("comfort_weight", 1.0))
+        price_threshold = float(np.clip(float(profile.get("PriceThreshold", 1.50) or 1.50), 0.25, 8.00))
 
         # ---- Economic utility ----
         # Low income + larger household -> stronger price pain.
@@ -154,16 +150,20 @@ class CognitiveChoiceModel(BaseChoiceModel):
         urgency = 0.40 * float(rush) + 0.35 * float(bad_weather) + 0.30 * float(airport)
         shopping_intensity = max(0.45, 1.0 - 0.45 * urgency)
 
-        # Nonlinear price pain: people react more strongly to larger fare gaps.
+        # Nonlinear price pain: people react more strongly once a fare gap clears
+        # their rider-specific threshold. Smaller gaps still matter, but are less salient.
         price_gap = float(price2 - price1)
-        price_term = w_price * price_sensitivity * np.sign(price_gap) * (abs(price_gap) ** 0.92) * shopping_intensity
+        threshold_ratio = abs(price_gap) / max(price_threshold, 1e-6)
+        price_salience = 0.35 + 0.65 * min(threshold_ratio, 1.0) + 0.25 * max(threshold_ratio - 1.0, 0.0)
+        price_salience = float(np.clip(price_salience, 0.20, 2.25))
+        price_term = price_sensitivity * np.sign(price_gap) * (abs(price_gap) ** 0.92) * shopping_intensity * price_salience
 
         # ---- Habit / loyalty ----
         loyalty_term = 0.0
         if loyalty_firm == "Firm1":
-            loyalty_term = +0.85 * self.loyalty_scale * loyalty_strength * w_loyalty
+            loyalty_term = +0.85 * self.loyalty_scale * loyalty_strength
         elif loyalty_firm == "Firm2":
-            loyalty_term = -0.85 * self.loyalty_scale * loyalty_strength * w_loyalty
+            loyalty_term = -0.85 * self.loyalty_scale * loyalty_strength
 
         # Inertia for non-loyal users near ties.
         habit_inertia = 0.0
@@ -177,12 +177,12 @@ class CognitiveChoiceModel(BaseChoiceModel):
         
         # Small structural preference drift (can be calibrated later with data).
         reliability_bias_firm1 = 0.02
-        reliability_term = reliability_pressure * reliability_bias_firm1 * self.reliability_scale * w_risk
+        reliability_term = reliability_pressure * reliability_bias_firm1 * self.reliability_scale
         
         # Convenience/service framing: premium riders less price-sensitive and more inertial.
         comfort_term = 0.0
         if service == "premium":
-            comfort_term = (0.05 + 0.10 * income_score) * w_comfort
+            comfort_term = 0.05 + 0.10 * income_score
         
         # Longer trips => stronger reaction to absolute gap.
         trip_scale = 1.0 + 0.06 * min(distance / 10.0, 2.0)
@@ -198,7 +198,7 @@ class CognitiveChoiceModel(BaseChoiceModel):
         choice = "Firm1" if choose_f1 else "Firm2"
         
         reasons: List[str] = []
-        if abs(price_gap) >= 0.75:
+        if abs(price_gap) >= price_threshold:
             reasons.append("PRICE")
         if loyalty_firm is not None and loyalty_strength > 0.2:
             reasons.append("LOYALTY")
@@ -228,12 +228,12 @@ class LLMChoiceModel(CognitiveChoiceModel):
     """
     Backward-compatible alias.
 
-    GPT-assisted rider utility generation is handled at profile bootstrap time in Core.
-    At choice time this class consumes profile-level UtilityWeights produced upstream.
+    GPT-assisted rider price-threshold generation is handled at profile bootstrap time in Core.
+    At choice time this class consumes profile-level PriceThreshold values produced upstream.
     """
 
     def __init__(self, model_name: str = "gpt-4o-mini", api_key: Optional[str] = None, seed: Optional[int] = None):
         self.model_name = model_name
         self.api_key = api_key
         super().__init__(seed=seed)
-        print("[ChoiceModel] GPT profile-utility mode enabled (weights consumed from profile).")
+        print("[ChoiceModel] GPT price-threshold mode enabled (thresholds consumed from profile).")

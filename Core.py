@@ -251,8 +251,6 @@ def _iter_tabular_rows(fpath: str):
             yield fieldnames, records
         return
 
-
-
 def _infer_service_level(row: Dict[str, Any]) -> str:
     service_text = str(_pick_value(row, ["service", "name", "cab_type", "product_name", "product_id", "business", "Business"]) or "").lower()
     premium_markers = ["black", "lux", "luxury", "prem", "premium", "select", "suv"]
@@ -377,7 +375,7 @@ class Core:
         if choice_mode in {"llm", "cognitive"}:
             self.choice_model = LLMChoiceModel(model_name=model_name, api_key=self.openai_api_key, seed=self.seed)
             if self.openai_api_key is None:
-                print("[Core] No OpenAI key found; GPT utility bootstrapping will use deterministic fallback weights.")
+                print("[Core] No OpenAI key found; GPT price-threshold bootstrapping will use deterministic fallback thresholds.")
         else:
             self.choice_model = ParametricChoiceModel(seed=self.seed)
 
@@ -697,15 +695,29 @@ class Core:
                         chunks.append(txt)
         return "\n".join(chunks).strip()
 
-    def _gpt_profile_utility(self, profile: Dict[str, Any], rides: List[Dict[str, Any]]) -> Dict[str, Any]:
-        fallback_weights = {"price_weight": 1.0, "loyalty_weight": 1.0, "risk_weight": 1.0, "comfort_weight": 1.0}
-        fallback = {
-            "weights": fallback_weights,
-            "utility_function": "U = w_price*price_term + w_loyalty*loyalty_term + w_risk*risk_term + w_comfort*comfort_term",
-            "rationale": "Deterministic fallback utility function (no API response).",
-            "source": "fallback",
-        }
+    @staticmethod
+    def _fallback_price_threshold(profile: Dict[str, Any], priced_rides: List[Dict[str, Any]]) -> float:
+        """Estimate the fare-gap threshold at which price becomes salient for a rider."""
+        income_score = {"<50k": 0.0, "50k-100k": 0.3, "100k-200k": 0.7, "200k+": 1.0}.get(
+            str(profile.get("IncomeBracket", "50k-100k")),
+            0.3,
+        )
+        household = int(profile.get("HouseholdSize", 1) or 1)
+        loyalty_strength = float(profile.get("LoyaltyStrength", 0.0) or 0.0)
+        is_returning = str(profile.get("LoyaltyType", "New")) == "Returning"
+        mean_fare = 15.0
+        if priced_rides:
+            fares = [float(r.get("firm1_price", 0.0)) for r in priced_rides] + [float(r.get("firm2_price", 0.0)) for r in priced_rides]
+            valid_fares = [fare for fare in fares if fare > 0.0]
+            if valid_fares:
+                mean_fare = float(np.mean(valid_fares))
 
+        threshold = 0.55 + 1.65 * income_score + 0.04 * mean_fare
+        threshold -= 0.18 * min(max(household - 1, 0), 3)
+        threshold += (0.35 + 0.45 * loyalty_strength) if is_returning else 0.0
+        return float(np.clip(threshold, 0.50, 5.00))
+
+    def _gpt_profile_price_threshold(self, profile: Dict[str, Any], rides: List[Dict[str, Any]]) -> Dict[str, Any]:
         priced = []
         for r in rides[:10]:
             rc = RideContext(
@@ -718,25 +730,32 @@ class Core:
             p1 = float(self.market.quote_price(float(r.get("DistanceMiles", 0.0)), float(r.get("DurationMinutes", 15.0)), rc, overrides=self.firm1.overrides))
             p2 = float(self.market.quote_price(float(r.get("DistanceMiles", 0.0)), float(r.get("DurationMinutes", 15.0)), rc, overrides=self.firm2.overrides))
             priced.append({**r, "firm1_price": p1, "firm2_price": p2})
+        
+        fallback = {
+            "price_threshold": self._fallback_price_threshold(profile, priced),
+            "rationale": "Deterministic fallback price threshold (no API response).",
+            "source": "fallback",
+        }
+        
         if not self.openai_api_key:
             return fallback
         prompt = {
             "task": (
-                "Infer a rider-level utility function from one profile and ten cold-start rides. "
-                "Return JSON with keys: weights, utility_function, rationale. "
-                "weights must include price_weight, loyalty_weight, risk_weight, comfort_weight, each in [0.6,1.6]."
+                "Infer one rider-level price threshold from one customer profile and ten cold-start rides. "
+                "The threshold is the dollar fare gap at which this customer starts treating price as a primary decision factor. "
+                "Return JSON with keys: price_threshold, rationale. Do not return utility functions or utility weights."
             ),
             "profile": profile,
             "coldstart_rides": priced[:10],
             "output_constraints": {
                 "format": "json_only",
-                "weights_range": [0.6, 1.6],
+                "price_threshold_range_usd": [0.50, 5.00],
             },
         }
         try:
             req = urllib.request.Request(
                 "https://api.openai.com/v1/responses",
-                data=json.dumps({"model": self.model_name, "input": json.dumps(prompt), "max_output_tokens": 260}).encode("utf-8"),
+                data=json.dumps({"model": self.model_name, "input": json.dumps(prompt), "max_output_tokens": 180}).encode("utf-8"),
                 headers={"Authorization": f"Bearer {self.openai_api_key}", "Content-Type": "application/json"},
                 method="POST",
             )
@@ -745,14 +764,9 @@ class Core:
             
             text = self._extract_response_text(payload)
             parsed = json.loads(text) if text else {}
-            raw_weights = parsed.get("weights", parsed)
-            weights = {
-                k: float(np.clip(raw_weights.get(k, v), 0.6, 1.6))
-                for k, v in fallback_weights.items()
-            }
+            raw_threshold = parsed.get("price_threshold", parsed.get("price_threshold_usd", fallback["price_threshold"]))
             return {
-                "weights": weights,
-                "utility_function": str(parsed.get("utility_function", fallback["utility_function"])),
+                "price_threshold": float(np.clip(float(raw_threshold), 0.50, 5.00)),
                 "rationale": str(parsed.get("rationale", "")),
                 "source": "gpt",
             }
@@ -762,23 +776,22 @@ class Core:
     def _bootstrap_synthetic_profiles(self, pool_size: int) -> None:
         base_profiles = self.agent_gen.sample_profiles(int(max(1, pool_size)))
         self.synthetic_profile_pool = []
-        utility_source_counts: Dict[str, int] = {}
+        threshold_source_counts: Dict[str, int] = {}
         for p in base_profiles:
             coldstart_rides = self._build_coldstart_rides(n=10)
-            util = self._gpt_profile_utility(profile=p, rides=coldstart_rides)
-            src = str(util.get("source", "fallback"))
-            utility_source_counts[src] = int(utility_source_counts.get(src, 0) + 1)
+            threshold = self._gpt_profile_price_threshold(profile=p, rides=coldstart_rides)
+            src = str(threshold.get("source", "fallback"))
+            threshold_source_counts[src] = int(threshold_source_counts.get(src, 0) + 1)
             self.synthetic_profile_pool.append({
                 **p,
                 "ColdstartRides": coldstart_rides,
-                "UtilityWeights": util["weights"],
-                "UtilityFunction": util["utility_function"],
-                "UtilityRationale": util.get("rationale", ""),
-                "UtilitySource": src,
+                "PriceThreshold": float(threshold["price_threshold"]),
+                "PriceThresholdRationale": threshold.get("rationale", ""),
+                "PriceThresholdSource": src,
             })
         print(
-            ">>> Utility bootstrap sources: "
-            + ", ".join(f"{k}={v}" for k, v in sorted(utility_source_counts.items()))
+            ">>> Price-threshold bootstrap sources: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(threshold_source_counts.items()))
         )
 
     def _sample_profiles_from_pool(self, n: int) -> List[Dict[str, Any]]:
