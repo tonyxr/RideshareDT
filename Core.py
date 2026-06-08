@@ -21,8 +21,10 @@ import io
 import importlib.util
 import json
 import os
+import urllib.error
 import urllib.request
 import random
+import time
 import re
 import zipfile
 from collections import Counter
@@ -343,6 +345,8 @@ class Core:
         reward_rev_scale: float = 25.0,
         reward_competitive_weight: float = 0.12,
         reward_trend_weight: float = 0.08,
+        gpt_threshold_batch_size: int = 20,
+        gpt_threshold_max_retries: int = 2,
     ):
         self.rng = np.random.default_rng(seed)
         self.market = MarketInteraction(city_name=market_name, seed=seed)
@@ -361,6 +365,9 @@ class Core:
         self.model_name = model_name
         self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
         self.synthetic_profile_pool: List[Dict[str, Any]] = []
+        self.gpt_threshold_batch_size = int(max(1, gpt_threshold_batch_size))
+        self.gpt_threshold_max_retries = int(max(0, gpt_threshold_max_retries))
+        self.gpt_threshold_error_counts: Dict[str, int] = {}
         self.training_stable_window = 30
         self.training_stable_tol = 0.012
         self.reward_convergence_window = 60
@@ -694,6 +701,15 @@ class Core:
                     if isinstance(txt, str) and txt:
                         chunks.append(txt)
         return "\n".join(chunks).strip()
+    
+    @staticmethod
+    def _parse_response_json(text: str) -> Dict[str, Any]:
+        """Parse model JSON, tolerating simple markdown code fences."""
+        cleaned = str(text or "").strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+        return json.loads(cleaned) if cleaned else {}
 
     @staticmethod
     def _fallback_price_threshold(profile: Dict[str, Any], priced_rides: List[Dict[str, Any]]) -> float:
@@ -717,8 +733,9 @@ class Core:
         threshold += (0.35 + 0.45 * loyalty_strength) if is_returning else 0.0
         return float(np.clip(threshold, 0.50, 5.00))
 
-    def _gpt_profile_price_threshold(self, profile: Dict[str, Any], rides: List[Dict[str, Any]]) -> Dict[str, Any]:
-        priced = []
+    def _price_coldstart_rides(self, rides: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Attach current firm prices to cold-start ride contexts."""
+        priced: List[Dict[str, Any]] = []
         for r in rides[:10]:
             rc = RideContext(
                 day_of_week=int(r["DayOfWeek"]),
@@ -730,69 +747,183 @@ class Core:
             p1 = float(self.market.quote_price(float(r.get("DistanceMiles", 0.0)), float(r.get("DurationMinutes", 15.0)), rc, overrides=self.firm1.overrides))
             p2 = float(self.market.quote_price(float(r.get("DistanceMiles", 0.0)), float(r.get("DurationMinutes", 15.0)), rc, overrides=self.firm2.overrides))
             priced.append({**r, "firm1_price": p1, "firm2_price": p2})
-        
-        fallback = {
-            "price_threshold": self._fallback_price_threshold(profile, priced),
-            "rationale": "Deterministic fallback price threshold (no API response).",
+        return priced
+
+    def _threshold_fallback_result(self, profile: Dict[str, Any], priced_rides: List[Dict[str, Any]], rationale: str = "Deterministic fallback price threshold (no API response).") -> Dict[str, Any]:
+        return {
+            "price_threshold": self._fallback_price_threshold(profile, priced_rides),
+            "rationale": rationale,
             "source": "fallback",
         }
         
-        if not self.openai_api_key:
-            return fallback
+        
+    def _record_gpt_threshold_error(self, reason: str, detail: str = "") -> None:
+        """Track GPT threshold failures without flooding logs during large bootstraps."""
+        key = str(reason or "unknown")
+        self.gpt_threshold_error_counts[key] = int(self.gpt_threshold_error_counts.get(key, 0) + 1)
+        if self.gpt_threshold_error_counts[key] <= 5:
+            suffix = f": {detail}" if detail else ""
+            print(f"[GPT threshold fallback] {key}{suffix}")
+
+    def _gpt_threshold_schema(self) -> Dict[str, Any]:
+        """Responses API structured-output schema for batched threshold generation."""
+        return {
+            "type": "json_schema",
+            "name": "price_threshold_batch",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "thresholds": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "index": {"type": "integer"},
+                                "price_threshold": {"type": "number", "minimum": 0.50, "maximum": 5.00},
+                                "rationale": {"type": "string"},
+                            },
+                            "required": ["index", "price_threshold", "rationale"],
+                        },
+                    }
+                },
+                "required": ["thresholds"],
+            },
+        }
+
+    def _gpt_batch_price_thresholds(self, batch: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]) -> List[Dict[str, Any]]:
+        """
+        Infer price thresholds for multiple profiles in one API request.
+
+        Batching reduces the default 20,000-profile bootstrap from 20,000 API calls
+        to roughly pool_size / gpt_threshold_batch_size calls, improving throughput
+        and reducing rate-limit pressure while keeping deterministic fallback safety.
+        """
+        prepared: List[Dict[str, Any]] = []
+        results: List[Dict[str, Any]] = []
+        for i, (profile, rides) in enumerate(batch):
+            priced = self._price_coldstart_rides(rides)
+            prepared.append({"index": i, "profile": profile, "coldstart_rides": priced[:10]})
+            results.append(self._threshold_fallback_result(profile, priced))
+
+        if not self.openai_api_key or not prepared:
+            return results
+
+                            
         prompt = {
             "task": (
-                "Infer one rider-level price threshold from one customer profile and ten cold-start rides. "
-                "The threshold is the dollar fare gap at which this customer starts treating price as a primary decision factor. "
-                "Return JSON with keys: price_threshold, rationale. Do not return utility functions or utility weights."
+                "Infer one rider-level price threshold for each item. The threshold is the dollar fare gap at which "
+                "that customer starts treating price as a primary decision factor. Return exactly one result for "
+                "each input index. Do not return utility functions or utility weights."
             ),
-            "profile": profile,
-            "coldstart_rides": priced[:10],
+            "profiles": prepared,
             "output_constraints": {
                 "format": "json_only",
                 "price_threshold_range_usd": [0.50, 5.00],
+                "response_shape": {"thresholds": [{"index": 0, "price_threshold": 2.0, "rationale": "short explanation"}]},
             },
         }
-        try:
-            req = urllib.request.Request(
-                "https://api.openai.com/v1/responses",
-                data=json.dumps({"model": self.model_name, "input": json.dumps(prompt), "max_output_tokens": 180}).encode("utf-8"),
-                headers={"Authorization": f"Bearer {self.openai_api_key}", "Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            
-            text = self._extract_response_text(payload)
-            parsed = json.loads(text) if text else {}
-            raw_threshold = parsed.get("price_threshold", parsed.get("price_threshold_usd", fallback["price_threshold"]))
-            return {
-                "price_threshold": float(np.clip(float(raw_threshold), 0.50, 5.00)),
-                "rationale": str(parsed.get("rationale", "")),
-                "source": "gpt",
-            }
-        except Exception:
-            return fallback
+        payload = {
+            "model": self.model_name,
+            "input": json.dumps(prompt),
+            "max_output_tokens": int(max(220, 80 * len(prepared))),
+            "text": {"format": self._gpt_threshold_schema()},
+        }
+
+        last_error = ""
+        for attempt in range(self.gpt_threshold_max_retries + 1):
+            try:
+                req = urllib.request.Request(
+                    "https://api.openai.com/v1/responses",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Authorization": f"Bearer {self.openai_api_key}", "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    response_payload = json.loads(resp.read().decode("utf-8"))
+
+                text = self._extract_response_text(response_payload)
+                parsed = self._parse_response_json(text)
+                threshold_rows = parsed.get("thresholds", [])
+                if not isinstance(threshold_rows, list):
+                    raise ValueError("Response JSON did not contain a thresholds array")
+
+                seen = 0
+                for item in threshold_rows:
+                    if not isinstance(item, dict):
+                        continue
+                    idx = int(item.get("index", -1))
+                    if idx < 0 or idx >= len(results):
+                        continue
+                    raw_threshold = item.get("price_threshold", item.get("price_threshold_usd"))
+                    if raw_threshold is None:
+                        continue
+                    results[idx] = {
+                        "price_threshold": float(np.clip(float(raw_threshold), 0.50, 5.00)),
+                        "rationale": str(item.get("rationale", "")),
+                        "source": "gpt",
+                    }
+                    seen += 1
+                if seen == 0:
+                    raise ValueError("Response JSON contained no usable threshold rows")
+                if seen < len(results):
+                    self._record_gpt_threshold_error("partial_batch", f"usable={seen}/{len(results)}")
+                return results
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", errors="replace")[:300]
+                last_error = f"HTTP {e.code} {detail}"
+                if e.code not in {408, 409, 429, 500, 502, 503, 504} or attempt >= self.gpt_threshold_max_retries:
+                    break
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+                if attempt >= self.gpt_threshold_max_retries:
+                    break
+            time.sleep(float(min(8.0, 1.5 * (2 ** attempt))))
+
+        self._record_gpt_threshold_error("batch_failed", last_error)
+        return results
+
+    def _gpt_profile_price_threshold(self, profile: Dict[str, Any], rides: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Compatibility wrapper for callers that need a single threshold."""
+        return self._gpt_batch_price_thresholds([(profile, rides)])[0]
 
     def _bootstrap_synthetic_profiles(self, pool_size: int) -> None:
         base_profiles = self.agent_gen.sample_profiles(int(max(1, pool_size)))
         self.synthetic_profile_pool = []
         threshold_source_counts: Dict[str, int] = {}
-        for p in base_profiles:
-            coldstart_rides = self._build_coldstart_rides(n=10)
-            threshold = self._gpt_profile_price_threshold(profile=p, rides=coldstart_rides)
-            src = str(threshold.get("source", "fallback"))
-            threshold_source_counts[src] = int(threshold_source_counts.get(src, 0) + 1)
-            self.synthetic_profile_pool.append({
-                **p,
-                "ColdstartRides": coldstart_rides,
-                "PriceThreshold": float(threshold["price_threshold"]),
-                "PriceThresholdRationale": threshold.get("rationale", ""),
-                "PriceThresholdSource": src,
-            })
+        self.gpt_threshold_error_counts = {}
+        batch_size = int(max(1, self.gpt_threshold_batch_size))
+        for start in range(0, len(base_profiles), batch_size):
+            profile_batch = list(base_profiles[start:start + batch_size])
+            rides_batch = [(p, self._build_coldstart_rides(n=10)) for p in profile_batch]
+            thresholds = self._gpt_batch_price_thresholds(rides_batch)
+            for (p, coldstart_rides), threshold in zip(rides_batch, thresholds):
+                src = str(threshold.get("source", "fallback"))
+                threshold_source_counts[src] = int(threshold_source_counts.get(src, 0) + 1)
+                self.synthetic_profile_pool.append({
+                    **p,
+                    "ColdstartRides": coldstart_rides,
+                    "PriceThreshold": float(threshold["price_threshold"]),
+                    "PriceThresholdRationale": threshold.get("rationale", ""),
+                    "PriceThresholdSource": src,
+                })
+
+        total = int(sum(threshold_source_counts.values()))
+        summary_parts = []
+        for k, v in sorted(threshold_source_counts.items()):
+            pct = 100.0 * float(v) / float(max(1, total))
+            summary_parts.append(f"{k}={v} ({pct:.1f}%)")
         print(
-            ">>> Price-threshold bootstrap sources: "
-            + ", ".join(f"{k}={v}" for k, v in sorted(threshold_source_counts.items()))
+            f">>> Price-threshold bootstrap sources (batch_size={batch_size}): "
+            + ", ".join(summary_parts)
         )
+        if self.gpt_threshold_error_counts:
+            print(
+                ">>> GPT threshold fallback errors: "
+                + ", ".join(f"{k}={v}" for k, v in sorted(self.gpt_threshold_error_counts.items()))
+            )
 
     def _sample_profiles_from_pool(self, n: int) -> List[Dict[str, Any]]:
         if not self.synthetic_profile_pool:
@@ -2151,6 +2282,8 @@ def main():
     parser.add_argument("--reward_rev_scale", type=float, default=25.0)
     parser.add_argument("--reward_competitive_weight", type=float, default=0.12)
     parser.add_argument("--reward_trend_weight", type=float, default=0.08)
+    parser.add_argument("--gpt_threshold_batch_size", type=int, default=20, help="Profiles per GPT price-threshold API request. Larger values improve API utilization but increase per-request payload size.")
+    parser.add_argument("--gpt_threshold_max_retries", type=int, default=2, help="Retries per GPT price-threshold batch before deterministic fallback is used.")
     parser.add_argument("--calibration_csv", type=str, default="", help="Optional historical CSV used to calibrate priors and choice sensitivity.")
     parser.add_argument("--calibration_city", type=str, default="", help="Optional city filter for --calibration_csv; defaults to --market if omitted.")
     parser.add_argument("--calibration_preset", type=str, default="nyc_public", choices=["", "nyc_public"], help="Built-in preset calibration. Defaults to nyc_public (NYC TLC + ACS + weather priors).")
@@ -2217,6 +2350,8 @@ def main():
         reward_rev_scale=args.reward_rev_scale,
         reward_competitive_weight=args.reward_competitive_weight,
         reward_trend_weight=args.reward_trend_weight,
+        gpt_threshold_batch_size=args.gpt_threshold_batch_size,
+        gpt_threshold_max_retries=args.gpt_threshold_max_retries,
     )
     
     if args.calibration_preset:

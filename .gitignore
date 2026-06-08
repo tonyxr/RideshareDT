@@ -1,3 +1,4 @@
 model/rideshare_data.parquet
 *.csv
 **/*.csv
+.env
