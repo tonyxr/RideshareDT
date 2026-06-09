@@ -1,0 +1,80 @@
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+[ChoiceModel] GPT price-threshold mode enabled (thresholds consumed from profile).
+Using random seed: 1083622708
+[RewardConfig] share=0.60, revenue=0.40, overprice_penalty=0.35, rev_scale=25.00, competitive=0.12, trend=0.08
+[Calibration] Applied preset=nyc_public for market=New York City.
+[Calibration] {
+  "sample_size": 12000000,
+  "market": {
+    "weather_probs": {
+      "clear": 0.58,
+      "rain": 0.29,
+      "snow": 0.13
+    },
+    "service_probs": {
+      "economy": 0.88,
+      "premium": 0.12
+    },
+    "airport_prob": 0.19
+  },
+  "agent": {
+    "age_mean": 36.8,
+    "age_std": 12.4,
+    "income_probs": {
+      "<50k": 0.21,
+      "50k-100k": 0.34,
+      "100k-200k": 0.29,
+      "200k+": 0.16
+    },
+    "household_lambda": 1.95,
+    "p_new": 0.34
+  },
+  "choice": {
+    "price_sensitivity_scale": 1.12,
+    "loyalty_scale": 0.97,
+    "reliability_scale": 1.08
+  }
+}
+>>> Price-threshold bootstrap sources (batch_size=10): gpt=40 (100.0%)
+>>> GPT threshold API utilization: batches_total=4, batches_attempted=4, batches_succeeded=4, profiles_requested=40, profiles_gpt=40, batch_success_rate=100.0%, profile_gpt_rate=100.0%, profile_fallback_rate=0.0%
+[Day 1/1] avg_share(F1)=0.200 avg_revPR(F1)=$4.89 avg_gap(F2-F1)=$-4.11
+  [PPO] KL=-0.0018 clipfrac=0.000 ent=2.708 ent_coeff=0.0449 lr=0.000300 kl_stop=False
+[Convergence Summary] converged_day=not reached window_std=0.0000 delta/day=1.0000
+>>> Saved sampled profiles -> artifacts/smoke_sampled_profiles.csv (rows=10)
+[Final Coefficients after 1 days] Firm1={"airport_fee": 5.3465124832872135, "base_fare": 3.149220796263767, "booking_fee": 2.9978767858469317, "per_mile": 2.06368928369704, "per_minute": 0.41769065661175186} Firm2={"airport_fee": 6.056379000723895, "base_fare": 3.0908749558517643, "booking_fee": 2.5653856940724378, "per_mile": 1.6400562621477015, "per_minute": 0.4475995657853494}
+Saved -> market_runs.csv
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_ride_distributions.csv
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_dist_DayOfWeek.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_dist_Weather.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_dist_Hour.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_dist_Airport.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_dist_Service.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_dist_Choice.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_dist_TravelDistance.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_reward_run.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_convergence_run.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_coeff_airport_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_coeff_base_fare_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_coeff_booking_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_coeff_per_mile_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_coeff_per_minute_trajectory.png

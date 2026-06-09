@@ -1541,21 +1541,21 @@ class Core:
         prices_pred = [float(r["rl_predicted_price"]) for r in rows_out if r.get("rl_predicted_price") is not None]
 
         if prices_actual and prices_pred:
-            plt.figure(figsize=(7, 5))
-            plt.scatter(prices_actual, prices_pred, s=10, alpha=0.35)
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.scatter(prices_actual, prices_pred, s=10, alpha=0.35)
             lo = float(min(prices_actual + prices_pred))
             hi = float(max(prices_actual + prices_pred))
-            plt.plot([lo, hi], [lo, hi], "r--", linewidth=1.2, label="ideal match")
-            plt.title("RL Predicted Price vs Actual Customer Price")
-            plt.xlabel("Actual customer price")
-            plt.ylabel("RL predicted price")
-            plt.legend(loc="best")
-            plt.tight_layout()
+            ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.2, label="ideal match")
+            ax.set_title("RL Predicted Price vs Actual Customer Price")
+            ax.set_xlabel("Actual customer price")
+            ax.set_ylabel("RL predicted price")
+            ax.legend(loc="best")
+            fig.tight_layout()
             out = f"{out_plot_prefix}_price_match_scatter.png"
             _ensure_parent_dir(out)
-            plt.savefig(out, dpi=150)
+            fig.savefig(out, dpi=150)
             print(f"Saved graph -> {out}")
-            plt.close()
+            plt.close(fig)
 
         duration_pairs = [
             (float(r["actual_duration_minutes"]), float(r["predicted_duration_minutes"]))
@@ -1565,20 +1565,21 @@ class Core:
         if duration_pairs:
             actual_dur = [a for a, _ in duration_pairs]
             pred_dur = [p for _, p in duration_pairs]
-            plt.figure(figsize=(7, 5))
-            plt.scatter(actual_dur, pred_dur, s=10, alpha=0.35, color="tab:orange")
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.scatter(actual_dur, pred_dur, s=10, alpha=0.35, color="tab:orange")
             lo = float(min(actual_dur + pred_dur))
             hi = float(max(actual_dur + pred_dur))
-            plt.plot([lo, hi], [lo, hi], "k--", linewidth=1.2, label="ideal match")
-            plt.title("Predicted Total Time vs Actual Duration")
-            plt.xlabel("Actual trip duration (minutes)")
-            plt.ylabel("Predicted total time (minutes)")
-            plt.legend(loc="best")
-            plt.tight_layout()
+            ax.plot([lo, hi], [lo, hi], "k--", linewidth=1.2, label="ideal match")
+            ax.set_title("Predicted Total Time vs Actual Duration")
+            ax.set_xlabel("Actual trip duration (minutes)")
+            ax.set_ylabel("Predicted total time (minutes)")
+            ax.legend(loc="best")
+            fig.tight_layout()
             out = f"{out_plot_prefix}_duration_match_scatter.png"
             _ensure_parent_dir(out)
-            plt.savefig(out, dpi=150)
-            plt.close()
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
             
     def simulate_day_cycle(self, day_ctx, rides, is_training):
         """Runs one 200-ride cycle. Primarily used by run_experiment."""
@@ -2116,68 +2117,78 @@ def _plot_reports(
 
         total = max(1, sum(c.values()))
         ys = [100.0 * c[x] / total for x in xs]
-        plt.figure(figsize=(8, 4))
-        plt.bar(xs, ys)
-        plt.title(f"Ride Distribution by {p}")
-        plt.xlabel(p)
-        plt.ylabel("% of rides")
-        plt.tight_layout()
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.bar(xs, ys)
+        ax.set_title(f"Ride Distribution by {p}")
+        ax.set_xlabel(p)
+        ax.set_ylabel("% of rides")
+        fig.tight_layout()
         out = f"{prefix}_dist_{p}.png"
         _ensure_parent_dir(out)
-        plt.savefig(out, dpi=150)
+        fig.savefig(out, dpi=150)
         print(f"Saved graph -> {out}")
-        plt.close()
+        plt.close(fig)
 
     # 2) Distance histogram
     if rows:
         dvals = [float(r.get("TravelDistance", 0.0)) for r in rows]
         weights = np.ones(len(dvals), dtype=float) * (100.0 / max(1, len(dvals)))
-        plt.figure(figsize=(8, 4))
-        plt.hist(dvals, bins=20, weights=weights)
-        plt.title("Ride Distance Distribution")
-        plt.xlabel("TravelDistance")
-        plt.ylabel("% of rides")
-        plt.tight_layout()
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.hist(dvals, bins=20, weights=weights)
+        ax.set_title("Ride Distance Distribution")
+        ax.set_xlabel("TravelDistance")
+        ax.set_ylabel("% of rides")
+        fig.tight_layout()
         out = f"{prefix}_dist_TravelDistance.png"
         _ensure_parent_dir(out)
-        plt.savefig(out, dpi=150)
+        fig.savefig(out, dpi=150)
         print(f"Saved graph -> {out}")
-        plt.close()
+        plt.close(fig)
+
+    def _plot_timeseries(ax: Any, xs: List[int], ys: List[float], *args: Any, **kwargs: Any) -> Any:
+        """Plot a time series with visible single-point smoke-test output."""
+        kwargs.setdefault("marker", "o")
+        kwargs.setdefault("markersize", 4)
+        line_objs = ax.plot(xs, ys, *args, **kwargs)
+        if len(xs) == 1:
+            x = float(xs[0])
+            ax.set_xlim(x - 0.5, x + 0.5)
+        return line_objs
 
     # 3) run reward trajectory + convergence diagnostics
     if run_logs:
         xs = [int(r["day"]) for r in run_logs]
         ys = [_extract_reward(r) for r in run_logs]
         converged_days = [int(r["day"]) for r in run_logs if bool(r.get("reward_converged", False))]
-        plt.figure(figsize=(9, 4))
-        plt.plot(xs, ys, label="avg_reward")
+        fig, ax = plt.subplots(figsize=(9, 4))
+        _plot_timeseries(ax, xs, ys, label="avg_reward")
         if converged_days:
             conv_day = int(converged_days[0])
             conv_reward = float(next((r["avg_reward"] for r in run_logs if int(r["day"]) == conv_day), ys[-1]))
-            plt.axvline(conv_day, color="tab:green", linestyle="--", linewidth=1.2, label=f"converged day={conv_day}")
-            plt.scatter([conv_day], [conv_reward], color="tab:green", zorder=3)
-        plt.title("Run Reward Trajectory")
-        plt.xlabel("Day")
-        plt.ylabel("Reward")
-        plt.legend(loc="best")
-        plt.tight_layout()
+            ax.axvline(conv_day, color="tab:green", linestyle="--", linewidth=1.2, label=f"converged day={conv_day}")
+            ax.scatter([conv_day], [conv_reward], color="tab:green", zorder=3)
+        ax.set_title("Run Reward Trajectory")
+        ax.set_xlabel("Day")
+        ax.set_ylabel("Reward")
+        ax.legend(loc="best")
+        fig.tight_layout()
         out = f"{prefix}_reward_run.png"
         _ensure_parent_dir(out)
-        plt.savefig(out, dpi=150)
+        fig.savefig(out, dpi=150)
         print(f"Saved graph -> {out}")
-        plt.close()
+        plt.close(fig)
         
         stds = [float(r.get("reward_window_std", np.nan)) for r in run_logs]
         deltas = [float(r.get("reward_window_delta", np.nan)) for r in run_logs]
         if any(np.isfinite(v) for v in stds) or any(np.isfinite(v) for v in deltas):
             fig, ax1 = plt.subplots(figsize=(9, 4))
-            ax1.plot(xs, stds, color="tab:blue", label="window std")
+            _plot_timeseries(ax1, xs, stds, color="tab:blue", label="window std")
             ax1.set_xlabel("Day")
             ax1.set_ylabel("Reward window std", color="tab:blue")
             ax1.tick_params(axis="y", labelcolor="tab:blue")
 
             ax2 = ax1.twinx()
-            ax2.plot(xs, deltas, color="tab:orange", label="|delta| per day")
+            _plot_timeseries(ax2, xs, deltas, color="tab:orange", label="|delta| per day")
             ax2.set_ylabel("Reward trend magnitude", color="tab:orange")
             ax2.tick_params(axis="y", labelcolor="tab:orange")
 
@@ -2187,11 +2198,11 @@ def _plot_reports(
             lines1, labels1 = ax1.get_legend_handles_labels()
             lines2, labels2 = ax2.get_legend_handles_labels()
             ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
-            plt.title("Optimization Convergence Diagnostics")
-            plt.tight_layout()
+            ax1.set_title("Optimization Convergence Diagnostics")
+            fig.tight_layout()
             out = f"{prefix}_convergence_run.png"
             _ensure_parent_dir(out)
-            plt.savefig(out, dpi=150)
+            fig.savefig(out, dpi=150)
             print(f"Saved graph -> {out}")
             plt.close(fig)
 
@@ -2199,8 +2210,8 @@ def _plot_reports(
     if training_logs:
         xs = [int(r["batch"]) + 1 for r in training_logs]
         ys = [float(r["avg_reward"]) for r in training_logs]
-        plt.figure(figsize=(9, 4))
-        plt.plot(xs, ys)
+        fig, ax = plt.subplots(figsize=(9, 4))
+        _plot_timeseries(ax, xs, ys)
         
         y_min, y_max = float(min(ys)), float(max(ys))
         y_span = max(1e-6, y_max - y_min)
@@ -2212,7 +2223,6 @@ def _plot_reports(
         y_total = max(1e-6, y_hi - y_lo)
         major_step = next((step for step in tick_candidates if (y_total / step) <= 12), tick_candidates[-1])
 
-        ax = plt.gca()
         ax.set_ylim(y_lo, y_hi)
         ax.yaxis.set_major_locator(MultipleLocator(major_step))
         ax.yaxis.set_minor_locator(MultipleLocator(max(major_step / 2.0, 0.005)))
@@ -2220,31 +2230,31 @@ def _plot_reports(
         ax.grid(axis="y", which="major", linestyle="--", alpha=0.35)
         ax.grid(axis="y", which="minor", linestyle=":", alpha=0.20)
         
-        plt.title("Training Reward Trajectory")
-        plt.xlabel("Batch")
-        plt.ylabel("Avg Reward")
-        plt.tight_layout()
+        ax.set_title("Training Reward Trajectory")
+        ax.set_xlabel("Batch")
+        ax.set_ylabel("Avg Reward")
+        fig.tight_layout()
         out = f"{prefix}_reward_training.png"
         _ensure_parent_dir(out)
-        plt.savefig(out, dpi=150)
+        fig.savefig(out, dpi=150)
         print(f"Saved graph -> {out}")
-        plt.close()
+        plt.close(fig)
 
     # 5) evaluation trajectory (run_experiment)
     if evaluation_logs:
         xs = [int(r["day"]) for r in evaluation_logs]
         ys = [_extract_reward(r) for r in evaluation_logs]
-        plt.figure(figsize=(9, 4))
-        plt.plot(xs, ys)
-        plt.title("Evaluation Reward Trajectory")
-        plt.xlabel("Day")
-        plt.ylabel("Reward")
-        plt.tight_layout()
+        fig, ax = plt.subplots(figsize=(9, 4))
+        _plot_timeseries(ax, xs, ys)
+        ax.set_title("Evaluation Reward Trajectory")
+        ax.set_xlabel("Day")
+        ax.set_ylabel("Reward")
+        fig.tight_layout()
         out = f"{prefix}_reward_evaluation.png"
         _ensure_parent_dir(out)
-        plt.savefig(out, dpi=150)
+        fig.savefig(out, dpi=150)
         print(f"Saved graph -> {out}")
-        plt.close()
+        plt.close(fig)
         
     # 6) manipulated coefficient trajectories
     if run_logs:
@@ -2272,19 +2282,19 @@ def _plot_reports(
             if not valid or not y1:
                 continue
 
-            plt.figure(figsize=(9, 4))
-            plt.plot(xs, y1, label=f"Firm1 {coeff}")
-            plt.plot(xs, y2, label=f"Firm2 {coeff}")
-            plt.title(f"Coefficient Trajectory: {coeff}")
-            plt.xlabel("Day")
-            plt.ylabel("Coefficient value")
-            plt.legend(loc="best")
-            plt.tight_layout()
+            fig, ax = plt.subplots(figsize=(9, 4))
+            _plot_timeseries(ax, xs, y1, label=f"Firm1 {coeff}")
+            _plot_timeseries(ax, xs, y2, label=f"Firm2 {coeff}")
+            ax.set_title(f"Coefficient Trajectory: {coeff}")
+            ax.set_xlabel("Day")
+            ax.set_ylabel("Coefficient value")
+            ax.legend(loc="best")
+            fig.tight_layout()
             out = f"{prefix}_coeff_{coeff}_trajectory.png"
             _ensure_parent_dir(out)
-            plt.savefig(out, dpi=150)
+            fig.savefig(out, dpi=150)
             print(f"Saved graph -> {out}")
-            plt.close()
+            plt.close(fig)
 
 
 def main():

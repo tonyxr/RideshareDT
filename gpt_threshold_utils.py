@@ -110,4 +110,3 @@ def diagnose_gpt_threshold_usage(
         notes.append(f"most frequent GPT fallback reason: {top_reason}")
 
     return notes
-tests/test_price_threshold_flow.py
