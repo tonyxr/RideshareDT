@@ -48,6 +48,14 @@ from pricing_models import FirmMetrics, FirmStaticPricer, FirmHeuristicPricer, F
 from coeff_utils import get_coeff, set_coeff
 from state_encoder import build_state_vector
 from calibration_utils import derive_calibration, load_calibration_preset
+from gpt_threshold_utils import (
+    build_threshold_profile,
+    clip_price_threshold,
+    diagnose_gpt_threshold_usage,
+    format_gpt_threshold_usage_summary,
+    increment_gpt_threshold_usage,
+    new_gpt_threshold_usage_counts,
+)
 
 import kagglehub
 
@@ -347,6 +355,7 @@ class Core:
         reward_trend_weight: float = 0.08,
         gpt_threshold_batch_size: int = 20,
         gpt_threshold_max_retries: int = 2,
+        gpt_threshold_failure_pause: float = 1.0,
     ):
         self.rng = np.random.default_rng(seed)
         self.market = MarketInteraction(city_name=market_name, seed=seed)
@@ -368,6 +377,9 @@ class Core:
         self.gpt_threshold_batch_size = int(max(1, gpt_threshold_batch_size))
         self.gpt_threshold_max_retries = int(max(0, gpt_threshold_max_retries))
         self.gpt_threshold_error_counts: Dict[str, int] = {}
+        self.gpt_threshold_last_error = ""
+        self.gpt_threshold_request_counts: Dict[str, int] = new_gpt_threshold_usage_counts()
+        self.gpt_threshold_failure_pause = float(max(0.0, gpt_threshold_failure_pause))
         self.training_stable_window = 30
         self.training_stable_tol = 0.012
         self.reward_convergence_window = 60
@@ -731,7 +743,7 @@ class Core:
         threshold = 0.55 + 1.65 * income_score + 0.04 * mean_fare
         threshold -= 0.18 * min(max(household - 1, 0), 3)
         threshold += (0.35 + 0.45 * loyalty_strength) if is_returning else 0.0
-        return float(np.clip(threshold, 0.50, 5.00))
+        return clip_price_threshold(threshold)
 
     def _price_coldstart_rides(self, rides: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Attach current firm prices to cold-start ride contexts."""
@@ -803,15 +815,23 @@ class Core:
         """
         prepared: List[Dict[str, Any]] = []
         results: List[Dict[str, Any]] = []
+        increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_total")
+        increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_requested", len(batch))
         for i, (profile, rides) in enumerate(batch):
             priced = self._price_coldstart_rides(rides)
             prepared.append({"index": i, "profile": profile, "coldstart_rides": priced[:10]})
             results.append(self._threshold_fallback_result(profile, priced))
 
-        if not self.openai_api_key or not prepared:
+        if not prepared:
+            return results
+        
+        if not self.openai_api_key:
+            increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_skipped_no_key")
+            increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_fallback", len(results))
             return results
 
-                            
+        increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_attempted")
+
         prompt = {
             "task": (
                 "Infer one rider-level price threshold for each item. The threshold is the dollar fare gap at which "
@@ -861,7 +881,7 @@ class Core:
                     if raw_threshold is None:
                         continue
                     results[idx] = {
-                        "price_threshold": float(np.clip(float(raw_threshold), 0.50, 5.00)),
+                        "price_threshold": clip_price_threshold(raw_threshold),
                         "rationale": str(item.get("rationale", "")),
                         "source": "gpt",
                     }
@@ -869,7 +889,12 @@ class Core:
                 if seen == 0:
                     raise ValueError("Response JSON contained no usable threshold rows")
                 if seen < len(results):
+                    increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_partial")
                     self._record_gpt_threshold_error("partial_batch", f"usable={seen}/{len(results)}")
+                else:
+                    increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_succeeded")
+                increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_gpt", seen)
+                increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_fallback", len(results) - seen)
                 return results
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", errors="replace")[:300]
@@ -881,7 +906,10 @@ class Core:
                 if attempt >= self.gpt_threshold_max_retries:
                     break
             time.sleep(float(min(8.0, 1.5 * (2 ** attempt))))
-
+        
+        self.gpt_threshold_last_error = last_error
+        increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_failed")
+        increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_fallback", len(results))
         self._record_gpt_threshold_error("batch_failed", last_error)
         return results
 
@@ -894,21 +922,30 @@ class Core:
         self.synthetic_profile_pool = []
         threshold_source_counts: Dict[str, int] = {}
         self.gpt_threshold_error_counts = {}
+        self.gpt_threshold_last_error = ""
+        self.gpt_threshold_request_counts = new_gpt_threshold_usage_counts()
         batch_size = int(max(1, self.gpt_threshold_batch_size))
         for start in range(0, len(base_profiles), batch_size):
             profile_batch = list(base_profiles[start:start + batch_size])
             rides_batch = [(p, self._build_coldstart_rides(n=10)) for p in profile_batch]
+            failed_before = int(self.gpt_threshold_request_counts.get("batches_failed", 0))
             thresholds = self._gpt_batch_price_thresholds(rides_batch)
+            failed_after = int(self.gpt_threshold_request_counts.get("batches_failed", 0))
             for (p, coldstart_rides), threshold in zip(rides_batch, thresholds):
                 src = str(threshold.get("source", "fallback"))
                 threshold_source_counts[src] = int(threshold_source_counts.get(src, 0) + 1)
-                self.synthetic_profile_pool.append({
-                    **p,
-                    "ColdstartRides": coldstart_rides,
-                    "PriceThreshold": float(threshold["price_threshold"]),
-                    "PriceThresholdRationale": threshold.get("rationale", ""),
-                    "PriceThresholdSource": src,
-                })
+                self.synthetic_profile_pool.append(build_threshold_profile(p, coldstart_rides, threshold))
+            transient_error = any(
+                token in self.gpt_threshold_last_error
+                for token in ("RemoteDisconnected", "Connection refused", "ConnectionReset", "Timeout", "timed out", "URLError")
+            )
+            if (
+                self.openai_api_key
+                and failed_after > failed_before
+                and transient_error
+                and self.gpt_threshold_failure_pause > 0.0
+            ):
+                time.sleep(self.gpt_threshold_failure_pause)
 
         total = int(sum(threshold_source_counts.values()))
         summary_parts = []
@@ -919,6 +956,16 @@ class Core:
             f">>> Price-threshold bootstrap sources (batch_size={batch_size}): "
             + ", ".join(summary_parts)
         )
+        request_summary = format_gpt_threshold_usage_summary(self.gpt_threshold_request_counts)
+        if request_summary:
+            print(f">>> GPT threshold API utilization: {request_summary}")
+        diagnostic_notes = diagnose_gpt_threshold_usage(
+            self.gpt_threshold_request_counts,
+            self.gpt_threshold_error_counts,
+            self.gpt_threshold_max_retries,
+        )
+        if diagnostic_notes:
+            print(">>> GPT threshold diagnosis: " + "; ".join(diagnostic_notes))
         if self.gpt_threshold_error_counts:
             print(
                 ">>> GPT threshold fallback errors: "
@@ -2284,6 +2331,7 @@ def main():
     parser.add_argument("--reward_trend_weight", type=float, default=0.08)
     parser.add_argument("--gpt_threshold_batch_size", type=int, default=20, help="Profiles per GPT price-threshold API request. Larger values improve API utilization but increase per-request payload size.")
     parser.add_argument("--gpt_threshold_max_retries", type=int, default=2, help="Retries per GPT price-threshold batch before deterministic fallback is used.")
+    parser.add_argument("--gpt_threshold_failure_pause", type=float, default=1.0, help="Seconds to pause after a failed GPT threshold batch before sending the next batch; helps avoid connection-refused cascades.")
     parser.add_argument("--calibration_csv", type=str, default="", help="Optional historical CSV used to calibrate priors and choice sensitivity.")
     parser.add_argument("--calibration_city", type=str, default="", help="Optional city filter for --calibration_csv; defaults to --market if omitted.")
     parser.add_argument("--calibration_preset", type=str, default="nyc_public", choices=["", "nyc_public"], help="Built-in preset calibration. Defaults to nyc_public (NYC TLC + ACS + weather priors).")
@@ -2352,6 +2400,7 @@ def main():
         reward_trend_weight=args.reward_trend_weight,
         gpt_threshold_batch_size=args.gpt_threshold_batch_size,
         gpt_threshold_max_retries=args.gpt_threshold_max_retries,
+        gpt_threshold_failure_pause=args.gpt_threshold_failure_pause,
     )
     
     if args.calibration_preset:
