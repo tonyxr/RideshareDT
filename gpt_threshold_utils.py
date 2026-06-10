@@ -8,6 +8,7 @@ Created on Tue Jun  9 08:28:07 2026
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping
 
 
@@ -44,6 +45,39 @@ def clip_price_threshold(value: Any, lo: float = 0.50, hi: float = 5.00) -> floa
     if value_f > hi:
         return float(hi)
     return float(value_f)
+
+def summarize_priced_coldstart_rides(priced_rides: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Aggregate cold-start rides into one profile-level pricing-evidence summary."""
+    rides = [dict(r) for r in priced_rides]
+    if not rides:
+        return {"ride_count": 0}
+
+    firm1_prices = [float(r.get("firm1_price", 0.0)) for r in rides]
+    firm2_prices = [float(r.get("firm2_price", 0.0)) for r in rides]
+    distances = [float(r.get("DistanceMiles", 0.0)) for r in rides]
+    durations = [float(r.get("DurationMinutes", 0.0)) for r in rides]
+    abs_gaps = [abs(p2 - p1) for p1, p2 in zip(firm1_prices, firm2_prices)]
+    services = Counter(str(r.get("Service", "unknown")) for r in rides)
+    weather = Counter(str(r.get("Weather", "unknown")) for r in rides)
+    airport_count = sum(1 for r in rides if bool(r.get("Airport", False)))
+    rush_count = sum(1 for r in rides if int(r.get("Hour", 0)) in {7, 8, 9, 16, 17, 18})
+
+    def mean(values: List[float]) -> float:
+        return float(sum(values) / max(1, len(values)))
+
+    return {
+        "ride_count": int(len(rides)),
+        "mean_firm1_price": round(mean(firm1_prices), 2),
+        "mean_firm2_price": round(mean(firm2_prices), 2),
+        "mean_absolute_price_gap": round(mean(abs_gaps), 2),
+        "max_absolute_price_gap": round(float(max(abs_gaps)), 2),
+        "mean_distance_miles": round(mean(distances), 2),
+        "mean_duration_minutes": round(mean(durations), 2),
+        "airport_ride_count": int(airport_count),
+        "rush_hour_ride_count": int(rush_count),
+        "service_mix": dict(sorted(services.items())),
+        "weather_mix": dict(sorted(weather.items())),
+    }
 
 
 def build_threshold_profile(

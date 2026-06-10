@@ -18,6 +18,7 @@ from gpt_threshold_utils import (
     format_gpt_threshold_usage_summary,
     increment_gpt_threshold_usage,
     new_gpt_threshold_usage_counts,
+    summarize_priced_coldstart_rides,
 )
 
 
@@ -65,6 +66,42 @@ class PriceThresholdFlowTests(unittest.TestCase):
         self.assertEqual(enriched["PriceThresholdRationale"], "unit-test")
         self.assertEqual(enriched["PriceThresholdSource"], "gpt")
         self.assertEqual(enriched["ColdstartRides"], coldstart_rides)
+        
+    def test_coldstart_rides_are_summarized_for_one_profile_threshold(self):
+        priced_rides = [
+            {
+                "Hour": 8,
+                "Weather": "rain",
+                "DistanceMiles": 2.0,
+                "DurationMinutes": 12.0,
+                "Service": "economy",
+                "Airport": False,
+                "firm1_price": 10.0,
+                "firm2_price": 12.0,
+            },
+            {
+                "Hour": 14,
+                "Weather": "clear",
+                "DistanceMiles": 6.0,
+                "DurationMinutes": 24.0,
+                "Service": "premium",
+                "Airport": True,
+                "firm1_price": 20.0,
+                "firm2_price": 17.0,
+            },
+        ]
+
+        summary = summarize_priced_coldstart_rides(priced_rides)
+
+        self.assertEqual(summary["ride_count"], 2)
+        self.assertEqual(summary["mean_firm1_price"], 15.0)
+        self.assertEqual(summary["mean_firm2_price"], 14.5)
+        self.assertEqual(summary["mean_absolute_price_gap"], 2.5)
+        self.assertEqual(summary["max_absolute_price_gap"], 3.0)
+        self.assertEqual(summary["airport_ride_count"], 1)
+        self.assertEqual(summary["rush_hour_ride_count"], 1)
+        self.assertEqual(summary["service_mix"], {"economy": 1, "premium": 1})
+        self.assertEqual(summary["weather_mix"], {"clear": 1, "rain": 1})
 
     def test_usage_summary_explains_low_gpt_utilization(self):
         counts = new_gpt_threshold_usage_counts()

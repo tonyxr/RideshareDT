@@ -55,6 +55,7 @@ from gpt_threshold_utils import (
     format_gpt_threshold_usage_summary,
     increment_gpt_threshold_usage,
     new_gpt_threshold_usage_counts,
+    summarize_priced_coldstart_rides,
 )
 
 import kagglehub
@@ -800,7 +801,7 @@ class Core:
             print(f"[GPT threshold fallback] {key}{suffix}")
 
     def _gpt_threshold_schema(self) -> Dict[str, Any]:
-        """Responses API structured-output schema for batched threshold generation."""
+        """Responses API structured-output schema for one aggregate threshold per profile."""
         return {
             "type": "json_schema",
             "name": "price_threshold_batch",
@@ -815,11 +816,11 @@ class Core:
                             "type": "object",
                             "additionalProperties": False,
                             "properties": {
-                                "index": {"type": "integer"},
+                                "profile_index": {"type": "integer"},
                                 "price_threshold": {"type": "number", "minimum": 0.50, "maximum": 5.00},
                                 "rationale": {"type": "string"},
                             },
-                            "required": ["index", "price_threshold", "rationale"],
+                            "required": ["profile_index", "price_threshold", "rationale"],
                         },
                     }
                 },
@@ -841,7 +842,13 @@ class Core:
         increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_requested", len(batch))
         for i, (profile, rides) in enumerate(batch):
             priced = self._price_coldstart_rides(rides)
-            prepared.append({"index": i, "profile": profile, "coldstart_rides": priced[:10]})
+            prepared.append({
+                "profile_index": i,
+                "profile": profile,
+                "coldstart_ride_summary": summarize_priced_coldstart_rides(priced[:10]),
+                "coldstart_rides": priced[:10],
+                "instruction": "Aggregate all coldstart_rides for this one profile into exactly one profile-level threshold.",
+            })
             results.append(self._threshold_fallback_result(profile, priced))
 
         if not prepared:
@@ -856,15 +863,19 @@ class Core:
 
         prompt = {
             "task": (
-                "Infer one rider-level price threshold for each item. The threshold is the dollar fare gap at which "
-                "that customer starts treating price as a primary decision factor. Return exactly one result for "
-                "each input index. Do not return utility functions or utility weights."
+                "Infer exactly one aggregate rider-level price threshold for each profile item. The threshold is the "
+                "single dollar fare gap at which that customer starts treating price as a primary decision factor, "
+                "after considering the profile and all 10 coldstart rides together. The coldstart rides are evidence "
+                "for one profile-level judgment; they are not separate threshold requests."
             ),
             "profiles": prepared,
             "output_constraints": {
                 "format": "json_only",
+                "one_threshold_per_profile": True,
+                "forbidden": "Do not return per-ride thresholds. Do not create more than one row for the same profile_index.",
+                "expected_threshold_count": len(prepared),
                 "price_threshold_range_usd": [0.50, 5.00],
-                "response_shape": {"thresholds": [{"index": 0, "price_threshold": 2.0, "rationale": "short explanation"}]},
+                "response_shape": {"thresholds": [{"profile_index": 0, "price_threshold": 2.0, "rationale": "short aggregate explanation"}]},
             },
         }
         payload = {
@@ -892,12 +903,20 @@ class Core:
                 if not isinstance(threshold_rows, list):
                     raise ValueError("Response JSON did not contain a thresholds array")
 
-                seen = 0
+                seen_indices = set()
+                duplicate_indices = 0
                 for item in threshold_rows:
                     if not isinstance(item, dict):
                         continue
-                    idx = int(item.get("index", -1))
+                    idx_raw = item.get("profile_index", item.get("index", -1))
+                    try:
+                        idx = int(idx_raw)
+                    except (TypeError, ValueError):
+                        continue
                     if idx < 0 or idx >= len(results):
+                        continue
+                    if idx in seen_indices:
+                        duplicate_indices += 1
                         continue
                     raw_threshold = item.get("price_threshold", item.get("price_threshold_usd"))
                     if raw_threshold is None:
@@ -907,7 +926,10 @@ class Core:
                         "rationale": str(item.get("rationale", "")),
                         "source": "gpt",
                     }
-                    seen += 1
+                    seen_indices.add(idx)
+                seen = len(seen_indices)
+                if duplicate_indices:
+                    self._record_gpt_threshold_error("duplicate_profile_thresholds", f"duplicates={duplicate_indices}")
                 if seen == 0:
                     raise ValueError("Response JSON contained no usable threshold rows")
                 if seen < len(results):
