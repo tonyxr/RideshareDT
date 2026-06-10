@@ -35,3 +35,51 @@ Using random seed: 1083622708
     "reliability_scale": 1.08
   }
 }
+>>> Price-threshold bootstrap sources (batch_size=20): gpt=2000 (100.0%)
+>>> GPT threshold API utilization: batches_total=100, batches_attempted=100, batches_succeeded=100, profiles_requested=2000, profiles_gpt=2000, batch_success_rate=100.0%, profile_gpt_rate=100.0%, profile_fallback_rate=0.0%
+>>> Synthetic setup: profile_pool=2000, train days=200 x 8 steps/day x 250 rides, eval timesteps=100 x 250 rides
+>>> PPO rollout/update cadence: 5 day(s) per optimizer step (~40 transitions/update).
+>>> Training RL agent on synthetic NYC-calibrated sampling (day/timestep cadence)...
+  [train 20/200] reward=0.434 moving_avg20=-0.045 share=0.597 revPR=13.04 gap(F2-F1)=0.66 KL=0.0022 clip=0.000
+  [train 40/200] reward=0.412 moving_avg20=0.263 share=0.579 revPR=12.77 gap(F2-F1)=0.56 KL=-0.0053 clip=0.000
+  [train 60/200] reward=0.585 moving_avg20=0.332 share=0.773 revPR=22.95 gap(F2-F1)=2.53 KL=0.0024 clip=0.000
+  [train 80/200] reward=0.697 moving_avg20=0.465 share=0.985 revPR=25.18 gap(F2-F1)=9.04 KL=-0.0059 clip=0.000
+  [train 100/200] reward=0.594 moving_avg20=0.634 share=0.984 revPR=9.28 gap(F2-F1)=8.88 KL=0.0116 clip=0.000
+  [train 120/200] reward=0.579 moving_avg20=0.592 share=0.968 revPR=8.34 gap(F2-F1)=8.78 KL=0.0011 clip=0.000
+  [train 140/200] reward=0.607 moving_avg20=0.590 share=0.983 revPR=11.00 gap(F2-F1)=11.68 KL=-0.0021 clip=0.075
+  [train 160/200] reward=0.599 moving_avg20=0.586 share=0.960 revPR=10.82 gap(F2-F1)=9.38 KL=0.0379 clip=0.200
+  [train 180/200] reward=0.420 moving_avg20=0.515 share=0.607 revPR=9.57 gap(F2-F1)=1.96 KL=0.0112 clip=0.000
+  [train 200/200] reward=0.387 moving_avg20=0.323 share=0.489 revPR=12.59 gap(F2-F1)=1.18 KL=0.0061 clip=0.000
+>>> Evaluating RL agent against static/heuristic opponent with shared profile pool...
+  [eval 10/100] reward=0.564 moving_avg20=0.628 share=0.844 revPR=13.51 gap(F2-F1)=6.80
+  [eval 20/100] reward=0.636 moving_avg20=0.618 share=0.848 revPR=20.49 gap(F2-F1)=10.11
+  [eval 30/100] reward=0.625 moving_avg20=0.617 share=0.848 revPR=20.68 gap(F2-F1)=7.56
+  [eval 40/100] reward=0.569 moving_avg20=0.612 share=0.788 revPR=16.90 gap(F2-F1)=6.90
+  [eval 50/100] reward=0.662 moving_avg20=0.608 share=0.832 revPR=25.25 gap(F2-F1)=10.45
+  [eval 60/100] reward=0.564 moving_avg20=0.613 share=0.824 revPR=14.83 gap(F2-F1)=7.23
+  [eval 70/100] reward=0.673 moving_avg20=0.609 share=0.848 revPR=25.22 gap(F2-F1)=10.35
+  [eval 80/100] reward=0.602 moving_avg20=0.606 share=0.808 revPR=18.55 gap(F2-F1)=6.84
+  [eval 90/100] reward=0.656 moving_avg20=0.604 share=0.880 revPR=21.12 gap(F2-F1)=11.00
+  [eval 100/100] reward=0.682 moving_avg20=0.623 share=0.908 revPR=23.53 gap(F2-F1)=12.57
+>>> Saved sampled profiles -> artifacts/experiment_gpt/sampled_profiles.csv (rows=200000)
+>>> Profile export capped at profiles_log_limit=200000 rows.
+>>> Training reward trajectory summary: min=-0.348, max=0.697, final=0.387
+>>> Testing reward trajectory summary: min=0.512, max=0.698, final=0.682
+Experiment Complete.
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_training_diagnostics.csv
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_evaluation_diagnostics.csv
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_reward_training.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_reward_evaluation.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_training_business_diagnostics.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_training_ppo_diagnostics.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_training_coeff_airport_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_training_coeff_base_fare_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_training_coeff_booking_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_training_coeff_per_mile_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_training_coeff_per_minute_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_evaluation_business_diagnostics.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_evaluation_coeff_airport_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_evaluation_coeff_base_fare_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_evaluation_coeff_booking_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_evaluation_coeff_per_mile_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/experiment_gpt/report_evaluation_coeff_per_minute_trajectory.png

@@ -631,40 +631,62 @@ class Core:
         )
         return float(np.clip(raw, -1.0, 1.0))
 
-    def _compute_rl_reward(self, m1: FirmMetrics, mean_gap: float) -> float:
-        """Low-complexity reward shaping for better PPO learning signal."""
+    def _reward_diagnostics(
+        self,
+        share: float,
+        rev_per_request: float,
+        mean_gap: float,
+        prev_share: float,
+        prev_rev_per_request: float,
+    ) -> Dict[str, float]:
+        """Return shaped reward and component diagnostics for trajectory analysis."""
+        share_f = float(np.clip(share, 0.0, 1.0))
+        revpr = float(max(0.0, rev_per_request))
+        gap = float(mean_gap)
         
         base_reward = self._reward_base(
-            share=float(m1.share),
-            rev_per_request=float(m1.rev_per_request),
-            price_gap_f2_minus_f1=float(mean_gap),
+            share=share_f,
+            rev_per_request=revpr,
+            price_gap_f2_minus_f1=gap,
         )
-        share = float(np.clip(m1.share, 0.0, 1.0))
-        revpr = float(max(0.0, m1.rev_per_request))
-
-        # Encourage beating the 50% share mark (dense, centered around 0).
-        competitive_term = float(np.clip((share - 0.5) / 0.5, -1.0, 1.0))
-
-        # Reward local improvement to reduce variance and speed up adaptation.
-        share_delta = float(np.clip(share - self.last_share, -0.20, 0.20) / 0.20)
-        rev_delta = float(np.clip((revpr - self.last_revpr) / self.reward_rev_scale, -0.20, 0.20) / 0.20)
-        trend_term = 0.5 * (share_delta + rev_delta)
         
-        # Simple action-linked signal: reward outcomes that improve share/revenue
-        # while not drifting too far into uncompetitive pricing (large negative gap).
-        pricing_discipline = float(np.clip(mean_gap / 2.0, -1.0, 1.0))
-        efficiency_term = 0.5 * trend_term + 0.5 * pricing_discipline
-
-        raw_reward = (
+        competitive_term = float(np.clip((share_f - 0.5) / 0.5, -1.0, 1.0))
+        share_delta = float(np.clip(share_f - float(prev_share), -0.20, 0.20) / 0.20)
+        rev_delta = float(np.clip((revpr - float(prev_rev_per_request)) / self.reward_rev_scale, -0.20, 0.20) / 0.20)
+        trend_term = float(0.5 * (share_delta + rev_delta))
+        pricing_discipline = float(np.clip(gap / 2.0, -1.0, 1.0))
+        efficiency_term = float(0.5 * trend_term + 0.5 * pricing_discipline)
+        raw_reward = float(
             base_reward
             + self.reward_competitive_weight * self.reward_competitive_scale * competitive_term
             + self.reward_trend_weight * self.reward_trend_scale * efficiency_term
         )
-        # Softsign-like compression keeps gradients informative while avoiding hard clipping saturation.
         reward = float(np.tanh(raw_reward / self.reward_softsign_temp))
 
-        self.last_reward = float(reward)
-        return float(reward)
+        return {
+            "reward": reward,
+            "reward_raw": raw_reward,
+            "reward_base": float(base_reward),
+            "reward_competitive_term": competitive_term,
+            "reward_share_delta": share_delta,
+            "reward_rev_delta": rev_delta,
+            "reward_trend_term": trend_term,
+            "reward_pricing_discipline": pricing_discipline,
+            "reward_efficiency_term": efficiency_term,
+        }
+
+    def _compute_rl_reward(self, m1: FirmMetrics, mean_gap: float) -> float:
+        """Low-complexity reward shaping for better PPO learning signal."""
+        diagnostics = self._reward_diagnostics(
+            share=float(m1.share),
+            rev_per_request=float(m1.rev_per_request),
+            mean_gap=float(mean_gap),
+            prev_share=float(self.last_share),
+            prev_rev_per_request=float(self.last_revpr),
+        )
+        reward = float(diagnostics["reward"])
+        self.last_reward = reward
+        return reward
     
     def _initialize_run_distributions(self) -> None:
         """Run-level slight variations to demographics/weather/ride nature priors."""
@@ -1030,16 +1052,37 @@ class Core:
             self.firm2_mode = "heuristic"
         
         update_every = int(max(1, ppo_update_interval_days))
-        last_ppo_metrics = {"loss": 0.0, "approx_kl": 0.0, "clipfrac": 0.0, "entropy": 0.0, "ent_coeff": 0.0}
+        last_ppo_metrics = {
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "approx_kl": 0.0,
+            "clipfrac": 0.0,
+            "entropy": 0.0,
+            "ent_coeff": 0.0,
+            "lr": 0.0,
+            "stopped_early_kl": False,
+        }
 
         for d in range(train_timesteps):
             day_ctx = self.market.sample_day_context()
             hours = [self.market.sample_timestep_hour().hour for _ in range(max(1, int(train_steps_per_day)))]
 
             reward_sum = 0.0
+            base_reward_sum = 0.0
+            raw_reward_sum = 0.0
+            competitive_sum = 0.0
+            trend_sum = 0.0
+            discipline_sum = 0.0
+            share_delta_sum = 0.0
+            rev_delta_sum = 0.0
+            efficiency_sum = 0.0
             share_sum = 0.0
             revpr_sum = 0.0
             gap_sum = 0.0
+            action_counts: Counter[int] = Counter()
+            last_action = -1
+            recovery_guardrail_count = 0
 
             for t, hour in enumerate(hours):
                 base = self.market.curr_market
@@ -1048,6 +1091,8 @@ class Core:
                     s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
                     action, s_ts, logits, val = self.firm1.agent.act(s_vec)
                     self.firm1.apply_action(action, self.market)
+                    action_counts[int(action)] += 1
+                    last_action = int(action)
                     rl_step = (action, s_ts, logits, val)
                 elif self.firm1_mode == "heuristic":
                     self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
@@ -1071,20 +1116,46 @@ class Core:
 
                 if self.firm2_mode == "heuristic":
                     self.firm2.update(metrics=m2, price_gap_mean=mean_gap)
+                    
+                reward_diag = self._reward_diagnostics(
+                    share=float(m1.share),
+                    rev_per_request=float(m1.rev_per_request),
+                    mean_gap=float(mean_gap),
+                    prev_share=float(self.last_share),
+                    prev_rev_per_request=float(self.last_revpr),
+                )
 
                 if self.firm1_mode == "RL" and rl_step is not None:
                     action, s_ts, logits, val = rl_step
-                    reward = self._compute_rl_reward(m1, mean_gap)
+                    reward = float(reward_diag["reward"])
+                    self.last_reward = reward
                     done = (t == len(hours) - 1)
-                    self.firm1.agent.store(s_ts, action, float(reward), done, None, logits, val)
+                    self.firm1.agent.store(s_ts, action, reward, done, None, logits, val)
                     if done:
+                        before_base = getattr(self.firm1.overrides, "base_fare", None)
+                        before_pmin = getattr(self.firm1.overrides, "per_minute", None)
                         self.firm1.stabilize_after_batch(
                             share=float(m1.share),
                             price_gap_f2_minus_f1=float(mean_gap),
                             city_base=float(base.base_fare),
                             city_pmin=float(base.per_minute),
                         )
-                    reward_sum += float(reward)
+                        after_base = getattr(self.firm1.overrides, "base_fare", None)
+                        after_pmin = getattr(self.firm1.overrides, "per_minute", None)
+                        if before_base != after_base or before_pmin != after_pmin:
+                            recovery_guardrail_count += 1
+                    reward_sum += reward
+                elif self.firm1_mode != "RL":
+                    reward_sum += float(reward_diag["reward_base"])
+
+                base_reward_sum += float(reward_diag["reward_base"])
+                raw_reward_sum += float(reward_diag["reward_raw"])
+                competitive_sum += float(reward_diag["reward_competitive_term"])
+                trend_sum += float(reward_diag["reward_trend_term"])
+                discipline_sum += float(reward_diag["reward_pricing_discipline"])
+                share_delta_sum += float(reward_diag["reward_share_delta"])
+                rev_delta_sum += float(reward_diag["reward_rev_delta"])
+                efficiency_sum += float(reward_diag["reward_efficiency_term"])
 
                 share_sum += float(m1.share)
                 revpr_sum += float(m1.rev_per_request)
@@ -1100,26 +1171,63 @@ class Core:
                     ppo_metrics = self.firm1.agent.update(epochs=self.ppo_update_epochs, batch_size=self.ppo_batch_size)
                     last_ppo_metrics = dict(ppo_metrics)
                 
-            
-            avg_reward = float(reward_sum / max(1, len(hours))) if self.firm1_mode == "RL" else float(self._reward_base(
-                share_sum / max(1, len(hours)),
-                revpr_sum / max(1, len(hours)),
-                price_gap_f2_minus_f1=gap_sum / max(1, len(hours)),
-            ))
+            n_steps = max(1, len(hours))
+            avg_reward = float(reward_sum / n_steps)
             reward_history.append(float(avg_reward))
                     
-            self.training_logs.append({
+            moving_window = reward_history[-min(len(reward_history), 20):]
+            moving_avg20 = float(np.mean(moving_window)) if moving_window else 0.0
+            moving_std20 = float(np.std(moving_window)) if moving_window else 0.0
+            avg_share = float(share_sum / n_steps)
+            avg_revpr = float(revpr_sum / n_steps)
+            avg_gap = float(gap_sum / n_steps)
+            dominant_action = int(action_counts.most_common(1)[0][0]) if action_counts else -1
+            dominant_action_rate = float(action_counts.most_common(1)[0][1] / n_steps) if action_counts else 0.0
+
+            log_row = {
                 "batch": d,
                 "avg_reward": float(avg_reward),
+                "reward_moving_avg20": moving_avg20,
+                "reward_moving_std20": moving_std20,
+                "reward_base": float(base_reward_sum / n_steps),
+                "reward_raw": float(raw_reward_sum / n_steps),
+                "reward_competitive_term": float(competitive_sum / n_steps),
+                "reward_trend_term": float(trend_sum / n_steps),
+                "reward_pricing_discipline": float(discipline_sum / n_steps),
+                "reward_share_delta": float(share_delta_sum / n_steps),
+                "reward_rev_delta": float(rev_delta_sum / n_steps),
+                "reward_efficiency_term": float(efficiency_sum / n_steps),
+                "avg_share": avg_share,
+                "avg_rev_per_request": avg_revpr,
+                "avg_price_gap_f2_minus_f1": avg_gap,
+                "last_action": int(last_action),
+                "dominant_action": dominant_action,
+                "dominant_action_rate": dominant_action_rate,
+                "action_counts": json.dumps(dict(sorted(action_counts.items())), sort_keys=True),
+                "recovery_guardrail_count": int(recovery_guardrail_count),
                 "loss": float(ppo_metrics.get("loss", 0.0)),
+                "ppo_policy_loss": float(ppo_metrics.get("policy_loss", 0.0)),
+                "ppo_value_loss": float(ppo_metrics.get("value_loss", 0.0)),
                 "ppo_approx_kl": float(ppo_metrics.get("approx_kl", 0.0)),
                 "ppo_clipfrac": float(ppo_metrics.get("clipfrac", 0.0)),
-            })
+                "ppo_entropy": float(ppo_metrics.get("entropy", 0.0)),
+                "ppo_ent_coeff": float(ppo_metrics.get("ent_coeff", 0.0)),
+                "ppo_lr": float(ppo_metrics.get("lr", 0.0)),
+                "ppo_stopped_early_kl": bool(ppo_metrics.get("stopped_early_kl", False)),
+            }
+            for k in self.shared_edit_keys:
+                log_row[f"firm1_{k}"] = float(get_coeff(self.market.curr_market, self.firm1.overrides, k))
+                log_row[f"firm2_{k}"] = float(get_coeff(self.market.curr_market, self.firm2.overrides, k))
+            self.training_logs.append(log_row)
             
             if (d + 1) % max(1, train_timesteps // 10) == 0:
-                window = reward_history[-min(len(reward_history), 20):]
-                moving_avg = float(np.mean(window)) if window else 0.0
-                print(f"  [train {d+1}/{train_timesteps}] reward={float(avg_reward):.3f} moving_avg20={moving_avg:.3f}")
+                print(
+                    f"  [train {d+1}/{train_timesteps}] reward={float(avg_reward):.3f} "
+                    f"moving_avg20={moving_avg20:.3f} share={avg_share:.3f} "
+                    f"revPR={avg_revpr:.2f} gap(F2-F1)={avg_gap:.2f} "
+                    f"KL={float(ppo_metrics.get('approx_kl', 0.0)):.4f} "
+                    f"clip={float(ppo_metrics.get('clipfrac', 0.0)):.3f}"
+                )
                 
             
         self.firm2, self.firm2_mode = orig_firm2, orig_firm2_mode
@@ -1141,10 +1249,12 @@ class Core:
                 profile_limit_reached = len(sampled_profile_rows) >= int(max(0, profiles_log_limit))
 
             base = self.market.curr_market
+            action = -1
             if self.firm1_mode == "RL":
                 s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
                 action, *_ = self.firm1.agent.act(s_vec)
                 self.firm1.apply_action(action, self.market)
+                action = int(action)
             elif self.firm1_mode == "heuristic":
                 self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
@@ -1163,43 +1273,55 @@ class Core:
             # Compute with local baselines to avoid mutating training history state.
             share = float(np.clip(m1.share, 0.0, 1.0))
             revpr = float(max(0.0, m1.rev_per_request))
-            base_reward = self._reward_base(
+            reward_diag = self._reward_diagnostics(
                 share=share,
                 rev_per_request=revpr,
-                price_gap_f2_minus_f1=float(mean_gap),
+                mean_gap=float(mean_gap),
+                prev_share=eval_last_share,
+                prev_rev_per_request=eval_last_revpr,
             )
-            competitive_term = float(np.clip((share - 0.5) / 0.5, -1.0, 1.0))
-            share_delta = float(np.clip(share - eval_last_share, -0.20, 0.20) / 0.20)
-            rev_delta = float(np.clip((revpr - eval_last_revpr) / self.reward_rev_scale, -0.20, 0.20) / 0.20)
-            trend_term = 0.5 * (share_delta + rev_delta)
-            pricing_discipline = float(np.clip(mean_gap / 2.0, -1.0, 1.0))
-            efficiency_term = 0.5 * trend_term + 0.5 * pricing_discipline
-            raw_eval_reward = (
-                base_reward
-                + self.reward_competitive_weight * self.reward_competitive_scale * competitive_term
-                + self.reward_trend_weight * self.reward_trend_scale * efficiency_term
-            )
-            eval_reward = float(np.tanh(raw_eval_reward / self.reward_softsign_temp))
+            eval_reward = float(reward_diag["reward"])
 
             eval_last_share = float(share)
             eval_last_revpr = float(revpr)
             eval_rewards.append(float(eval_reward))
-            self.evaluation_logs.append({
+            moving_window = eval_rewards[-min(len(eval_rewards), 20):]
+            moving_avg20 = float(np.mean(moving_window)) if moving_window else 0.0
+            moving_std20 = float(np.std(moving_window)) if moving_window else 0.0
+            log_row = {
                 "day": t,
+                "reward": float(eval_reward),
+                "reward_moving_avg20": moving_avg20,
+                "reward_moving_std20": moving_std20,
+                "reward_raw": float(reward_diag["reward_raw"]),
+                "reward_base": float(reward_diag["reward_base"]),
+                "reward_competitive_term": float(reward_diag["reward_competitive_term"]),
+                "reward_trend_term": float(reward_diag["reward_trend_term"]),
+                "reward_pricing_discipline": float(reward_diag["reward_pricing_discipline"]),
+                "reward_share_delta": float(reward_diag["reward_share_delta"]),
+                "reward_rev_delta": float(reward_diag["reward_rev_delta"]),
+                "reward_efficiency_term": float(reward_diag["reward_efficiency_term"]),
                 "rl_share": float(m1.share),
                 "heuristic_share": float(m2.share),
                 "rl_revenue": float(m1.rev_per_request),
-                "reward": float(eval_reward),
-                "reward_base": float(base_reward),
-            })
+                "heuristic_revenue": float(m2.rev_per_request),
+                "price_gap_f2_minus_f1": float(mean_gap),
+                "action": int(action),
+            }
+            for k in self.shared_edit_keys:
+                log_row[f"firm1_{k}"] = float(get_coeff(self.market.curr_market, self.firm1.overrides, k))
+                log_row[f"firm2_{k}"] = float(get_coeff(self.market.curr_market, self.firm2.overrides, k))
+            self.evaluation_logs.append(log_row)
             self.last_share = float(m1.share)
             self.last_revpr = float(m1.rev_per_request)
             self.last_gap = float(mean_gap)
 
             if (t + 1) % max(1, eval_timesteps // 10) == 0:
-                window = eval_rewards[-min(len(eval_rewards), 20):]
-                moving_avg = float(np.mean(window)) if window else 0.0
-                print(f"  [eval {t+1}/{eval_timesteps}] reward={float(eval_reward):.3f} moving_avg20={moving_avg:.3f}")
+                print(
+                    f"  [eval {t+1}/{eval_timesteps}] reward={float(eval_reward):.3f} "
+                    f"moving_avg20={moving_avg20:.3f} share={float(m1.share):.3f} "
+                    f"revPR={float(m1.rev_per_request):.2f} gap(F2-F1)={float(mean_gap):.2f}"
+                )
 
         if profiles_out:
             _ensure_parent_dir(profiles_out)
@@ -1793,6 +1915,8 @@ class Core:
                     s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
                     action, s_ts, logits, val = self.firm1.agent.act(s_vec)
                     self.firm1.apply_action(action, self.market)
+                    action_counts[int(action)] += 1
+                    last_action = int(action)
                     rl_step = (action, s_ts, logits, val)
                 elif self.firm1_mode == "heuristic":
                     self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
@@ -2001,9 +2125,16 @@ def _write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
     if not rows:
         print("No rows to write.")
         return
-    cols = list(rows[0].keys())
+    cols: List[str] = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                cols.append(key)
+    _ensure_parent_dir(path)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
 
@@ -2075,6 +2206,12 @@ def _plot_reports(
     evaluation_logs: List[Dict[str, Any]],
     prefix: str,
 ) -> None:
+    for name, logs in (("training_diagnostics", training_logs), ("evaluation_diagnostics", evaluation_logs)):
+        if logs:
+            out = f"{prefix}_{name}.csv"
+            _write_csv(out, logs)
+            print(f"Saved -> {out}")
+            
     if importlib.util.find_spec("matplotlib") is None:
         print("[WARN] matplotlib not installed; skipping graph generation.")
         return
@@ -2154,6 +2291,13 @@ def _plot_reports(
             x = float(xs[0])
             ax.set_xlim(x - 0.5, x + 0.5)
         return line_objs
+    
+    def _moving_average(values: List[float], window: int = 20) -> List[float]:
+        out: List[float] = []
+        for i in range(len(values)):
+            start = max(0, i + 1 - int(max(1, window)))
+            out.append(float(np.mean(values[start : i + 1])))
+        return out
 
     # 3) run reward trajectory + convergence diagnostics
     if run_logs:
@@ -2211,9 +2355,14 @@ def _plot_reports(
         xs = [int(r["batch"]) + 1 for r in training_logs]
         ys = [float(r["avg_reward"]) for r in training_logs]
         fig, ax = plt.subplots(figsize=(9, 4))
-        _plot_timeseries(ax, xs, ys)
+        _plot_timeseries(ax, xs, ys, label="avg reward", alpha=0.45)
+        if len(ys) > 1:
+            _plot_timeseries(ax, xs, _moving_average(ys, 20), label="moving avg20", marker="", linewidth=2.0)
+        if any("reward_base" in r for r in training_logs):
+            base_ys = [float(r.get("reward_base", np.nan)) for r in training_logs]
+            _plot_timeseries(ax, xs, base_ys, label="base reward", marker="", linestyle="--", alpha=0.8)
         
-        y_min, y_max = float(min(ys)), float(max(ys))
+        y_min, y_max = float(np.nanmin(ys)), float(np.nanmax(ys))
         y_span = max(1e-6, y_max - y_min)
         y_pad = max(0.02, 0.10 * y_span)
         y_lo, y_hi = y_min - y_pad, y_max + y_pad
@@ -2233,6 +2382,7 @@ def _plot_reports(
         ax.set_title("Training Reward Trajectory")
         ax.set_xlabel("Batch")
         ax.set_ylabel("Avg Reward")
+        ax.legend(loc="best")
         fig.tight_layout()
         out = f"{prefix}_reward_training.png"
         _ensure_parent_dir(out)
@@ -2245,10 +2395,16 @@ def _plot_reports(
         xs = [int(r["day"]) for r in evaluation_logs]
         ys = [_extract_reward(r) for r in evaluation_logs]
         fig, ax = plt.subplots(figsize=(9, 4))
-        _plot_timeseries(ax, xs, ys)
+        _plot_timeseries(ax, xs, ys, label="reward", alpha=0.45)
+        if len(ys) > 1:
+            _plot_timeseries(ax, xs, _moving_average(ys, 20), label="moving avg20", marker="", linewidth=2.0)
+        if any("reward_base" in r for r in evaluation_logs):
+            base_ys = [float(r.get("reward_base", np.nan)) for r in evaluation_logs]
+            _plot_timeseries(ax, xs, base_ys, label="base reward", marker="", linestyle="--", alpha=0.8)
         ax.set_title("Evaluation Reward Trajectory")
         ax.set_xlabel("Day")
         ax.set_ylabel("Reward")
+        ax.legend(loc="best")
         fig.tight_layout()
         out = f"{prefix}_reward_evaluation.png"
         _ensure_parent_dir(out)
@@ -2256,6 +2412,79 @@ def _plot_reports(
         print(f"Saved graph -> {out}")
         plt.close(fig)
         
+    def _plot_experiment_diagnostics(logs: List[Dict[str, Any]], label: str, x_key: str) -> None:
+        if not logs:
+            return
+        xs = [int(r[x_key]) + (1 if x_key == "batch" else 0) for r in logs]
+
+        share_key = "avg_share" if "avg_share" in logs[0] else "rl_share"
+        revenue_key = "avg_rev_per_request" if "avg_rev_per_request" in logs[0] else "rl_revenue"
+        gap_key = "avg_price_gap_f2_minus_f1" if "avg_price_gap_f2_minus_f1" in logs[0] else "price_gap_f2_minus_f1"
+        if all(k in logs[0] for k in (share_key, revenue_key, gap_key)):
+            fig, axes = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
+            _plot_timeseries(axes[0], xs, [float(r[share_key]) for r in logs], label="share", color="tab:blue")
+            axes[0].set_ylabel("Share")
+            axes[0].grid(axis="y", linestyle="--", alpha=0.25)
+            _plot_timeseries(axes[1], xs, [float(r[revenue_key]) for r in logs], label="rev/request", color="tab:green")
+            axes[1].set_ylabel("Revenue/request")
+            axes[1].grid(axis="y", linestyle="--", alpha=0.25)
+            _plot_timeseries(axes[2], xs, [float(r[gap_key]) for r in logs], label="F2-F1 gap", color="tab:orange")
+            axes[2].axhline(0.0, color="black", linewidth=0.8, alpha=0.4)
+            axes[2].set_ylabel("Price gap")
+            axes[2].set_xlabel("Batch" if x_key == "batch" else "Day")
+            axes[2].grid(axis="y", linestyle="--", alpha=0.25)
+            fig.suptitle(f"{label.title()} Business Diagnostics")
+            fig.tight_layout()
+            out = f"{prefix}_{label}_business_diagnostics.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+
+        ppo_keys = ["ppo_approx_kl", "ppo_clipfrac", "ppo_entropy", "ppo_ent_coeff"]
+        present_ppo = [k for k in ppo_keys if any(k in r for r in logs)]
+        if present_ppo:
+            fig, ax = plt.subplots(figsize=(9, 4))
+            for k in present_ppo:
+                _plot_timeseries(ax, xs, [float(r.get(k, np.nan)) for r in logs], label=k.replace("ppo_", ""), marker="")
+            ax.set_title(f"{label.title()} PPO Diagnostics")
+            ax.set_xlabel("Batch" if x_key == "batch" else "Day")
+            ax.set_ylabel("Value")
+            ax.legend(loc="best")
+            ax.grid(axis="y", linestyle="--", alpha=0.25)
+            fig.tight_layout()
+            out = f"{prefix}_{label}_ppo_diagnostics.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+
+        coeff_keys: List[str] = sorted(
+            {
+                k[len("firm1_"):]
+                for r in logs
+                for k in r.keys()
+                if k.startswith("firm1_") and ("firm2_" + k[len("firm1_"):]) in r
+            }
+        )
+        for coeff in coeff_keys:
+            fig, ax = plt.subplots(figsize=(9, 4))
+            _plot_timeseries(ax, xs, [float(r.get(f"firm1_{coeff}", np.nan)) for r in logs], label=f"Firm1 {coeff}")
+            _plot_timeseries(ax, xs, [float(r.get(f"firm2_{coeff}", np.nan)) for r in logs], label=f"Firm2 {coeff}")
+            ax.set_title(f"{label.title()} Coefficient Trajectory: {coeff}")
+            ax.set_xlabel("Batch" if x_key == "batch" else "Day")
+            ax.set_ylabel("Coefficient value")
+            ax.legend(loc="best")
+            fig.tight_layout()
+            out = f"{prefix}_{label}_coeff_{coeff}_trajectory.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+
+    _plot_experiment_diagnostics(training_logs, "training", "batch")
+    _plot_experiment_diagnostics(evaluation_logs, "evaluation", "day")
+
     # 6) manipulated coefficient trajectories
     if run_logs:
         xs = [int(r["day"]) for r in run_logs]
