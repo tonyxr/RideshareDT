@@ -847,7 +847,11 @@ class Core:
                 "profile": profile,
                 "coldstart_ride_summary": summarize_priced_coldstart_rides(priced[:10]),
                 "coldstart_rides": priced[:10],
-                "instruction": "Aggregate all coldstart_rides for this one profile into exactly one profile-level threshold.",
+                "instruction": (
+                    "Aggregate all coldstart_rides for this one profile into exactly one profile-level threshold. "
+                    "Use the summary distribution and profile attributes to infer the smallest fare gap that would make "
+                    "price a primary decision factor for this rider across similar rides; do not answer separately per ride."
+                ),
             })
             results.append(self._threshold_fallback_result(profile, priced))
 
@@ -864,10 +868,28 @@ class Core:
         prompt = {
             "task": (
                 "Infer exactly one aggregate rider-level price threshold for each profile item. The threshold is the "
-                "single dollar fare gap at which that customer starts treating price as a primary decision factor, "
+                "smallest dollar fare gap at which that customer starts treating price as a primary decision factor, "
                 "after considering the profile and all 10 coldstart rides together. The coldstart rides are evidence "
                 "for one profile-level judgment; they are not separate threshold requests."
             ),
+            "calibration_guide": {
+                "do": [
+                    "Use profile economics first, then coldstart price-gap distribution as grounding evidence.",
+                    "Lower thresholds for lower income, larger households, new/no-loyalty riders, and repeated small gaps.",
+                    "Raise thresholds for higher income, strong loyalty to either firm, airport/rush/weather urgency, and premium-heavy rides.",
+                    "Pick a continuous dollar value to the nearest $0.25 when useful; do not default to only integers or half-dollars.",
+                    "Rationale must cite the aggregate profile signals and coldstart summary; avoid generic phrases.",
+                ],
+                "do_not": [
+                    "Do not copy the mean_absolute_price_gap as the threshold unless the profile evidence specifically supports it.",
+                    "Do not use max_absolute_price_gap as the threshold; max gaps are only upper-bound evidence.",
+                    "Do not make one threshold per ride or duplicate a profile_index.",
+                ],
+                "interpretation": (
+                    "A threshold below the observed mean gap means price becomes primary even for modest differences; "
+                    "a threshold above the mean gap means brand, convenience, or context often outweighs price until gaps are larger."
+                ),
+            },
             "profiles": prepared,
             "output_constraints": {
                 "format": "json_only",
@@ -875,7 +897,7 @@ class Core:
                 "forbidden": "Do not return per-ride thresholds. Do not create more than one row for the same profile_index.",
                 "expected_threshold_count": len(prepared),
                 "price_threshold_range_usd": [0.50, 5.00],
-                "response_shape": {"thresholds": [{"profile_index": 0, "price_threshold": 2.0, "rationale": "short aggregate explanation"}]},
+                "response_shape": {"thresholds": [{"profile_index": 0, "price_threshold": 2.25, "rationale": "short aggregate explanation using profile and summary evidence"}]},
             },
         }
         payload = {
