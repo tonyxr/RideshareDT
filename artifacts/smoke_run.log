@@ -1,0 +1,62 @@
+[ChoiceModel] GPT price-threshold mode enabled (thresholds consumed from profile).
+[Core] No OpenAI key found; GPT price-threshold bootstrapping will use deterministic fallback thresholds.
+Using random seed: 42
+[RewardConfig] share=0.60, revenue=0.40, overprice_penalty=0.35, rev_scale=25.00, competitive=0.12, trend=0.08
+[Calibration] Applied preset=nyc_public for market=New York City.
+[Calibration] {
+  "sample_size": 12000000,
+  "market": {
+    "weather_probs": {
+      "clear": 0.58,
+      "rain": 0.29,
+      "snow": 0.13
+    },
+    "service_probs": {
+      "economy": 0.88,
+      "premium": 0.12
+    },
+    "airport_prob": 0.19
+  },
+  "agent": {
+    "age_mean": 36.8,
+    "age_std": 12.4,
+    "income_probs": {
+      "<50k": 0.21,
+      "50k-100k": 0.34,
+      "100k-200k": 0.29,
+      "200k+": 0.16
+    },
+    "household_lambda": 1.95,
+    "p_new": 0.34
+  },
+  "choice": {
+    "price_sensitivity_scale": 1.12,
+    "loyalty_scale": 0.97,
+    "reliability_scale": 1.08
+  }
+}
+>>> Price-threshold bootstrap sources (batch_size=20): fallback=500 (100.0%)
+>>> GPT threshold API utilization: batches_total=25, batches_skipped_no_key=25, profiles_requested=500, profiles_fallback=500, profile_gpt_rate=0.0%, profile_fallback_rate=100.0%
+>>> GPT threshold diagnosis: no OpenAI API key was available, so every profile used deterministic fallback thresholds; fallback thresholds dominate this bootstrap, so GPT utilization is low for this run
+[Day 1/3] avg_share(F1)=0.441 avg_revPR(F1)=$12.71 avg_gap(F2-F1)=$0.46 no_ride_share=0.162
+[Day 2/3] avg_share(F1)=0.490 avg_revPR(F1)=$14.71 avg_gap(F2-F1)=$0.73 no_ride_share=0.140
+[Day 3/3] avg_share(F1)=0.445 avg_revPR(F1)=$14.02 avg_gap(F2-F1)=$0.64 no_ride_share=0.174
+[Convergence Summary] converged_day=not reached window_std=0.0253 delta/day=0.0116
+>>> Saved sampled profiles -> artifacts/smoke_sampled_profiles.csv (rows=2400)
+[Final Coefficients after 3 days] Firm1={"airport_fee": 5.269519226197769, "base_fare": 3.246560443700367, "booking_fee": 2.912828623973975, "per_mile": 2.0044008143494882, "per_minute": 0.40266541277024626} Firm2={"airport_fee": 5.91069468821202, "base_fare": 3.4280601164730804, "booking_fee": 2.4431937469573253, "per_mile": 2.0630566540078634, "per_minute": 0.4313367642388423}
+Saved -> artifacts/smoke_market_runs.csv
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_ride_distributions.csv
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_dist_DayOfWeek.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_dist_Weather.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_dist_Hour.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_dist_Airport.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_dist_Service.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_dist_Choice.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_dist_TravelDistance.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_reward_run.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_convergence_run.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_coeff_airport_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_coeff_base_fare_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_coeff_booking_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_coeff_per_mile_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/smoke_report_coeff_per_minute_trajectory.png

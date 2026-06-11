@@ -354,7 +354,7 @@ class Core:
         reward_rev_scale: float = 25.0,
         reward_competitive_weight: float = 0.12,
         reward_trend_weight: float = 0.08,
-        gpt_threshold_batch_size: int = 20,
+        gpt_threshold_batch_size: int = 5,
         gpt_threshold_max_retries: int = 2,
         gpt_threshold_failure_pause: float = 1.0,
     ):
@@ -2618,7 +2618,7 @@ def main():
     parser.add_argument("--reward_rev_scale", type=float, default=25.0)
     parser.add_argument("--reward_competitive_weight", type=float, default=0.12)
     parser.add_argument("--reward_trend_weight", type=float, default=0.08)
-    parser.add_argument("--gpt_threshold_batch_size", type=int, default=20, help="Profiles per GPT price-threshold API request. Larger values improve API utilization but increase per-request payload size.")
+    parser.add_argument("--gpt_threshold_batch_size", type=int, default=5, help="Profiles per GPT price-threshold API request. Larger values improve API utilization but increase per-request payload size.")
     parser.add_argument("--gpt_threshold_max_retries", type=int, default=2, help="Retries per GPT price-threshold batch before deterministic fallback is used.")
     parser.add_argument("--gpt_threshold_failure_pause", type=float, default=1.0, help="Seconds to pause after a failed GPT threshold batch before sending the next batch; helps avoid connection-refused cascades.")
     parser.add_argument("--calibration_csv", type=str, default="", help="Optional historical CSV used to calibrate priors and choice sensitivity.")
