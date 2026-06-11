@@ -1884,10 +1884,12 @@ class Core:
             if choice == "Firm1":
                 firm1.wins += 1
                 firm1.revenue += float(p1)
-            else:
+            elif choice == "Firm2":
                 firm2.wins += 1
                 firm2.revenue += float(p2)
-
+            # "NoRide" / outside-option choices remain demand opportunities but
+            # generate no firm win and no rideshare revenue.
+            
             rows.append({
                 "City": self.market_name,
                 "DayOfWeek": day_of_week,
@@ -1948,6 +1950,7 @@ class Core:
             
             share_sum_two = 0.0
             revpr_sum_two = 0.0
+            no_ride_share_sum = 0.0
 
             for t in range(timesteps_per_day):
                 hour = hours[t]
@@ -2027,6 +2030,7 @@ class Core:
                 
                 share_sum_two += float(m2.share)
                 revpr_sum_two += float(m2.rev_per_request)
+                no_ride_share_sum += float(max(0.0, 1.0 - float(m1.share) - float(m2.share)))
                 
                 self.last_share = float(m1.share)
                 self.last_revpr = float(m1.rev_per_request)
@@ -2048,11 +2052,13 @@ class Core:
             avg_revpr = revpr_sum / max(1, timesteps_per_day)
             avg_gap = gap_sum / max(1, timesteps_per_day)
             avg_reward = (reward_sum / max(1, timesteps_per_day)) if self.firm1_mode == "RL" else self._reward_base(avg_share, avg_revpr, price_gap_f2_minus_f1=avg_gap)
+            avg_no_ride_share = no_ride_share_sum / max(1, timesteps_per_day)
             self.run_logs.append({
                 "day": d + 1,
                 "avg_share": float(avg_share),
                 "avg_revpr": float(avg_revpr),
                 "avg_gap": float(avg_gap),
+                "avg_no_ride_share": float(avg_no_ride_share),
                 "avg_reward": float(avg_reward),
                 "ppo_approx_kl": float(ppo_metrics.get("approx_kl", 0.0)),
                 "ppo_clipfrac": float(ppo_metrics.get("clipfrac", 0.0)),
@@ -2100,7 +2106,7 @@ class Core:
 
                 print(
                     f"[Day {d+1}/{days}] avg_share(F1)={avg_share:.3f} avg_revPR(F1)=${avg_revpr:.2f} "
-                    f"avg_gap(F2-F1)=${avg_gap:.2f}"
+                    f"avg_gap(F2-F1)=${avg_gap:.2f} no_ride_share={avg_no_ride_share:.3f}"
                 )
                 if self.firm1_mode == "RL":
                     print(

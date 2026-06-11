@@ -162,6 +162,50 @@ class PriceThresholdFlowTests(unittest.TestCase):
         self.assertIn("COG_PRICE", low_threshold.reason_codes)
         self.assertNotIn("COG_PRICE", high_threshold.reason_codes)
 
+    def test_cognitive_choice_model_allows_no_ride_outside_option(self):
+        previous_numpy = sys.modules.get("numpy")
+        previous_choice_models = sys.modules.get("choice_models")
+        sys.modules["numpy"] = _FakeNumpy()
+        try:
+            sys.modules.pop("choice_models", None)
+            choice_models = importlib.import_module("choice_models")
+            model = choice_models.CognitiveChoiceModel(seed=11)
+            scenario = {
+                "Hour": 12,
+                "Weather": "clear",
+                "Airport": False,
+                "Service": "economy",
+                "DistanceMiles": 4.0,
+                "DurationMinutes": 16.0,
+                "DayOfWeek": 2,
+            }
+            profile = {
+                "Age": 35,
+                "IncomeBracket": "50k-100k",
+                "HouseholdSize": 1,
+                "EmploymentStatus": "Employed",
+                "LoyaltyFirm": None,
+                "LoyaltyStrength": 0.0,
+                "PriceThreshold": 1.50,
+                "ReservationPrice": 15.00,
+                "OutsideOptionCost": 3.00,
+                "OutsideOptionInconvenience": 0.10,
+            }
+
+            result = model.choose(profile, scenario, 48.0, 50.0)
+        finally:
+            sys.modules.pop("choice_models", None)
+            if previous_choice_models is not None:
+                sys.modules["choice_models"] = previous_choice_models
+            if previous_numpy is None:
+                sys.modules.pop("numpy", None)
+            else:
+                sys.modules["numpy"] = previous_numpy
+
+        self.assertEqual(result.choice, "NoRide")
+        self.assertIn("COG_OUTSIDE_OPTION", result.reason_codes)
+        self.assertIn("COG_TOO_EXPENSIVE", result.reason_codes)
+
 
 if __name__ == "__main__":
     unittest.main()

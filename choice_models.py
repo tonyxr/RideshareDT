@@ -14,7 +14,7 @@ import numpy as np
 
 @dataclass(frozen=True)
 class ChoiceResult:
-    choice: str  # "Firm1" or "Firm2"
+    choice: str  # "Firm1", "Firm2", or "NoRide"
     reason_codes: List[str]
     short_reason: str
 
@@ -26,6 +26,99 @@ class BaseChoiceModel:
     def apply_calibration(self, params: Dict[str, float]) -> None:
         del params
         return None
+    
+    @staticmethod
+    def _sigmoid(x: float) -> float:
+        x = float(np.clip(x, -60.0, 60.0))
+        return 1.0 / (1.0 + float(np.exp(-x)))
+
+    @staticmethod
+    def _income_score(income: str) -> float:
+        return {"<50k": 0.0, "50k-100k": 0.3, "100k-200k": 0.7, "200k+": 1.0}.get(str(income), 0.3)
+
+    def _reservation_price(self, profile: Dict[str, Any], scenario: Dict[str, Any]) -> float:
+        """Estimate the maximum acceptable rideshare fare before outside options become attractive."""
+        explicit = profile.get("ReservationPrice", profile.get("RideshareReservationPrice"))
+        if explicit is not None:
+            return float(np.clip(float(explicit), 5.0, 120.0))
+
+        income_score = self._income_score(profile.get("IncomeBracket", "50k-100k"))
+        household = int(profile.get("HouseholdSize", 1) or 1)
+        loyalty_strength = float(profile.get("LoyaltyStrength", 0.0) or 0.0)
+        returning = str(profile.get("LoyaltyType", "New")) == "Returning"
+        distance = float(scenario.get("DistanceMiles", 4.0) or 4.0)
+        duration = float(scenario.get("DurationMinutes", 15.0) or 15.0)
+        service = str(scenario.get("Service", "economy") or "economy").lower()
+        hour = int(scenario.get("Hour", 12) or 12)
+        weather = str(scenario.get("Weather", "clear") or "clear").lower()
+        airport = bool(scenario.get("Airport", False))
+        rush = (7 <= hour < 10) or (16 <= hour < 19)
+        bad_weather = weather in {"rain", "snow", "storm"}
+
+        reservation = 11.0 + 26.0 * income_score
+        reservation += 0.95 * distance + 0.10 * duration
+        reservation += 8.0 if service == "premium" else 0.0
+        reservation += 7.0 if airport else 0.0
+        reservation += 2.5 if rush else 0.0
+        reservation += 2.5 if bad_weather else 0.0
+        reservation += (2.0 + 3.0 * loyalty_strength) if returning else 0.0
+        reservation -= 1.25 * min(max(household - 1, 0), 4)
+        return float(np.clip(reservation, 5.0, 120.0))
+
+    def _outside_option_cost(self, profile: Dict[str, Any], scenario: Dict[str, Any]) -> float:
+        explicit = profile.get("OutsideOptionCost", profile.get("AlternativeTransportCost"))
+        if explicit is not None:
+            return float(np.clip(float(explicit), 0.0, 80.0))
+        distance = float(scenario.get("DistanceMiles", 4.0) or 4.0)
+        airport = bool(scenario.get("Airport", False))
+        return float(np.clip(2.90 + 0.20 * distance + (9.0 if airport else 0.0), 0.0, 80.0))
+
+    def _outside_option_inconvenience(self, profile: Dict[str, Any], scenario: Dict[str, Any]) -> float:
+        explicit = profile.get("OutsideOptionInconvenience")
+        if explicit is not None:
+            return float(np.clip(float(explicit), 0.0, 4.0))
+        distance = float(scenario.get("DistanceMiles", 4.0) or 4.0)
+        hour = int(scenario.get("Hour", 12) or 12)
+        weather = str(scenario.get("Weather", "clear") or "clear").lower()
+        service = str(scenario.get("Service", "economy") or "economy").lower()
+        airport = bool(scenario.get("Airport", False))
+        rush = (7 <= hour < 10) or (16 <= hour < 19)
+        bad_weather = weather in {"rain", "snow", "storm"}
+        income_score = self._income_score(profile.get("IncomeBracket", "50k-100k"))
+
+        inconvenience = 0.35 + 0.05 * min(distance, 15.0)
+        inconvenience += 0.45 if bad_weather else 0.0
+        inconvenience += 0.55 if airport else 0.0
+        inconvenience += 0.20 if rush else 0.0
+        inconvenience += 0.25 + 0.25 * income_score if service == "premium" else 0.0
+        return float(np.clip(inconvenience, 0.0, 4.0))
+
+    def _no_ride_probability(self, profile: Dict[str, Any], scenario: Dict[str, Any], price1: float, price2: float) -> float:
+        """Probability that the rider rejects both quotes in favor of no ride/outside transport."""
+        best_price = float(min(price1, price2))
+        reservation = self._reservation_price(profile, scenario)
+        outside_cost = self._outside_option_cost(profile, scenario)
+        inconvenience = self._outside_option_inconvenience(profile, scenario)
+        income_score = self._income_score(profile.get("IncomeBracket", "50k-100k"))
+        household = int(profile.get("HouseholdSize", 1) or 1)
+        loyalty_strength = float(profile.get("LoyaltyStrength", 0.0) or 0.0)
+
+        affordability_pressure = (best_price - reservation) / max(reservation, 1e-6)
+        outside_savings = max(0.0, best_price - outside_cost) / max(reservation, 1e-6)
+        household_pressure = 0.08 * min(max(household - 1, 0), 4)
+        loyalty_pull = 0.35 * loyalty_strength
+        income_buffer = 0.35 * income_score
+
+        latent = (
+            -2.15
+            + 4.00 * affordability_pressure
+            + 0.65 * outside_savings
+            + household_pressure
+            - 0.70 * inconvenience
+            - loyalty_pull
+            - income_buffer
+        )
+        return float(np.clip(self._sigmoid(latent), 0.0, 0.98))
 
 class ParametricChoiceModel(BaseChoiceModel):
     """Simple baseline model: price + loyalty + random noise."""
@@ -64,6 +157,20 @@ class ParametricChoiceModel(BaseChoiceModel):
 
         eps = float(self.rng.normal(0.0, self.noise_std))
         delta = beta * price_gap + loy + eps
+        
+        scenario = dict(scenario or {})
+        p_no_ride = self._no_ride_probability(profile, scenario, price1, price2)
+        if bool(self.rng.random() < p_no_ride):
+            reservation = self._reservation_price(profile, scenario)
+            best_price = float(min(price1, price2))
+            reasons = ["OUTSIDE_OPTION"]
+            if best_price > reservation:
+                reasons.append("TOO_EXPENSIVE")
+            return ChoiceResult(
+                choice="NoRide",
+                reason_codes=reasons,
+                short_reason="Parametric outside-option choice (both rideshare quotes rejected).",
+            )
 
         choice = "Firm1" if delta >= 0 else "Firm2"
 
@@ -88,8 +195,11 @@ class CognitiveChoiceModel(BaseChoiceModel):
     - Reliability-risk sensitivity: stronger in airport, bad weather, rush periods
     - Convenience effects: trip urgency and service context
 
-    Choice is probabilistic via logistic response, with temperature tuned by context
-    so close offers remain stochastic while large utility gaps become decisive.
+    A separate outside-option gate can reject both rideshare quotes when the best
+    absolute fare exceeds the rider's reservation price enough to make no ride or
+    alternative transportation attractive. Conditional on taking rideshare, choice
+    is probabilistic via logistic response, with temperature tuned by context so
+    close offers remain stochastic while large utility gaps become decisive.
     """
 
     def __init__(self, seed: Optional[int] = None):
@@ -192,6 +302,23 @@ class CognitiveChoiceModel(BaseChoiceModel):
         # Choice stochasticity: lower temp in urgent contexts -> more deterministic.
         temperature = 0.70 - 0.15 * float(rush) - 0.10 * float(bad_weather) - 0.05 * float(airport)
         temperature = float(np.clip(temperature, 0.35, 0.90))
+        
+        p_no_ride = self._no_ride_probability(profile, scenario, price1, price2)
+        if bool(self.rng.random() < p_no_ride):
+            reservation = self._reservation_price(profile, scenario)
+            best_price = float(min(price1, price2))
+            reasons = ["OUTSIDE_OPTION"]
+            if best_price > reservation:
+                reasons.append("TOO_EXPENSIVE")
+            if rush or airport:
+                reasons.append("URGENCY")
+            if bad_weather:
+                reasons.append("WEATHER")
+            return ChoiceResult(
+                choice="NoRide",
+                reason_codes=[f"COG_{r}" for r in reasons],
+                short_reason="Cognitive outside-option choice (rideshare rejected for no ride/alternative transport).",
+            )
 
         p_f1 = 1.0 / (1.0 + float(np.exp(-latent / temperature)))
         choose_f1 = bool(self.rng.random() < p_f1)
