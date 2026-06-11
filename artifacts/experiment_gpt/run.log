@@ -35,3 +35,5 @@ Using random seed: 1083622708
     "reliability_scale": 1.08
   }
 }
+[GPT threshold fallback] partial_batch: usable=16/20
+[GPT threshold fallback] batch_failed: TimeoutError: The read operation timed out
