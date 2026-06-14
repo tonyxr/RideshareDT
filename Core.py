@@ -1225,7 +1225,7 @@ class Core:
                     action_counts[int(action)] += 1
                     last_action = int(action)
                     rl_step = (action, s_ts, logits, val)
-                elif self.firm1_mode == "heuristic":
+                elif self.firm1_mode != "static":
                     self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
                 self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
@@ -1245,7 +1245,7 @@ class Core:
                     sampled_profiles=sampled_profiles,
                 )
 
-                if self.firm2_mode == "heuristic":
+                if self.firm2_mode != "static":
                     self.firm2.update(metrics=m2, price_gap_mean=mean_gap)
                     
                 reward_diag = self._reward_diagnostics(
@@ -1392,10 +1392,10 @@ class Core:
                 action, *_ = self.firm1.agent.act(s_vec)
                 self.firm1.apply_action(action, self.market)
                 action = int(action)
-            elif self.firm1_mode == "heuristic":
+            elif self.firm1_mode != "static":
                 self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
-            if self.firm2_mode == "heuristic":
+            if self.firm2_mode != "static":
                 self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
             _, m1, m2, mean_gap, _, _ = self.simulate_batch(
@@ -1856,10 +1856,10 @@ class Core:
             action, s_ts, logits, val = self.firm1.agent.act(s_vec)
             self.firm1.apply_action(action, self.market)
             rl_step = (action, s_ts, logits, val)
-        elif self.firm1_mode == "heuristic":
+        elif self.firm1_mode != "static":
             self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
-        if self.firm2_mode == "heuristic":
+        if self.firm2_mode != "static":
             self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
         results, m1, m2, gap, air, dist = self.simulate_batch(day_ctx.day_of_week, day_ctx.weather, hour, rides)
@@ -2068,11 +2068,11 @@ class Core:
                     action_counts[int(action)] += 1
                     last_action = int(action)
                     rl_step = (action, s_ts, logits, val)
-                elif self.firm1_mode == "heuristic":
+                elif self.firm1_mode != "static":
                     self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
                 # Firm 2 action
-                if self.firm2_mode == "heuristic":
+                if self.firm2_mode != "static":
                     self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
                 
                 sampled_profiles = self._sample_profiles_from_pool(customers_per_step)
@@ -2107,9 +2107,9 @@ class Core:
                     all_rows.extend(rows)
 
                 # update heuristic memory (only if heuristic)
-                if self.firm1_mode == "heuristic":
+                if self.firm1_mode != "static" and self.firm1_mode != "RL":
                     self.firm1.update(metrics=m1, price_gap_mean=-mean_gap)  # note sign: Firm1 - Firm2
-                if self.firm2_mode == "heuristic":
+                if self.firm2_mode != "static":
                     self.firm2.update(metrics=m2, price_gap_mean=mean_gap)   # Firm2 - Firm1
                     
                 # RL memory + reward shaping

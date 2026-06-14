@@ -182,6 +182,87 @@ class FirmHeuristicPricer:
         self.ema_share = self._ema(metrics.share, self.ema_share, self.alpha)
         self.ema_gap = self._ema(price_gap_mean, self.ema_gap, self.alpha)
         
+class FirmMarginGuardrailPricer(FirmHeuristicPricer):
+    """
+    Heuristic pricer with conservative margin/share guardrails.
+
+    This keeps the existing schedule and competitive response behavior, then
+    nudges prices back toward a safer band when recent revenue per request or
+    win share indicates the firm may be pricing too aggressively or too cheaply.
+    """
+
+    def __init__(self, seed: Optional[int] = None, managed_keys: Optional[List[str]] = None):
+        super().__init__(seed=seed, managed_keys=managed_keys)
+        self.min_rev_per_request = 6.00
+        self.high_share_threshold = 0.62
+        self.low_share_threshold = 0.38
+        self.guardrail_cooldown_H = 2
+
+    def update(self, metrics: FirmMetrics, price_gap_mean: float):
+        super().update(metrics=metrics, price_gap_mean=price_gap_mean)
+
+        if self.cooldown > 0:
+            return
+
+        # If share is high but revenue per request is weak, add a small price
+        # increase to protect margin. If share is low while the firm is already
+        # more expensive than its competitor, trim prices to recover demand.
+        increase_for_margin = (
+            metrics.total > 0
+            and metrics.share >= self.high_share_threshold
+            and metrics.rev_per_request < self.min_rev_per_request
+        )
+        cut_for_share = metrics.total > 0 and metrics.share <= self.low_share_threshold and price_gap_mean > 0.0
+
+        if not (increase_for_margin or cut_for_share):
+            return
+
+        direction = 1 if increase_for_margin else -1
+        if "base_fare" in self.managed_keys and self.overrides.base_fare is not None:
+            self.overrides.base_fare = float(np.clip(
+                float(self.overrides.base_fare) + direction * (0.5 * self.step_base_fare),
+                *self.base_bounds,
+            ))
+        if "per_minute" in self.managed_keys and self.overrides.per_minute is not None:
+            self.overrides.per_minute = float(np.clip(
+                float(self.overrides.per_minute) + direction * (0.5 * self.step_per_minute),
+                *self.pmin_bounds,
+            ))
+        self.cooldown = self.guardrail_cooldown_H
+
+
+class FirmRandomWalkPricer(FirmHeuristicPricer):
+    """Heuristic pricer with occasional bounded random exploration."""
+
+    def __init__(self, seed: Optional[int] = None, managed_keys: Optional[List[str]] = None):
+        super().__init__(seed=seed, managed_keys=managed_keys)
+        self.exploration_prob = 0.20
+
+    def act(self, city_base: float, city_pmin: float, hour: int, weather: str):
+        super().act(city_base=city_base, city_pmin=city_pmin, hour=hour, weather=weather)
+
+        if self.cooldown > 0 or float(self.rng.random()) >= self.exploration_prob:
+            return
+
+        choices = [k for k in self.managed_keys if getattr(self.overrides, k, None) is not None]
+        if not choices:
+            return
+
+        key = str(self.rng.choice(choices))
+        direction = int(self.rng.choice([-1, 1]))
+        if key == "base_fare":
+            self.overrides.base_fare = float(np.clip(float(self.overrides.base_fare) + direction * self.step_base_fare, *self.base_bounds))
+        elif key == "per_minute":
+            self.overrides.per_minute = float(np.clip(float(self.overrides.per_minute) + direction * self.step_per_minute, *self.pmin_bounds))
+        elif key == "per_mile":
+            self.overrides.per_mile = float(np.clip(float(self.overrides.per_mile) + direction * self.step_per_mile, *self.pmile_bounds))
+        elif key == "booking_fee":
+            self.overrides.booking_fee = float(np.clip(float(self.overrides.booking_fee) + direction * self.step_booking_fee, *self.booking_bounds))
+        elif key == "airport_fee":
+            self.overrides.airport_fee = float(np.clip(float(self.overrides.airport_fee) + direction * self.step_airport_fee, *self.airport_bounds))
+        self.cooldown = self.cooldown_H
+
+        
 class FirmRLPricer:
     MAX_MANIPULATED_COEFFS = 5
 
