@@ -44,7 +44,14 @@ from MarketInteraction import MarketInteraction, RideContext
 from Market_models import CoefficientOverrides
 from GenerateAgent import GenerateAgent
 from choice_models import ParametricChoiceModel, LLMChoiceModel, ChoiceResult
-from pricing_models import FirmMetrics, FirmStaticPricer, FirmHeuristicPricer, FirmRLPricer
+from pricing_models import (
+    FirmMetrics,
+    FirmStaticPricer,
+    FirmHeuristicPricer,
+    FirmMarginGuardrailPricer,
+    FirmRandomWalkPricer,
+    FirmRLPricer,
+)
 from coeff_utils import get_coeff, set_coeff
 from state_encoder import build_state_vector
 from calibration_utils import derive_calibration, load_calibration_preset
@@ -354,6 +361,14 @@ class Core:
         reward_rev_scale: float = 25.0,
         reward_competitive_weight: float = 0.33,
         reward_trend_weight: float = 0.0,
+        reward_profit_scale: float = 12.0,
+        reward_underprice_weight: float = 0.15,
+        reward_acceptable_discount: float = 2.00,
+        min_profit_margin: float = 0.08,
+        driver_cost_per_mile: float = 0.85,
+        driver_cost_per_minute: float = 0.12,
+        fixed_trip_cost: float = 1.25,
+        airport_cost: float = 2.00,
         gpt_threshold_batch_size: int = 5,
         gpt_threshold_max_retries: int = 2,
         gpt_threshold_failure_pause: float = 1.0,
@@ -403,23 +418,30 @@ class Core:
         self.firm1_mode = firm1_mode
         self.firm2_mode = firm2_mode
 
-        if self.firm1_mode not in {"RL", "heuristic", "static"}:
-            raise ValueError("firm1_mode must be one of: RL, heuristic, static")
-        if self.firm2_mode not in {"heuristic", "static"}:
-            raise ValueError("firm2_mode must be one of: heuristic, static")
+        dynamic_pricer_modes = {"heuristic", "heuristic_margin", "heuristic_random"}
+        if self.firm1_mode not in {"RL", "static", *dynamic_pricer_modes}:
+            raise ValueError("firm1_mode must be one of: RL, heuristic, heuristic_margin, heuristic_random, static")
+        if self.firm2_mode not in {"static", *dynamic_pricer_modes}:
+            raise ValueError("firm2_mode must be one of: heuristic, heuristic_margin, heuristic_random, static")
 
         self.opt_keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
         self.shared_edit_keys = list(self.opt_keys)
+        
+        pricer_by_mode = {
+            "heuristic": FirmHeuristicPricer,
+            "heuristic_margin": FirmMarginGuardrailPricer,
+            "heuristic_random": FirmRandomWalkPricer,
+        }
 
         if self.firm1_mode == "RL":
             self.firm1 = FirmRLPricer(seed=self.seed, opt_keys=self.shared_edit_keys)
-        elif self.firm1_mode == "heuristic":
-            self.firm1 = FirmHeuristicPricer(seed=self.seed, managed_keys=self.shared_edit_keys)
+        elif self.firm1_mode in pricer_by_mode:
+            self.firm1 = pricer_by_mode[self.firm1_mode](seed=self.seed, managed_keys=self.shared_edit_keys)
         else:
             self.firm1 = FirmStaticPricer()
 
-        if self.firm2_mode == "heuristic":
-            self.firm2 = FirmHeuristicPricer(seed=self.seed + 1, managed_keys=self.shared_edit_keys)
+        if self.firm2_mode in pricer_by_mode:
+            self.firm2 = pricer_by_mode[self.firm2_mode](seed=self.seed + 1, managed_keys=self.shared_edit_keys)
         else:
             self.firm2 = FirmStaticPricer()
             
@@ -459,7 +481,15 @@ class Core:
         self.reward_share_weight = float(max(0.0, reward_share_weight))
         self.reward_revenue_weight = float(max(0.0, reward_revenue_weight))
         self.reward_overprice_weight = float(max(0.0, reward_overprice_weight))
+        self.reward_underprice_weight = float(max(0.0, reward_underprice_weight))
+        self.reward_acceptable_discount = float(max(0.0, reward_acceptable_discount))
+        self.min_profit_margin = float(np.clip(min_profit_margin, 0.0, 0.95))
+        self.driver_cost_per_mile = float(max(0.0, driver_cost_per_mile))
+        self.driver_cost_per_minute = float(max(0.0, driver_cost_per_minute))
+        self.fixed_trip_cost = float(max(0.0, fixed_trip_cost))
+        self.airport_cost = float(max(0.0, airport_cost))
         self.reward_rev_scale = float(max(1e-6, reward_rev_scale))
+        self.reward_profit_scale = float(max(1e-6, reward_profit_scale))
         # Kept as the CLI/API name for backward compatibility; this now weights
         # the explicit dominance component in the balanced reward.
         self.reward_competitive_weight = float(max(0.0, reward_competitive_weight))
@@ -476,6 +506,7 @@ class Core:
             denom = 1.0
 
         self.reward_share_weight /= denom
+        self.reward_revenue_weight /= denom
         self.reward_competitive_weight /= denom
 
         self.reward_dominance_threshold = 0.50
@@ -489,9 +520,10 @@ class Core:
         print(
             "[RewardConfig] "
             f"share={self.reward_share_weight:.2f}, "
-            f"revenue={self.reward_revenue_weight:.2f}, "
+            f"profit={self.reward_revenue_weight:.2f}, "
             f"overprice_penalty={self.reward_overprice_weight:.2f}, "
-            f"rev_scale={self.reward_rev_scale:.2f}, "
+            f"underprice_penalty={self.reward_underprice_weight:.2f}, "
+            f"profit_scale={self.reward_profit_scale:.2f}, "
             f"dominance={self.reward_competitive_weight:.2f}, "
             f"trend={self.reward_trend_weight:.2f}"
         )
@@ -618,11 +650,28 @@ class Core:
         self.firm2.overrides.booking_fee = max(0.0, f2_book)
         self.firm2.overrides.airport_fee = max(0.0, f2_air)
         
+    def _estimate_trip_cost(self, distance_miles: float, duration_minutes: float, airport: bool) -> float:
+        """Approximate platform contribution cost for a completed ride."""
+        return float(
+            self.fixed_trip_cost
+            + self.driver_cost_per_mile * max(0.0, float(distance_miles))
+            + self.driver_cost_per_minute * max(0.0, float(duration_minutes))
+            + (self.airport_cost if airport else 0.0)
+        )
+
+    @staticmethod
+    def _profit_margin(metrics: FirmMetrics) -> float:
+        if metrics.revenue <= 0.0:
+            return 0.0
+        return float(metrics.profit / max(metrics.revenue, 1e-6))
+        
     def _reward_base(
         self,
         share: float,
         rev_per_request: float,
         price_gap_f2_minus_f1: float = 0.0,
+        profit_per_request: Optional[float] = None,
+        profit_margin: Optional[float] = None,
     ) -> float:
         """Balanced business reward: revenue + share + sustained dominance.
 
@@ -636,17 +685,23 @@ class Core:
         """
         
         share_f = float(np.clip(share, 0.0, 1.0))
-        rev_term = float(np.clip(rev_per_request / self.reward_rev_scale, 0.0, 1.0))
+        profitpr = float(rev_per_request if profit_per_request is None else profit_per_request)
+        margin = float(0.0 if profit_margin is None else profit_margin)
+        profit_term = float(np.clip(profitpr / self.reward_profit_scale, -1.0, 1.0))
         dominance_width = max(1e-6, self.reward_dominance_full_credit_share - self.reward_dominance_threshold)
         dominance_term = float(np.clip((share_f - self.reward_dominance_threshold) / dominance_width, 0.0, 1.0))
         overprice_gap = float(max(0.0, -price_gap_f2_minus_f1))
         overprice_penalty = float(np.clip((overprice_gap / 2.5) ** 2, 0.0, 1.0))
+        underprice_gap = float(max(0.0, price_gap_f2_minus_f1 - self.reward_acceptable_discount))
+        underprice_penalty = float(np.clip((underprice_gap / 4.0) ** 2, 0.0, 1.0))
+        margin_penalty = float(np.clip((self.min_profit_margin - margin) / max(self.min_profit_margin, 1e-6), 0.0, 1.0))
         
         raw = (
             (self.reward_share_weight * share_f)
-            + (self.reward_revenue_weight * rev_term)
+            + (self.reward_revenue_weight * profit_term)
             + (self.reward_competitive_weight * dominance_term)
             - (self.reward_overprice_weight * overprice_penalty)
+            - (self.reward_underprice_weight * max(underprice_penalty, margin_penalty))
         )
         return float(np.clip(raw, -1.0, 1.0))
 
@@ -657,22 +712,28 @@ class Core:
         mean_gap: float,
         prev_share: float,
         prev_rev_per_request: float,
+        profit_per_request: Optional[float] = None,
+        profit_margin: Optional[float] = None,
     ) -> Dict[str, float]:
         """Return shaped reward and component diagnostics for trajectory analysis."""
         share_f = float(np.clip(share, 0.0, 1.0))
         revpr = float(max(0.0, rev_per_request))
+        profitpr = float(revpr if profit_per_request is None else profit_per_request)
+        margin = float(0.0 if profit_margin is None else profit_margin)
         gap = float(mean_gap)
         
         base_reward = self._reward_base(
             share=share_f,
             rev_per_request=revpr,
             price_gap_f2_minus_f1=gap,
+            profit_per_request=profitpr,
+            profit_margin=margin,
         )
         
         dominance_width = max(1e-6, self.reward_dominance_full_credit_share - self.reward_dominance_threshold)
         dominance_term = float(np.clip((share_f - self.reward_dominance_threshold) / dominance_width, 0.0, 1.0))
         share_delta = float(np.clip(share_f - float(prev_share), -0.20, 0.20) / 0.20)
-        rev_delta = float(np.clip((revpr - float(prev_rev_per_request)) / self.reward_rev_scale, -0.20, 0.20) / 0.20)
+        rev_delta = float(np.clip((profitpr - float(prev_rev_per_request)) / self.reward_profit_scale, -0.20, 0.20) / 0.20)
         trend_term = float(0.5 * (share_delta + rev_delta))
         pricing_discipline = float(np.clip(gap / 2.0, -1.0, 1.0))
         efficiency_term = float(0.5 * trend_term + 0.5 * pricing_discipline)
@@ -694,6 +755,8 @@ class Core:
             "reward_trend_term": trend_term,
             "reward_pricing_discipline": pricing_discipline,
             "reward_efficiency_term": efficiency_term,
+            "reward_profit_per_request": profitpr,
+            "reward_profit_margin": margin,
         }
 
     def _compute_rl_reward(self, m1: FirmMetrics, mean_gap: float) -> float:
@@ -702,6 +765,8 @@ class Core:
             share=float(m1.share),
             rev_per_request=float(m1.rev_per_request),
             mean_gap=float(mean_gap),
+            profit_per_request=float(m1.profit_per_request),
+            profit_margin=self._profit_margin(m1),
             prev_share=float(self.last_share),
             prev_rev_per_request=float(self.last_revpr),
         )
@@ -1109,9 +1174,10 @@ class Core:
         sampled_profile_rows: List[Dict[str, Any]] = []
         profile_limit_reached = False
 
-        # Force heuristic opponent during training to match the long-horizon `run` behavior.
+        # If evaluation opponent is static, use the default dynamic heuristic during training
+        # to match the long-horizon `run` behavior. Preserve explicit dynamic alternatives.
         orig_firm2, orig_firm2_mode = self.firm2, self.firm2_mode
-        if self.firm2_mode != "heuristic":
+        if self.firm2_mode == "static":
             self.firm2 = FirmHeuristicPricer(seed=self.seed + 1, managed_keys=self.shared_edit_keys)
             self.firm2_mode = "heuristic"
         
@@ -1143,6 +1209,7 @@ class Core:
             efficiency_sum = 0.0
             share_sum = 0.0
             revpr_sum = 0.0
+            profitpr_sum = 0.0
             gap_sum = 0.0
             action_counts: Counter[int] = Counter()
             last_action = -1
@@ -1187,6 +1254,8 @@ class Core:
                     mean_gap=float(mean_gap),
                     prev_share=float(self.last_share),
                     prev_rev_per_request=float(self.last_revpr),
+                    profit_per_request=float(m1.profit_per_request),
+                    profit_margin=self._profit_margin(m1),
                 )
 
                 if self.firm1_mode == "RL" and rl_step is not None:
@@ -1223,6 +1292,7 @@ class Core:
 
                 share_sum += float(m1.share)
                 revpr_sum += float(m1.rev_per_request)
+                profitpr_sum += float(m1.profit_per_request)
                 gap_sum += float(mean_gap)
                 self.last_share = float(m1.share)
                 self.last_revpr = float(m1.rev_per_request)
@@ -1244,6 +1314,7 @@ class Core:
             moving_std20 = float(np.std(moving_window)) if moving_window else 0.0
             avg_share = float(share_sum / n_steps)
             avg_revpr = float(revpr_sum / n_steps)
+            avg_profitpr = float(profitpr_sum / n_steps)
             avg_gap = float(gap_sum / n_steps)
             dominant_action = int(action_counts.most_common(1)[0][0]) if action_counts else -1
             dominant_action_rate = float(action_counts.most_common(1)[0][1] / n_steps) if action_counts else 0.0
@@ -1264,6 +1335,7 @@ class Core:
                 "reward_efficiency_term": float(efficiency_sum / n_steps),
                 "avg_share": avg_share,
                 "avg_rev_per_request": avg_revpr,
+                "avg_profit_per_request": avg_profitpr,
                 "avg_price_gap_f2_minus_f1": avg_gap,
                 "last_action": int(last_action),
                 "dominant_action": dominant_action,
@@ -1344,6 +1416,8 @@ class Core:
                 mean_gap=float(mean_gap),
                 prev_share=eval_last_share,
                 prev_rev_per_request=eval_last_revpr,
+                profit_per_request=float(m1.profit_per_request),
+                profit_margin=self._profit_margin(m1),
             )
             eval_reward = float(reward_diag["reward"])
 
@@ -1371,6 +1445,8 @@ class Core:
                 "heuristic_share": float(m2.share),
                 "rl_revenue": float(m1.rev_per_request),
                 "heuristic_revenue": float(m2.rev_per_request),
+                "rl_profit": float(m1.profit_per_request),
+                "heuristic_profit": float(m2.profit_per_request),
                 "price_gap_f2_minus_f1": float(mean_gap),
                 "action": int(action),
             }
@@ -1903,12 +1979,15 @@ class Core:
 
             firm1.total += 1
             firm2.total += 1
+            trip_cost = self._estimate_trip_cost(travel_distance, duration, airport)
             if choice == "Firm1":
                 firm1.wins += 1
                 firm1.revenue += float(p1)
+                firm1.profit += float(p1) - trip_cost
             elif choice == "Firm2":
                 firm2.wins += 1
                 firm2.revenue += float(p2)
+                firm2.profit += float(p2) - trip_cost
             # "NoRide" / outside-option choices remain demand opportunities but
             # generate no firm win and no rideshare revenue.
             
@@ -1967,11 +2046,13 @@ class Core:
             # day accumulators for logging
             share_sum = 0.0
             revpr_sum = 0.0
+            profit_sum = 0.0
             gap_sum = 0.0
             reward_sum = 0.0
             
             share_sum_two = 0.0
             revpr_sum_two = 0.0
+            profit_sum_two = 0.0
             no_ride_share_sum = 0.0
 
             for t in range(timesteps_per_day):
@@ -2048,10 +2129,12 @@ class Core:
 
                 share_sum += float(m1.share)
                 revpr_sum += float(m1.rev_per_request)
+                profit_sum += float(m1.profit_per_request)
                 gap_sum += float(mean_gap)
                 
                 share_sum_two += float(m2.share)
                 revpr_sum_two += float(m2.rev_per_request)
+                profit_sum_two += float(m2.profit_per_request)
                 no_ride_share_sum += float(max(0.0, 1.0 - float(m1.share) - float(m2.share)))
                 
                 self.last_share = float(m1.share)
@@ -2073,12 +2156,14 @@ class Core:
             avg_share = share_sum / max(1, timesteps_per_day)
             avg_revpr = revpr_sum / max(1, timesteps_per_day)
             avg_gap = gap_sum / max(1, timesteps_per_day)
-            avg_reward = (reward_sum / max(1, timesteps_per_day)) if self.firm1_mode == "RL" else self._reward_base(avg_share, avg_revpr, price_gap_f2_minus_f1=avg_gap)
+            avg_profitpr = profit_sum / max(1, timesteps_per_day)
+            avg_reward = (reward_sum / max(1, timesteps_per_day)) if self.firm1_mode == "RL" else self._reward_base(avg_share, avg_revpr, price_gap_f2_minus_f1=avg_gap, profit_per_request=avg_profitpr)
             avg_no_ride_share = no_ride_share_sum / max(1, timesteps_per_day)
             self.run_logs.append({
                 "day": d + 1,
                 "avg_share": float(avg_share),
                 "avg_revpr": float(avg_revpr),
+                "avg_profitpr": float(avg_profitpr),
                 "avg_gap": float(avg_gap),
                 "avg_no_ride_share": float(avg_no_ride_share),
                 "avg_reward": float(avg_reward),
@@ -2277,12 +2362,56 @@ def _plot_reports(
     training_logs: List[Dict[str, Any]],
     evaluation_logs: List[Dict[str, Any]],
     prefix: str,
+    threshold_profiles: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     for name, logs in (("training_diagnostics", training_logs), ("evaluation_diagnostics", evaluation_logs)):
         if logs:
             out = f"{prefix}_{name}.csv"
             _write_csv(out, logs)
             print(f"Saved -> {out}")
+    
+    
+    threshold_rows = list(threshold_profiles or [])
+    if not threshold_rows and rows:
+        seen_thresholds = set()
+        for r in rows:
+            if "PriceThreshold" not in r:
+                continue
+            key = (r.get("ProfileID", id(r)), r.get("PriceThreshold"), r.get("PriceThresholdSource"))
+            if key in seen_thresholds:
+                continue
+            seen_thresholds.add(key)
+            threshold_rows.append(r)
+
+    if threshold_rows:
+        summary: Dict[str, List[float]] = {}
+        for r in threshold_rows:
+            try:
+                value = float(r.get("PriceThreshold"))
+            except (TypeError, ValueError):
+                continue
+            source = str(r.get("PriceThresholdSource", "unknown"))
+            summary.setdefault(source, []).append(value)
+        if summary:
+            summary_path = f"{prefix}_price_threshold_distribution.csv"
+            _ensure_parent_dir(summary_path)
+            with open(summary_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=["source", "count", "mean", "std", "min", "p25", "median", "p75", "max"])
+                w.writeheader()
+                for source, vals in sorted(summary.items()):
+                    arr = np.asarray(vals, dtype=float)
+                    w.writerow({
+                        "source": source,
+                        "count": int(arr.size),
+                        "mean": float(np.mean(arr)),
+                        "std": float(np.std(arr)),
+                        "min": float(np.min(arr)),
+                        "p25": float(np.percentile(arr, 25)),
+                        "median": float(np.percentile(arr, 50)),
+                        "p75": float(np.percentile(arr, 75)),
+                        "max": float(np.max(arr)),
+                    })
+            print(f"Saved -> {summary_path}")
             
     if importlib.util.find_spec("matplotlib") is None:
         print("[WARN] matplotlib not installed; skipping graph generation.")
@@ -2309,6 +2438,31 @@ def _plot_reports(
         return 0.0
     
     _ensure_parent_dir(prefix + "_dummy")
+    
+    if threshold_rows:
+        threshold_values_by_source: Dict[str, List[float]] = {}
+        for r in threshold_rows:
+            try:
+                value = float(r.get("PriceThreshold"))
+            except (TypeError, ValueError):
+                continue
+            threshold_values_by_source.setdefault(str(r.get("PriceThresholdSource", "unknown")), []).append(value)
+        if threshold_values_by_source:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            bins = np.linspace(0.5, 5.0, 19)
+            for source, vals in sorted(threshold_values_by_source.items()):
+                weights = np.ones(len(vals), dtype=float) * (100.0 / max(1, len(vals)))
+                ax.hist(vals, bins=bins, weights=weights, alpha=0.55, label=f"{source} (n={len(vals)})")
+            ax.set_title("Profile Price-Threshold Distribution")
+            ax.set_xlabel("PriceThreshold ($ fare gap)")
+            ax.set_ylabel("% of profiles within source")
+            ax.legend(loc="best")
+            fig.tight_layout()
+            out = f"{prefix}_dist_PriceThreshold.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
 
     # 1) Ride parameter distributions
     params = ["DayOfWeek", "Weather", "Hour", "Airport", "Service", "Choice"]
@@ -2610,8 +2764,9 @@ def main():
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed. If omitted, a new seed is generated each run.")
     parser.add_argument("--out", type=str, default="market_runs.csv")
 
-    parser.add_argument("--firm1_mode", type=str, default="heuristic", choices=["RL", "heuristic", "static"])
-    parser.add_argument("--firm2_mode", type=str, default="static", choices=["heuristic", "static"])
+    dynamic_mode_choices = ["heuristic", "heuristic_margin", "heuristic_random"]
+    parser.add_argument("--firm1_mode", type=str, default="heuristic", choices=["RL", *dynamic_mode_choices, "static"])
+    parser.add_argument("--firm2_mode", type=str, default="static", choices=[*dynamic_mode_choices, "static"])
 
     parser.add_argument("--firm1_static_values", type=str, default="")
     parser.add_argument("--firm2_static_values", type=str, default="")
@@ -2639,7 +2794,15 @@ def main():
     parser.add_argument("--reward_overprice_weight", type=float, default=0.20, help="Penalty weight when Firm1 is more expensive than Firm2.")
     parser.add_argument("--reward_rev_scale", type=float, default=25.0, help="Revenue/request value that maps to full revenue reward credit.")
     parser.add_argument("--reward_competitive_weight", type=float, default=0.33, help="Backward-compatible name for sustained-dominance reward weight; normalized with share and revenue weights.")
-    parser.add_argument("--reward_trend_weight", type=float, default=0.0, help="Optional small trend-shaping weight for short-term share/revenue improvements.")
+    parser.add_argument("--reward_trend_weight", type=float, default=0.0, help="Optional small trend-shaping weight for short-term share/profit improvements.")
+    parser.add_argument("--reward_profit_scale", type=float, default=12.0, help="Profit/request value that maps to full profit reward credit.")
+    parser.add_argument("--reward_underprice_weight", type=float, default=0.15, help="Penalty weight for destructive underpricing or sub-target profit margin.")
+    parser.add_argument("--reward_acceptable_discount", type=float, default=2.0, help="Firm1 may be this many dollars cheaper than Firm2 before underpricing penalty starts.")
+    parser.add_argument("--min_profit_margin", type=float, default=0.08, help="Minimum contribution margin target used by the margin discipline penalty.")
+    parser.add_argument("--driver_cost_per_mile", type=float, default=0.85, help="Approximate per-mile contribution cost for completed rides.")
+    parser.add_argument("--driver_cost_per_minute", type=float, default=0.12, help="Approximate per-minute contribution cost for completed rides.")
+    parser.add_argument("--fixed_trip_cost", type=float, default=1.25, help="Approximate fixed platform/driver cost for completed rides.")
+    parser.add_argument("--airport_cost", type=float, default=2.0, help="Approximate extra cost for airport rides.")
     parser.add_argument("--gpt_threshold_batch_size", type=int, default=10, help="Profiles per GPT price-threshold API request. Larger values improve API utilization but increase per-request payload size.")
     parser.add_argument("--gpt_threshold_max_retries", type=int, default=2, help="Retries per GPT price-threshold batch before deterministic fallback is used.")
     parser.add_argument("--gpt_threshold_failure_pause", type=float, default=1.0, help="Seconds to pause after a failed GPT threshold batch before sending the next batch; helps avoid connection-refused cascades.")
@@ -2709,6 +2872,14 @@ def main():
         reward_rev_scale=args.reward_rev_scale,
         reward_competitive_weight=args.reward_competitive_weight,
         reward_trend_weight=args.reward_trend_weight,
+        reward_profit_scale=args.reward_profit_scale,
+        reward_underprice_weight=args.reward_underprice_weight,
+        reward_acceptable_discount=args.reward_acceptable_discount,
+        min_profit_margin=args.min_profit_margin,
+        driver_cost_per_mile=args.driver_cost_per_mile,
+        driver_cost_per_minute=args.driver_cost_per_minute,
+        fixed_trip_cost=args.fixed_trip_cost,
+        airport_cost=args.airport_cost,
         gpt_threshold_batch_size=args.gpt_threshold_batch_size,
         gpt_threshold_max_retries=args.gpt_threshold_max_retries,
         gpt_threshold_failure_pause=args.gpt_threshold_failure_pause,
@@ -2780,6 +2951,7 @@ def main():
         training_logs=core.training_logs,
         evaluation_logs=core.evaluation_logs,
         prefix=args.report_prefix,
+        threshold_profiles=core.synthetic_profile_pool,
     )
     
     if args.compare_with_dataset:
