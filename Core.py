@@ -348,12 +348,12 @@ class Core:
         firm2_static_values: str = "",
         total_customers_pool: int = 20000,
         deterministic_torch: bool = False,
-        reward_share_weight: float = 0.550,
-        reward_revenue_weight: float = 0.45,
-        reward_overprice_weight: float = 0.35,
+        reward_share_weight: float = 0.34,
+        reward_revenue_weight: float = 0.33,
+        reward_overprice_weight: float = 0.20,
         reward_rev_scale: float = 25.0,
-        reward_competitive_weight: float = 0.12,
-        reward_trend_weight: float = 0.08,
+        reward_competitive_weight: float = 0.33,
+        reward_trend_weight: float = 0.0,
         gpt_threshold_batch_size: int = 5,
         gpt_threshold_max_retries: int = 2,
         gpt_threshold_failure_pause: float = 1.0,
@@ -460,21 +460,28 @@ class Core:
         self.reward_revenue_weight = float(max(0.0, reward_revenue_weight))
         self.reward_overprice_weight = float(max(0.0, reward_overprice_weight))
         self.reward_rev_scale = float(max(1e-6, reward_rev_scale))
+        # Kept as the CLI/API name for backward compatibility; this now weights
+        # the explicit dominance component in the balanced reward.
         self.reward_competitive_weight = float(max(0.0, reward_competitive_weight))
         self.reward_trend_weight = float(max(0.0, reward_trend_weight))
 
-        denom = self.reward_share_weight + self.reward_revenue_weight
+        # Normalize the three positive business objectives together so defaults
+        # are easy to justify: revenue, market share, and sustained dominance each
+        # receive roughly one third of the positive reward budget.
+        denom = self.reward_share_weight + self.reward_revenue_weight + self.reward_competitive_weight
         if denom <= 0.0:
-            self.reward_share_weight = 0.6
-            self.reward_revenue_weight = 0.4
+            self.reward_share_weight = 0.34
+            self.reward_revenue_weight = 0.33
+            self.reward_competitive_weight = 0.33
             denom = 1.0
 
         self.reward_share_weight /= denom
-        self.reward_revenue_weight /= denom
-        
-        self.reward_competitive_scale = 0.75
-        self.reward_trend_scale = 0.75
-        self.reward_softsign_temp = 1.25
+        self.reward_competitive_weight /= denom
+
+        self.reward_dominance_threshold = 0.50
+        self.reward_dominance_full_credit_share = 0.85
+        self.reward_trend_scale = 0.20
+        self.reward_softsign_temp = 1.00
 
         self.ppo_update_epochs = 5
         self.ppo_batch_size = 256
@@ -485,7 +492,7 @@ class Core:
             f"revenue={self.reward_revenue_weight:.2f}, "
             f"overprice_penalty={self.reward_overprice_weight:.2f}, "
             f"rev_scale={self.reward_rev_scale:.2f}, "
-            f"competitive={self.reward_competitive_weight:.2f}, "
+            f"dominance={self.reward_competitive_weight:.2f}, "
             f"trend={self.reward_trend_weight:.2f}"
         )
         
@@ -617,17 +624,28 @@ class Core:
         rev_per_request: float,
         price_gap_f2_minus_f1: float = 0.0,
     ) -> float:
-        """Simplified reward: market share + revenue with light overpricing penalty."""
-        
+        """Balanced business reward: revenue + share + sustained dominance.
+
+        The three positive terms are normalized to [0, 1] and weighted together:
+        revenue per request, absolute market share, and a saturating dominance term
+        that starts at a 50% share lead and reaches full credit at 85% share.
+        The saturating dominance term rewards staying ahead without giving extra
+        credit for pushing from dominant to near-monopoly share. A modest
+        overpricing penalty discourages losing dominance through prices above the
+        competitor.
+        """
         
         share_f = float(np.clip(share, 0.0, 1.0))
         rev_term = float(np.clip(rev_per_request / self.reward_rev_scale, 0.0, 1.0))
+        dominance_width = max(1e-6, self.reward_dominance_full_credit_share - self.reward_dominance_threshold)
+        dominance_term = float(np.clip((share_f - self.reward_dominance_threshold) / dominance_width, 0.0, 1.0))
         overprice_gap = float(max(0.0, -price_gap_f2_minus_f1))
         overprice_penalty = float(np.clip((overprice_gap / 2.5) ** 2, 0.0, 1.0))
         
         raw = (
             (self.reward_share_weight * share_f)
             + (self.reward_revenue_weight * rev_term)
+            + (self.reward_competitive_weight * dominance_term)
             - (self.reward_overprice_weight * overprice_penalty)
         )
         return float(np.clip(raw, -1.0, 1.0))
@@ -651,7 +669,8 @@ class Core:
             price_gap_f2_minus_f1=gap,
         )
         
-        competitive_term = float(np.clip((share_f - 0.5) / 0.5, -1.0, 1.0))
+        dominance_width = max(1e-6, self.reward_dominance_full_credit_share - self.reward_dominance_threshold)
+        dominance_term = float(np.clip((share_f - self.reward_dominance_threshold) / dominance_width, 0.0, 1.0))
         share_delta = float(np.clip(share_f - float(prev_share), -0.20, 0.20) / 0.20)
         rev_delta = float(np.clip((revpr - float(prev_rev_per_request)) / self.reward_rev_scale, -0.20, 0.20) / 0.20)
         trend_term = float(0.5 * (share_delta + rev_delta))
@@ -659,8 +678,7 @@ class Core:
         efficiency_term = float(0.5 * trend_term + 0.5 * pricing_discipline)
         raw_reward = float(
             base_reward
-            + self.reward_competitive_weight * self.reward_competitive_scale * competitive_term
-            + self.reward_trend_weight * self.reward_trend_scale * efficiency_term
+            + self.reward_trend_weight * self.reward_trend_scale * trend_term
         )
         reward = float(np.tanh(raw_reward / self.reward_softsign_temp))
 
@@ -668,7 +686,9 @@ class Core:
             "reward": reward,
             "reward_raw": raw_reward,
             "reward_base": float(base_reward),
-            "reward_competitive_term": competitive_term,
+            "reward_dominance_term": dominance_term,
+            # Backward-compatible diagnostic column name used by existing plots/CSVs.
+            "reward_competitive_term": dominance_term,
             "reward_share_delta": share_delta,
             "reward_rev_delta": rev_delta,
             "reward_trend_term": trend_term,
@@ -1235,6 +1255,7 @@ class Core:
                 "reward_moving_std20": moving_std20,
                 "reward_base": float(base_reward_sum / n_steps),
                 "reward_raw": float(raw_reward_sum / n_steps),
+                "reward_dominance_term": float(competitive_sum / n_steps),
                 "reward_competitive_term": float(competitive_sum / n_steps),
                 "reward_trend_term": float(trend_sum / n_steps),
                 "reward_pricing_discipline": float(discipline_sum / n_steps),
@@ -1339,6 +1360,7 @@ class Core:
                 "reward_moving_std20": moving_std20,
                 "reward_raw": float(reward_diag["reward_raw"]),
                 "reward_base": float(reward_diag["reward_base"]),
+                "reward_dominance_term": float(reward_diag["reward_dominance_term"]),
                 "reward_competitive_term": float(reward_diag["reward_competitive_term"]),
                 "reward_trend_term": float(reward_diag["reward_trend_term"]),
                 "reward_pricing_discipline": float(reward_diag["reward_pricing_discipline"]),
@@ -2612,13 +2634,13 @@ def main():
     parser.add_argument("--eval_customers", type=int, default=1000)
     parser.add_argument("--profiles_out", type=str, default="artifacts/sampled_profiles.csv")
     parser.add_argument("--profiles_log_limit", type=int, default=200000)
-    parser.add_argument("--reward_share_weight", type=float, default=0.60)
-    parser.add_argument("--reward_revenue_weight", type=float, default=0.40)
-    parser.add_argument("--reward_overprice_weight", type=float, default=0.35)
-    parser.add_argument("--reward_rev_scale", type=float, default=25.0)
-    parser.add_argument("--reward_competitive_weight", type=float, default=0.12)
-    parser.add_argument("--reward_trend_weight", type=float, default=0.08)
-    parser.add_argument("--gpt_threshold_batch_size", type=int, default=5, help="Profiles per GPT price-threshold API request. Larger values improve API utilization but increase per-request payload size.")
+    parser.add_argument("--reward_share_weight", type=float, default=0.34, help="Positive reward weight for absolute market share; normalized with revenue and dominance weights.")
+    parser.add_argument("--reward_revenue_weight", type=float, default=0.33, help="Positive reward weight for revenue per request; normalized with share and dominance weights.")
+    parser.add_argument("--reward_overprice_weight", type=float, default=0.20, help="Penalty weight when Firm1 is more expensive than Firm2.")
+    parser.add_argument("--reward_rev_scale", type=float, default=25.0, help="Revenue/request value that maps to full revenue reward credit.")
+    parser.add_argument("--reward_competitive_weight", type=float, default=0.33, help="Backward-compatible name for sustained-dominance reward weight; normalized with share and revenue weights.")
+    parser.add_argument("--reward_trend_weight", type=float, default=0.0, help="Optional small trend-shaping weight for short-term share/revenue improvements.")
+    parser.add_argument("--gpt_threshold_batch_size", type=int, default=10, help="Profiles per GPT price-threshold API request. Larger values improve API utilization but increase per-request payload size.")
     parser.add_argument("--gpt_threshold_max_retries", type=int, default=2, help="Retries per GPT price-threshold batch before deterministic fallback is used.")
     parser.add_argument("--gpt_threshold_failure_pause", type=float, default=1.0, help="Seconds to pause after a failed GPT threshold batch before sending the next batch; helps avoid connection-refused cascades.")
     parser.add_argument("--calibration_csv", type=str, default="", help="Optional historical CSV used to calibrate priors and choice sensitivity.")
