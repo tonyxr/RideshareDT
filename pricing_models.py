@@ -21,6 +21,7 @@ from optim_config import default_specs_for
 @dataclass
 class FirmMetrics:
     revenue: float = 0.0
+    profit: float = 0.0
     wins: int = 0
     total: int = 0
 
@@ -31,6 +32,10 @@ class FirmMetrics:
     @property
     def rev_per_request(self) -> float:
         return (self.revenue / self.total) if self.total > 0 else 0.0
+    
+    @property
+    def profit_per_request(self) -> float:
+        return (self.profit / self.total) if self.total > 0 else 0.0
 
 
 class FirmStaticPricer:
