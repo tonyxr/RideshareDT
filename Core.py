@@ -830,6 +830,14 @@ class Core:
             cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
             cleaned = re.sub(r"\s*```$", "", cleaned).strip()
         return json.loads(cleaned) if cleaned else {}
+    
+    @staticmethod
+    def _gpt_threshold_max_output_tokens(batch_size: int) -> int:
+        """Return an output-token budget large enough for strict JSON batch responses."""
+        # Each row must include a free-text rationale. A 400-token cap for a 5-profile
+        # batch can truncate otherwise-successful JSON responses, causing
+        # JSONDecodeError("Unterminated string...") and unnecessary fallback usage.
+        return int(max(1200, 250 * int(max(1, batch_size))))
 
     @staticmethod
     def _fallback_price_threshold(profile: Dict[str, Any], priced_rides: List[Dict[str, Any]]) -> float:
@@ -988,7 +996,7 @@ class Core:
         payload = {
             "model": self.model_name,
             "input": json.dumps(prompt),
-            "max_output_tokens": int(max(220, 80 * len(prepared))),
+            "max_output_tokens": self._gpt_threshold_max_output_tokens(len(prepared)),
             "text": {"format": self._gpt_threshold_schema()},
         }
 
