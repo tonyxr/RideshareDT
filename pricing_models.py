@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 import numpy as np
 
-from WPOAgent import PPOAgent
+from PPOAgent import PPOAgent
 from Market_models import CoefficientOverrides
 from optim_config import default_specs_for
 
@@ -299,24 +299,6 @@ class FirmRLPricer:
         if not hasattr(self, "config"):
             self.config = default_specs_for(self.opt_keys)
     
-    
-    def _build_action_cost_matrix(self, action_dim: int) -> np.ndarray:
-        """Build a symmetric Wasserstein ground-cost matrix over discrete actions."""
-        if action_dim <= 0:
-            raise ValueError("action_dim must be positive")
-
-        vectors = [
-            self.action_vectors.get(i, np.zeros(2, dtype=float))
-            for i in range(action_dim)
-        ]
-        cost = np.zeros((action_dim, action_dim), dtype=np.float32)
-        for i in range(action_dim):
-            for j in range(i + 1, action_dim):
-                d = float(np.linalg.norm(vectors[i] - vectors[j], ord=2))
-                cost[i, j] = d
-                cost[j, i] = d
-        return cost
-    
     def __init__(self, seed: Optional[int], opt_keys: List[str]):
         # Shared action manipulates up to five pricing coefficients per step.
         self.opt_keys = list(opt_keys[: self.MAX_MANIPULATED_COEFFS])
@@ -370,11 +352,7 @@ class FirmRLPricer:
             self.action_to_steps[a_idx]["per_minute"] = -1
             self.aggressive_actions.add(a_idx)
         action_dim = len(self.action_to_steps)
-        self.action_vectors = {
-            a: np.array([d.get(k, 0.0) for k in active_keys], dtype=float)
-            for a, d in self.action_to_steps.items()
-        }
-
+        
         # Expanded state includes context, competitor memory, and coefficient deltas.
         # State encoder adds 12 market/competitor features, 8 driver-supply
         # features, and normalized fare-coefficient deltas.  Firm1 still
@@ -382,9 +360,6 @@ class FirmRLPricer:
         # are intentionally excluded for the future Option B extension.
         state_dim = 20 + len(active_keys)
 
-        # Wasserstein geometry: penalize large policy moves in coefficient-step space.
-        self.cost_matrix = self._build_action_cost_matrix(action_dim)
-        
         # Initialize PPO agent.
         self.agent = PPOAgent(
             state_dim=state_dim,

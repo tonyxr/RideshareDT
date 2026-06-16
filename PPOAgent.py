@@ -7,11 +7,12 @@ Created on Sun Feb  8 15:58:46 2026
 
 @author: Xiaoru Shi
 
-Actor-Critic with Wasserstein (Sinkhorn) trust region penalty for discrete policies.
+PPO actor-critic for discrete pricing policies.
 
 This is designed for STABILITY:
 - advantage normalization
-- entropic Sinkhorn penalty to limit policy distribution shifts in Wasserstein geometry
+- clipped policy and value objectives
+- adaptive entropy and learning-rate controls
 - gradient clipping
 
 """

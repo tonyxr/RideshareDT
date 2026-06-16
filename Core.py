@@ -10,7 +10,7 @@ End-to-end two-firm market simulator + Firm1 RL training.
 Defaults aim for stable learning:
 - large customers_per_step
 - normalized reward + coefficient movement penalty
-- Wasserstein trust region in policy update
+- clipped PPO policy/value updates
 """
 
 import argparse
@@ -557,11 +557,12 @@ class Core:
         self.driver_reward_warmup_fraction = float(np.clip(driver_reward_warmup_fraction, 0.0, 1.0))
         self.driver_reward_scale_current = 1.0 if self.driver_reward_warmup_fraction <= 0.0 else 0.0
         
-        self.ppo_update_epochs = 8
-        self.ppo_batch_size = 64
-
+        # Keep minibatches close to the default rollout size
+        # (5 days x 10 synthetic steps/day) instead of silently forcing
+        # full-batch PPO updates through an oversized batch setting.
+        
         self.ppo_update_epochs = 5
-        self.ppo_batch_size = 256
+        self.ppo_batch_size = 64
         
         print(
             "[RewardConfig] "
@@ -2531,7 +2532,12 @@ class Core:
                 self.airport_rate_last = airport_rate
                 self.mean_distance_last = mean_dist
             
-            ppo_metrics = {"loss": 0.0, "approx_kl": 0.0, "clipfrac": 0.0, "ent_coeff": 0.0}
+            ppo_metrics = {
+                "loss": 0.0,
+                "approx_kl": 0.0,
+                "clipfrac": 0.0,
+                "ent_coeff": 0.0,
+            }
             if self.firm1_mode == "RL":
                 ppo_metrics = self.firm1.agent.update(epochs=self.ppo_update_epochs, batch_size=self.ppo_batch_size)
                 
