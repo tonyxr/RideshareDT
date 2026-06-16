@@ -321,43 +321,39 @@ class FirmRLPricer:
         self.aggressive_actions = set()
         self.allow_aggressive_actions = True
         
-        # Action space includes coordinated and aggressive coefficient moves.
-        # This lets RL respond faster to heuristic schedule/cooldown behavior.
+        # Use a compact macro-action space so rewards map to clear pricing moves.
+        # The driver layer is observed but external: all actions still change only
+        # rider-facing fare coefficients, never driver-pay policy.
         
         all_keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
         active_keys = [k for k in all_keys if k in self.opt_keys]
-        self.action_to_steps: Dict[int, Dict[str, int]] = {0: {k: 0 for k in active_keys}}
+        def zero_steps() -> Dict[str, int]:
+            return {k: 0 for k in active_keys}
+
+        self.action_to_steps: Dict[int, Dict[str, int]] = {0: zero_steps()}
+        macro_specs = [
+            {"base_fare": -1, "booking_fee": -1},
+            {"base_fare": +1, "booking_fee": +1},
+            {"per_minute": -1, "per_mile": -1},
+            {"per_minute": +1, "per_mile": +1},
+            {"base_fare": -1, "per_minute": -1, "per_mile": -1, "booking_fee": -1},
+            {"base_fare": +1, "per_minute": +1, "per_mile": +1, "booking_fee": +1},
+            {"airport_fee": -1},
+            {"airport_fee": +1},
+        ]
         a_idx = 1
-        for k in active_keys:
-            self.action_to_steps[a_idx] = {kk: 0 for kk in active_keys}
-            self.action_to_steps[a_idx][k] = -1
-            a_idx += 1
-            self.action_to_steps[a_idx] = {kk: 0 for kk in active_keys}
-            self.action_to_steps[a_idx][k] = +1
-            a_idx += 1
-        # Coordinated "all down / all up" steps.
-        self.action_to_steps[a_idx] = {k: -1 for k in active_keys}
-        a_idx += 1
-        self.action_to_steps[a_idx] = {k: +1 for k in active_keys}
-        a_idx += 1
-        # Mild aggressive bias on base fare + per-minute for quicker recovery.
-        if "base_fare" in active_keys and "per_minute" in active_keys:
-            self.action_to_steps[a_idx] = {k: 0 for k in active_keys}
-            self.action_to_steps[a_idx]["base_fare"] = +2
-            self.action_to_steps[a_idx]["per_minute"] = +1
-            self.aggressive_actions.add(a_idx)
-            a_idx += 1
-            self.action_to_steps[a_idx] = {k: 0 for k in active_keys}
-            self.action_to_steps[a_idx]["base_fare"] = -2
-            self.action_to_steps[a_idx]["per_minute"] = -1
-            self.aggressive_actions.add(a_idx)
+        for spec in macro_specs:
+            action = zero_steps()
+            for key, step in spec.items():
+                if key in action:
+                    action[key] = int(step)
+            if any(v != 0 for v in action.values()):
+                self.action_to_steps[a_idx] = action
+                a_idx += 1
         action_dim = len(self.action_to_steps)
         
-        # Expanded state includes context, competitor memory, and coefficient deltas.
-        # State encoder adds 12 market/competitor features, 8 driver-supply
-        # features, and normalized fare-coefficient deltas.  Firm1 still
-        # controls rider-facing fare coefficients only; driver-pay coefficients
-        # are intentionally excluded for the future Option B extension.
+        # State encoder emits 20 target-centered market/service features plus
+        # normalized fare-coefficient deltas for the active rider-price knobs.
         state_dim = 20 + len(active_keys)
 
         # Initialize PPO agent.
@@ -419,7 +415,7 @@ class FirmRLPricer:
         
         
         if (not self.allow_aggressive_actions) and action in self.aggressive_actions:
-            action = 6
+            action = 0
         
         step_map = {k: v for k, v in self.action_to_steps[action].items() if k in self.opt_keys}
         if not step_map:

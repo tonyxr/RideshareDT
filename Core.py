@@ -493,6 +493,11 @@ class Core:
         self.last_revpr = 0.0
         self.last_gap = 0.0
         self.last_reward = 0.0
+        self.last_profitpr = 0.0
+        self.last_fulfillment = 1.0
+        self.last_acceptance = 1.0
+        self.last_wait = 0.0
+        self.last_driver_paypr = 0.0
         
         self.training_logs = []
         self.evaluation_logs = []
@@ -735,41 +740,50 @@ class Core:
         avg_wait_minutes: float = 0.0,
         driver_acceptance_rate: float = 1.0,
     ) -> Dict[str, float]:
-        """Return smooth reward components for stable PPO optimization.
+        """Return target-centered reward components for clearer PPO signals.
 
-        The three positive terms are normalized to [0, 1] and weighted together:
-        revenue per request, absolute market share, and a saturating dominance term
-        that starts at a 50% share lead and reaches full credit at 85% share.
-        Price, margin, and driver-service penalties use smooth rational curves
-        instead of quadratic hard clipping so large violations remain informative
-        instead of collapsing to the same saturated penalty.
+        Driver supply is treated as an external service constraint, not as a direct
+        control target.  The main demand objective is therefore *served share*
+        (chosen share that is actually fulfilled).  Profit receives credit only
+        after it approaches break-even, while margin/price/service shortfalls stay
+        as separate penalties.  This avoids a mixed signal where raising rider
+        fares can be rewarded only because it indirectly buys driver acceptance.
         """
         
         share_f = float(np.clip(share, 0.0, 1.0))
         profitpr = float(rev_per_request if profit_per_request is None else profit_per_request)
         margin = float(0.0 if profit_margin is None else profit_margin)
-        profit_term = float(np.clip(profitpr / self.reward_profit_scale, -1.0, 1.0))
+        fulfillment_term = float(np.clip(fulfillment_rate, 0.0, 1.0))
+        acceptance_term = float(np.clip(driver_acceptance_rate, 0.0, 1.0))
+        served_share = float(share_f * fulfillment_term)
+
+        # Positive terms are bounded credits with interpretable targets.
+        served_share_target = 0.35
+        profit_break_even_buffer = 2.0
+        profit_term = float(np.clip((profitpr + profit_break_even_buffer) / (self.reward_profit_scale + profit_break_even_buffer), 0.0, 1.0))
+        served_share_term = float(np.clip(served_share / served_share_target, 0.0, 1.0))
         dominance_width = max(1e-6, self.reward_dominance_full_credit_share - self.reward_dominance_threshold)
         dominance_term = float(np.clip((share_f - self.reward_dominance_threshold) / dominance_width, 0.0, 1.0))
-        overprice_gap = float(max(0.0, -price_gap_f2_minus_f1))
-        overprice_penalty = self._smooth_positive_penalty(overprice_gap, scale=3.0)
+        # Price discipline: negative gap means Firm1 is more expensive; very large
+        # positive gap means Firm1 may be buying share through destructive discounts.
+        overprice_gap = float(max(0.0, -price_gap_f2_minus_f1 - 0.50))
+        overprice_penalty = self._smooth_positive_penalty(overprice_gap, scale=2.0)
         underprice_gap = float(max(0.0, price_gap_f2_minus_f1 - self.reward_acceptable_discount))
-        underprice_penalty = self._smooth_positive_penalty(underprice_gap, scale=8.0)
+        underprice_penalty = self._smooth_positive_penalty(underprice_gap, scale=5.0)
         margin_shortfall = float(max(0.0, self.min_profit_margin - margin) / max(self.min_profit_margin, 1e-6))
         margin_penalty = self._smooth_positive_penalty(margin_shortfall, scale=1.0)
-        fulfillment_term = float(np.clip(fulfillment_rate, 0.0, 1.0))
-        service_penalty = self._smooth_positive_penalty(float(avg_wait_minutes) - 6.0, scale=12.0)
-        reject_penalty = self._smooth_positive_penalty(1.0 - float(driver_acceptance_rate), scale=0.50)
+        # External driver layer signal: penalize supply stress that prevents chosen
+        # demand from converting, but do not give a large standalone reward for
+        # simply raising rider fares enough to improve acceptance.
+        service_penalty = self._smooth_positive_penalty(float(avg_wait_minutes) - 6.0, scale=10.0)
+        reject_penalty = self._smooth_positive_penalty(0.70 - acceptance_term, scale=0.35)
+        unfulfilled_penalty = self._smooth_positive_penalty(0.75 - fulfillment_term, scale=0.35)
         driver_reward_scale = float(np.clip(getattr(self, "driver_reward_scale_current", 1.0), 0.0, 1.0))
         
-        share_component = self.reward_share_weight * share_f
+        share_component = self.reward_share_weight * served_share_term
         profit_component = self.reward_revenue_weight * profit_term
         dominance_component = self.reward_competitive_weight * dominance_term
-        driver_fulfillment_component = (
-            driver_reward_scale * self.driver_reward_fulfillment_weight * fulfillment_term
-            if self.enable_driver_supply
-            else 0.0
-        )
+        driver_fulfillment_component = 0.0
         overprice_component = self.reward_overprice_weight * overprice_penalty
         price_discipline_penalty = max(underprice_penalty, margin_penalty)
         underprice_component = self.reward_underprice_weight * price_discipline_penalty
@@ -779,7 +793,7 @@ class Core:
             else 0.0
         )
         driver_reject_component = (
-            driver_reward_scale * self.driver_reward_reject_weight * reject_penalty
+            driver_reward_scale * self.driver_reward_reject_weight * max(reject_penalty, unfulfilled_penalty)
             if self.enable_driver_supply
             else 0.0
         )
@@ -811,12 +825,15 @@ class Core:
             "reward_driver_reject_component": float(driver_reject_component),
             "reward_fulfillment_term": float(fulfillment_term),
             "reward_service_penalty": float(service_penalty),
-            "reward_driver_reject_penalty": float(reject_penalty),
+            "reward_driver_reject_penalty": float(max(reject_penalty, unfulfilled_penalty)),
             "reward_profit_term": float(profit_term),
             "reward_dominance_term": float(dominance_term),
             "reward_underprice_gap": float(underprice_gap),
             "reward_overprice_gap": float(overprice_gap),
             "reward_driver_scale": float(driver_reward_scale),
+            "reward_served_share": float(served_share),
+            "reward_served_share_term": float(served_share_term),
+            "reward_driver_unfulfilled_penalty": float(unfulfilled_penalty),
         }
 
     def _reward_base(
@@ -1526,6 +1543,9 @@ class Core:
                     "reward_price_discipline_penalty",
                     "reward_underprice_gap",
                     "reward_overprice_gap",
+                    "reward_served_share",
+                    "reward_served_share_term",
+                    "reward_driver_unfulfilled_penalty",
                 ):
                     reward_component_sums[component_key] += float(reward_diag.get(component_key, 0.0))
 
@@ -1540,6 +1560,11 @@ class Core:
                 self.last_share = float(m1.share)
                 self.last_revpr = float(m1.rev_per_request)
                 self.last_gap = float(mean_gap)
+                self.last_profitpr = float(m1.profit_per_request)
+                self.last_fulfillment = float(m1.fulfillment_rate)
+                self.last_acceptance = float(m1.driver_acceptance_rate)
+                self.last_wait = float(m1.avg_wait_minutes)
+                self.last_driver_paypr = float(m1.driver_pay / max(1, m1.total))
 
             ppo_metrics = dict(last_ppo_metrics)
             if self.firm1_mode == "RL":
@@ -1724,6 +1749,11 @@ class Core:
             self.last_share = float(m1.share)
             self.last_revpr = float(m1.rev_per_request)
             self.last_gap = float(mean_gap)
+            self.last_profitpr = float(m1.profit_per_request)
+            self.last_fulfillment = float(m1.fulfillment_rate)
+            self.last_acceptance = float(m1.driver_acceptance_rate)
+            self.last_wait = float(m1.avg_wait_minutes)
+            self.last_driver_paypr = float(m1.driver_pay / max(1, m1.total))
 
             if (t + 1) % max(1, eval_timesteps // 10) == 0:
                 print(
@@ -2147,6 +2177,11 @@ class Core:
         self.last_share = float(m1.share)
         self.last_revpr = float(m1.rev_per_request)
         self.last_gap = float(gap)
+        self.last_profitpr = float(m1.profit_per_request)
+        self.last_fulfillment = float(m1.fulfillment_rate)
+        self.last_acceptance = float(m1.driver_acceptance_rate)
+        self.last_wait = float(m1.avg_wait_minutes)
+        self.last_driver_paypr = float(m1.driver_pay / max(1, m1.total))
         
         self.airport_rate_last = air
         self.mean_distance_last = dist
@@ -2186,6 +2221,11 @@ class Core:
             firm1_last_revpr=float(self.last_revpr),
             firm1_last_gap=float(self.last_gap),
             firm1_last_reward=float(self.last_reward),
+            firm1_last_profitpr=float(self.last_profitpr),
+            firm1_last_fulfillment=float(self.last_fulfillment),
+            firm1_last_acceptance=float(self.last_acceptance),
+            firm1_last_wait=float(self.last_wait),
+            firm1_last_driver_paypr=float(self.last_driver_paypr),
             driver_state_vec=self.driver_supply.state_features_for_firm1() if self.enable_driver_supply else None,
         )
 
@@ -2509,6 +2549,9 @@ class Core:
                     "reward_price_discipline_penalty",
                     "reward_underprice_gap",
                     "reward_overprice_gap",
+                    "reward_served_share",
+                    "reward_served_share_term",
+                    "reward_driver_unfulfilled_penalty",
                 ):
                     reward_component_sums[component_key] += float(reward_diag.get(component_key, 0.0))
 
@@ -2529,6 +2572,11 @@ class Core:
                 self.last_share = float(m1.share)
                 self.last_revpr = float(m1.rev_per_request)
                 self.last_gap = float(mean_gap)
+                self.last_profitpr = float(m1.profit_per_request)
+                self.last_fulfillment = float(m1.fulfillment_rate)
+                self.last_acceptance = float(m1.driver_acceptance_rate)
+                self.last_wait = float(m1.avg_wait_minutes)
+                self.last_driver_paypr = float(m1.driver_pay / max(1, m1.total))
                 self.airport_rate_last = airport_rate
                 self.mean_distance_last = mean_dist
             

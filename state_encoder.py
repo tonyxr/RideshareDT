@@ -9,10 +9,11 @@ Created on Sun Feb  8 19:47:22 2026
 
 """
 State encoder:
-compact context + last-batch summaries + selected coefficient deltas.
+compact context + normalized demand/supply health + selected coefficient deltas.
 
-The state intentionally keeps only low-variance signals so the policy is easier to
-learn and less sensitive to transient competitor behavior.
+The state intentionally exposes target-centered signals instead of raw, redundant
+metrics.  Driver supply remains an external layer: the policy can observe service
+health and supply stress, but it still only controls rider-facing price actions.
 """
 
 from typing import List, Optional
@@ -38,6 +39,11 @@ def build_state_vector(
     firm1_last_revpr: float,
     firm1_last_gap: float,
     firm1_last_reward: float,
+    firm1_last_profitpr: float = 0.0,
+    firm1_last_fulfillment: float = 1.0,
+    firm1_last_acceptance: float = 1.0,
+    firm1_last_wait: float = 0.0,
+    firm1_last_driver_paypr: float = 0.0,
     driver_state_vec: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     
@@ -45,6 +51,7 @@ def build_state_vector(
     if ride_ctx.size < 3:
         ride_ctx = np.pad(ride_ctx, (0, 3 - ride_ctx.size), mode="constant")
     ride_ctx = ride_ctx[:3]
+    _ = driver_state_vec  # Driver summary inputs are passed as target-centered scalars above.
 
     # Coefficient features: normalized relative deltas vs base
     base_empty = CoefficientOverrides()
@@ -56,23 +63,34 @@ def build_state_vector(
 
     while len(coef_feats) < 5:
         coef_feats.append(0.0)
+        
+    share = float(np.clip(firm1_last_share, 0.0, 1.0))
+    fulfillment = float(np.clip(firm1_last_fulfillment, 0.0, 1.0))
+    acceptance = float(np.clip(firm1_last_acceptance, 0.0, 1.0))
+    served_share = share * fulfillment
+    gap = float(firm1_last_gap)
+    profitpr = float(firm1_last_profitpr)
 
     fixed = [
         float(np.clip(ride_ctx[0], 0.0, 1.0)),
         float(np.clip(ride_ctx[1], 0.0, 1.0)),
         float(np.clip(ride_ctx[2], 0.0, 1.0)),
-        float(np.clip(firm1_last_share, 0.0, 1.0)),
+        share,
         float(np.clip(firm2_ema_share, 0.0, 1.0)),
-        float(np.clip((firm1_last_gap + 4.0) / 8.0, 0.0, 1.0)),
-        float(np.clip((firm2_ema_gap + 4.0) / 8.0, 0.0, 1.0)),
+        float(np.clip(served_share / 0.50, 0.0, 1.0)),
+        float(np.clip((gap + 3.0) / 6.0, 0.0, 1.0)),
+        float(np.clip((firm2_ema_gap + 3.0) / 6.0, 0.0, 1.0)),
+        float(np.clip((profitpr + 6.0) / 18.0, 0.0, 1.0)),
         float(np.clip(firm1_last_revpr / 30.0, 0.0, 1.0)),
         float(np.clip((firm1_last_reward + 1.0) / 2.0, 0.0, 1.0)),
         float(np.clip(airport_rate_last, 0.0, 1.0)),
         float(np.clip(mean_distance_last / 12.0, 0.0, 1.0)),
         float(np.clip(firm2_cooldown / 5.0, 0.0, 1.0)),
+        fulfillment,
+        acceptance,
+        float(np.clip(firm1_last_wait / 20.0, 0.0, 1.0)),
+        float(np.clip(firm1_last_driver_paypr / 20.0, 0.0, 1.0)),
+        float(np.clip((0.30 - served_share) / 0.30, 0.0, 1.0)),
+        float(np.clip((0.60 - acceptance) / 0.60, 0.0, 1.0)),
     ]
-    driver_feats = np.asarray(driver_state_vec if driver_state_vec is not None else [], dtype=np.float32).reshape(-1)
-    if driver_feats.size < 8:
-        driver_feats = np.pad(driver_feats, (0, 8 - driver_feats.size), mode="constant")
-    driver_feats = driver_feats[:8]
-    return np.array(fixed + list(driver_feats) + coef_feats, dtype=np.float32)
+    return np.array(fixed + coef_feats, dtype=np.float32)
