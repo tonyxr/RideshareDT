@@ -2298,6 +2298,8 @@ class Core:
             wait_sum = 0.0
             driver_accept_sum = 0.0
             driver_paypr_sum = 0.0
+            action_counts: Counter[int] = Counter()
+            last_action = -1
             
             share_sum_two = 0.0
             revpr_sum_two = 0.0
@@ -2415,6 +2417,12 @@ class Core:
             avg_wait = wait_sum / max(1, timesteps_per_day)
             avg_driver_accept = driver_accept_sum / max(1, timesteps_per_day)
             avg_driver_paypr = driver_paypr_sum / max(1, timesteps_per_day)
+            dominant_action = int(action_counts.most_common(1)[0][0]) if action_counts else -1
+            dominant_action_rate = (
+                float(action_counts.most_common(1)[0][1] / max(1, timesteps_per_day))
+                if action_counts
+                else 0.0
+            )
             avg_reward = (
                 (reward_sum / max(1, timesteps_per_day))
                 if self.firm1_mode == "RL"
@@ -2441,6 +2449,10 @@ class Core:
                 "driver_pay_per_request": float(avg_driver_paypr),
                 "driver_reward_scale": float(self.driver_reward_scale_current),
                 "avg_reward": float(avg_reward),
+                "last_action": int(last_action),
+                "dominant_action": dominant_action,
+                "dominant_action_rate": dominant_action_rate,
+                "action_counts": json.dumps(dict(sorted(action_counts.items())), sort_keys=True),
                 "ppo_approx_kl": float(ppo_metrics.get("approx_kl", 0.0)),
                 "ppo_clipfrac": float(ppo_metrics.get("clipfrac", 0.0)),
                 "ppo_entropy": float(ppo_metrics.get("entropy", 0.0)),
