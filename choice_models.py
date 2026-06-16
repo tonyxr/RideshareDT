@@ -263,6 +263,8 @@ class CognitiveChoiceModel(BaseChoiceModel):
         # Nonlinear price pain: people react more strongly once a fare gap clears
         # their rider-specific threshold. Smaller gaps still matter, but are less salient.
         price_gap = float(price2 - price1)
+        wait_gap = float(scenario.get("WaitEstimateFirm2", 0.0) or 0.0) - float(scenario.get("WaitEstimateFirm1", 0.0) or 0.0)
+        cancel_gap = float(scenario.get("CancelRiskFirm2", 0.0) or 0.0) - float(scenario.get("CancelRiskFirm1", 0.0) or 0.0)
         threshold_ratio = abs(price_gap) / max(price_threshold, 1e-6)
         price_salience = 0.35 + 0.65 * min(threshold_ratio, 1.0) + 0.25 * max(threshold_ratio - 1.0, 0.0)
         price_salience = float(np.clip(price_salience, 0.20, 2.25))
@@ -287,7 +289,12 @@ class CognitiveChoiceModel(BaseChoiceModel):
         
         # Small structural preference drift (can be calibrated later with data).
         reliability_bias_firm1 = 0.02
-        reliability_term = reliability_pressure * reliability_bias_firm1 * self.reliability_scale
+        wait_value = (0.035 + 0.035 * employment_flex + 0.025 * float(rush or airport)) * self.reliability_scale
+        reliability_term = (
+            reliability_pressure * reliability_bias_firm1 * self.reliability_scale
+            + wait_value * wait_gap
+            + 0.85 * reliability_pressure * cancel_gap
+        )
         
         # Convenience/service framing: premium riders less price-sensitive and more inertial.
         comfort_term = 0.0
@@ -334,6 +341,8 @@ class CognitiveChoiceModel(BaseChoiceModel):
             reasons.append("URGENCY")
         if bad_weather:
             reasons.append("WEATHER")
+        if abs(wait_gap) >= 3.0 or abs(cancel_gap) >= 0.15:
+            reasons.append("RELIABILITY")
             
         if service == "premium":
             reasons.append("COMFORT")

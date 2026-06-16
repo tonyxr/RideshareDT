@@ -64,6 +64,7 @@ from gpt_threshold_utils import (
     new_gpt_threshold_usage_counts,
     summarize_priced_coldstart_rides,
 )
+from driver_supply import DriverSupplyConfig, DriverSupplyLayer
 
 import kagglehub
 
@@ -369,7 +370,24 @@ class Core:
         driver_cost_per_minute: float = 0.12,
         fixed_trip_cost: float = 1.25,
         airport_cost: float = 2.00,
-        gpt_threshold_batch_size: int = 5,
+        enable_driver_supply: bool = True,
+        use_osmnx: bool = False,
+        osmnx_place: Optional[str] = None,
+        driver_base_active: int = 260,
+        driver_reservation_wage: float = 24.0,
+        driver_acceptance_mode: str = "expected",
+        driver_state_smoothing: float = 0.35,
+        driver_reward_fulfillment_weight: float = 0.06,
+        driver_reward_wait_weight: float = 0.04,
+        driver_reward_reject_weight: float = 0.03,
+        driver_reward_warmup_fraction: float = 0.30,
+        threshold_cache_path: str = "",
+        reuse_threshold_cache: bool = False,
+        save_threshold_cache: bool = True,
+        gpt_threshold_include_rationales: bool = False,
+        gpt_threshold_coldstart_rides: int = 5,
+        gpt_threshold_send_raw_rides: bool = False,
+        gpt_threshold_batch_size: int = 20,
         gpt_threshold_max_retries: int = 2,
         gpt_threshold_failure_pause: float = 1.0,
     ):
@@ -396,6 +414,12 @@ class Core:
         self.gpt_threshold_last_error = ""
         self.gpt_threshold_request_counts: Dict[str, int] = new_gpt_threshold_usage_counts()
         self.gpt_threshold_failure_pause = float(max(0.0, gpt_threshold_failure_pause))
+        self.threshold_cache_path = str(threshold_cache_path or "")
+        self.reuse_threshold_cache = bool(reuse_threshold_cache)
+        self.save_threshold_cache = bool(save_threshold_cache)
+        self.gpt_threshold_include_rationales = bool(gpt_threshold_include_rationales)
+        self.gpt_threshold_coldstart_rides = int(np.clip(gpt_threshold_coldstart_rides, 1, 10))
+        self.gpt_threshold_send_raw_rides = bool(gpt_threshold_send_raw_rides)
         self.training_stable_window = 30
         self.training_stable_tol = 0.012
         self.reward_convergence_window = 60
@@ -488,6 +512,20 @@ class Core:
         self.driver_cost_per_minute = float(max(0.0, driver_cost_per_minute))
         self.fixed_trip_cost = float(max(0.0, fixed_trip_cost))
         self.airport_cost = float(max(0.0, airport_cost))
+        self.enable_driver_supply = bool(enable_driver_supply)
+        self.driver_supply = DriverSupplyLayer(
+            seed=self.seed + 17,
+            config=DriverSupplyConfig(
+                base_active_drivers=int(max(1, driver_base_active)),
+                reservation_wage_per_hour=float(max(1.0, driver_reservation_wage)),
+                operating_cost_per_mile=self.driver_cost_per_mile,
+                platform_variable_cost=self.fixed_trip_cost,
+                acceptance_mode=str(driver_acceptance_mode),
+                state_smoothing_alpha=float(np.clip(driver_state_smoothing, 0.0, 1.0)),
+            ),
+            use_osmnx=bool(use_osmnx),
+            osmnx_place=osmnx_place or f"{market_name}, USA",
+        )
         self.reward_rev_scale = float(max(1e-6, reward_rev_scale))
         self.reward_profit_scale = float(max(1e-6, reward_profit_scale))
         # Kept as the CLI/API name for backward compatibility; this now weights
@@ -513,6 +551,11 @@ class Core:
         self.reward_dominance_full_credit_share = 0.85
         self.reward_trend_scale = 0.20
         self.reward_softsign_temp = 1.00
+        self.driver_reward_fulfillment_weight = float(max(0.0, driver_reward_fulfillment_weight))
+        self.driver_reward_wait_weight = float(max(0.0, driver_reward_wait_weight))
+        self.driver_reward_reject_weight = float(max(0.0, driver_reward_reject_weight))
+        self.driver_reward_warmup_fraction = float(np.clip(driver_reward_warmup_fraction, 0.0, 1.0))
+        self.driver_reward_scale_current = 1.0 if self.driver_reward_warmup_fraction <= 0.0 else 0.0
 
         self.ppo_update_epochs = 5
         self.ppo_batch_size = 256
@@ -525,7 +568,11 @@ class Core:
             f"underprice_penalty={self.reward_underprice_weight:.2f}, "
             f"profit_scale={self.reward_profit_scale:.2f}, "
             f"dominance={self.reward_competitive_weight:.2f}, "
-            f"trend={self.reward_trend_weight:.2f}"
+            f"trend={self.reward_trend_weight:.2f}, "
+            f"driver_fulfillment={self.driver_reward_fulfillment_weight:.2f}, "
+            f"driver_wait={self.driver_reward_wait_weight:.2f}, "
+            f"driver_reject={self.driver_reward_reject_weight:.2f}, "
+            f"driver_warmup={self.driver_reward_warmup_fraction:.2f}"
         )
         
     
@@ -672,6 +719,9 @@ class Core:
         price_gap_f2_minus_f1: float = 0.0,
         profit_per_request: Optional[float] = None,
         profit_margin: Optional[float] = None,
+        fulfillment_rate: float = 1.0,
+        avg_wait_minutes: float = 0.0,
+        driver_acceptance_rate: float = 1.0,
     ) -> float:
         """Balanced business reward: revenue + share + sustained dominance.
 
@@ -695,13 +745,20 @@ class Core:
         underprice_gap = float(max(0.0, price_gap_f2_minus_f1 - self.reward_acceptable_discount))
         underprice_penalty = float(np.clip((underprice_gap / 4.0) ** 2, 0.0, 1.0))
         margin_penalty = float(np.clip((self.min_profit_margin - margin) / max(self.min_profit_margin, 1e-6), 0.0, 1.0))
+        fulfillment_term = float(np.clip(fulfillment_rate, 0.0, 1.0))
+        service_penalty = float(np.clip((float(avg_wait_minutes) - 6.0) / 12.0, 0.0, 1.0))
+        reject_penalty = float(np.clip(1.0 - float(driver_acceptance_rate), 0.0, 1.0))
+        driver_reward_scale = float(np.clip(getattr(self, "driver_reward_scale_current", 1.0), 0.0, 1.0))
         
         raw = (
             (self.reward_share_weight * share_f)
             + (self.reward_revenue_weight * profit_term)
             + (self.reward_competitive_weight * dominance_term)
+            + (driver_reward_scale * self.driver_reward_fulfillment_weight * fulfillment_term if self.enable_driver_supply else 0.0)
             - (self.reward_overprice_weight * overprice_penalty)
             - (self.reward_underprice_weight * max(underprice_penalty, margin_penalty))
+            - (driver_reward_scale * self.driver_reward_wait_weight * service_penalty if self.enable_driver_supply else 0.0)
+            - (driver_reward_scale * self.driver_reward_reject_weight * reject_penalty if self.enable_driver_supply else 0.0)
         )
         return float(np.clip(raw, -1.0, 1.0))
 
@@ -714,6 +771,9 @@ class Core:
         prev_rev_per_request: float,
         profit_per_request: Optional[float] = None,
         profit_margin: Optional[float] = None,
+        fulfillment_rate: float = 1.0,
+        avg_wait_minutes: float = 0.0,
+        driver_acceptance_rate: float = 1.0,
     ) -> Dict[str, float]:
         """Return shaped reward and component diagnostics for trajectory analysis."""
         share_f = float(np.clip(share, 0.0, 1.0))
@@ -728,6 +788,9 @@ class Core:
             price_gap_f2_minus_f1=gap,
             profit_per_request=profitpr,
             profit_margin=margin,
+            fulfillment_rate=fulfillment_rate,
+            avg_wait_minutes=avg_wait_minutes,
+            driver_acceptance_rate=driver_acceptance_rate,
         )
         
         dominance_width = max(1e-6, self.reward_dominance_full_credit_share - self.reward_dominance_threshold)
@@ -736,6 +799,8 @@ class Core:
         rev_delta = float(np.clip((profitpr - float(prev_rev_per_request)) / self.reward_profit_scale, -0.20, 0.20) / 0.20)
         trend_term = float(0.5 * (share_delta + rev_delta))
         pricing_discipline = float(np.clip(gap / 2.0, -1.0, 1.0))
+        service_penalty = float(np.clip((float(avg_wait_minutes) - 6.0) / 12.0, 0.0, 1.0))
+        reject_penalty = float(np.clip(1.0 - float(driver_acceptance_rate), 0.0, 1.0))
         efficiency_term = float(0.5 * trend_term + 0.5 * pricing_discipline)
         raw_reward = float(
             base_reward
@@ -757,6 +822,12 @@ class Core:
             "reward_efficiency_term": efficiency_term,
             "reward_profit_per_request": profitpr,
             "reward_profit_margin": margin,
+            "reward_fulfillment_rate": float(np.clip(fulfillment_rate, 0.0, 1.0)),
+            "reward_avg_wait_minutes": float(avg_wait_minutes),
+            "reward_driver_acceptance_rate": float(np.clip(driver_acceptance_rate, 0.0, 1.0)),
+            "reward_service_penalty": service_penalty,
+            "reward_driver_reject_penalty": reject_penalty,
+            "reward_driver_scale": float(np.clip(getattr(self, "driver_reward_scale_current", 1.0), 0.0, 1.0)),
         }
 
     def _compute_rl_reward(self, m1: FirmMetrics, mean_gap: float) -> float:
@@ -767,6 +838,9 @@ class Core:
             mean_gap=float(mean_gap),
             profit_per_request=float(m1.profit_per_request),
             profit_margin=self._profit_margin(m1),
+            fulfillment_rate=float(m1.fulfillment_rate),
+            avg_wait_minutes=float(m1.avg_wait_minutes),
+            driver_acceptance_rate=float(m1.driver_acceptance_rate),
             prev_share=float(self.last_share),
             prev_rev_per_request=float(self.last_revpr),
         )
@@ -832,12 +906,13 @@ class Core:
         return json.loads(cleaned) if cleaned else {}
     
     @staticmethod
-    def _gpt_threshold_max_output_tokens(batch_size: int) -> int:
+    def _gpt_threshold_max_output_tokens(batch_size: int, include_rationales: bool = True) -> int:
         """Return an output-token budget large enough for strict JSON batch responses."""
-        # Each row must include a free-text rationale. A 400-token cap for a 5-profile
-        # batch can truncate otherwise-successful JSON responses, causing
-        # JSONDecodeError("Unterminated string...") and unnecessary fallback usage.
-        return int(max(1200, 250 * int(max(1, batch_size))))
+        # Rationale-free production mode keeps output small; debug mode budgets more
+        # tokens because free-text rationales can otherwise truncate JSON responses.
+        per_profile = 250 if include_rationales else 70
+        floor = 1200 if include_rationales else 500
+        return int(max(floor, per_profile * int(max(1, batch_size))))
 
     @staticmethod
     def _fallback_price_threshold(profile: Dict[str, Any], priced_rides: List[Dict[str, Any]]) -> float:
@@ -864,7 +939,7 @@ class Core:
     def _price_coldstart_rides(self, rides: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Attach current firm prices to cold-start ride contexts."""
         priced: List[Dict[str, Any]] = []
-        for r in rides[:10]:
+        for r in rides[: self.gpt_threshold_coldstart_rides]:
             rc = RideContext(
                 day_of_week=int(r["DayOfWeek"]),
                 weather=str(r["Weather"]),
@@ -895,6 +970,14 @@ class Core:
 
     def _gpt_threshold_schema(self) -> Dict[str, Any]:
         """Responses API structured-output schema for one aggregate threshold per profile."""
+        item_properties = {
+            "profile_index": {"type": "integer"},
+            "price_threshold": {"type": "number", "minimum": 0.50, "maximum": 5.00},
+        }
+        required = ["profile_index", "price_threshold"]
+        if self.gpt_threshold_include_rationales:
+            item_properties["rationale"] = {"type": "string"}
+            required.append("rationale")
         return {
             "type": "json_schema",
             "name": "price_threshold_batch",
@@ -908,12 +991,8 @@ class Core:
                         "items": {
                             "type": "object",
                             "additionalProperties": False,
-                            "properties": {
-                                "profile_index": {"type": "integer"},
-                                "price_threshold": {"type": "number", "minimum": 0.50, "maximum": 5.00},
-                                "rationale": {"type": "string"},
-                            },
-                            "required": ["profile_index", "price_threshold", "rationale"],
+                            "properties": item_properties,
+                            "required": required,
                         },
                     }
                 },
@@ -935,17 +1014,19 @@ class Core:
         increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_requested", len(batch))
         for i, (profile, rides) in enumerate(batch):
             priced = self._price_coldstart_rides(rides)
-            prepared.append({
+            evidence = {
                 "profile_index": i,
                 "profile": profile,
-                "coldstart_ride_summary": summarize_priced_coldstart_rides(priced[:10]),
-                "coldstart_rides": priced[:10],
+                "coldstart_ride_summary": summarize_priced_coldstart_rides(priced[: self.gpt_threshold_coldstart_rides]),
                 "instruction": (
                     "Aggregate all coldstart_rides for this one profile into exactly one profile-level threshold. "
                     "Use the summary distribution and profile attributes to infer the smallest fare gap that would make "
                     "price a primary decision factor for this rider across similar rides; do not answer separately per ride."
                 ),
-            })
+            }
+            if self.gpt_threshold_send_raw_rides:
+                evidence["coldstart_rides"] = priced[: self.gpt_threshold_coldstart_rides]
+            prepared.append(evidence)
             results.append(self._threshold_fallback_result(profile, priced))
 
         if not prepared:
@@ -962,8 +1043,8 @@ class Core:
             "task": (
                 "Infer exactly one aggregate rider-level price threshold for each profile item. The threshold is the "
                 "smallest dollar fare gap at which that customer starts treating price as a primary decision factor, "
-                "after considering the profile and all 10 coldstart rides together. The coldstart rides are evidence "
-                "for one profile-level judgment; they are not separate threshold requests."
+                f"after considering the profile and all {self.gpt_threshold_coldstart_rides} coldstart ride summaries together. The coldstart evidence is "
+                "for one profile-level judgment; it is not a set of separate threshold requests."
             ),
             "calibration_guide": {
                 "do": [
@@ -971,7 +1052,7 @@ class Core:
                     "Lower thresholds for lower income, larger households, new/no-loyalty riders, and repeated small gaps.",
                     "Raise thresholds for higher income, strong loyalty to either firm, airport/rush/weather urgency, and premium-heavy rides.",
                     "Pick a continuous dollar value to the nearest $0.25 when useful; do not default to only integers or half-dollars.",
-                    "Rationale must cite the aggregate profile signals and coldstart summary; avoid generic phrases.",
+                    "If rationale is requested, cite aggregate profile signals and coldstart summary; avoid generic phrases.",
                 ],
                 "do_not": [
                     "Do not copy the mean_absolute_price_gap as the threshold unless the profile evidence specifically supports it.",
@@ -990,13 +1071,17 @@ class Core:
                 "forbidden": "Do not return per-ride thresholds. Do not create more than one row for the same profile_index.",
                 "expected_threshold_count": len(prepared),
                 "price_threshold_range_usd": [0.50, 5.00],
-                "response_shape": {"thresholds": [{"profile_index": 0, "price_threshold": 2.25, "rationale": "short aggregate explanation using profile and summary evidence"}]},
+                "response_shape": (
+                    {"thresholds": [{"profile_index": 0, "price_threshold": 2.25, "rationale": "short aggregate explanation using profile and summary evidence"}]}
+                    if self.gpt_threshold_include_rationales
+                    else {"thresholds": [{"profile_index": 0, "price_threshold": 2.25}]}
+                ),
             },
         }
         payload = {
             "model": self.model_name,
             "input": json.dumps(prompt),
-            "max_output_tokens": self._gpt_threshold_max_output_tokens(len(prepared)),
+            "max_output_tokens": self._gpt_threshold_max_output_tokens(len(prepared), include_rationales=self.gpt_threshold_include_rationales),
             "text": {"format": self._gpt_threshold_schema()},
         }
 
@@ -1075,8 +1160,47 @@ class Core:
     def _gpt_profile_price_threshold(self, profile: Dict[str, Any], rides: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Compatibility wrapper for callers that need a single threshold."""
         return self._gpt_batch_price_thresholds([(profile, rides)])[0]
+    
+    def _try_load_threshold_cache(self, pool_size: int) -> bool:
+        """Load cached threshold-enriched profiles to avoid repeated GPT bootstrap latency."""
+        path = self.threshold_cache_path
+        if not (self.reuse_threshold_cache and path and os.path.exists(path)):
+            return False
+        rows: List[Dict[str, Any]] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if "PriceThreshold" not in row:
+                    continue
+                row["PriceThreshold"] = clip_price_threshold(row["PriceThreshold"])
+                rows.append(row)
+                if len(rows) >= int(pool_size):
+                    break
+        if len(rows) < int(pool_size):
+            print(f"[ThresholdCache] Cache has {len(rows)} profiles; need {int(pool_size)}. Regenerating missing pool.")
+            return False
+        self.synthetic_profile_pool = rows[: int(pool_size)]
+        self.gpt_threshold_request_counts = new_gpt_threshold_usage_counts()
+        print(f"[ThresholdCache] Loaded {len(self.synthetic_profile_pool)} cached threshold profiles from {path}.")
+        return True
+
+    def _save_threshold_cache(self) -> None:
+        """Persist threshold-enriched profiles as JSONL for fast repeated experiments."""
+        path = self.threshold_cache_path
+        if not (self.save_threshold_cache and path and self.synthetic_profile_pool):
+            return
+        _ensure_parent_dir(path)
+        with open(path, "w", encoding="utf-8") as f:
+            for row in self.synthetic_profile_pool:
+                f.write(json.dumps(row, sort_keys=True) + "\n")
+        print(f"[ThresholdCache] Saved {len(self.synthetic_profile_pool)} threshold profiles -> {path}")
 
     def _bootstrap_synthetic_profiles(self, pool_size: int) -> None:
+        if self._try_load_threshold_cache(pool_size):
+            return
         base_profiles = self.agent_gen.sample_profiles(int(max(1, pool_size)))
         self.synthetic_profile_pool = []
         threshold_source_counts: Dict[str, int] = {}
@@ -1086,7 +1210,7 @@ class Core:
         batch_size = int(max(1, self.gpt_threshold_batch_size))
         for start in range(0, len(base_profiles), batch_size):
             profile_batch = list(base_profiles[start:start + batch_size])
-            rides_batch = [(p, self._build_coldstart_rides(n=10)) for p in profile_batch]
+            rides_batch = [(p, self._build_coldstart_rides(n=self.gpt_threshold_coldstart_rides)) for p in profile_batch]
             failed_before = int(self.gpt_threshold_request_counts.get("batches_failed", 0))
             thresholds = self._gpt_batch_price_thresholds(rides_batch)
             failed_after = int(self.gpt_threshold_request_counts.get("batches_failed", 0))
@@ -1130,6 +1254,7 @@ class Core:
                 ">>> GPT threshold fallback errors: "
                 + ", ".join(f"{k}={v}" for k, v in sorted(self.gpt_threshold_error_counts.items()))
             )
+        self._save_threshold_cache()
 
     def _sample_profiles_from_pool(self, n: int) -> List[Dict[str, Any]]:
         if not self.synthetic_profile_pool:
@@ -1203,6 +1328,8 @@ class Core:
         }
 
         for d in range(train_timesteps):
+            warmup_days = max(1.0, float(train_timesteps) * self.driver_reward_warmup_fraction)
+            self.driver_reward_scale_current = float(np.clip((d + 1) / warmup_days, 0.0, 1.0)) if self.enable_driver_supply else 0.0
             day_ctx = self.market.sample_day_context()
             hours = [self.market.sample_timestep_hour().hour for _ in range(max(1, int(train_steps_per_day)))]
 
@@ -1219,6 +1346,10 @@ class Core:
             revpr_sum = 0.0
             profitpr_sum = 0.0
             gap_sum = 0.0
+            fulfillment_sum = 0.0
+            wait_sum = 0.0
+            driver_accept_sum = 0.0
+            driver_paypr_sum = 0.0
             action_counts: Counter[int] = Counter()
             last_action = -1
             recovery_guardrail_count = 0
@@ -1264,6 +1395,9 @@ class Core:
                     prev_rev_per_request=float(self.last_revpr),
                     profit_per_request=float(m1.profit_per_request),
                     profit_margin=self._profit_margin(m1),
+                    fulfillment_rate=float(m1.fulfillment_rate),
+                    avg_wait_minutes=float(m1.avg_wait_minutes),
+                    driver_acceptance_rate=float(m1.driver_acceptance_rate),
                 )
 
                 if self.firm1_mode == "RL" and rl_step is not None:
@@ -1302,6 +1436,10 @@ class Core:
                 revpr_sum += float(m1.rev_per_request)
                 profitpr_sum += float(m1.profit_per_request)
                 gap_sum += float(mean_gap)
+                fulfillment_sum += float(m1.fulfillment_rate)
+                wait_sum += float(m1.avg_wait_minutes)
+                driver_accept_sum += float(m1.driver_acceptance_rate)
+                driver_paypr_sum += float(m1.driver_pay / max(1, m1.total))
                 self.last_share = float(m1.share)
                 self.last_revpr = float(m1.rev_per_request)
                 self.last_gap = float(mean_gap)
@@ -1324,6 +1462,10 @@ class Core:
             avg_revpr = float(revpr_sum / n_steps)
             avg_profitpr = float(profitpr_sum / n_steps)
             avg_gap = float(gap_sum / n_steps)
+            avg_fulfillment = float(fulfillment_sum / n_steps)
+            avg_wait = float(wait_sum / n_steps)
+            avg_driver_accept = float(driver_accept_sum / n_steps)
+            avg_driver_paypr = float(driver_paypr_sum / n_steps)
             dominant_action = int(action_counts.most_common(1)[0][0]) if action_counts else -1
             dominant_action_rate = float(action_counts.most_common(1)[0][1] / n_steps) if action_counts else 0.0
 
@@ -1345,6 +1487,11 @@ class Core:
                 "avg_rev_per_request": avg_revpr,
                 "avg_profit_per_request": avg_profitpr,
                 "avg_price_gap_f2_minus_f1": avg_gap,
+                "avg_fulfillment_rate": avg_fulfillment,
+                "avg_wait_minutes": avg_wait,
+                "driver_acceptance_rate": avg_driver_accept,
+                "driver_pay_per_request": avg_driver_paypr,
+                "driver_reward_scale": float(self.driver_reward_scale_current),
                 "last_action": int(last_action),
                 "dominant_action": dominant_action,
                 "dominant_action_rate": dominant_action_rate,
@@ -1378,6 +1525,7 @@ class Core:
         self.firm2, self.firm2_mode = orig_firm2, orig_firm2_mode
         
         print(">>> Evaluating RL agent against static/heuristic opponent with shared profile pool...")
+        self.driver_reward_scale_current = 1.0 if self.enable_driver_supply else 0.0
         eval_rewards: List[float] = []
         # Reset reward-trend baselines so evaluation reward reflects evaluation dynamics,
         # not trailing deltas from the end of training.
@@ -1426,6 +1574,9 @@ class Core:
                 prev_rev_per_request=eval_last_revpr,
                 profit_per_request=float(m1.profit_per_request),
                 profit_margin=self._profit_margin(m1),
+                fulfillment_rate=float(m1.fulfillment_rate),
+                avg_wait_minutes=float(m1.avg_wait_minutes),
+                driver_acceptance_rate=float(m1.driver_acceptance_rate),
             )
             eval_reward = float(reward_diag["reward"])
 
@@ -1455,6 +1606,11 @@ class Core:
                 "heuristic_revenue": float(m2.rev_per_request),
                 "rl_profit": float(m1.profit_per_request),
                 "heuristic_profit": float(m2.profit_per_request),
+                "rl_fulfillment_rate": float(m1.fulfillment_rate),
+                "rl_avg_wait_minutes": float(m1.avg_wait_minutes),
+                "rl_driver_acceptance_rate": float(m1.driver_acceptance_rate),
+                "rl_driver_pay_per_request": float(m1.driver_pay / max(1, m1.total)),
+                "driver_reward_scale": float(self.driver_reward_scale_current),
                 "price_gap_f2_minus_f1": float(mean_gap),
                 "action": int(action),
             }
@@ -1927,6 +2083,7 @@ class Core:
             firm1_last_revpr=float(self.last_revpr),
             firm1_last_gap=float(self.last_gap),
             firm1_last_reward=float(self.last_reward),
+            driver_state_vec=self.driver_supply.state_features_for_firm1() if self.enable_driver_supply else None,
         )
 
     def simulate_batch(
@@ -1946,6 +2103,8 @@ class Core:
         dist_sum = 0.0
         
         profiles = sampled_profiles if sampled_profiles is not None else self.agent_gen.sample_profiles(customers_per_step)
+        if self.enable_driver_supply:
+            self.driver_supply.begin_batch(customers_per_step=customers_per_step, hour=hour, weather=weather)
 
         for profile in profiles:
             # trip-specific distance (scenario-side)
@@ -1970,6 +2129,9 @@ class Core:
             p2 = self.market.quote_price(travel_distance, duration, ctx, overrides=self.firm2.overrides)
 
             gaps.append(p2 - p1)
+            
+            service_q1 = self.driver_supply.estimate_service_quality("Firm1", airport=airport) if self.enable_driver_supply else {"pickup_minutes": 0.0, "cancel_risk": 0.0}
+            service_q2 = self.driver_supply.estimate_service_quality("Firm2", airport=airport) if self.enable_driver_supply else {"pickup_minutes": 0.0, "cancel_risk": 0.0}
 
             scenario = {
                 "City": self.market_name,
@@ -1980,6 +2142,10 @@ class Core:
                 "Weather": str(weather),
                 "Airport": bool(airport),
                 "Service": str(service),
+                "WaitEstimateFirm1": float(service_q1["pickup_minutes"]),
+                "WaitEstimateFirm2": float(service_q2["pickup_minutes"]),
+                "CancelRiskFirm1": float(service_q1["cancel_risk"]),
+                "CancelRiskFirm2": float(service_q2["cancel_risk"]),
             }
 
             choice_res: ChoiceResult = self.choice_model.choose(profile, scenario, p1, p2)
@@ -1987,17 +2153,77 @@ class Core:
 
             firm1.total += 1
             firm2.total += 1
-            trip_cost = self._estimate_trip_cost(travel_distance, duration, airport)
+            fulfilled = False
+            match_status = "NoRide" if choice == "NoRide" else "NotDispatched"
+            driver_pay = 0.0
+            pickup_minutes = 0.0
+            wait_minutes = 0.0
+            acceptance_prob = 0.0
             if choice == "Firm1":
-                firm1.wins += 1
-                firm1.revenue += float(p1)
-                firm1.profit += float(p1) - trip_cost
+                firm1.chosen += 1
+                if self.enable_driver_supply:
+                    dispatch = self.driver_supply.dispatch("Firm1", p1, travel_distance, duration, airport=airport)
+                    firm1.dispatch_offers += 1
+                    acceptance_prob = float(dispatch.acceptance_probability)
+                    pickup_minutes = float(dispatch.pickup_minutes)
+                    wait_minutes = float(dispatch.wait_minutes)
+                    driver_pay = float(dispatch.driver_pay)
+                    if dispatch.fulfilled:
+                        fulfilled = True
+                        firm1.completed += 1
+                        firm1.wins += 1
+                        firm1.revenue += float(p1)
+                        firm1.driver_pay += driver_pay
+                        firm1.wait_minutes += wait_minutes
+                        firm1.pickup_minutes += pickup_minutes
+                        firm1.profit += float(p1) - driver_pay - float(dispatch.platform_variable_cost)
+                        match_status = "Completed"
+                    else:
+                        firm1.unfulfilled += 1
+                        firm1.driver_rejections += 1
+                        match_status = dispatch.reject_reason
+                else:
+                    trip_cost = self._estimate_trip_cost(travel_distance, duration, airport)
+                    fulfilled = True
+                    firm1.completed += 1
+                    firm1.wins += 1
+                    firm1.revenue += float(p1)
+                    firm1.profit += float(p1) - trip_cost
+                    match_status = "Completed"
             elif choice == "Firm2":
-                firm2.wins += 1
-                firm2.revenue += float(p2)
-                firm2.profit += float(p2) - trip_cost
-            # "NoRide" / outside-option choices remain demand opportunities but
-            # generate no firm win and no rideshare revenue.
+                firm2.chosen += 1
+                if self.enable_driver_supply:
+                    dispatch = self.driver_supply.dispatch("Firm2", p2, travel_distance, duration, airport=airport)
+                    firm2.dispatch_offers += 1
+                    acceptance_prob = float(dispatch.acceptance_probability)
+                    pickup_minutes = float(dispatch.pickup_minutes)
+                    wait_minutes = float(dispatch.wait_minutes)
+                    driver_pay = float(dispatch.driver_pay)
+                    if dispatch.fulfilled:
+                        fulfilled = True
+                        firm2.completed += 1
+                        firm2.wins += 1
+                        firm2.revenue += float(p2)
+                        firm2.driver_pay += driver_pay
+                        firm2.wait_minutes += wait_minutes
+                        firm2.pickup_minutes += pickup_minutes
+                        firm2.profit += float(p2) - driver_pay - float(dispatch.platform_variable_cost)
+                        match_status = "Completed"
+                    else:
+                        firm2.unfulfilled += 1
+                        firm2.driver_rejections += 1
+                        match_status = dispatch.reject_reason
+                else:
+                    trip_cost = self._estimate_trip_cost(travel_distance, duration, airport)
+                    fulfilled = True
+                    firm2.completed += 1
+                    firm2.wins += 1
+                    firm2.revenue += float(p2)
+                    firm2.profit += float(p2) - trip_cost
+                    match_status = "Completed"
+            # "NoRide" / outside-option choices remain demand opportunities.
+            # Driver-layer unfulfilled choices also remain demand opportunities but
+            # generate no completed win or rideshare revenue.
             
             rows.append({
                 "City": self.market_name,
@@ -2010,11 +2236,21 @@ class Core:
                 "Price_Firm1": p1,
                 "Price_Firm2": p2,
                 "Choice": choice,
+                "Fulfilled": bool(fulfilled),
+                "MatchStatus": match_status,
+                "DriverPay": float(driver_pay),
+                "PickupMinutes": float(pickup_minutes),
+                "WaitMinutes": float(wait_minutes),
+                "DriverAcceptanceProbability": float(acceptance_prob),
+                "WaitEstimateFirm1": float(service_q1["pickup_minutes"]),
+                "WaitEstimateFirm2": float(service_q2["pickup_minutes"]),
                 "ReasonCodes": ",".join(choice_res.reason_codes),
                 "ShortReason": choice_res.short_reason,
                 **profile,
             })
 
+        if self.enable_driver_supply:
+            self.driver_supply.end_batch()
         mean_gap = float(np.mean(gaps)) if gaps else 0.0
         airport_rate = float(airport_count / max(1, customers_per_step))
         mean_dist = float(dist_sum / max(1, customers_per_step))
@@ -2046,6 +2282,7 @@ class Core:
         self.convergence_window_std_at_day = None
         self.convergence_delta_per_day_at_day = None
         self._convergence_streak = 0
+        self.driver_reward_scale_current = 1.0 if self.enable_driver_supply else 0.0
         
         for d in range(days):
             day_ctx = self.market.sample_day_context()
@@ -2057,6 +2294,10 @@ class Core:
             profit_sum = 0.0
             gap_sum = 0.0
             reward_sum = 0.0
+            fulfillment_sum = 0.0
+            wait_sum = 0.0
+            driver_accept_sum = 0.0
+            driver_paypr_sum = 0.0
             
             share_sum_two = 0.0
             revpr_sum_two = 0.0
@@ -2139,6 +2380,10 @@ class Core:
                 revpr_sum += float(m1.rev_per_request)
                 profit_sum += float(m1.profit_per_request)
                 gap_sum += float(mean_gap)
+                fulfillment_sum += float(m1.fulfillment_rate)
+                wait_sum += float(m1.avg_wait_minutes)
+                driver_accept_sum += float(m1.driver_acceptance_rate)
+                driver_paypr_sum += float(m1.driver_pay / max(1, m1.total))
                 
                 share_sum_two += float(m2.share)
                 revpr_sum_two += float(m2.rev_per_request)
@@ -2165,8 +2410,24 @@ class Core:
             avg_revpr = revpr_sum / max(1, timesteps_per_day)
             avg_gap = gap_sum / max(1, timesteps_per_day)
             avg_profitpr = profit_sum / max(1, timesteps_per_day)
-            avg_reward = (reward_sum / max(1, timesteps_per_day)) if self.firm1_mode == "RL" else self._reward_base(avg_share, avg_revpr, price_gap_f2_minus_f1=avg_gap, profit_per_request=avg_profitpr)
             avg_no_ride_share = no_ride_share_sum / max(1, timesteps_per_day)
+            avg_fulfillment = fulfillment_sum / max(1, timesteps_per_day)
+            avg_wait = wait_sum / max(1, timesteps_per_day)
+            avg_driver_accept = driver_accept_sum / max(1, timesteps_per_day)
+            avg_driver_paypr = driver_paypr_sum / max(1, timesteps_per_day)
+            avg_reward = (
+                (reward_sum / max(1, timesteps_per_day))
+                if self.firm1_mode == "RL"
+                else self._reward_base(
+                    avg_share,
+                    avg_revpr,
+                    price_gap_f2_minus_f1=avg_gap,
+                    profit_per_request=avg_profitpr,
+                    fulfillment_rate=avg_fulfillment,
+                    avg_wait_minutes=avg_wait,
+                    driver_acceptance_rate=avg_driver_accept,
+                )
+            )
             self.run_logs.append({
                 "day": d + 1,
                 "avg_share": float(avg_share),
@@ -2174,6 +2435,11 @@ class Core:
                 "avg_profitpr": float(avg_profitpr),
                 "avg_gap": float(avg_gap),
                 "avg_no_ride_share": float(avg_no_ride_share),
+                "avg_fulfillment_rate": float(avg_fulfillment),
+                "avg_wait_minutes": float(avg_wait),
+                "driver_acceptance_rate": float(avg_driver_accept),
+                "driver_pay_per_request": float(avg_driver_paypr),
+                "driver_reward_scale": float(self.driver_reward_scale_current),
                 "avg_reward": float(avg_reward),
                 "ppo_approx_kl": float(ppo_metrics.get("approx_kl", 0.0)),
                 "ppo_clipfrac": float(ppo_metrics.get("clipfrac", 0.0)),
@@ -2811,7 +3077,24 @@ def main():
     parser.add_argument("--driver_cost_per_minute", type=float, default=0.12, help="Approximate per-minute contribution cost for completed rides.")
     parser.add_argument("--fixed_trip_cost", type=float, default=1.25, help="Approximate fixed platform/driver cost for completed rides.")
     parser.add_argument("--airport_cost", type=float, default=2.0, help="Approximate extra cost for airport rides.")
-    parser.add_argument("--gpt_threshold_batch_size", type=int, default=10, help="Profiles per GPT price-threshold API request. Larger values improve API utilization but increase per-request payload size.")
+    parser.add_argument("--disable_driver_supply", action="store_true", help="Disable the driver supply/matching layer and use legacy completed-ride costs.")
+    parser.add_argument("--use_osmnx", action="store_true", help="Load an OpenStreetMap drive network through OSMnx for future spatial routing hooks.")
+    parser.add_argument("--osmnx_place", type=str, default="", help="OSMnx place string; defaults to '<market>, USA'.")
+    parser.add_argument("--driver_base_active", type=int, default=260, help="Baseline active drivers for the batch-level driver supply model.")
+    parser.add_argument("--driver_reservation_wage", type=float, default=24.0, help="Driver reservation wage used by acceptance and online-supply response.")
+    parser.add_argument("--driver_acceptance_mode", type=str, default="expected", choices=["expected", "stochastic"], help="Use deterministic expected driver acceptance for faster RL convergence, or stochastic Bernoulli acceptance for realism.")
+    parser.add_argument("--driver_state_smoothing", type=float, default=0.35, help="EMA smoothing alpha for driver features fed into the RL state.")
+    parser.add_argument("--driver_reward_fulfillment_weight", type=float, default=0.06, help="Reward bonus weight for completed/chosen fulfillment when driver supply is enabled.")
+    parser.add_argument("--driver_reward_wait_weight", type=float, default=0.04, help="Reward penalty weight for long average pickup wait when driver supply is enabled.")
+    parser.add_argument("--driver_reward_reject_weight", type=float, default=0.03, help="Reward penalty weight for driver rejection when driver supply is enabled.")
+    parser.add_argument("--driver_reward_warmup_fraction", type=float, default=0.30, help="Fraction of training over which driver reward terms ramp from zero to full strength.")
+    parser.add_argument("--threshold_cache_path", type=str, default="", help="Optional JSONL path for cached GPT/fallback threshold-enriched profiles.")
+    parser.add_argument("--reuse_threshold_cache", action="store_true", help="Reuse --threshold_cache_path when it contains enough threshold profiles.")
+    parser.add_argument("--no_save_threshold_cache", action="store_true", help="Do not write threshold profiles to --threshold_cache_path after bootstrap.")
+    parser.add_argument("--gpt_threshold_include_rationales", action="store_true", help="Request GPT rationales for thresholds; slower but useful for debugging.")
+    parser.add_argument("--gpt_threshold_coldstart_rides", type=int, default=5, help="Cold-start rides per profile sent/summarized for threshold bootstrapping.")
+    parser.add_argument("--gpt_threshold_send_raw_rides", action="store_true", help="Send raw cold-start ride rows in addition to compact summaries; slower but more detailed.")
+    parser.add_argument("--gpt_threshold_batch_size", type=int, default=20, help="Profiles per GPT price-threshold API request. Larger values improve API utilization but increase payload size.")
     parser.add_argument("--gpt_threshold_max_retries", type=int, default=2, help="Retries per GPT price-threshold batch before deterministic fallback is used.")
     parser.add_argument("--gpt_threshold_failure_pause", type=float, default=1.0, help="Seconds to pause after a failed GPT threshold batch before sending the next batch; helps avoid connection-refused cascades.")
     parser.add_argument("--calibration_csv", type=str, default="", help="Optional historical CSV used to calibrate priors and choice sensitivity.")
@@ -2888,6 +3171,23 @@ def main():
         driver_cost_per_minute=args.driver_cost_per_minute,
         fixed_trip_cost=args.fixed_trip_cost,
         airport_cost=args.airport_cost,
+        enable_driver_supply=not args.disable_driver_supply,
+        use_osmnx=args.use_osmnx,
+        osmnx_place=args.osmnx_place or None,
+        driver_base_active=args.driver_base_active,
+        driver_reservation_wage=args.driver_reservation_wage,
+        driver_acceptance_mode=args.driver_acceptance_mode,
+        driver_state_smoothing=args.driver_state_smoothing,
+        driver_reward_fulfillment_weight=args.driver_reward_fulfillment_weight,
+        driver_reward_wait_weight=args.driver_reward_wait_weight,
+        driver_reward_reject_weight=args.driver_reward_reject_weight,
+        driver_reward_warmup_fraction=args.driver_reward_warmup_fraction,
+        threshold_cache_path=args.threshold_cache_path,
+        reuse_threshold_cache=args.reuse_threshold_cache,
+        save_threshold_cache=not args.no_save_threshold_cache,
+        gpt_threshold_include_rationales=args.gpt_threshold_include_rationales,
+        gpt_threshold_coldstart_rides=args.gpt_threshold_coldstart_rides,
+        gpt_threshold_send_raw_rides=args.gpt_threshold_send_raw_rides,
         gpt_threshold_batch_size=args.gpt_threshold_batch_size,
         gpt_threshold_max_retries=args.gpt_threshold_max_retries,
         gpt_threshold_failure_pause=args.gpt_threshold_failure_pause,

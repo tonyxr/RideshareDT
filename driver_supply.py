@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jun 16 14:13:52 2026
+
+@author: Xiaoru Shi
+"""
+
+from __future__ import annotations
+
+"""Driver supply, acceptance, matching, and optional OpenStreetMap/OSMnx hooks.
+
+The first implementation is intentionally lightweight and batch-friendly: Firm 1's
+RL agent still controls rider-facing fare coefficients only (Option A), while the
+driver layer responds endogenously through supply, wait times, and acceptance.
+Driver-pay policy is isolated in ``DriverPayPolicy`` so Option B can later expose
+those pay coefficients to the RL action space without rewriting matching logic.
+"""
+
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
+import importlib
+import importlib.util
+
+import numpy as np
+
+
+@dataclass
+class DriverPayPolicy:
+    """Driver compensation policy, separated from rider fare for Option B later."""
+
+    fare_share: float = 0.72
+    base_pay: float = 1.25
+    per_mile_pay: Optional[float] = None
+    per_minute_pay: Optional[float] = None
+    pickup_minute_pay: float = 0.08
+    airport_bonus: float = 1.00
+    minimum_pay: float = 3.50
+
+
+@dataclass
+class DriverSupplyConfig:
+    base_active_drivers: int = 260
+    reservation_wage_per_hour: float = 24.0
+    operating_cost_per_mile: float = 0.35
+    acceptance_temperature: float = 5.0
+    max_pickup_minutes: float = 16.0
+    base_pickup_minutes: float = 3.5
+    supply_elasticity: float = 0.35
+    online_temperature: float = 12.0
+    platform_variable_cost: float = 0.45
+    acceptance_mode: str = "expected"  # "expected" removes per-dispatch Bernoulli noise for faster RL convergence.
+    expected_acceptance_cutoff: float = 0.35
+    state_smoothing_alpha: float = 0.35
+    pickup_noise_sigma: float = 0.10
+
+
+@dataclass
+class FirmDriverBatchState:
+    active_drivers: int = 0
+    idle_drivers: int = 0
+    busy_drivers: int = 0
+    offered_dispatches: int = 0
+    accepted_dispatches: int = 0
+    rejected_dispatches: int = 0
+    completed_rides: int = 0
+    unfulfilled_requests: int = 0
+    total_driver_pay: float = 0.0
+    total_pickup_minutes: float = 0.0
+    total_pickup_miles: float = 0.0
+    total_wait_minutes: float = 0.0
+    total_online_minutes: float = 0.0
+
+    @property
+    def acceptance_rate(self) -> float:
+        return self.accepted_dispatches / self.offered_dispatches if self.offered_dispatches > 0 else 1.0
+
+    @property
+    def fulfillment_rate(self) -> float:
+        denom = self.completed_rides + self.unfulfilled_requests
+        return self.completed_rides / denom if denom > 0 else 1.0
+
+    @property
+    def avg_wait_minutes(self) -> float:
+        return self.total_wait_minutes / self.completed_rides if self.completed_rides > 0 else 0.0
+
+    @property
+    def avg_pickup_minutes(self) -> float:
+        return self.total_pickup_minutes / self.completed_rides if self.completed_rides > 0 else 0.0
+
+    @property
+    def driver_earnings_per_hour(self) -> float:
+        hours = self.total_online_minutes / 60.0
+        return self.total_driver_pay / hours if hours > 0 else 0.0
+
+    @property
+    def idle_driver_share(self) -> float:
+        return self.idle_drivers / self.active_drivers if self.active_drivers > 0 else 0.0
+
+    @property
+    def utilization(self) -> float:
+        return self.busy_drivers / self.active_drivers if self.active_drivers > 0 else 0.0
+
+
+@dataclass
+class DispatchResult:
+    fulfilled: bool
+    driver_pay: float = 0.0
+    platform_variable_cost: float = 0.0
+    pickup_minutes: float = 0.0
+    pickup_miles: float = 0.0
+    wait_minutes: float = 0.0
+    acceptance_probability: float = 0.0
+    reject_reason: str = ""
+
+
+class OpenStreetMapRouter:
+    """Optional OSMnx-backed road-network hook with deterministic fallback.
+
+    This class intentionally avoids importing OSMnx at module import time. When a
+    graph is requested and OSMnx is installed, it is imported dynamically. This
+    keeps normal experiments runnable in environments without OSMnx while leaving
+    a clear integration point for city-network routing.
+    """
+
+    def __init__(self, place_name: str, network_type: str = "drive", use_osmnx: bool = False):
+        self.place_name = str(place_name)
+        self.network_type = str(network_type)
+        self.use_osmnx = bool(use_osmnx)
+        self.graph = None
+        if self.use_osmnx and importlib.util.find_spec("osmnx") is not None:
+            ox = importlib.import_module("osmnx")
+            self.graph = ox.graph_from_place(self.place_name, network_type=self.network_type)
+            self.graph = ox.add_edge_speeds(self.graph)
+            self.graph = ox.add_edge_travel_times(self.graph)
+
+    @property
+    def enabled(self) -> bool:
+        return self.graph is not None
+
+
+class DriverSupplyLayer:
+    """Batch-level two-sided driver supply and matching simulator."""
+
+    def __init__(
+        self,
+        seed: Optional[int] = None,
+        config: Optional[DriverSupplyConfig] = None,
+        firm1_pay_policy: Optional[DriverPayPolicy] = None,
+        firm2_pay_policy: Optional[DriverPayPolicy] = None,
+        use_osmnx: bool = False,
+        osmnx_place: str = "New York City, New York, USA",
+    ):
+        self.rng = np.random.default_rng(seed)
+        self.config = config or DriverSupplyConfig()
+        self.pay_policies = {
+            "Firm1": firm1_pay_policy or DriverPayPolicy(),
+            "Firm2": firm2_pay_policy or DriverPayPolicy(fare_share=0.70),
+        }
+        self.router = OpenStreetMapRouter(place_name=osmnx_place, use_osmnx=use_osmnx)
+        self.last_states = {"Firm1": FirmDriverBatchState(), "Firm2": FirmDriverBatchState()}
+        self.smoothed_states = {"Firm1": FirmDriverBatchState(), "Firm2": FirmDriverBatchState()}
+        self._batch_states = {"Firm1": FirmDriverBatchState(), "Firm2": FirmDriverBatchState()}
+
+    def begin_batch(self, customers_per_step: int, hour: int, weather: str) -> None:
+        self._batch_states = {}
+        demand_scale = max(0.25, float(customers_per_step) / 500.0)
+        peak = 1.18 if (7 <= int(hour) < 10 or 16 <= int(hour) < 19) else 1.0
+        weather_supply = 0.88 if str(weather).lower() in {"rain", "snow", "storm"} else 1.0
+        for firm, bias in (("Firm1", 1.0), ("Firm2", 0.96)):
+            previous_earnings = self.last_states[firm].driver_earnings_per_hour or self.config.reservation_wage_per_hour
+            online_response = 1.0 + self.config.supply_elasticity * np.tanh(
+                (previous_earnings - self.config.reservation_wage_per_hour) / max(1e-6, self.config.online_temperature)
+            )
+            active = int(max(1, round(self.config.base_active_drivers * demand_scale * peak * weather_supply * bias * online_response)))
+            busy = int(np.clip(round(active * (0.18 if peak > 1.0 else 0.12)), 0, max(0, active - 1)))
+            idle = max(1, active - busy)
+            state = FirmDriverBatchState(active_drivers=active, idle_drivers=idle, busy_drivers=busy)
+            state.total_online_minutes = float(active * 60.0)
+            self._batch_states[firm] = state
+
+    def estimate_pickup_minutes(self, firm: str, airport: bool = False) -> float:
+        state = self._batch_states.get(firm, FirmDriverBatchState(active_drivers=1, idle_drivers=1))
+        supply_ratio = state.idle_drivers / max(1.0, float(state.active_drivers))
+        scarcity = 1.0 / max(0.08, supply_ratio)
+        airport_factor = 1.18 if airport else 1.0
+        noise = float(self.rng.lognormal(mean=0.0, sigma=max(0.0, self.config.pickup_noise_sigma)))
+        return float(np.clip(self.config.base_pickup_minutes * scarcity * airport_factor * noise, 1.0, 25.0))
+
+    def estimate_service_quality(self, firm: str, airport: bool = False) -> Dict[str, float]:
+        pickup = self.estimate_pickup_minutes(firm, airport=airport)
+        cancel_risk = float(np.clip((pickup - 6.0) / 18.0, 0.0, 0.95))
+        return {"pickup_minutes": pickup, "cancel_risk": cancel_risk}
+
+    def quote_driver_pay(
+        self,
+        firm: str,
+        rider_fare: float,
+        distance_miles: float,
+        duration_minutes: float,
+        pickup_minutes: float,
+        airport: bool,
+    ) -> float:
+        policy = self.pay_policies[firm]
+        per_mile = policy.per_mile_pay if policy.per_mile_pay is not None else 0.55 * float(rider_fare) / max(1.0, float(distance_miles))
+        per_min = policy.per_minute_pay if policy.per_minute_pay is not None else 0.12 * float(rider_fare) / max(5.0, float(duration_minutes))
+        pay = (
+            policy.base_pay
+            + policy.fare_share * float(rider_fare) * 0.55
+            + float(per_mile) * max(0.0, float(distance_miles))
+            + float(per_min) * max(0.0, float(duration_minutes))
+            + policy.pickup_minute_pay * max(0.0, float(pickup_minutes))
+            + (policy.airport_bonus if airport else 0.0)
+        )
+        return float(max(policy.minimum_pay, pay))
+
+    def dispatch(
+        self,
+        firm: str,
+        rider_fare: float,
+        distance_miles: float,
+        duration_minutes: float,
+        airport: bool = False,
+    ) -> DispatchResult:
+        state = self._batch_states.setdefault(firm, FirmDriverBatchState(active_drivers=1, idle_drivers=1))
+        state.offered_dispatches += 1
+        pickup_minutes = self.estimate_pickup_minutes(firm, airport=airport)
+        pickup_miles = max(0.1, pickup_minutes * 0.28)
+        driver_pay = self.quote_driver_pay(firm, rider_fare, distance_miles, duration_minutes, pickup_minutes, airport)
+        driver_cost = self.config.operating_cost_per_mile * (pickup_miles + max(0.0, float(distance_miles)))
+        total_time_hours = max(1e-6, (pickup_minutes + max(0.0, float(duration_minutes))) / 60.0)
+        implied_hourly = (driver_pay - driver_cost) / total_time_hours
+        utility_gap = implied_hourly - self.config.reservation_wage_per_hour
+        accept_prob = float(1.0 / (1.0 + np.exp(-utility_gap / max(1e-6, self.config.acceptance_temperature))))
+        feasible = state.idle_drivers > 0 and pickup_minutes <= self.config.max_pickup_minutes
+        if str(self.config.acceptance_mode).lower() == "stochastic":
+            accepted = bool(feasible and self.rng.random() < accept_prob)
+        else:
+            accepted = bool(feasible and accept_prob >= float(np.clip(self.config.expected_acceptance_cutoff, 0.01, 0.99)))
+        if not accepted:
+            state.rejected_dispatches += 1
+            state.unfulfilled_requests += 1
+            reason = "NO_IDLE_DRIVER" if state.idle_drivers <= 0 else "LOW_DRIVER_UTILITY_OR_LONG_PICKUP"
+            return DispatchResult(
+                fulfilled=False,
+                driver_pay=0.0,
+                pickup_minutes=pickup_minutes,
+                pickup_miles=pickup_miles,
+                wait_minutes=pickup_minutes,
+                acceptance_probability=accept_prob,
+                reject_reason=reason,
+            )
+
+        state.accepted_dispatches += 1
+        state.completed_rides += 1
+        state.idle_drivers = max(0, state.idle_drivers - 1)
+        state.busy_drivers += 1
+        state.total_driver_pay += driver_pay
+        state.total_pickup_minutes += pickup_minutes
+        state.total_pickup_miles += pickup_miles
+        state.total_wait_minutes += pickup_minutes
+        platform_cost = self.config.platform_variable_cost + 0.05 * max(0.0, float(duration_minutes))
+        return DispatchResult(
+            fulfilled=True,
+            driver_pay=driver_pay,
+            platform_variable_cost=float(platform_cost),
+            pickup_minutes=pickup_minutes,
+            pickup_miles=pickup_miles,
+            wait_minutes=pickup_minutes,
+            acceptance_probability=accept_prob,
+        )
+
+    def end_batch(self) -> Dict[str, FirmDriverBatchState]:
+        self.last_states = {firm: state for firm, state in self._batch_states.items()}
+        alpha = float(np.clip(self.config.state_smoothing_alpha, 0.0, 1.0))
+        for firm, state in self.last_states.items():
+            prev = self.smoothed_states.get(firm, FirmDriverBatchState())
+            self.smoothed_states[firm] = FirmDriverBatchState(
+                active_drivers=int(round((1.0 - alpha) * prev.active_drivers + alpha * state.active_drivers)),
+                idle_drivers=int(round((1.0 - alpha) * prev.idle_drivers + alpha * state.idle_drivers)),
+                busy_drivers=int(round((1.0 - alpha) * prev.busy_drivers + alpha * state.busy_drivers)),
+                offered_dispatches=int(round((1.0 - alpha) * prev.offered_dispatches + alpha * state.offered_dispatches)),
+                accepted_dispatches=int(round((1.0 - alpha) * prev.accepted_dispatches + alpha * state.accepted_dispatches)),
+                rejected_dispatches=int(round((1.0 - alpha) * prev.rejected_dispatches + alpha * state.rejected_dispatches)),
+                completed_rides=int(round((1.0 - alpha) * prev.completed_rides + alpha * state.completed_rides)),
+                unfulfilled_requests=int(round((1.0 - alpha) * prev.unfulfilled_requests + alpha * state.unfulfilled_requests)),
+                total_driver_pay=(1.0 - alpha) * prev.total_driver_pay + alpha * state.total_driver_pay,
+                total_pickup_minutes=(1.0 - alpha) * prev.total_pickup_minutes + alpha * state.total_pickup_minutes,
+                total_pickup_miles=(1.0 - alpha) * prev.total_pickup_miles + alpha * state.total_pickup_miles,
+                total_wait_minutes=(1.0 - alpha) * prev.total_wait_minutes + alpha * state.total_wait_minutes,
+                total_online_minutes=(1.0 - alpha) * prev.total_online_minutes + alpha * state.total_online_minutes,
+            )
+        return self.last_states
+
+    def state_features_for_firm1(self) -> np.ndarray:
+        f1 = self.smoothed_states.get("Firm1", self.last_states.get("Firm1", FirmDriverBatchState()))
+        f2 = self.smoothed_states.get("Firm2", self.last_states.get("Firm2", FirmDriverBatchState()))
+        features = [
+            np.clip(f1.active_drivers / 800.0, 0.0, 1.0),
+            np.clip(f1.idle_driver_share, 0.0, 1.0),
+            np.clip(f1.utilization, 0.0, 1.0),
+            np.clip(f1.acceptance_rate, 0.0, 1.0),
+            np.clip(f1.fulfillment_rate, 0.0, 1.0),
+            np.clip(f1.avg_wait_minutes / 20.0, 0.0, 1.0),
+            np.clip(f1.driver_earnings_per_hour / 60.0, 0.0, 1.0),
+            np.clip((f2.avg_wait_minutes - f1.avg_wait_minutes + 10.0) / 20.0, 0.0, 1.0),
+        ]
+        return np.asarray(features, dtype=np.float32)

@@ -15,7 +15,7 @@ The state intentionally keeps only low-variance signals so the policy is easier 
 learn and less sensitive to transient competitor behavior.
 """
 
-from typing import List
+from typing import List, Optional
 import numpy as np
 
 from Market_models import MarketCoefficients, CoefficientOverrides
@@ -38,6 +38,7 @@ def build_state_vector(
     firm1_last_revpr: float,
     firm1_last_gap: float,
     firm1_last_reward: float,
+    driver_state_vec: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     
     ride_ctx = np.asarray(ride_ctx_vec, dtype=np.float32).reshape(-1)
@@ -70,4 +71,8 @@ def build_state_vector(
         float(np.clip(mean_distance_last / 12.0, 0.0, 1.0)),
         float(np.clip(firm2_cooldown / 5.0, 0.0, 1.0)),
     ]
-    return np.array(fixed + coef_feats, dtype=np.float32)
+    driver_feats = np.asarray(driver_state_vec if driver_state_vec is not None else [], dtype=np.float32).reshape(-1)
+    if driver_feats.size < 8:
+        driver_feats = np.pad(driver_feats, (0, 8 - driver_feats.size), mode="constant")
+    driver_feats = driver_feats[:8]
+    return np.array(fixed + list(driver_feats) + coef_feats, dtype=np.float32)

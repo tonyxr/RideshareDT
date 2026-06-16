@@ -24,6 +24,14 @@ class FirmMetrics:
     profit: float = 0.0
     wins: int = 0
     total: int = 0
+    chosen: int = 0
+    completed: int = 0
+    unfulfilled: int = 0
+    driver_pay: float = 0.0
+    wait_minutes: float = 0.0
+    pickup_minutes: float = 0.0
+    driver_rejections: int = 0
+    dispatch_offers: int = 0
 
     @property
     def share(self) -> float:
@@ -36,7 +44,18 @@ class FirmMetrics:
     @property
     def profit_per_request(self) -> float:
         return (self.profit / self.total) if self.total > 0 else 0.0
+    
+    @property
+    def fulfillment_rate(self) -> float:
+        return (self.completed / self.chosen) if self.chosen > 0 else 1.0
 
+    @property
+    def avg_wait_minutes(self) -> float:
+        return (self.wait_minutes / self.completed) if self.completed > 0 else 0.0
+
+    @property
+    def driver_acceptance_rate(self) -> float:
+        return ((self.dispatch_offers - self.driver_rejections) / self.dispatch_offers) if self.dispatch_offers > 0 else 1.0
 
 class FirmStaticPricer:
     def __init__(self):
@@ -357,7 +376,11 @@ class FirmRLPricer:
         }
 
         # Expanded state includes context, competitor memory, and coefficient deltas.
-        state_dim = 12 + len(active_keys)
+        # State encoder adds 12 market/competitor features, 8 driver-supply
+        # features, and normalized fare-coefficient deltas.  Firm1 still
+        # controls rider-facing fare coefficients only; driver-pay coefficients
+        # are intentionally excluded for the future Option B extension.
+        state_dim = 20 + len(active_keys)
 
         # Wasserstein geometry: penalize large policy moves in coefficient-step space.
         self.cost_matrix = self._build_action_cost_matrix(action_dim)
