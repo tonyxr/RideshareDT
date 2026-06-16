@@ -383,6 +383,7 @@ class Core:
         driver_reward_warmup_fraction: float = 0.30,
         threshold_cache_path: str = "",
         reuse_threshold_cache: bool = False,
+        threshold_profile_source: str = "generated",
         save_threshold_cache: bool = True,
         gpt_threshold_include_rationales: bool = False,
         gpt_threshold_coldstart_rides: int = 5,
@@ -415,7 +416,13 @@ class Core:
         self.gpt_threshold_request_counts: Dict[str, int] = new_gpt_threshold_usage_counts()
         self.gpt_threshold_failure_pause = float(max(0.0, gpt_threshold_failure_pause))
         self.threshold_cache_path = str(threshold_cache_path or "")
-        self.reuse_threshold_cache = bool(reuse_threshold_cache)
+        requested_profile_source = str(threshold_profile_source or "generated").strip().lower()
+        if requested_profile_source not in {"generated", "cached"}:
+            raise ValueError("threshold_profile_source must be either 'generated' or 'cached'")
+        if reuse_threshold_cache:
+            requested_profile_source = "cached"
+        self.threshold_profile_source = requested_profile_source
+        self.reuse_threshold_cache = self.threshold_profile_source == "cached"
         self.save_threshold_cache = bool(save_threshold_cache)
         self.gpt_threshold_include_rationales = bool(gpt_threshold_include_rationales)
         self.gpt_threshold_coldstart_rides = int(np.clip(gpt_threshold_coldstart_rides, 1, 10))
@@ -1258,10 +1265,14 @@ class Core:
         return self._gpt_batch_price_thresholds([(profile, rides)])[0]
     
     def _try_load_threshold_cache(self, pool_size: int) -> bool:
-        """Load cached threshold-enriched profiles to avoid repeated GPT bootstrap latency."""
+        """Load cached threshold-enriched profiles when cached profile mode is requested."""
         path = self.threshold_cache_path
-        if not (self.reuse_threshold_cache and path and os.path.exists(path)):
+        if self.threshold_profile_source != "cached":
             return False
+        if not path:
+            raise ValueError("threshold_profile_source='cached' requires --threshold_cache_path")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Threshold profile cache not found: {path}")
         rows: List[Dict[str, Any]] = []
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -1276,8 +1287,11 @@ class Core:
                 if len(rows) >= int(pool_size):
                     break
         if len(rows) < int(pool_size):
-            print(f"[ThresholdCache] Cache has {len(rows)} profiles; need {int(pool_size)}. Regenerating missing pool.")
-            return False
+            raise ValueError(
+                f"Threshold profile cache has {len(rows)} usable profiles; need {int(pool_size)}. "
+                "Use threshold_profile_source='generated' to create a completely new profile pool, "
+                "or provide a larger cache for threshold_profile_source='cached'."
+            )
         self.synthetic_profile_pool = rows[: int(pool_size)]
         self.gpt_threshold_request_counts = new_gpt_threshold_usage_counts()
         print(f"[ThresholdCache] Loaded {len(self.synthetic_profile_pool)} cached threshold profiles from {path}.")
@@ -1297,6 +1311,8 @@ class Core:
     def _bootstrap_synthetic_profiles(self, pool_size: int) -> None:
         if self._try_load_threshold_cache(pool_size):
             return
+        if self.threshold_profile_source != "generated":
+            raise ValueError(f"Unsupported threshold_profile_source={self.threshold_profile_source!r}")
         base_profiles = self.agent_gen.sample_profiles(int(max(1, pool_size)))
         self.synthetic_profile_pool = []
         threshold_source_counts: Dict[str, int] = {}
@@ -3294,7 +3310,8 @@ def main():
     parser.add_argument("--driver_reward_reject_weight", type=float, default=0.03, help="Reward penalty weight for driver rejection when driver supply is enabled.")
     parser.add_argument("--driver_reward_warmup_fraction", type=float, default=0.30, help="Fraction of training over which driver reward terms ramp from zero to full strength.")
     parser.add_argument("--threshold_cache_path", type=str, default="", help="Optional JSONL path for cached GPT/fallback threshold-enriched profiles.")
-    parser.add_argument("--reuse_threshold_cache", action="store_true", help="Reuse --threshold_cache_path when it contains enough threshold profiles.")
+    parser.add_argument("--threshold_profile_source", type=str, default="generated", choices=["generated", "cached"], help="Use completely newly generated threshold profiles, or load threshold profiles from --threshold_cache_path.")
+    parser.add_argument("--reuse_threshold_cache", action="store_true", help="Deprecated alias for --threshold_profile_source cached.")
     parser.add_argument("--no_save_threshold_cache", action="store_true", help="Do not write threshold profiles to --threshold_cache_path after bootstrap.")
     parser.add_argument("--gpt_threshold_include_rationales", action="store_true", help="Request GPT rationales for thresholds; slower but useful for debugging.")
     parser.add_argument("--gpt_threshold_coldstart_rides", type=int, default=5, help="Cold-start rides per profile sent/summarized for threshold bootstrapping.")
@@ -3389,6 +3406,7 @@ def main():
         driver_reward_warmup_fraction=args.driver_reward_warmup_fraction,
         threshold_cache_path=args.threshold_cache_path,
         reuse_threshold_cache=args.reuse_threshold_cache,
+        threshold_profile_source=args.threshold_profile_source,
         save_threshold_cache=not args.no_save_threshold_cache,
         gpt_threshold_include_rationales=args.gpt_threshold_include_rationales,
         gpt_threshold_coldstart_rides=args.gpt_threshold_coldstart_rides,
