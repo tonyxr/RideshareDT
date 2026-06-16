@@ -392,9 +392,12 @@ class FirmRLPricer:
             hidden_dim=192,
             clip_eps=0.2,
             max_grad_norm=0.8,
-            ent_coeff=0.045,
-            min_ent_coeff=0.0015,
-            ent_decay=0.997,
+            ent_coeff=0.030,
+            min_ent_coeff=0.0008,
+            ent_decay=0.990,
+            target_kl=0.030,
+            max_lr=7e-4,
+            value_clip_eps=0.20,
         )
         
     def configure_training_controls(self, progress: float, reward_converged: bool, reward_std: float) -> None:

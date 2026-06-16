@@ -94,7 +94,10 @@ class PPOAgent:
         target_kl: float = 0.02,
         adv_clip: float = 4.0,
         lr_decay_on_spike: float = 0.85,
+        lr_growth_on_stall: float = 1.08,
         min_lr: float = 5e-5,
+        max_lr: Optional[float] = None,
+        value_clip_eps: float = 0.20,
         device: Optional[str] = None,
     ):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -103,6 +106,7 @@ class PPOAgent:
         self.base_lr = float(lr)
         self.curr_lr = float(lr)
         self.min_lr = float(max(1e-6, min_lr))
+        self.max_lr = float(max_lr if max_lr is not None else max(lr, 6e-4))
 
         self.gamma = gamma
         self.lam = lam
@@ -118,6 +122,9 @@ class PPOAgent:
         self.target_kl = float(max(1e-4, target_kl))
         self.adv_clip = float(max(1.0, adv_clip))
         self.lr_decay_on_spike = float(np.clip(lr_decay_on_spike, 0.5, 0.99))
+        self.lr_growth_on_stall = float(np.clip(lr_growth_on_stall, 1.0, 1.25))
+        self.value_clip_eps = float(max(0.05, value_clip_eps))
+        self.low_update_streak = 0
 
         self.buf: List[Transition] = []
         
@@ -132,7 +139,11 @@ class PPOAgent:
             self.ent_coeff = float(max(self.ent_coeff, 0.55 * self.max_ent_coeff))
             return
 
-        target = self.min_ent_coeff + (self.max_ent_coeff - self.min_ent_coeff) * max(0.0, 1.0 - p)
+        # The driver-supply environment is non-stationary and high variance, so
+        # keep enough exploration early but decay more decisively after the
+        # policy has seen a representative warmup window.  Persistently high
+        # entropy was preventing convergence in longer driver-enabled runs.
+        target = self.min_ent_coeff + (self.max_ent_coeff - self.min_ent_coeff) * max(0.0, 1.0 - p) ** 1.5
         if reward_converged:
             target = max(self.min_ent_coeff, 0.75 * target)
         self.ent_coeff = float(np.clip(min(self.ent_coeff, target), self.min_ent_coeff, self.max_ent_coeff))
@@ -219,6 +230,8 @@ class PPOAgent:
         a_all = torch.stack([tr.a for tr in self.buf], dim=0)
         old_logp_all = torch.stack([tr.old_logp for tr in self.buf], dim=0)
         old_logp_all = torch.nan_to_num(old_logp_all, nan=0.0, posinf=20.0, neginf=-20.0)
+        old_value_all = torch.stack([tr.old_value for tr in self.buf], dim=0).detach()
+        old_value_all = torch.nan_to_num(old_value_all, nan=0.0, posinf=0.0, neginf=0.0)
         
         n = s_all.size(0)
         last = {
@@ -244,6 +257,7 @@ class PPOAgent:
                 adv_b = adv[j].detach().clamp(-self.adv_clip, self.adv_clip)
                 ret_b = ret[j].detach()
                 old_logp_b = old_logp_all[j].detach()
+                old_value_b = old_value_all[j].detach()
 
                 logits, v = self.net(s_b)
                 logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
@@ -257,9 +271,13 @@ class PPOAgent:
                 unclipped = ratio * adv_b
                 clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv_b
                 policy_loss = -torch.min(unclipped, clipped).mean()
-                value_loss = ((v - ret_b) ** 2).mean()
+                value_unclipped = (v - ret_b) ** 2
+                v_clipped = old_value_b + torch.clamp(v - old_value_b, -self.value_clip_eps, self.value_clip_eps)
+                value_clipped = (v_clipped - ret_b) ** 2
+                value_loss = torch.max(value_unclipped, value_clipped).mean()
                 entropy = dist.entropy().mean()
-                approx_kl = (old_logp_b - logp).mean()
+                logratio = logp - old_logp_b
+                approx_kl = ((torch.exp(logratio) - 1.0) - logratio).mean()
                 clipfrac = ((ratio - 1.0).abs() > self.clip_eps).float().mean()
 
                 if float(approx_kl.item()) > 1.5 * self.target_kl:
@@ -290,10 +308,22 @@ class PPOAgent:
             if stop_for_kl:
                 break
 
-        if float(last.get("clipfrac", 0.0)) > 0.30 or float(last.get("approx_kl", 0.0)) > self.target_kl:
+        final_clipfrac = float(last.get("clipfrac", 0.0))
+        final_kl = float(last.get("approx_kl", 0.0))
+        if final_clipfrac > 0.30 or final_kl > self.target_kl:
             self.curr_lr = float(max(self.min_lr, self.curr_lr * self.lr_decay_on_spike))
             for g in self.opt.param_groups:
                 g["lr"] = self.curr_lr
+            self.low_update_streak = 0
+        elif final_clipfrac < 0.02 and final_kl < 0.25 * self.target_kl:
+            self.low_update_streak += 1
+            if self.low_update_streak >= 2 and self.curr_lr < self.max_lr:
+                self.curr_lr = float(min(self.max_lr, self.curr_lr * self.lr_growth_on_stall))
+                for g in self.opt.param_groups:
+                    g["lr"] = self.curr_lr
+                self.low_update_streak = 0
+        else:
+            self.low_update_streak = 0
 
         self.buf.clear()
         self.update_calls += 1
