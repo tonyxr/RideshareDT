@@ -764,10 +764,15 @@ class Core:
         acceptance_term = float(np.clip(driver_acceptance_rate, 0.0, 1.0))
         served_share = float(share_f * fulfillment_term)
 
-        # Positive terms are bounded credits with interpretable targets.
+        # Positive terms are bounded credits with interpretable targets.  Keep
+        # the profit signal signed instead of clipping all loss-making actions
+        # to the same zero credit: in driver-enabled runs profit/request can
+        # remain negative for long stretches, and a clipped profit term leaves
+        # PPO trying to learn mostly from noisy share/fulfillment variation.
         served_share_target = 0.35
-        profit_break_even_buffer = 2.0
-        profit_term = float(np.clip((profitpr + profit_break_even_buffer) / (self.reward_profit_scale + profit_break_even_buffer), 0.0, 1.0))
+        profit_term = float(np.tanh(profitpr / self.reward_profit_scale))
+        profit_credit = float(max(0.0, profit_term))
+        profit_loss = float(max(0.0, -profit_term))
         served_share_term = float(np.clip(served_share / served_share_target, 0.0, 1.0))
         dominance_width = max(1e-6, self.reward_dominance_full_credit_share - self.reward_dominance_threshold)
         dominance_term = float(np.clip((share_f - self.reward_dominance_threshold) / dominance_width, 0.0, 1.0))
@@ -788,7 +793,8 @@ class Core:
         driver_reward_scale = float(np.clip(getattr(self, "driver_reward_scale_current", 1.0), 0.0, 1.0))
         
         share_component = self.reward_share_weight * served_share_term
-        profit_component = self.reward_revenue_weight * profit_term
+        profit_component = self.reward_revenue_weight * profit_credit
+        profit_loss_component = self.reward_revenue_weight * profit_loss
         dominance_component = self.reward_competitive_weight * dominance_term
         driver_fulfillment_component = 0.0
         overprice_component = self.reward_overprice_weight * overprice_penalty
@@ -810,6 +816,7 @@ class Core:
             + profit_component
             + dominance_component
             + driver_fulfillment_component
+            - profit_loss_component
             - overprice_component
             - underprice_component
             - driver_wait_component
@@ -820,6 +827,7 @@ class Core:
             "reward_base_unclipped": float(raw),
             "reward_share_component": float(share_component),
             "reward_profit_component": float(profit_component),
+            "reward_profit_loss_component": float(profit_loss_component),
             "reward_dominance_component": float(dominance_component),
             "reward_driver_fulfillment_component": float(driver_fulfillment_component),
             "reward_overprice_penalty": float(overprice_penalty),
@@ -834,6 +842,8 @@ class Core:
             "reward_service_penalty": float(service_penalty),
             "reward_driver_reject_penalty": float(max(reject_penalty, unfulfilled_penalty)),
             "reward_profit_term": float(profit_term),
+            "reward_profit_credit": float(profit_credit),
+            "reward_profit_loss": float(profit_loss),
             "reward_dominance_term": float(dominance_term),
             "reward_underprice_gap": float(underprice_gap),
             "reward_overprice_gap": float(overprice_gap),
@@ -903,7 +913,7 @@ class Core:
         dominance_width = max(1e-6, self.reward_dominance_full_credit_share - self.reward_dominance_threshold)
         dominance_term = float(np.clip((share_f - self.reward_dominance_threshold) / dominance_width, 0.0, 1.0))
         share_delta = float(np.clip(share_f - float(prev_share), -0.20, 0.20) / 0.20)
-        rev_delta = float(np.clip((profitpr - float(prev_rev_per_request)) / self.reward_profit_scale, -0.20, 0.20) / 0.20)
+        rev_delta = float(np.clip((revpr - float(prev_rev_per_request)) / self.reward_profit_scale, -0.20, 0.20) / 0.20)
         trend_term = float(0.5 * (share_delta + rev_delta))
         pricing_discipline = float(np.clip(gap / 2.0, -1.0, 1.0))
         efficiency_term = float(0.5 * trend_term + 0.5 * pricing_discipline)
