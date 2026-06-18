@@ -61,6 +61,7 @@ from gpt_threshold_utils import (
     diagnose_gpt_threshold_usage,
     format_gpt_threshold_usage_summary,
     increment_gpt_threshold_usage,
+    is_retryable_gpt_threshold_http_status,
     new_gpt_threshold_usage_counts,
     summarize_priced_coldstart_rides,
 )
@@ -1258,7 +1259,7 @@ class Core:
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", errors="replace")[:300]
                 last_error = f"HTTP {e.code} {detail}"
-                if e.code not in {408, 409, 429, 500, 502, 503, 504} or attempt >= self.gpt_threshold_max_retries:
+                if not is_retryable_gpt_threshold_http_status(e.code) or attempt >= self.gpt_threshold_max_retries:
                     break
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}"

@@ -17,6 +17,7 @@ from gpt_threshold_utils import (
     diagnose_gpt_threshold_usage,
     format_gpt_threshold_usage_summary,
     increment_gpt_threshold_usage,
+    is_retryable_gpt_threshold_http_status,
     new_gpt_threshold_usage_counts,
     summarize_priced_coldstart_rides,
 )
@@ -54,6 +55,15 @@ class _FakeNumpy(types.SimpleNamespace):
 
 
 class PriceThresholdFlowTests(unittest.TestCase):
+    def test_transient_proxy_520_family_is_retryable(self):
+        for status_code in (520, 521, 522, 523, 524):
+            with self.subTest(status_code=status_code):
+                self.assertTrue(is_retryable_gpt_threshold_http_status(status_code))
+
+        self.assertTrue(is_retryable_gpt_threshold_http_status(429))
+        self.assertFalse(is_retryable_gpt_threshold_http_status(400))
+        self.assertFalse(is_retryable_gpt_threshold_http_status("invalid"))
+        
     def test_generated_threshold_is_attached_to_profile_for_simulation(self):
         profile = {"IncomeBracket": "100k-200k", "LoyaltyFirm": "Firm1"}
         coldstart_rides = [{"firm1_price": 12.0, "firm2_price": 14.5}]

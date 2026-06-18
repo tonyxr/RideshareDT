@@ -24,11 +24,35 @@ GPT_THRESHOLD_COUNTER_KEYS = (
     "profiles_fallback",
 )
 
+GPT_THRESHOLD_RETRYABLE_HTTP_STATUS_CODES = frozenset(
+    {
+        408,  # Request Timeout
+        409,  # Conflict (occasionally returned for transient API state)
+        425,  # Too Early
+        429,  # Too Many Requests
+        500,
+        502,
+        503,
+        504,
+        520,  # Cloudflare/proxy unknown upstream error
+        521,  # Cloudflare/proxy origin unavailable
+        522,  # Cloudflare/proxy origin timeout
+        523,  # Cloudflare/proxy origin unreachable
+        524,  # Cloudflare/proxy upstream timeout
+    }
+)
 
 def new_gpt_threshold_usage_counts() -> Dict[str, int]:
     """Create a fresh GPT threshold utilization counter dictionary."""
     return {key: 0 for key in GPT_THRESHOLD_COUNTER_KEYS}
 
+def is_retryable_gpt_threshold_http_status(status_code: Any) -> bool:
+    """Return whether an HTTP failure is transient enough to retry safely."""
+    try:
+        code = int(status_code)
+    except (TypeError, ValueError):
+        return False
+    return code in GPT_THRESHOLD_RETRYABLE_HTTP_STATUS_CODES
 
 def increment_gpt_threshold_usage(counts: MutableMapping[str, int], key: str, amount: int = 1) -> None:
     """Increment a GPT threshold utilization counter, tolerating older saved key maps."""
