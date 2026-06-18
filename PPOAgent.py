@@ -74,6 +74,7 @@ class Transition:
     r: float
     done: bool
     old_logp: torch.Tensor
+    old_value: torch.Tensor
     exploration_rate: float
 
 
