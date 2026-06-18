@@ -18,7 +18,7 @@ This is designed for STABILITY:
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -74,7 +74,7 @@ class Transition:
     r: float
     done: bool
     old_logp: torch.Tensor
-    old_value: torch.Tensor
+    exploration_rate: float
 
 
 class PPOAgent:
@@ -99,6 +99,12 @@ class PPOAgent:
         min_lr: float = 5e-5,
         max_lr: Optional[float] = None,
         value_clip_eps: float = 0.20,
+        initial_exploration_rate: float = 0.35,
+        final_exploration_rate: float = 0.02,
+        exploration_fraction: float = 0.75,
+        exploration_warmup_fraction: float = 0.20,
+        min_action_visits: int = 8,
+        exploration_rescue_rate: float = 0.12,
         device: Optional[str] = None,
     ):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -126,9 +132,89 @@ class PPOAgent:
         self.lr_growth_on_stall = float(np.clip(lr_growth_on_stall, 1.0, 1.25))
         self.value_clip_eps = float(max(0.05, value_clip_eps))
         self.low_update_streak = 0
+        
+        self.initial_exploration_rate = float(np.clip(initial_exploration_rate, 0.0, 1.0))
+        self.final_exploration_rate = float(
+            np.clip(final_exploration_rate, 0.0, self.initial_exploration_rate)
+        )
+        self.exploration_fraction = float(np.clip(exploration_fraction, 1e-6, 1.0))
+        self.exploration_warmup_fraction = float(
+            np.clip(exploration_warmup_fraction, 0.0, self.exploration_fraction)
+        )
+        self.min_action_visits = int(max(0, min_action_visits))
+        self.exploration_rescue_rate = float(
+            np.clip(exploration_rescue_rate, self.final_exploration_rate, self.initial_exploration_rate)
+        )
+        self.exploration_rate = self.initial_exploration_rate
+        self.last_action_exploration_rate = self.exploration_rate
+        self.action_visits = np.zeros(int(action_dim), dtype=np.int64)
+        self.last_policy_entropy_fraction = 1.0
 
         self.buf: List[Transition] = []
         
+    def adapt_exploration(
+        self,
+        progress: float,
+        reward_converged: bool,
+        reward_std: Optional[float] = None,
+    ) -> None:
+        """Anneal exploration only after action coverage and a true warmup.
+
+        Entropy bonuses only encourage a policy to remain diffuse; they do not
+        guarantee that every action is sampled.  Mixing the learned categorical
+        policy with a uniform distribution gives every action a known minimum
+        probability in the large state space.  The same mixture is used when
+        PPO recomputes log probabilities, so importance ratios remain valid.
+
+        A cosine schedule avoids the abrupt loss of exploration caused by the
+        old linear schedule.  Annealing is delayed until every action has been
+        sampled enough times, and a rescue floor is restored when the learned
+        policy collapses early or the reward becomes flat before convergence.
+        """
+        p = float(np.clip(progress, 0.0, 1.0))
+        if reward_converged:
+            self.exploration_rate = self.final_exploration_rate
+            return
+
+        covered = bool(
+            self.min_action_visits <= 0
+            or (self.action_visits.size > 0 and int(self.action_visits.min()) >= self.min_action_visits)
+        )
+        if p <= self.exploration_warmup_fraction or not covered:
+            rate = self.initial_exploration_rate
+        else:
+            decay_width = max(1e-6, self.exploration_fraction - self.exploration_warmup_fraction)
+            decay_progress = float(
+                np.clip((p - self.exploration_warmup_fraction) / decay_width, 0.0, 1.0)
+            )
+            cosine = 0.5 * (1.0 + np.cos(np.pi * decay_progress))
+            rate = self.final_exploration_rate + (
+                self.initial_exploration_rate - self.final_exploration_rate
+            ) * cosine
+
+        flat_reward = reward_std is not None and np.isfinite(reward_std) and reward_std < 0.01
+        premature_collapse = p < 0.85 and self.last_policy_entropy_fraction < 0.20
+        if flat_reward or premature_collapse:
+            rate = max(rate, self.exploration_rescue_rate)
+        self.exploration_rate = float(
+            np.clip(rate, self.final_exploration_rate, self.initial_exploration_rate)
+        )
+
+    @staticmethod
+    def _exploratory_distribution(
+        logits: torch.Tensor, exploration_rate: torch.Tensor | float
+    ) -> torch.distributions.Categorical:
+        policy_probs = torch.softmax(logits, dim=-1)
+        eps = torch.as_tensor(
+            exploration_rate, dtype=policy_probs.dtype, device=policy_probs.device
+        )
+        if eps.ndim == 0:
+            eps = eps.expand(policy_probs.shape[:-1])
+        eps = eps.unsqueeze(-1)
+        action_count = max(1, policy_probs.shape[-1])
+        mixed_probs = (1.0 - eps) * policy_probs + eps / float(action_count)
+        return torch.distributions.Categorical(probs=mixed_probs)
+    
     def adapt_entropy(self, progress: float, reward_converged: bool) -> None:
         """Keep exploration high early, then tighten as training converges."""
         p = float(np.clip(progress, 0.0, 1.0))
@@ -162,9 +248,13 @@ class PPOAgent:
         logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         if not torch.isfinite(logits).all():
             logits = torch.zeros_like(logits)
-        dist = torch.distributions.Categorical(logits=logits)
+        exploration_rate = 0.0 if deterministic else self.exploration_rate
+        dist = self._exploratory_distribution(logits, exploration_rate)
         a = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
         logp = dist.log_prob(a)
+        self.last_action_exploration_rate = float(exploration_rate)
+        if not deterministic:
+            self.action_visits[int(a.item())] += 1
         return int(a.item()), s.squeeze(0), logp.squeeze(0), value.squeeze(0)
     
     def store(
@@ -187,6 +277,9 @@ class PPOAgent:
                 done=bool(done),
                 old_logp=old_logp.detach(),
                 old_value=old_value.detach(),
+                exploration_rate=float(
+                    np.clip(getattr(self, "last_action_exploration_rate", 0.0), 0.0, 1.0)
+                ),
             )
         )
 
@@ -196,15 +289,14 @@ class PPOAgent:
         adv = torch.zeros(t_size, dtype=torch.float32, device=self.device)
         ret = torch.zeros(t_size, dtype=torch.float32, device=self.device)
 
-        gae = 0.0
-        next_v = torch.tensor(0.0, device=self.device)
+        gae = torch.zeros((), dtype=torch.float32, device=self.device)
+        next_v = torch.zeros((), dtype=torch.float32, device=self.device)
         for t in reversed(range(t_size)):
             tr = self.buf[t]
             v_t = tr.old_value
-            if tr.done:
-                next_v = torch.tensor(0.0, device=self.device)
-            delta = torch.tensor(tr.r, device=self.device) + self.gamma * next_v - v_t
-            gae = delta + self.gamma * self.lam * (0.0 if tr.done else gae)
+            continuation = 0.0 if tr.done else 1.0
+            delta = tr.r + self.gamma * next_v * continuation - v_t
+            gae = delta + self.gamma * self.lam * continuation * gae
             adv[t] = gae
             ret[t] = adv[t] + v_t
             next_v = v_t
@@ -222,7 +314,16 @@ class PPOAgent:
 
     def update(self, epochs: int = 5, batch_size: int = 256) -> dict:
         if not self.buf:
-            return {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
+            return {
+                "loss": 0.0,
+                "policy_loss": 0.0,
+                "value_loss": 0.0,
+                "entropy": 0.0,
+                "policy_entropy": 0.0,
+                "policy_entropy_fraction": float(self.last_policy_entropy_fraction),
+                "exploration_rate": float(self.exploration_rate),
+                "action_coverage": self._action_coverage(),
+            }
 
         adv, ret = self._gae()
 
@@ -233,6 +334,11 @@ class PPOAgent:
         old_logp_all = torch.nan_to_num(old_logp_all, nan=0.0, posinf=20.0, neginf=-20.0)
         old_value_all = torch.stack([tr.old_value for tr in self.buf], dim=0).detach()
         old_value_all = torch.nan_to_num(old_value_all, nan=0.0, posinf=0.0, neginf=0.0)
+        exploration_all = torch.tensor(
+            [tr.exploration_rate for tr in self.buf],
+            dtype=torch.float32,
+            device=self.device,
+        )
         
         n = s_all.size(0)
         last = {
@@ -240,13 +346,29 @@ class PPOAgent:
             "policy_loss": 0.0,
             "value_loss": 0.0,
             "entropy": 0.0,
+            "policy_entropy": 0.0,
+            "policy_entropy_fraction": float(self.last_policy_entropy_fraction),
             "approx_kl": 0.0,
             "clipfrac": 0.0,
+            "explained_variance": 0.0,
             "ent_coeff": float(self.ent_coeff),
             "lr": float(self.curr_lr),
             "stopped_early_kl": False,
+            "exploration_rate": float(self.exploration_rate),
+            "action_coverage": self._action_coverage(),
+            "optimizer_steps": 0,
         }
         stop_for_kl = False
+        metric_sums: Dict[str, float] = {
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "entropy": 0.0,
+            "policy_entropy": 0.0,
+            "approx_kl": 0.0,
+            "clipfrac": 0.0,
+        }
+        optimizer_steps = 0
 
 
         for _ in range(epochs):
@@ -259,12 +381,14 @@ class PPOAgent:
                 ret_b = ret[j].detach()
                 old_logp_b = old_logp_all[j].detach()
                 old_value_b = old_value_all[j].detach()
+                exploration_b = exploration_all[j].detach()
 
                 logits, v = self.net(s_b)
                 logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
                 if not torch.isfinite(logits).all():
                     continue
-                dist = torch.distributions.Categorical(logits=logits)
+                dist = self._exploratory_distribution(logits, exploration_b)
+                policy_dist = torch.distributions.Categorical(logits=logits)
                 logp = dist.log_prob(a_b)
                 
                 ratio = torch.exp(logp - old_logp_b)
@@ -277,13 +401,17 @@ class PPOAgent:
                 value_clipped = (v_clipped - ret_b) ** 2
                 value_loss = torch.max(value_unclipped, value_clipped).mean()
                 entropy = dist.entropy().mean()
+                policy_entropy = policy_dist.entropy().mean()
                 logratio = logp - old_logp_b
                 approx_kl = ((torch.exp(logratio) - 1.0) - logratio).mean()
                 clipfrac = ((ratio - 1.0).abs() > self.clip_eps).float().mean()
 
                 if float(approx_kl.item()) > 1.5 * self.target_kl:
                     stop_for_kl = True
-                loss = policy_loss + self.v_coeff * value_loss - self.ent_coeff * entropy
+                    break
+                # Entropy regularizes the learned policy, not the externally
+                # forced uniform mixture. Otherwise epsilon can hide collapse.
+                loss = policy_loss + self.v_coeff * value_loss - self.ent_coeff * policy_entropy
                 if not torch.isfinite(loss):
                     continue
 
@@ -291,24 +419,35 @@ class PPOAgent:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
                 self.opt.step()
-                
-                last = {
-                    "loss": float(loss.item()),
-                    "policy_loss": float(policy_loss.item()),
-                    "value_loss": float(value_loss.item()),
-                    "entropy": float(entropy.item()),
-                    "approx_kl": float(approx_kl.item()),
-                    "clipfrac": float(clipfrac.item()),
-                    "ent_coeff": float(self.ent_coeff),
-                    "lr": float(self.curr_lr),
-                    "stopped_early_kl": bool(stop_for_kl),
-                }
-                
-                if stop_for_kl:
-                    break
+                optimizer_steps += 1
+                metric_sums["loss"] += float(loss.item())
+                metric_sums["policy_loss"] += float(policy_loss.item())
+                metric_sums["value_loss"] += float(value_loss.item())
+                metric_sums["entropy"] += float(entropy.item())
+                metric_sums["policy_entropy"] += float(policy_entropy.item())
+                metric_sums["approx_kl"] += float(approx_kl.item())
+                metric_sums["clipfrac"] += float(clipfrac.item())
             if stop_for_kl:
                 break
-
+        
+        if optimizer_steps > 0:
+            for key, total in metric_sums.items():
+                last[key] = float(total / optimizer_steps)
+        max_entropy = float(np.log(max(2, self.action_visits.size)))
+        self.last_policy_entropy_fraction = float(
+            np.clip(last["policy_entropy"] / max_entropy, 0.0, 1.0)
+        )
+        last["policy_entropy_fraction"] = self.last_policy_entropy_fraction
+        last["optimizer_steps"] = int(optimizer_steps)
+        last["action_coverage"] = self._action_coverage()
+        with torch.no_grad():
+            ret_var = torch.var(ret, unbiased=False)
+            if torch.isfinite(ret_var) and float(ret_var.item()) > 1e-8:
+                prediction_error = torch.var(ret - old_value_all, unbiased=False)
+                last["explained_variance"] = float(
+                    torch.clamp(1.0 - prediction_error / ret_var, -1.0, 1.0).item()
+                )
+                
         final_clipfrac = float(last.get("clipfrac", 0.0))
         final_kl = float(last.get("approx_kl", 0.0))
         if final_clipfrac > 0.30 or final_kl > self.target_kl:
@@ -333,4 +472,12 @@ class PPOAgent:
         last["ent_coeff"] = float(self.ent_coeff)
         last["lr"] = float(self.curr_lr)
         last["stopped_early_kl"] = bool(stop_for_kl)
+        last["exploration_rate"] = float(self.exploration_rate)
         return last
+
+    def _action_coverage(self) -> float:
+        if self.action_visits.size == 0:
+            return 1.0
+        if self.min_action_visits <= 0:
+            return float(np.mean(self.action_visits > 0))
+        return float(np.mean(self.action_visits >= self.min_action_visits))

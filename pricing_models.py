@@ -369,6 +369,12 @@ class FirmRLPricer:
             target_kl=0.030,
             max_lr=7e-4,
             value_clip_eps=0.20,
+            initial_exploration_rate=0.40,
+            final_exploration_rate=0.01,
+            exploration_fraction=0.80,
+            exploration_warmup_fraction=0.20,
+            min_action_visits=12,
+            exploration_rescue_rate=0.15,
         )
         
     def configure_training_controls(self, progress: float, reward_converged: bool, reward_std: float) -> None:
@@ -380,6 +386,11 @@ class FirmRLPricer:
         self.step_scale = self.converged_step_scale if stable else self.base_step_scale
         self.max_relative_dev = self.converged_max_relative_dev if stable else self.base_max_relative_dev
         self.agent.adapt_entropy(progress=p, reward_converged=stable)
+        self.agent.adapt_exploration(
+            progress=p,
+            reward_converged=stable,
+            reward_std=reward_std,
+        )
     
     @staticmethod
     def _bounded_relative_move(value: float, anchor: float, max_relative_dev: float, lb: float, ub: float) -> float:

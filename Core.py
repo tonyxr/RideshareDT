@@ -567,10 +567,10 @@ class Core:
         self.reward_dominance_threshold = 0.30
         self.reward_dominance_full_credit_share = 0.45
         self.reward_trend_scale = 0.20
-        self.reward_momentum_weight = max(0.12, self.reward_trend_weight)
-        self.reward_share_floor = 0.25
-        self.reward_profit_floor_weight = 0.18
-        self.reward_softsign_temp = 1.00
+        # Keep the default objective stationary. Trend shaping is opt-in because
+        # non-potential momentum rewards can change the optimal pricing policy
+        # and keep PPO chasing short-lived deltas instead of the business target.
+        self.reward_momentum_weight = self.reward_trend_weight
         self.driver_reward_fulfillment_weight = float(max(0.0, driver_reward_fulfillment_weight))
         self.driver_reward_wait_weight = float(max(0.0, driver_reward_wait_weight))
         self.driver_reward_reject_weight = float(max(0.0, driver_reward_reject_weight))
@@ -588,8 +588,8 @@ class Core:
             "[RewardConfig] "
             f"share={self.reward_share_weight:.2f}, "
             f"profit={self.reward_revenue_weight:.2f}, "
-            f"overprice_penalty={self.reward_overprice_weight:.2f}, "
-            f"underprice_penalty={self.reward_underprice_weight:.2f}, "
+            f"price_gap_penalty={max(self.reward_overprice_weight, self.reward_underprice_weight):.2f}, "
+            f"target_gap(F2-F1)=${self.reward_target_price_gap:.2f}, "
             f"profit_scale={self.reward_profit_scale:.2f}, "
             f"dominance={self.reward_competitive_weight:.2f}, "
             f"trend={self.reward_trend_weight:.2f}, "
@@ -787,56 +787,37 @@ class Core:
         margin = self._finite_float(profit_margin)
         gap = self._finite_float(price_gap_f2_minus_f1)
         fulfillment_term = float(np.clip(self._finite_float(fulfillment_rate, 1.0), 0.0, 1.0))
-        acceptance_term = float(np.clip(self._finite_float(driver_acceptance_rate, 1.0), 0.0, 1.0))
-        wait_minutes = max(0.0, self._finite_float(avg_wait_minutes))
-
-        # Customers and drivers interact through completed demand: a chosen ride
-        # without driver fulfillment should not earn market-share credit.
+        # Customers and drivers interact through completed demand: an unserved
+        # choice earns no share credit.  Centering at the equal split of the two
+        # firms (rather than 50% of all requests) accommodates the outside option.
         served_share = float(np.clip(share_f * fulfillment_term, 0.0, 1.0))
-        market_term = float(2.0 * served_share - 1.0)
+        market_term = float(np.tanh((served_share - self.reward_dominance_threshold) / 0.15))
 
         # Firm objective: signed and bounded contribution profit per request.
         profit_term = float(np.tanh(profitpr / self.reward_profit_scale))
-        profit_credit = float(max(0.0, profit_term))
-        profit_loss = float(max(0.0, -profit_term))
+        # One symmetric price-gap objective. A positive gap means Firm1 is
         # Use one symmetric price-gap objective. A positive gap means Firm1 is
         # cheaper than Firm2, so the default target is a modest $1 discount when
         # the acceptable discount is $2. This gives the agent one clear target
         # instead of separate and potentially conflicting over/underprice rules.
-        price_gap_error = float(abs(gap - self.reward_target_price_gap))
-        price_gap_penalty = self._smooth_positive_penalty(price_gap_error, scale=2.0)
-        margin_shortfall = float(max(0.0, self.min_profit_margin - margin) / max(self.min_profit_margin, 1e-6))
-        service_penalty = self._smooth_positive_penalty(wait_minutes - 6.0, scale=10.0)
-        reject_penalty = self._smooth_positive_penalty(0.70 - acceptance_term, scale=0.35)
+        price_gap_deviation = float(gap - self.reward_target_price_gap)
+        price_gap_penalty = self._smooth_positive_penalty(
+            abs(price_gap_deviation), scale=max(1.0, self.reward_acceptable_discount)
+        )
+        margin_shortfall = float(
+            max(0.0, self.min_profit_margin - margin) / max(self.min_profit_margin, 1e-6)
+        )
         unfulfilled_penalty = self._smooth_positive_penalty(0.75 - fulfillment_term, scale=0.35)
         margin_penalty = self._smooth_positive_penalty(margin_shortfall, scale=1.0)
         price_discipline_penalty = max(price_gap_penalty, margin_penalty)
-        driver_reward_scale = float(np.clip(getattr(self, "driver_reward_scale_current", 1.0), 0.0, 1.0))
-        
-        # Balance share with unit economics.  Share remains valuable, but not
-        # enough to make deeply loss-making share look optimal.  A smooth
-        # viability gate preserves gradients around break-even while shrinking
-        # served-share credit in the extreme "buy share with losses" case.
-        profit_viability = float(1.0 / (1.0 + np.exp(-profitpr / max(1e-6, 0.30 * self.reward_profit_scale))))
-        share_quality_gate = float(0.50 + 0.50 * profit_viability)
+        # The average is deliberately the complete business objective: completed
+        # customer share captures riders and driver supply, while signed
+        # contribution profit captures the firm and driver compensation.  The
+        # gap term is only price discipline, not a competing business objective.
         share_component = self.reward_share_weight * market_term
         profit_component = self.reward_revenue_weight * profit_term
-        profit_loss_component = self.reward_revenue_weight * 1.45 * profit_loss
-        dominance_term = float(np.clip((share_f - self.reward_dominance_threshold) / max(1e-6, self.reward_dominance_full_credit_share - self.reward_dominance_threshold), 0.0, 1.0))
-        dominance_component = 0.0
-        driver_fulfillment_component = 0.0
         price_gap_weight = max(self.reward_overprice_weight, self.reward_underprice_weight)
         price_gap_component = price_gap_weight * price_discipline_penalty
-
-        # Wait/rejection remain diagnostics, but are not separate reward terms.
-        # Fulfillment already links driver supply to served customer share, while
-        # profit includes driver compensation. Extra wait/rejection penalties
-        # would double-count supply and can encourage fare increases merely to
-        # improve driver acceptance.
-        driver_wait_component = 0.0
-        driver_reject_component = 0.0
-        overprice_component = 0.0
-        underprice_component = 0.0
 
         raw = share_component + profit_component - price_gap_component
         base = float(np.clip(raw, -1.0, 1.0))
@@ -844,30 +825,16 @@ class Core:
             "reward_base": base,
             "reward_base_unclipped": float(raw),
             "reward_share_component": float(share_component),
-            "reward_profit_component": float(max(0.0, self.reward_revenue_weight * profit_term)),
-            "reward_profit_loss_component": float(profit_loss_component),
-            "reward_profit_viability": float(profit_viability),
-            "reward_share_quality_gate": float(share_quality_gate),
-            "reward_dominance_component": float(dominance_component),
-            "reward_driver_fulfillment_component": float(driver_fulfillment_component),
-            "reward_overprice_penalty": float(price_gap_penalty),
-            "reward_underprice_penalty": float(price_gap_penalty),
+            "reward_profit_component": float(profit_component),
             "reward_margin_penalty": float(margin_penalty),
             "reward_price_discipline_penalty": float(price_discipline_penalty),
-            "reward_underprice_gap": float(max(0.0, gap - self.reward_target_price_gap)),
-            "reward_overprice_gap": float(max(0.0, self.reward_target_price_gap - gap)),
-            "reward_driver_wait_component": float(driver_wait_component),
-            "reward_driver_reject_component": float(driver_reject_component),
+            "reward_price_gap": float(gap),
+            "reward_target_price_gap": float(self.reward_target_price_gap),
+            "reward_price_gap_deviation": float(price_gap_deviation),
+            "reward_price_gap_penalty": float(price_gap_penalty),
             "reward_fulfillment_term": float(fulfillment_term),
-            "reward_service_penalty": float(service_penalty),
-            "reward_driver_reject_penalty": float(max(reject_penalty, unfulfilled_penalty)),
             "reward_profit_term": float(profit_term),
-            "reward_profit_credit": float(profit_credit),
-            "reward_profit_loss": float(profit_loss),
-            "reward_dominance_term": float(dominance_term),
-            "reward_driver_scale": float(driver_reward_scale),
             "reward_served_share": float(served_share),
-            "reward_served_share_term": float(served_share),
             "reward_driver_unfulfilled_penalty": float(unfulfilled_penalty),
         }
 
@@ -916,7 +883,7 @@ class Core:
         revpr = float(max(0.0, rev_per_request))
         profitpr = float(revpr if profit_per_request is None else profit_per_request)
         margin = float(0.0 if profit_margin is None else profit_margin)
-        gap = float(mean_gap)
+        gap = self._finite_float(mean_gap)
         
         components = self._reward_components(
             share=share_f,
@@ -942,11 +909,16 @@ class Core:
         # already penalized by the base reward.
         gap_delta = float(np.clip((gap - prev_gap_f) / 2.0, -1.0, 1.0))
         trend_term = float(0.40 * share_delta + 0.35 * profit_delta + 0.25 * gap_delta)
-        pricing_discipline = float(np.clip(gap / max(1e-6, self.reward_acceptable_discount), -1.0, 1.0))
+        pricing_discipline = float(
+            1.0 - 2.0 * components["reward_price_gap_penalty"]
+        )
         efficiency_term = float(0.5 * trend_term + 0.5 * pricing_discipline)
         momentum_component = float(self.reward_momentum_weight * self.reward_trend_scale * trend_term)
         raw_reward = float(base_reward + momentum_component)
-        reward = float(np.tanh(raw_reward / self.reward_softsign_temp))
+        # The base terms are already smoothly bounded. A second tanh compressed
+        # useful differences between good and excellent outcomes and weakened
+        # PPO's advantage signal without changing safety.
+        reward = float(np.clip(raw_reward, -1.0, 1.0))
 
         return {
             "reward": reward,
@@ -1412,7 +1384,9 @@ class Core:
         if not self.synthetic_profile_pool:
             self._bootstrap_synthetic_profiles(pool_size=max(self.total_customers_pool, n))
         idx = self.rng.integers(0, len(self.synthetic_profile_pool), size=int(max(0, n)))
-        return [dict(self.synthetic_profile_pool[int(i)]) for i in idx]
+        # Simulation and choice models treat profiles as read-only. Reusing the
+        # pool dictionaries avoids thousands of allocations per timestep.
+        return [self.synthetic_profile_pool[int(i)] for i in idx]
 
     def run_experiment(
         self,
@@ -1474,7 +1448,13 @@ class Core:
             "approx_kl": 0.0,
             "clipfrac": 0.0,
             "entropy": 0.0,
+            "policy_entropy": 0.0,
+            "policy_entropy_fraction": 1.0,
             "ent_coeff": 0.0,
+            "exploration_rate": 0.0,
+            "action_coverage": 0.0,
+            "explained_variance": 0.0,
+            "optimizer_steps": 0,
             "lr": 0.0,
             "stopped_early_kl": False,
         }
@@ -1535,6 +1515,7 @@ class Core:
                     hour=hour,
                     customers_per_step=train_customers_per_step,
                     sampled_profiles=sampled_profiles,
+                    collect_rows=False,
                 )
 
                 if self.firm2_mode != "static":
@@ -1594,28 +1575,14 @@ class Core:
                 for component_key in (
                     "reward_share_component",
                     "reward_profit_component",
-                    "reward_profit_loss_component",
-                    "reward_profit_floor_component",
-                    "reward_share_floor_component",
-                    "reward_profit_viability",
-                    "reward_share_quality_gate",
                     "reward_momentum_component",
                     "reward_profit_delta",
                     "reward_gap_delta",
-                    "reward_dominance_component",
-                    "reward_driver_fulfillment_component",
-                    "reward_overprice_component",
-                    "reward_underprice_component",
-                    "reward_driver_wait_component",
-                    "reward_driver_reject_component",
-                    "reward_overprice_penalty",
-                    "reward_underprice_penalty",
                     "reward_margin_penalty",
                     "reward_price_discipline_penalty",
-                    "reward_underprice_gap",
-                    "reward_overprice_gap",
+                    "reward_price_gap_deviation",
+                    "reward_price_gap_penalty",
                     "reward_served_share",
-                    "reward_served_share_term",
                     "reward_driver_unfulfilled_penalty",
                 ):
                     reward_component_sums[component_key] += float(reward_diag.get(component_key, 0.0))
@@ -1700,7 +1667,13 @@ class Core:
                 "ppo_approx_kl": float(ppo_metrics.get("approx_kl", 0.0)),
                 "ppo_clipfrac": float(ppo_metrics.get("clipfrac", 0.0)),
                 "ppo_entropy": float(ppo_metrics.get("entropy", 0.0)),
+                "ppo_policy_entropy": float(ppo_metrics.get("policy_entropy", 0.0)),
+                "ppo_policy_entropy_fraction": float(ppo_metrics.get("policy_entropy_fraction", 1.0)),
                 "ppo_ent_coeff": float(ppo_metrics.get("ent_coeff", 0.0)),
+                "ppo_exploration_rate": float(ppo_metrics.get("exploration_rate", 0.0)),
+                "ppo_action_coverage": float(ppo_metrics.get("action_coverage", 0.0)),
+                "ppo_explained_variance": float(ppo_metrics.get("explained_variance", 0.0)),
+                "ppo_optimizer_steps": int(ppo_metrics.get("optimizer_steps", 0)),
                 "ppo_lr": float(ppo_metrics.get("lr", 0.0)),
                 "ppo_stopped_early_kl": bool(ppo_metrics.get("stopped_early_kl", False)),
             }
@@ -1708,6 +1681,36 @@ class Core:
                 log_row[f"firm1_{k}"] = float(get_coeff(self.market.curr_market, self.firm1.overrides, k))
                 log_row[f"firm2_{k}"] = float(get_coeff(self.market.curr_market, self.firm2.overrides, k))
             self.training_logs.append(log_row)
+            
+            if self.firm1_mode == "RL":
+                # Keep exploration/entropy controls synchronized in the primary
+                # experiment workflow as well as in ``run``. Previously this
+                # path stayed at the initial 40% uniform mixture for the entire
+                # training run, preventing the learned policy from exploiting.
+                convergence_window = reward_history[-min(len(reward_history), 40):]
+                convergence_std = (
+                    float(np.std(convergence_window))
+                    if len(convergence_window) >= 2
+                    else 1.0
+                )
+                convergence_delta = (
+                    float(abs(convergence_window[-1] - convergence_window[0])
+                          / max(1, len(convergence_window) - 1))
+                    if len(convergence_window) >= 2
+                    else 1.0
+                )
+                reward_converged = bool(
+                    len(convergence_window) >= 40
+                    and convergence_std <= self.reward_convergence_tol
+                    and convergence_delta <= self.reward_trend_tol
+                    and float(ppo_metrics.get("action_coverage", 0.0)) >= 0.95
+                    and float(ppo_metrics.get("policy_entropy_fraction", 1.0)) <= 0.40
+                )
+                self.firm1.configure_training_controls(
+                    progress=float((d + 1) / max(1, train_timesteps)),
+                    reward_converged=reward_converged,
+                    reward_std=convergence_std,
+                )
             
             if (d + 1) % max(1, train_timesteps // 10) == 0:
                 print(
@@ -1761,6 +1764,7 @@ class Core:
                 hour=hour,
                 customers_per_step=eval_customers_per_step,
                 sampled_profiles=sampled_profiles,
+                collect_rows=False,
             )
                 
             # Use the same shaped reward family as training for consistent trajectory logs.
@@ -2318,11 +2322,13 @@ class Core:
         hour: int,
         customers_per_step: int,
         sampled_profiles: Optional[List[Dict[str, Any]]] = None,
+        collect_rows: bool = True,
     ) -> Tuple[List[Dict[str, Any]], FirmMetrics, FirmMetrics, float, float, float]:
         rows: List[Dict[str, Any]] = []
         firm1 = FirmMetrics()
         firm2 = FirmMetrics()
-        gaps: List[float] = []
+        gap_sum = 0.0
+        profile_count = 0
 
         airport_count = 0
         dist_sum = 0.0
@@ -2332,6 +2338,7 @@ class Core:
             self.driver_supply.begin_batch(customers_per_step=customers_per_step, hour=hour, weather=weather)
 
         for profile in profiles:
+            profile_count += 1
             # trip-specific distance (scenario-side)
             travel_distance = round(float(self.rng.exponential(4.0)), 2)
 
@@ -2353,10 +2360,18 @@ class Core:
             p1 = self.market.quote_price(travel_distance, duration, ctx, overrides=self.firm1.overrides)
             p2 = self.market.quote_price(travel_distance, duration, ctx, overrides=self.firm2.overrides)
 
-            gaps.append(p2 - p1)
+            gap_sum += p2 - p1
             
-            service_q1 = self.driver_supply.estimate_service_quality("Firm1", airport=airport) if self.enable_driver_supply else {"pickup_minutes": 0.0, "cancel_risk": 0.0}
-            service_q2 = self.driver_supply.estimate_service_quality("Firm2", airport=airport) if self.enable_driver_supply else {"pickup_minutes": 0.0, "cancel_risk": 0.0}
+            if self.enable_driver_supply:
+                service_q1 = self.driver_supply.estimate_service_quality("Firm1", airport=airport)
+                service_q2 = self.driver_supply.estimate_service_quality("Firm2", airport=airport)
+                pickup_estimate1 = float(service_q1["pickup_minutes"])
+                pickup_estimate2 = float(service_q2["pickup_minutes"])
+                cancel_risk1 = float(service_q1["cancel_risk"])
+                cancel_risk2 = float(service_q2["cancel_risk"])
+            else:
+                pickup_estimate1 = pickup_estimate2 = 0.0
+                cancel_risk1 = cancel_risk2 = 0.0
 
             scenario = {
                 "City": self.market_name,
@@ -2367,10 +2382,10 @@ class Core:
                 "Weather": str(weather),
                 "Airport": bool(airport),
                 "Service": str(service),
-                "WaitEstimateFirm1": float(service_q1["pickup_minutes"]),
-                "WaitEstimateFirm2": float(service_q2["pickup_minutes"]),
-                "CancelRiskFirm1": float(service_q1["cancel_risk"]),
-                "CancelRiskFirm2": float(service_q2["cancel_risk"]),
+                "WaitEstimateFirm1": pickup_estimate1,
+                "WaitEstimateFirm2": pickup_estimate2,
+                "CancelRiskFirm1": cancel_risk1,
+                "CancelRiskFirm2": cancel_risk2,
             }
 
             choice_res: ChoiceResult = self.choice_model.choose(profile, scenario, p1, p2)
@@ -2450,35 +2465,37 @@ class Core:
             # Driver-layer unfulfilled choices also remain demand opportunities but
             # generate no completed win or rideshare revenue.
             
-            rows.append({
-                "City": self.market_name,
-                "DayOfWeek": day_of_week,
-                "Weather": weather,
-                "Hour": hour,
-                "Airport": airport,
-                "Service": service,
-                "TravelDistance": travel_distance,
-                "Price_Firm1": p1,
-                "Price_Firm2": p2,
-                "Choice": choice,
-                "Fulfilled": bool(fulfilled),
-                "MatchStatus": match_status,
-                "DriverPay": float(driver_pay),
-                "PickupMinutes": float(pickup_minutes),
-                "WaitMinutes": float(wait_minutes),
-                "DriverAcceptanceProbability": float(acceptance_prob),
-                "WaitEstimateFirm1": float(service_q1["pickup_minutes"]),
-                "WaitEstimateFirm2": float(service_q2["pickup_minutes"]),
-                "ReasonCodes": ",".join(choice_res.reason_codes),
-                "ShortReason": choice_res.short_reason,
-                **profile,
-            })
+            if collect_rows:
+                rows.append({
+                    "City": self.market_name,
+                    "DayOfWeek": day_of_week,
+                    "Weather": weather,
+                    "Hour": hour,
+                    "Airport": airport,
+                    "Service": service,
+                    "TravelDistance": travel_distance,
+                    "Price_Firm1": p1,
+                    "Price_Firm2": p2,
+                    "Choice": choice,
+                    "Fulfilled": bool(fulfilled),
+                    "MatchStatus": match_status,
+                    "DriverPay": float(driver_pay),
+                    "PickupMinutes": float(pickup_minutes),
+                    "WaitMinutes": float(wait_minutes),
+                    "DriverAcceptanceProbability": float(acceptance_prob),
+                    "WaitEstimateFirm1": pickup_estimate1,
+                    "WaitEstimateFirm2": pickup_estimate2,
+                    "ReasonCodes": ",".join(choice_res.reason_codes),
+                    "ShortReason": choice_res.short_reason,
+                    **profile,
+                })
 
         if self.enable_driver_supply:
             self.driver_supply.end_batch()
-        mean_gap = float(np.mean(gaps)) if gaps else 0.0
-        airport_rate = float(airport_count / max(1, customers_per_step))
-        mean_dist = float(dist_sum / max(1, customers_per_step))
+        denominator = max(1, profile_count)
+        mean_gap = float(gap_sum / denominator)
+        airport_rate = float(airport_count / denominator)
+        mean_dist = float(dist_sum / denominator)
         return rows, firm1, firm2, mean_gap, airport_rate, mean_dist
 
     def run(
@@ -2626,28 +2643,14 @@ class Core:
                 for component_key in (
                     "reward_share_component",
                     "reward_profit_component",
-                    "reward_profit_loss_component",
-                    "reward_profit_floor_component",
-                    "reward_share_floor_component",
-                    "reward_profit_viability",
-                    "reward_share_quality_gate",
                     "reward_momentum_component",
                     "reward_profit_delta",
                     "reward_gap_delta",
-                    "reward_dominance_component",
-                    "reward_driver_fulfillment_component",
-                    "reward_overprice_component",
-                    "reward_underprice_component",
-                    "reward_driver_wait_component",
-                    "reward_driver_reject_component",
-                    "reward_overprice_penalty",
-                    "reward_underprice_penalty",
                     "reward_margin_penalty",
                     "reward_price_discipline_penalty",
-                    "reward_underprice_gap",
-                    "reward_overprice_gap",
+                    "reward_price_gap_deviation",
+                    "reward_price_gap_penalty",
                     "reward_served_share",
-                    "reward_served_share_term",
                     "reward_driver_unfulfilled_penalty",
                 ):
                     reward_component_sums[component_key] += float(reward_diag.get(component_key, 0.0))
@@ -2682,6 +2685,10 @@ class Core:
                 "approx_kl": 0.0,
                 "clipfrac": 0.0,
                 "ent_coeff": 0.0,
+                "exploration_rate": 0.0,
+                "policy_entropy_fraction": 1.0,
+                "action_coverage": 0.0,
+                "explained_variance": 0.0,
             }
             if self.firm1_mode == "RL":
                 ppo_metrics = self.firm1.agent.update(epochs=self.ppo_update_epochs, batch_size=self.ppo_batch_size)
@@ -2744,7 +2751,12 @@ class Core:
                 "ppo_approx_kl": float(ppo_metrics.get("approx_kl", 0.0)),
                 "ppo_clipfrac": float(ppo_metrics.get("clipfrac", 0.0)),
                 "ppo_entropy": float(ppo_metrics.get("entropy", 0.0)),
+                "ppo_policy_entropy": float(ppo_metrics.get("policy_entropy", 0.0)),
+                "ppo_policy_entropy_fraction": float(ppo_metrics.get("policy_entropy_fraction", 1.0)),
                 "ppo_ent_coeff": float(ppo_metrics.get("ent_coeff", 0.0)),
+                "ppo_exploration_rate": float(ppo_metrics.get("exploration_rate", 0.0)),
+                "ppo_action_coverage": float(ppo_metrics.get("action_coverage", 0.0)),
+                "ppo_explained_variance": float(ppo_metrics.get("explained_variance", 0.0)),
             })
             for k in self.shared_edit_keys:
                 self.run_logs[-1][f"firm1_{k}"] = float(get_coeff(base, self.firm1.overrides, k))
@@ -2764,6 +2776,8 @@ class Core:
                 and reward_delta <= self.reward_trend_tol
                 and float(ppo_metrics.get("approx_kl", 0.0)) <= 0.025
                 and float(ppo_metrics.get("clipfrac", 0.0)) <= 0.22
+                and float(ppo_metrics.get("action_coverage", 0.0)) >= 0.95
+                and float(ppo_metrics.get("policy_entropy_fraction", 1.0)) <= 0.40
             )
             
             self._convergence_streak = int(self._convergence_streak + 1) if reward_converged else 0
@@ -2796,7 +2810,10 @@ class Core:
                         f"  [PPO] KL={float(ppo_metrics.get('approx_kl', 0.0)):.4f} "
                         f"clipfrac={float(ppo_metrics.get('clipfrac', 0.0)):.3f} "
                         f"ent={float(ppo_metrics.get('entropy', 0.0)):.3f} "
+                        f"policy_ent={float(ppo_metrics.get('policy_entropy_fraction', 1.0)):.3f} "
                         f"ent_coeff={float(ppo_metrics.get('ent_coeff', 0.0)):.4f} "
+                        f"explore={float(ppo_metrics.get('exploration_rate', 0.0)):.3f} "
+                        f"coverage={float(ppo_metrics.get('action_coverage', 0.0)):.2f} "
                         f"lr={float(ppo_metrics.get('lr', 0.0)):.6f} "
                         f"kl_stop={bool(ppo_metrics.get('stopped_early_kl', False))}"
                     )
@@ -3243,7 +3260,16 @@ def _plot_reports(
             print(f"Saved graph -> {out}")
             plt.close(fig)
 
-        ppo_keys = ["ppo_approx_kl", "ppo_clipfrac", "ppo_entropy", "ppo_ent_coeff"]
+        ppo_keys = [
+            "ppo_approx_kl",
+            "ppo_clipfrac",
+            "ppo_entropy",
+            "ppo_policy_entropy_fraction",
+            "ppo_ent_coeff",
+            "ppo_exploration_rate",
+            "ppo_action_coverage",
+            "ppo_explained_variance",
+        ]
         present_ppo = [k for k in ppo_keys if any(k in r for r in logs)]
         if present_ppo:
             fig, ax = plt.subplots(figsize=(9, 4))
