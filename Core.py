@@ -520,6 +520,7 @@ class Core:
         self.reward_underprice_weight = float(max(0.0, reward_underprice_weight))
         self.reward_acceptable_discount = float(max(0.0, reward_acceptable_discount))
         self.min_profit_margin = float(np.clip(min_profit_margin, 0.0, 0.95))
+        self.reward_target_price_gap = 0.5 * self.reward_acceptable_discount
         self.driver_cost_per_mile = float(max(0.0, driver_cost_per_mile))
         self.driver_cost_per_minute = float(max(0.0, driver_cost_per_minute))
         self.fixed_trip_cost = float(max(0.0, fixed_trip_cost))
@@ -540,28 +541,35 @@ class Core:
         )
         self.reward_rev_scale = float(max(1e-6, reward_rev_scale))
         self.reward_profit_scale = float(max(1e-6, reward_profit_scale))
-        # Kept as the CLI/API name for backward compatibility; this now weights
-        # the explicit dominance component in the balanced reward.
+        # Kept as the CLI/API name for backward compatibility; this weight is
+        # folded into the simple market-share objective below.
         self.reward_competitive_weight = float(max(0.0, reward_competitive_weight))
         self.reward_trend_weight = float(max(0.0, reward_trend_weight))
 
-        # Normalize the three positive business objectives together so defaults
-        # are easy to justify: revenue, market share, and sustained dominance each
-        # receive roughly one third of the positive reward budget.
-        denom = self.reward_share_weight + self.reward_revenue_weight + self.reward_competitive_weight
+        # Simple balanced reward: normalize the two decision objectives only.
+        # ``reward_competitive_weight`` is kept for CLI/API compatibility and is
+        # folded into the customer/market-share side instead of adding a third
+        # objective that can reward dominance without profit.
+        self.reward_share_weight += self.reward_competitive_weight
+        denom = self.reward_share_weight + self.reward_revenue_weight
         if denom <= 0.0:
-            self.reward_share_weight = 0.34
-            self.reward_revenue_weight = 0.33
-            self.reward_competitive_weight = 0.33
+            self.reward_share_weight = 0.50
+            self.reward_revenue_weight = 0.50
             denom = 1.0
 
         self.reward_share_weight /= denom
         self.reward_revenue_weight /= denom
-        self.reward_competitive_weight /= denom
+        self.reward_competitive_weight = 0.0
 
-        self.reward_dominance_threshold = 0.50
-        self.reward_dominance_full_credit_share = 0.85
+        # In a three-option market (Firm1/Firm2/NoRide), sustainable dominance
+        # starts well below 50% absolute request share.  Reward dominance as a
+        # momentum-preserving advantage zone instead of only as monopoly share.
+        self.reward_dominance_threshold = 0.30
+        self.reward_dominance_full_credit_share = 0.45
         self.reward_trend_scale = 0.20
+        self.reward_momentum_weight = max(0.12, self.reward_trend_weight)
+        self.reward_share_floor = 0.25
+        self.reward_profit_floor_weight = 0.18
         self.reward_softsign_temp = 1.00
         self.driver_reward_fulfillment_weight = float(max(0.0, driver_reward_fulfillment_weight))
         self.driver_reward_wait_weight = float(max(0.0, driver_reward_wait_weight))
@@ -585,6 +593,7 @@ class Core:
             f"profit_scale={self.reward_profit_scale:.2f}, "
             f"dominance={self.reward_competitive_weight:.2f}, "
             f"trend={self.reward_trend_weight:.2f}, "
+            f"momentum={self.reward_momentum_weight:.2f}, "
             f"driver_fulfillment={self.driver_reward_fulfillment_weight:.2f}, "
             f"driver_wait={self.driver_reward_wait_weight:.2f}, "
             f"driver_reject={self.driver_reward_reject_weight:.2f}, "
@@ -735,6 +744,15 @@ class Core:
         s = max(1e-6, float(scale))
         y = x / (x + s)
         return float(y * y)
+    
+    @staticmethod
+    def _finite_float(value: float, default: float = 0.0) -> float:
+        """Return a scalar float with NaN/infinite values mapped to a safe default."""
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        return out if np.isfinite(out) else float(default)
 
     def _reward_components(
         self,
@@ -747,95 +765,97 @@ class Core:
         avg_wait_minutes: float = 0.0,
         driver_acceptance_rate: float = 1.0,
     ) -> Dict[str, float]:
-        """Return target-centered reward components for clearer PPO signals.
+        """Return a small, robust reward for the customer-driver-firm loop.
 
-        Driver supply is treated as an external service constraint, not as a direct
-        control target.  The main demand objective is therefore *served share*
-        (chosen share that is actually fulfilled).  Profit receives credit only
-        after it approaches break-even, while margin/price/service shortfalls stay
-        as separate penalties.  This avoids a mixed signal where raising rider
-        fares can be rewarded only because it indirectly buys driver acceptance.
+        The reward intentionally has two primary terms:
+        1. **Market term**: completed customer share, so riders choosing the firm
+           only counts when driver supply can fulfill those rides.
+        2. **Profit term**: signed profit per request, so losses are penalized and
+           profitable operation is rewarded.
+
+        This avoids corner-case incentives where the agent can maximize share by
+        destructive underpricing, maximize margin with no customers, or improve
+        driver acceptance by raising prices without serving demand.  All inputs
+        are clipped/sanitized before use so empty batches, NaNs, infinities, zero
+        revenue, and extreme prices still produce a finite reward in [-1, 1].
         """
         
-        share_f = float(np.clip(share, 0.0, 1.0))
-        profitpr = float(rev_per_request if profit_per_request is None else profit_per_request)
-        margin = float(0.0 if profit_margin is None else profit_margin)
-        fulfillment_term = float(np.clip(fulfillment_rate, 0.0, 1.0))
-        acceptance_term = float(np.clip(driver_acceptance_rate, 0.0, 1.0))
-        served_share = float(share_f * fulfillment_term)
+        share_f = float(np.clip(self._finite_float(share), 0.0, 1.0))
+        profitpr = self._finite_float(
+            rev_per_request if profit_per_request is None else profit_per_request
+        )
+        margin = self._finite_float(profit_margin)
+        gap = self._finite_float(price_gap_f2_minus_f1)
+        fulfillment_term = float(np.clip(self._finite_float(fulfillment_rate, 1.0), 0.0, 1.0))
+        acceptance_term = float(np.clip(self._finite_float(driver_acceptance_rate, 1.0), 0.0, 1.0))
+        wait_minutes = max(0.0, self._finite_float(avg_wait_minutes))
 
-        # Positive terms are bounded credits with interpretable targets.  Keep
-        # the profit signal signed instead of clipping all loss-making actions
-        # to the same zero credit: in driver-enabled runs profit/request can
-        # remain negative for long stretches, and a clipped profit term leaves
-        # PPO trying to learn mostly from noisy share/fulfillment variation.
-        served_share_target = 0.35
+        # Customers and drivers interact through completed demand: a chosen ride
+        # without driver fulfillment should not earn market-share credit.
+        served_share = float(np.clip(share_f * fulfillment_term, 0.0, 1.0))
+        market_term = float(2.0 * served_share - 1.0)
+
+        # Firm objective: signed and bounded contribution profit per request.
         profit_term = float(np.tanh(profitpr / self.reward_profit_scale))
         profit_credit = float(max(0.0, profit_term))
         profit_loss = float(max(0.0, -profit_term))
-        served_share_term = float(np.clip(served_share / served_share_target, 0.0, 1.0))
-        dominance_width = max(1e-6, self.reward_dominance_full_credit_share - self.reward_dominance_threshold)
-        dominance_term = float(np.clip((share_f - self.reward_dominance_threshold) / dominance_width, 0.0, 1.0))
-        # Price discipline: negative gap means Firm1 is more expensive; very large
-        # positive gap means Firm1 may be buying share through destructive discounts.
-        overprice_gap = float(max(0.0, -price_gap_f2_minus_f1 - 0.50))
-        overprice_penalty = self._smooth_positive_penalty(overprice_gap, scale=2.0)
-        underprice_gap = float(max(0.0, price_gap_f2_minus_f1 - self.reward_acceptable_discount))
-        underprice_penalty = self._smooth_positive_penalty(underprice_gap, scale=5.0)
+        # Use one symmetric price-gap objective. A positive gap means Firm1 is
+        # cheaper than Firm2, so the default target is a modest $1 discount when
+        # the acceptable discount is $2. This gives the agent one clear target
+        # instead of separate and potentially conflicting over/underprice rules.
+        price_gap_error = float(abs(gap - self.reward_target_price_gap))
+        price_gap_penalty = self._smooth_positive_penalty(price_gap_error, scale=2.0)
         margin_shortfall = float(max(0.0, self.min_profit_margin - margin) / max(self.min_profit_margin, 1e-6))
-        margin_penalty = self._smooth_positive_penalty(margin_shortfall, scale=1.0)
-        # External driver layer signal: penalize supply stress that prevents chosen
-        # demand from converting, but do not give a large standalone reward for
-        # simply raising rider fares enough to improve acceptance.
-        service_penalty = self._smooth_positive_penalty(float(avg_wait_minutes) - 6.0, scale=10.0)
+        service_penalty = self._smooth_positive_penalty(wait_minutes - 6.0, scale=10.0)
         reject_penalty = self._smooth_positive_penalty(0.70 - acceptance_term, scale=0.35)
         unfulfilled_penalty = self._smooth_positive_penalty(0.75 - fulfillment_term, scale=0.35)
+        margin_penalty = self._smooth_positive_penalty(margin_shortfall, scale=1.0)
+        price_discipline_penalty = max(price_gap_penalty, margin_penalty)
         driver_reward_scale = float(np.clip(getattr(self, "driver_reward_scale_current", 1.0), 0.0, 1.0))
         
-        share_component = self.reward_share_weight * served_share_term
-        profit_component = self.reward_revenue_weight * profit_credit
-        profit_loss_component = self.reward_revenue_weight * profit_loss
-        dominance_component = self.reward_competitive_weight * dominance_term
+        # Balance share with unit economics.  Share remains valuable, but not
+        # enough to make deeply loss-making share look optimal.  A smooth
+        # viability gate preserves gradients around break-even while shrinking
+        # served-share credit in the extreme "buy share with losses" case.
+        profit_viability = float(1.0 / (1.0 + np.exp(-profitpr / max(1e-6, 0.30 * self.reward_profit_scale))))
+        share_quality_gate = float(0.50 + 0.50 * profit_viability)
+        share_component = self.reward_share_weight * market_term
+        profit_component = self.reward_revenue_weight * profit_term
+        profit_loss_component = self.reward_revenue_weight * 1.45 * profit_loss
+        dominance_term = float(np.clip((share_f - self.reward_dominance_threshold) / max(1e-6, self.reward_dominance_full_credit_share - self.reward_dominance_threshold), 0.0, 1.0))
+        dominance_component = 0.0
         driver_fulfillment_component = 0.0
-        overprice_component = self.reward_overprice_weight * overprice_penalty
-        price_discipline_penalty = max(underprice_penalty, margin_penalty)
-        underprice_component = self.reward_underprice_weight * price_discipline_penalty
-        driver_wait_component = (
-            driver_reward_scale * self.driver_reward_wait_weight * service_penalty
-            if self.enable_driver_supply
-            else 0.0
-        )
-        driver_reject_component = (
-            driver_reward_scale * self.driver_reward_reject_weight * max(reject_penalty, unfulfilled_penalty)
-            if self.enable_driver_supply
-            else 0.0
-        )
-        
-        raw = (
-            share_component
-            + profit_component
-            + dominance_component
-            + driver_fulfillment_component
-            - profit_loss_component
-            - overprice_component
-            - underprice_component
-            - driver_wait_component
-            - driver_reject_component
-        )
+        price_gap_weight = max(self.reward_overprice_weight, self.reward_underprice_weight)
+        price_gap_component = price_gap_weight * price_discipline_penalty
+
+        # Wait/rejection remain diagnostics, but are not separate reward terms.
+        # Fulfillment already links driver supply to served customer share, while
+        # profit includes driver compensation. Extra wait/rejection penalties
+        # would double-count supply and can encourage fare increases merely to
+        # improve driver acceptance.
+        driver_wait_component = 0.0
+        driver_reject_component = 0.0
+        overprice_component = 0.0
+        underprice_component = 0.0
+
+        raw = share_component + profit_component - price_gap_component
+        base = float(np.clip(raw, -1.0, 1.0))
         return {
-            "reward_base": float(np.clip(raw, -1.0, 1.0)),
+            "reward_base": base,
             "reward_base_unclipped": float(raw),
             "reward_share_component": float(share_component),
-            "reward_profit_component": float(profit_component),
+            "reward_profit_component": float(max(0.0, self.reward_revenue_weight * profit_term)),
             "reward_profit_loss_component": float(profit_loss_component),
+            "reward_profit_viability": float(profit_viability),
+            "reward_share_quality_gate": float(share_quality_gate),
             "reward_dominance_component": float(dominance_component),
             "reward_driver_fulfillment_component": float(driver_fulfillment_component),
-            "reward_overprice_penalty": float(overprice_penalty),
-            "reward_underprice_penalty": float(underprice_penalty),
+            "reward_overprice_penalty": float(price_gap_penalty),
+            "reward_underprice_penalty": float(price_gap_penalty),
             "reward_margin_penalty": float(margin_penalty),
             "reward_price_discipline_penalty": float(price_discipline_penalty),
-            "reward_overprice_component": float(overprice_component),
-            "reward_underprice_component": float(underprice_component),
+            "reward_underprice_gap": float(max(0.0, gap - self.reward_target_price_gap)),
+            "reward_overprice_gap": float(max(0.0, self.reward_target_price_gap - gap)),
             "reward_driver_wait_component": float(driver_wait_component),
             "reward_driver_reject_component": float(driver_reject_component),
             "reward_fulfillment_term": float(fulfillment_term),
@@ -845,11 +865,9 @@ class Core:
             "reward_profit_credit": float(profit_credit),
             "reward_profit_loss": float(profit_loss),
             "reward_dominance_term": float(dominance_term),
-            "reward_underprice_gap": float(underprice_gap),
-            "reward_overprice_gap": float(overprice_gap),
             "reward_driver_scale": float(driver_reward_scale),
             "reward_served_share": float(served_share),
-            "reward_served_share_term": float(served_share_term),
+            "reward_served_share_term": float(served_share),
             "reward_driver_unfulfilled_penalty": float(unfulfilled_penalty),
         }
 
@@ -864,7 +882,7 @@ class Core:
         avg_wait_minutes: float = 0.0,
         driver_acceptance_rate: float = 1.0,
     ) -> float:
-        """Balanced business reward: revenue + share + sustained dominance."""
+        """Balanced business reward: completed market share plus signed profit."""
         return float(
             self._reward_components(
                 share=share,
@@ -885,6 +903,8 @@ class Core:
         mean_gap: float,
         prev_share: float,
         prev_rev_per_request: float,
+        prev_profit_per_request: Optional[float] = None,
+        prev_gap: Optional[float] = None,
         profit_per_request: Optional[float] = None,
         profit_margin: Optional[float] = None,
         fulfillment_rate: float = 1.0,
@@ -914,13 +934,18 @@ class Core:
         dominance_term = float(np.clip((share_f - self.reward_dominance_threshold) / dominance_width, 0.0, 1.0))
         share_delta = float(np.clip(share_f - float(prev_share), -0.20, 0.20) / 0.20)
         rev_delta = float(np.clip((revpr - float(prev_rev_per_request)) / self.reward_profit_scale, -0.20, 0.20) / 0.20)
-        trend_term = float(0.5 * (share_delta + rev_delta))
-        pricing_discipline = float(np.clip(gap / 2.0, -1.0, 1.0))
+        prev_profit = float(profitpr if prev_profit_per_request is None else prev_profit_per_request)
+        profit_delta = float(np.clip((profitpr - prev_profit) / self.reward_profit_scale, -0.20, 0.20) / 0.20)
+        prev_gap_f = float(gap if prev_gap is None else prev_gap)
+        # Positive gap movement usually means Firm1 is becoming less overpriced or
+        # more strategically discounted.  Cap it because extreme discounts are
+        # already penalized by the base reward.
+        gap_delta = float(np.clip((gap - prev_gap_f) / 2.0, -1.0, 1.0))
+        trend_term = float(0.40 * share_delta + 0.35 * profit_delta + 0.25 * gap_delta)
+        pricing_discipline = float(np.clip(gap / max(1e-6, self.reward_acceptable_discount), -1.0, 1.0))
         efficiency_term = float(0.5 * trend_term + 0.5 * pricing_discipline)
-        raw_reward = float(
-            base_reward
-            + self.reward_trend_weight * self.reward_trend_scale * trend_term
-        )
+        momentum_component = float(self.reward_momentum_weight * self.reward_trend_scale * trend_term)
+        raw_reward = float(base_reward + momentum_component)
         reward = float(np.tanh(raw_reward / self.reward_softsign_temp))
 
         return {
@@ -933,6 +958,9 @@ class Core:
             "reward_share_delta": share_delta,
             "reward_rev_delta": rev_delta,
             "reward_trend_term": trend_term,
+            "reward_profit_delta": profit_delta,
+            "reward_gap_delta": gap_delta,
+            "reward_momentum_component": momentum_component,
             "reward_pricing_discipline": pricing_discipline,
             "reward_efficiency_term": efficiency_term,
             "reward_profit_per_request": profitpr,
@@ -956,6 +984,8 @@ class Core:
             driver_acceptance_rate=float(m1.driver_acceptance_rate),
             prev_share=float(self.last_share),
             prev_rev_per_request=float(self.last_revpr),
+            prev_profit_per_request=float(self.last_profitpr),
+            prev_gap=float(self.last_gap),
         )
         reward = float(diagnostics["reward"])
         self.last_reward = reward
@@ -1516,6 +1546,8 @@ class Core:
                     mean_gap=float(mean_gap),
                     prev_share=float(self.last_share),
                     prev_rev_per_request=float(self.last_revpr),
+                    prev_profit_per_request=float(self.last_profitpr),
+                    prev_gap=float(self.last_gap),
                     profit_per_request=float(m1.profit_per_request),
                     profit_margin=self._profit_margin(m1),
                     fulfillment_rate=float(m1.fulfillment_rate),
@@ -1537,6 +1569,11 @@ class Core:
                             price_gap_f2_minus_f1=float(mean_gap),
                             city_base=float(base.base_fare),
                             city_pmin=float(base.per_minute),
+                            city_pmile=float(base.per_mile),
+                            city_booking=float(base.booking_fee),
+                            city_airport=float(base.airport_fee),
+                            profit_per_request=float(m1.profit_per_request),
+                            fulfillment_rate=float(m1.fulfillment_rate),
                         )
                         after_base = getattr(self.firm1.overrides, "base_fare", None)
                         after_pmin = getattr(self.firm1.overrides, "per_minute", None)
@@ -1557,6 +1594,14 @@ class Core:
                 for component_key in (
                     "reward_share_component",
                     "reward_profit_component",
+                    "reward_profit_loss_component",
+                    "reward_profit_floor_component",
+                    "reward_share_floor_component",
+                    "reward_profit_viability",
+                    "reward_share_quality_gate",
+                    "reward_momentum_component",
+                    "reward_profit_delta",
+                    "reward_gap_delta",
                     "reward_dominance_component",
                     "reward_driver_fulfillment_component",
                     "reward_overprice_component",
@@ -1685,6 +1730,8 @@ class Core:
         # not trailing deltas from the end of training.
         eval_last_share = float(self.last_share)
         eval_last_revpr = float(self.last_revpr)
+        eval_last_profitpr = float(self.last_profitpr)
+        eval_last_gap = float(self.last_gap)
         for t in range(eval_timesteps):
             day_ctx = self.market.sample_day_context()
             hour = self.market.sample_timestep_hour().hour
@@ -1699,7 +1746,7 @@ class Core:
             action = -1
             if self.firm1_mode == "RL":
                 s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
-                action, *_ = self.firm1.agent.act(s_vec)
+                action, *_ = self.firm1.agent.act(s_vec, deterministic=True)
                 self.firm1.apply_action(action, self.market)
                 action = int(action)
             elif self.firm1_mode != "static":
@@ -1727,6 +1774,8 @@ class Core:
                 prev_share=eval_last_share,
                 prev_rev_per_request=eval_last_revpr,
                 profit_per_request=float(m1.profit_per_request),
+                prev_profit_per_request=eval_last_profitpr,
+                prev_gap=eval_last_gap,
                 profit_margin=self._profit_margin(m1),
                 fulfillment_rate=float(m1.fulfillment_rate),
                 avg_wait_minutes=float(m1.avg_wait_minutes),
@@ -1736,6 +1785,8 @@ class Core:
 
             eval_last_share = float(share)
             eval_last_revpr = float(revpr)
+            eval_last_profitpr = float(m1.profit_per_request)
+            eval_last_gap = float(mean_gap)
             eval_rewards.append(float(eval_reward))
             moving_window = eval_rewards[-min(len(eval_rewards), 20):]
             moving_avg20 = float(np.mean(moving_window)) if moving_window else 0.0
@@ -2198,6 +2249,11 @@ class Core:
                 price_gap_f2_minus_f1=float(gap),
                 city_base=float(self.market.curr_market.base_fare),
                 city_pmin=float(self.market.curr_market.per_minute),
+                city_pmile=float(self.market.curr_market.per_mile),
+                city_booking=float(self.market.curr_market.booking_fee),
+                city_airport=float(self.market.curr_market.airport_fee),
+                profit_per_request=float(m1.profit_per_request),
+                fulfillment_rate=float(m1.fulfillment_rate),
             )
         
         self.last_share = float(m1.share)
@@ -2540,6 +2596,8 @@ class Core:
                     mean_gap=float(mean_gap),
                     prev_share=float(self.last_share),
                     prev_rev_per_request=float(self.last_revpr),
+                    prev_profit_per_request=float(self.last_profitpr),
+                    prev_gap=float(self.last_gap),
                     profit_per_request=float(m1.profit_per_request),
                     profit_margin=self._profit_margin(m1),
                     fulfillment_rate=float(m1.fulfillment_rate),
@@ -2558,11 +2616,24 @@ class Core:
                             price_gap_f2_minus_f1=float(mean_gap),
                             city_base=float(base.base_fare),
                             city_pmin=float(base.per_minute),
+                            city_pmile=float(base.per_mile),
+                            city_booking=float(base.booking_fee),
+                            city_airport=float(base.airport_fee),
+                            profit_per_request=float(m1.profit_per_request),
+                            fulfillment_rate=float(m1.fulfillment_rate),
                         )
                     reward_sum += float(reward)
                 for component_key in (
                     "reward_share_component",
                     "reward_profit_component",
+                    "reward_profit_loss_component",
+                    "reward_profit_floor_component",
+                    "reward_share_floor_component",
+                    "reward_profit_viability",
+                    "reward_share_quality_gate",
+                    "reward_momentum_component",
+                    "reward_profit_delta",
+                    "reward_gap_delta",
                     "reward_dominance_component",
                     "reward_driver_fulfillment_component",
                     "reward_overprice_component",

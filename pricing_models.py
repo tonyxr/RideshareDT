@@ -390,24 +390,86 @@ class FirmRLPricer:
             floor, ceil = lb, ub
         return float(np.clip(value, floor, ceil))
 
-    def stabilize_after_batch(self, share: float, price_gap_f2_minus_f1: float, city_base: float, city_pmin: float) -> None:
-        """Light-touch guardrails to avoid prolonged share-collapse from runaway pricing."""
-        if share >= self.recovery_share_threshold and price_gap_f2_minus_f1 >= self.recovery_gap_threshold:
+    def stabilize_after_batch(
+        self,
+        share: float,
+        price_gap_f2_minus_f1: float,
+        city_base: float,
+        city_pmin: float,
+        city_pmile: Optional[float] = None,
+        city_booking: Optional[float] = None,
+        city_airport: Optional[float] = None,
+        profit_per_request: float = 0.0,
+        fulfillment_rate: float = 1.0,
+    ) -> None:
+        """Guard against extreme dynamic-market failure modes.
+
+        The guardrail is intentionally small: PPO still owns the strategy, but
+        it should not remain stuck in obviously dominated regions such as
+        overpricing with collapsing share, negative-profit share buying, or
+        severe driver-fulfillment stress.  Adjust all rider-facing fare knobs
+        around market anchors instead of only base fare/per-minute.
+        """
+        share_f = float(np.clip(share, 0.0, 1.0))
+        gap = float(price_gap_f2_minus_f1)
+        profit = float(profit_per_request)
+        fulfill = float(np.clip(fulfillment_rate, 0.0, 1.0))
+        overpricing = share_f < self.recovery_share_threshold or gap < self.recovery_gap_threshold
+        loss_buying_share = profit < 0.0 and share_f >= self.recovery_share_threshold and gap >= -0.50
+        supply_stress = fulfill < 0.75 and profit >= -0.50
+        if not (overpricing or loss_buying_share or supply_stress):
             return
 
-        for key, anchor in (("base_fare", float(city_base)), ("per_minute", float(city_pmin))):
+        anchors = {
+            "base_fare": float(city_base),
+            "per_minute": float(city_pmin),
+            "per_mile": float(city_pmile if city_pmile is not None else 1.50),
+            "booking_fee": float(city_booking if city_booking is not None else max(0.0, city_base - 0.25)),
+            "airport_fee": float(city_airport if city_airport is not None else 5.0),
+        }
+
+        def move(key: str, direction: int, multiplier: float = 1.0) -> None:
+            if key not in self.opt_keys:
+                return
             curr = getattr(self.overrides, key)
+            anchor = anchors[key]
             if curr is None:
                 curr = anchor
-            step = self.config.step[key] * self.step_scale
+            step = self.config.step[key] * self.step_scale * float(multiplier)
             lb, ub = self.config.bounds[key]
-            nudged = float(curr) - step
+            nudged = float(curr) + float(np.sign(direction)) * step
             setattr(
                 self.overrides,
                 key,
                 self._bounded_relative_move(nudged, anchor, self.max_relative_dev, lb, ub),
             )
         
+        if overpricing:
+            # Restore competitiveness first through fixed fees, then segment
+            # levers if the mean gap shows a severe broad overprice.
+            move("base_fare", -1)
+            move("booking_fee", -1)
+            move("per_minute", -1, 0.5)
+            if gap < -1.00:
+                move("airport_fee", -1)
+            if gap < -2.00:
+                move("per_mile", -1, 0.75)
+            return
+
+        if loss_buying_share:
+            # Repair unit economics without immediately giving up all share.
+            move("per_mile", +1, 0.75)
+            move("per_minute", +1, 0.75)
+            if gap > 0.75:
+                move("booking_fee", +1, 0.5)
+            return
+
+        if supply_stress:
+            # Temper demand and support acceptance with small variable increases;
+            # avoid abrupt fixed-fee shocks that can collapse demand.
+            move("per_minute", +1, 0.5)
+            move("per_mile", +1, 0.5)
+            
     def apply_action(self, action: int, market_interaction) -> None:
         """Map discrete steps back into concrete market coefficient overrides."""
         if action not in self.action_to_steps:
