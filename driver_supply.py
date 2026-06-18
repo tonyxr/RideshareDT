@@ -31,8 +31,8 @@ class DriverPayPolicy:
 
     fare_share: float = 0.72
     base_pay: float = 1.25
-    per_mile_pay: Optional[float] = None
-    per_minute_pay: Optional[float] = None
+    per_mile_pay: Optional[float] = 0.90
+    per_minute_pay: Optional[float] = 0.20
     pickup_minute_pay: float = 0.08
     airport_bonus: float = 1.00
     minimum_pay: float = 3.50
@@ -53,6 +53,7 @@ class DriverSupplyConfig:
     expected_acceptance_cutoff: float = 0.35
     state_smoothing_alpha: float = 0.35
     pickup_noise_sigma: float = 0.10
+    
 
 
 @dataclass
@@ -70,10 +71,16 @@ class FirmDriverBatchState:
     total_pickup_miles: float = 0.0
     total_wait_minutes: float = 0.0
     total_online_minutes: float = 0.0
+    total_engaged_minutes: float = 0.0
+    total_acceptance_probability: float = 0.0
 
     @property
     def acceptance_rate(self) -> float:
-        return self.accepted_dispatches / self.offered_dispatches if self.offered_dispatches > 0 else 1.0
+        if self.offered_dispatches <= 0:
+            return 1.0
+        if self.total_acceptance_probability > 0.0:
+            return self.total_acceptance_probability / self.offered_dispatches
+        return self.accepted_dispatches / self.offered_dispatches
 
     @property
     def fulfillment_rate(self) -> float:
@@ -90,7 +97,7 @@ class FirmDriverBatchState:
 
     @property
     def driver_earnings_per_hour(self) -> float:
-        hours = self.total_online_minutes / 60.0
+        hours = self.total_engaged_minutes / 60.0
         return self.total_driver_pay / hours if hours > 0 else 0.0
 
     @property
@@ -161,6 +168,7 @@ class DriverSupplyLayer:
         self.last_states = {"Firm1": FirmDriverBatchState(), "Firm2": FirmDriverBatchState()}
         self.smoothed_states = {"Firm1": FirmDriverBatchState(), "Firm2": FirmDriverBatchState()}
         self._batch_states = {"Firm1": FirmDriverBatchState(), "Firm2": FirmDriverBatchState()}
+        self._expected_acceptance_credit = {"Firm1": 0.0, "Firm2": 0.0}
 
     def begin_batch(self, customers_per_step: int, hour: int, weather: str) -> None:
         self._batch_states = {}
@@ -168,7 +176,8 @@ class DriverSupplyLayer:
         peak = 1.18 if (7 <= int(hour) < 10 or 16 <= int(hour) < 19) else 1.0
         weather_supply = 0.88 if str(weather).lower() in {"rain", "snow", "storm"} else 1.0
         for firm, bias in (("Firm1", 1.0), ("Firm2", 0.96)):
-            previous_earnings = self.last_states[firm].driver_earnings_per_hour or self.config.reservation_wage_per_hour
+            previous = self.smoothed_states.get(firm, self.last_states[firm])
+            previous_earnings = previous.driver_earnings_per_hour or self.config.reservation_wage_per_hour
             online_response = 1.0 + self.config.supply_elasticity * np.tanh(
                 (previous_earnings - self.config.reservation_wage_per_hour) / max(1e-6, self.config.online_temperature)
             )
@@ -202,17 +211,20 @@ class DriverSupplyLayer:
         airport: bool,
     ) -> float:
         policy = self.pay_policies[firm]
-        per_mile = policy.per_mile_pay if policy.per_mile_pay is not None else 0.55 * float(rider_fare) / max(1.0, float(distance_miles))
-        per_min = policy.per_minute_pay if policy.per_minute_pay is not None else 0.12 * float(rider_fare) / max(5.0, float(duration_minutes))
-        pay = (
+        per_mile = policy.per_mile_pay if policy.per_mile_pay is not None else 0.90
+        per_min = policy.per_minute_pay if policy.per_minute_pay is not None else 0.20
+        rate_card_pay = (
             policy.base_pay
-            + policy.fare_share * float(rider_fare) * 0.55
             + float(per_mile) * max(0.0, float(distance_miles))
             + float(per_min) * max(0.0, float(duration_minutes))
             + policy.pickup_minute_pay * max(0.0, float(pickup_minutes))
             + (policy.airport_bonus if airport else 0.0)
         )
-        return float(max(policy.minimum_pay, pay))
+        # Fare share and the rate card are alternative compensation floors.
+        # Adding several fare-derived formulas together paid more than 100% of
+        # fare on ordinary trips and made positive platform profit impossible.
+        fare_share_pay = policy.fare_share * max(0.0, float(rider_fare))
+        return float(max(policy.minimum_pay, fare_share_pay, rate_card_pay))
 
     def dispatch(
         self,
@@ -233,10 +245,15 @@ class DriverSupplyLayer:
         utility_gap = implied_hourly - self.config.reservation_wage_per_hour
         accept_prob = float(1.0 / (1.0 + np.exp(-utility_gap / max(1e-6, self.config.acceptance_temperature))))
         feasible = state.idle_drivers > 0 and pickup_minutes <= self.config.max_pickup_minutes
+        state.total_acceptance_probability += accept_prob if feasible else 0.0
         if str(self.config.acceptance_mode).lower() == "stochastic":
             accepted = bool(feasible and self.rng.random() < accept_prob)
         else:
-            accepted = bool(feasible and accept_prob >= float(np.clip(self.config.expected_acceptance_cutoff, 0.01, 0.99)))
+            # Deterministic weighted-round-robin preserves the expected number
+            # of accepted offers without the discontinuity of a hard cutoff.
+            credit = self._expected_acceptance_credit.get(firm, 0.0) + (accept_prob if feasible else 0.0)
+            accepted = bool(feasible and credit >= 1.0)
+            self._expected_acceptance_credit[firm] = credit - 1.0 if accepted else credit
         if not accepted:
             state.rejected_dispatches += 1
             state.unfulfilled_requests += 1
@@ -258,6 +275,7 @@ class DriverSupplyLayer:
         state.total_driver_pay += driver_pay
         state.total_pickup_minutes += pickup_minutes
         state.total_pickup_miles += pickup_miles
+        state.total_engaged_minutes += pickup_minutes + max(0.0, float(duration_minutes))
         state.total_wait_minutes += pickup_minutes
         platform_cost = self.config.platform_variable_cost + 0.05 * max(0.0, float(duration_minutes))
         return DispatchResult(
@@ -289,6 +307,11 @@ class DriverSupplyLayer:
                 total_pickup_miles=(1.0 - alpha) * prev.total_pickup_miles + alpha * state.total_pickup_miles,
                 total_wait_minutes=(1.0 - alpha) * prev.total_wait_minutes + alpha * state.total_wait_minutes,
                 total_online_minutes=(1.0 - alpha) * prev.total_online_minutes + alpha * state.total_online_minutes,
+                total_engaged_minutes=(1.0 - alpha) * prev.total_engaged_minutes + alpha * state.total_engaged_minutes,
+                total_acceptance_probability=(
+                    (1.0 - alpha) * prev.total_acceptance_probability
+                    + alpha * state.total_acceptance_probability
+                ),
             )
         return self.last_states
 

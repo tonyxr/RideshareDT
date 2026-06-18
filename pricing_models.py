@@ -352,9 +352,10 @@ class FirmRLPricer:
                 a_idx += 1
         action_dim = len(self.action_to_steps)
         
-        # State encoder emits 20 target-centered market/service features plus
-        # normalized fare-coefficient deltas for the active rider-price knobs.
-        state_dim = 20 + len(active_keys)
+        # State encoder emits 20 target-centered market/service features, eight
+        # direct supply-state features, plus normalized fare-coefficient deltas
+        # for the active rider-price knobs.
+        state_dim = 28 + len(active_keys)
 
         # Initialize PPO agent.
         self.agent = PPOAgent(
@@ -508,4 +509,15 @@ class FirmRLPricer:
             step_size=scaled_steps,
             bounds=bounds,
         )
+        
+        base = market_interaction.curr_market
+        for key in step_map:
+            anchor = float(getattr(base, key))
+            lb, ub = bounds[key]
+            current = float(getattr(self.overrides, key))
+            setattr(
+                self.overrides,
+                key,
+                self._bounded_relative_move(current, anchor, self.max_relative_dev, lb, ub),
+            )
 

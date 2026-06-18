@@ -420,10 +420,13 @@ class Core:
         requested_profile_source = str(threshold_profile_source or "generated").strip().lower()
         if requested_profile_source not in {"generated", "cached"}:
             raise ValueError("threshold_profile_source must be either 'generated' or 'cached'")
-        if reuse_threshold_cache:
+        self.strict_cached_profiles = requested_profile_source == "cached"
+        self.reuse_threshold_cache = bool(reuse_threshold_cache)
+        # The legacy alias means "reuse if available", not "cached-only".
+        # Explicit --threshold_profile_source cached retains strict behavior.
+        if reuse_threshold_cache and self.threshold_cache_path:
             requested_profile_source = "cached"
         self.threshold_profile_source = requested_profile_source
-        self.reuse_threshold_cache = self.threshold_profile_source == "cached"
         self.save_threshold_cache = bool(save_threshold_cache)
         self.gpt_threshold_include_rationales = bool(gpt_threshold_include_rationales)
         self.gpt_threshold_coldstart_rides = int(np.clip(gpt_threshold_coldstart_rides, 1, 10))
@@ -788,15 +791,14 @@ class Core:
         margin = self._finite_float(profit_margin)
         gap = self._finite_float(price_gap_f2_minus_f1)
         fulfillment_term = float(np.clip(self._finite_float(fulfillment_rate, 1.0), 0.0, 1.0))
-        # Customers and drivers interact through completed demand: an unserved
-        # choice earns no share credit.  Centering at the equal split of the two
-        # firms (rather than 50% of all requests) accommodates the outside option.
-        served_share = float(np.clip(share_f * fulfillment_term, 0.0, 1.0))
+        # FirmMetrics.share is already completed rides / all requests. Do not
+        # multiply it by fulfillment again: that previously squared supply
+        # failures and overwhelmed both the market signal and PPO advantages.
+        served_share = share_f
         market_term = float(np.tanh((served_share - self.reward_dominance_threshold) / 0.15))
 
         # Firm objective: signed and bounded contribution profit per request.
         profit_term = float(np.tanh(profitpr / self.reward_profit_scale))
-        # One symmetric price-gap objective. A positive gap means Firm1 is
         # Use one symmetric price-gap objective. A positive gap means Firm1 is
         # cheaper than Firm2, so the default target is a modest $1 discount when
         # the acceptable discount is $2. This gives the agent one clear target
@@ -820,7 +822,31 @@ class Core:
         price_gap_weight = max(self.reward_overprice_weight, self.reward_underprice_weight)
         price_gap_component = price_gap_weight * price_discipline_penalty
 
-        raw = share_component + profit_component - price_gap_component
+        driver_scale = float(np.clip(self.driver_reward_scale_current, 0.0, 1.0))
+        fulfillment_component = (
+            driver_scale
+            * self.driver_reward_fulfillment_weight
+            * (2.0 * fulfillment_term - 1.0)
+        )
+        wait_penalty = (
+            driver_scale
+            * self.driver_reward_wait_weight
+            * self._smooth_positive_penalty(max(0.0, avg_wait_minutes - 5.0), scale=5.0)
+        )
+        rejection_penalty = (
+            driver_scale
+            * self.driver_reward_reject_weight
+            * (1.0 - float(np.clip(driver_acceptance_rate, 0.0, 1.0)))
+        )
+
+        raw = (
+            share_component
+            + profit_component
+            + fulfillment_component
+            - price_gap_component
+            - wait_penalty
+            - rejection_penalty
+        )
         base = float(np.clip(raw, -1.0, 1.0))
         return {
             "reward_base": base,
@@ -837,6 +863,9 @@ class Core:
             "reward_profit_term": float(profit_term),
             "reward_served_share": float(served_share),
             "reward_driver_unfulfilled_penalty": float(unfulfilled_penalty),
+            "reward_driver_fulfillment_component": float(fulfillment_component),
+            "reward_driver_wait_penalty": float(wait_penalty),
+            "reward_driver_rejection_penalty": float(rejection_penalty),
         }
 
     def _reward_base(
@@ -1280,11 +1309,18 @@ class Core:
     def _try_load_threshold_cache(self, pool_size: int) -> bool:
         """Load cached threshold-enriched profiles when cached profile mode is requested."""
         path = self.threshold_cache_path
-        if self.threshold_profile_source != "cached":
+        if self.threshold_profile_source != "cached" and not self.reuse_threshold_cache:
             return False
         if not path:
+            if self.reuse_threshold_cache and not self.strict_cached_profiles:
+                print("[ThresholdCache] --reuse_threshold_cache ignored because no --threshold_cache_path was supplied.")
+                return False
             raise ValueError("threshold_profile_source='cached' requires --threshold_cache_path")
         if not os.path.exists(path):
+            if self.reuse_threshold_cache and not self.strict_cached_profiles:
+                print(f"[ThresholdCache] Cache not found at {path}; generating and saving a new pool.")
+                self.threshold_profile_source = "generated"
+                return False
             raise FileNotFoundError(f"Threshold profile cache not found: {path}")
         rows: List[Dict[str, Any]] = []
         with open(path, "r", encoding="utf-8") as f:
@@ -1585,6 +1621,9 @@ class Core:
                     "reward_price_gap_penalty",
                     "reward_served_share",
                     "reward_driver_unfulfilled_penalty",
+                    "reward_driver_fulfillment_component",
+                    "reward_driver_wait_penalty",
+                    "reward_driver_rejection_penalty",
                 ):
                     reward_component_sums[component_key] += float(reward_diag.get(component_key, 0.0))
 
@@ -1787,6 +1826,25 @@ class Core:
                 driver_acceptance_rate=float(m1.driver_acceptance_rate),
             )
             eval_reward = float(reward_diag["reward"])
+            
+            if self.firm1_mode == "RL":
+                # Evaluation uses a deterministic argmax policy. Repeating the
+                # same incremental macro action can otherwise walk coefficients
+                # to a boundary even after the resulting market collapses.
+                # Apply the same business safety projection used in training so
+                # evaluation measures the deployed controller, not unbounded
+                # accumulation of one action.
+                self.firm1.stabilize_after_batch(
+                    share=float(m1.share),
+                    price_gap_f2_minus_f1=float(mean_gap),
+                    city_base=float(base.base_fare),
+                    city_pmin=float(base.per_minute),
+                    city_pmile=float(base.per_mile),
+                    city_booking=float(base.booking_fee),
+                    city_airport=float(base.airport_fee),
+                    profit_per_request=float(m1.profit_per_request),
+                    fulfillment_rate=float(m1.fulfillment_rate),
+                )
 
             eval_last_share = float(share)
             eval_last_revpr = float(revpr)
@@ -2653,6 +2711,9 @@ class Core:
                     "reward_price_gap_penalty",
                     "reward_served_share",
                     "reward_driver_unfulfilled_penalty",
+                    "reward_driver_fulfillment_component",
+                    "reward_driver_wait_penalty",
+                    "reward_driver_rejection_penalty",
                 ):
                     reward_component_sums[component_key] += float(reward_diag.get(component_key, 0.0))
 

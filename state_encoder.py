@@ -51,7 +51,14 @@ def build_state_vector(
     if ride_ctx.size < 3:
         ride_ctx = np.pad(ride_ctx, (0, 3 - ride_ctx.size), mode="constant")
     ride_ctx = ride_ctx[:3]
-    _ = driver_state_vec  # Driver summary inputs are passed as target-centered scalars above.
+    supply = np.asarray(
+        driver_state_vec if driver_state_vec is not None else np.zeros(8),
+        dtype=np.float32,
+    ).reshape(-1)
+    if supply.size < 8:
+        supply = np.pad(supply, (0, 8 - supply.size), mode="constant")
+    supply = np.nan_to_num(supply[:8], nan=0.0, posinf=1.0, neginf=0.0)
+    supply = np.clip(supply, 0.0, 1.0)
 
     # Coefficient features: normalized relative deltas vs base
     base_empty = CoefficientOverrides()
@@ -67,7 +74,9 @@ def build_state_vector(
     share = float(np.clip(firm1_last_share, 0.0, 1.0))
     fulfillment = float(np.clip(firm1_last_fulfillment, 0.0, 1.0))
     acceptance = float(np.clip(firm1_last_acceptance, 0.0, 1.0))
-    served_share = share * fulfillment
+    # The incoming share is completed rides / all requests, so it already
+    # includes fulfillment and must not be multiplied by fulfillment again.
+    served_share = share
     gap = float(firm1_last_gap)
     profitpr = float(firm1_last_profitpr)
 
@@ -93,4 +102,4 @@ def build_state_vector(
         float(np.clip((0.30 - served_share) / 0.30, 0.0, 1.0)),
         float(np.clip((0.60 - acceptance) / 0.60, 0.0, 1.0)),
     ]
-    return np.array(fixed + coef_feats, dtype=np.float32)
+    return np.array(fixed + supply.tolist() + coef_feats, dtype=np.float32)
