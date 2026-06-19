@@ -11,8 +11,9 @@ Firm2: Heuristic dynamic pricing (schedule + competitive response + guardrails)
 """
 
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple
+from typing import Deque, Optional, Dict, List, Tuple
 import numpy as np
+from collections import deque
 
 from PPOAgent import PPOAgent
 from Market_models import CoefficientOverrides
@@ -299,7 +300,7 @@ class FirmRLPricer:
         if not hasattr(self, "config"):
             self.config = default_specs_for(self.opt_keys)
     
-    def __init__(self, seed: Optional[int], opt_keys: List[str]):
+    def __init__(self, seed: Optional[int], opt_keys: List[str], state_frame_stack: int = 4):
         # Shared action manipulates up to five pricing coefficients per step.
         self.opt_keys = list(opt_keys[: self.MAX_MANIPULATED_COEFFS])
         if len(opt_keys) > self.MAX_MANIPULATED_COEFFS:
@@ -309,6 +310,8 @@ class FirmRLPricer:
             )
         self.config = default_specs_for(self.opt_keys)
         self.overrides = CoefficientOverrides()
+        self.state_frame_stack = int(max(1, state_frame_stack))
+        self._state_history: Deque[np.ndarray] = deque(maxlen=self.state_frame_stack)
         
         self.base_step_scale = 0.95
         self.converged_step_scale = 0.5
@@ -354,8 +357,12 @@ class FirmRLPricer:
         
         # State encoder emits 20 target-centered market/service features, eight
         # direct supply-state features, plus normalized fare-coefficient deltas
-        # for the active rider-price knobs.
-        state_dim = 28 + len(active_keys)
+        # for the active rider-price knobs.  Frame stacking appends recent encoded
+        # states so PPO can infer short-run trends in driver supply, fulfillment,
+        # competitor response, and previous price pressure without requiring an
+        # LSTM/recurrent policy.
+        self.single_state_dim = 28 + len(active_keys)
+        state_dim = self.single_state_dim * self.state_frame_stack
 
         # Initialize PPO agent.
         self.agent = PPOAgent(
@@ -377,6 +384,28 @@ class FirmRLPricer:
             min_action_visits=12,
             exploration_rescue_rate=0.15,
         )
+        
+    def reset_state_history(self) -> None:
+        """Clear stacked observation history at train/eval episode boundaries."""
+        self._state_history.clear()
+
+    def stack_state(self, state: np.ndarray) -> np.ndarray:
+        """Return a fixed-width frame stack ending with the current state.
+
+        The first observation is repeated to fill the stack, avoiding an all-zero
+        cold start that would be out-of-distribution relative to later states.
+        """
+        current = np.asarray(state, dtype=np.float32).reshape(-1)
+        if current.size != self.single_state_dim:
+            raise ValueError(f"Single state dim mismatch: got {current.size}, expected {self.single_state_dim}")
+        if not self._state_history:
+            for _ in range(self.state_frame_stack - 1):
+                self._state_history.append(current.copy())
+        self._state_history.append(current.copy())
+        frames = list(self._state_history)
+        while len(frames) < self.state_frame_stack:
+            frames.insert(0, current.copy())
+        return np.concatenate(frames[-self.state_frame_stack:]).astype(np.float32, copy=False)
         
     def configure_training_controls(self, progress: float, reward_converged: bool, reward_std: float) -> None:
         """Adapt exploration and action aggressiveness across training phases."""

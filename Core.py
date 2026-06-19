@@ -382,6 +382,9 @@ class Core:
         driver_reward_wait_weight: float = 0.04,
         driver_reward_reject_weight: float = 0.03,
         driver_reward_warmup_fraction: float = 0.30,
+        ppo_batch_size: int = 128,
+        ppo_update_epochs: int = 5,
+        state_frame_stack: int = 4,
         threshold_cache_path: str = "",
         reuse_threshold_cache: bool = False,
         threshold_profile_source: str = "generated",
@@ -469,7 +472,7 @@ class Core:
         }
 
         if self.firm1_mode == "RL":
-            self.firm1 = FirmRLPricer(seed=self.seed, opt_keys=self.shared_edit_keys)
+            self.firm1 = FirmRLPricer(seed=self.seed, opt_keys=self.shared_edit_keys, state_frame_stack=state_frame_stack)
         elif self.firm1_mode in pricer_by_mode:
             self.firm1 = pricer_by_mode[self.firm1_mode](seed=self.seed, managed_keys=self.shared_edit_keys)
         else:
@@ -581,12 +584,11 @@ class Core:
         self.driver_reward_warmup_fraction = float(np.clip(driver_reward_warmup_fraction, 0.0, 1.0))
         self.driver_reward_scale_current = 1.0 if self.driver_reward_warmup_fraction <= 0.0 else 0.0
         
-        # Keep minibatches close to the default rollout size
-        # (5 days x 10 synthetic steps/day) instead of silently forcing
-        # full-batch PPO updates through an oversized batch setting.
+        # Keep PPO optimization controls explicit so longer rollout windows can
+        # use minibatches instead of silently falling back to full-batch updates.
         
-        self.ppo_update_epochs = 5
-        self.ppo_batch_size = 64
+        self.ppo_update_epochs = int(max(1, ppo_update_epochs))
+        self.ppo_batch_size = int(max(1, ppo_batch_size))
         
         print(
             "[RewardConfig] "
@@ -1434,11 +1436,13 @@ class Core:
         profiles_out: Optional[str] = None,
         profiles_log_limit: int = 200000,
         train_steps_per_day: int = 10,
-        ppo_update_interval_days: int = 5,
+        ppo_update_interval_days: int = 20,
         stochastic_training: bool = True,
     ):
         """Run workflow: synthetic-data RL training (day/timestep cadence), then held-out evaluation."""
         self._initialize_run_distributions()
+        if self.firm1_mode == "RL":
+            self.firm1.reset_state_history()
         self._refresh_profile_pool(rides_per_timestep=train_customers_per_step)
         
         if stochastic_training:
@@ -1451,6 +1455,8 @@ class Core:
             print(f">>> run_experiment stochastic seed={exp_seed} (independent of --seed for robustness)")
             self._initialize_arbitrary_starting_coefficients()
             self._initialize_run_distributions()
+            if self.firm1_mode == "RL":
+                self.firm1.reset_state_history()
             self._refresh_profile_pool(rides_per_timestep=train_customers_per_step)
 
         print(
@@ -1529,6 +1535,7 @@ class Core:
                 rl_step = None
                 if self.firm1_mode == "RL":
                     s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
+                    s_vec = self.firm1.stack_state(s_vec)
                     action, s_ts, logits, val = self.firm1.agent.act(s_vec)
                     self.firm1.apply_action(action, self.market)
                     action_counts[int(action)] += 1
@@ -1767,6 +1774,8 @@ class Core:
         self.firm2, self.firm2_mode = orig_firm2, orig_firm2_mode
         
         print(">>> Evaluating RL agent against static/heuristic opponent with shared profile pool...")
+        if self.firm1_mode == "RL":
+            self.firm1.reset_state_history()
         self.driver_reward_scale_current = 1.0 if self.enable_driver_supply else 0.0
         eval_rewards: List[float] = []
         # Reset reward-trend baselines so evaluation reward reflects evaluation dynamics,
@@ -1789,6 +1798,7 @@ class Core:
             action = -1
             if self.firm1_mode == "RL":
                 s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
+                s_vec = self.firm1.stack_state(s_vec)
                 action, *_ = self.firm1.agent.act(s_vec, deterministic=True)
                 self.firm1.apply_action(action, self.market)
                 action = int(action)
@@ -2578,6 +2588,8 @@ class Core:
             csv_file = open(out_path, "w", newline="", encoding="utf-8")
 
         self._initialize_run_distributions()
+        if self.firm1_mode == "RL":
+            self.firm1.reset_state_history()
         self._refresh_profile_pool(rides_per_timestep=customers_per_step)
         self.convergence_day = None
         self.convergence_window_std_at_day = None
@@ -2616,6 +2628,7 @@ class Core:
                 rl_step = None
                 if self.firm1_mode == "RL":
                     s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
+                    s_vec = self.firm1.stack_state(s_vec)
                     action, s_ts, logits, val = self.firm1.agent.act(s_vec)
                     self.firm1.apply_action(action, self.market)
                     action_counts[int(action)] += 1
@@ -3447,7 +3460,10 @@ def main():
     parser.add_argument("--train_timesteps", type=int, default=1000)
     parser.add_argument("--train_customers", type=int, default=5000)
     parser.add_argument("--train_steps_per_day", type=int, default=10, help="Synthetic training timesteps per day (run_experiment mode).")
-    parser.add_argument("--ppo_update_interval_days", type=int, default=5, help="How many synthetic training days to collect before each PPO optimizer update.")
+    parser.add_argument("--ppo_update_interval_days", type=int, default=20, help="How many synthetic training days to collect before each PPO optimizer update; larger values produce longer, lower-variance PPO rollouts.")
+    parser.add_argument("--ppo_batch_size", type=int, default=128, help="PPO minibatch size used when optimizing each rollout buffer.")
+    parser.add_argument("--ppo_update_epochs", type=int, default=5, help="Number of optimization epochs per PPO rollout buffer.")
+    parser.add_argument("--state_frame_stack", type=int, default=4, help="Number of recent encoded RL states to concatenate for history-aware PPO observations.")
     parser.add_argument("--deterministic_experiment_seed", action="store_true", help="If set, keep run_experiment fully deterministic with --seed.")
     parser.add_argument("--eval_timesteps", type=int, default=200)
     parser.add_argument("--eval_customers", type=int, default=1000)
@@ -3573,6 +3589,9 @@ def main():
         driver_reward_wait_weight=args.driver_reward_wait_weight,
         driver_reward_reject_weight=args.driver_reward_reject_weight,
         driver_reward_warmup_fraction=args.driver_reward_warmup_fraction,
+        ppo_batch_size=args.ppo_batch_size,
+        ppo_update_epochs=args.ppo_update_epochs,
+        state_frame_stack=args.state_frame_stack,
         threshold_cache_path=args.threshold_cache_path,
         reuse_threshold_cache=args.reuse_threshold_cache,
         threshold_profile_source=args.threshold_profile_source,
