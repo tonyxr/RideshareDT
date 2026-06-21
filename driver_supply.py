@@ -35,6 +35,14 @@ class DriverPayPolicy:
 
 @dataclass
 class DriverSupplyConfig:
+    """Configuration for driver supply and dispatch acceptance.
+
+    acceptance_mode controls how dispatch acceptance is resolved after the
+    earnings-based acceptance probability is calculated:
+    - expected: deterministic thresholding for lower-variance training runs.
+    - stochastic: Bernoulli sampling for simulation runs that need randomness.
+    """
+    
     base_active_drivers: int = 260
     reservation_wage_per_hour: float = 24.0
     operating_cost_per_mile: float = 0.35
@@ -47,7 +55,15 @@ class DriverSupplyConfig:
     state_smoothing_alpha: float = 0.35
     pickup_noise_sigma: float = 0.10
     
+    acceptance_mode: str = "expected"
 
+    def __post_init__(self) -> None:
+        self.acceptance_mode = str(self.acceptance_mode).lower().strip()
+        if self.acceptance_mode not in {"expected", "stochastic"}:
+            raise ValueError(
+                "DriverSupplyConfig.acceptance_mode must be either "
+                "'expected' or 'stochastic'"
+            )
 
 @dataclass
 class FirmDriverBatchState:
@@ -241,6 +257,15 @@ class DriverSupplyLayer:
             weather=weather,
         )
         return float(np.clip(ratio / max(1e-6, self.config.acceptance_ratio_threshold), 0.0, 1.0))
+    
+    def _resolve_acceptance(self, feasible: bool, acceptance_probability: float) -> bool:
+        """Resolve whether a feasible dispatch is accepted under the configured mode."""
+        if not feasible:
+            return False
+        probability = float(np.clip(acceptance_probability, 0.0, 1.0))
+        if self.config.acceptance_mode == "stochastic":
+            return bool(self.rng.random() < probability)
+        return bool(probability >= 1.0)
 
     def dispatch(
         self,
@@ -265,7 +290,7 @@ class DriverSupplyLayer:
         )
         feasible = state.idle_drivers > 0 and pickup_minutes <= self.config.max_pickup_minutes
         state.total_acceptance_probability += accept_prob if feasible else 0.0
-        accepted = bool(feasible and accept_prob >= 1.0)
+        accepted = self._resolve_acceptance(feasible=feasible, acceptance_probability=accept_prob)
         if not accepted:
             state.rejected_dispatches += 1
             state.unfulfilled_requests += 1
