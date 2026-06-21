@@ -13,8 +13,8 @@ from __future__ import annotations
 The first implementation is intentionally lightweight and batch-friendly: Firm 1's
 RL agent still controls rider-facing fare coefficients only (Option A), while the
 driver layer responds endogenously through supply, wait times, and acceptance.
-Driver-pay policy is isolated in ``DriverPayPolicy`` so Option B can later expose
-those pay coefficients to the RL action space without rewriting matching logic.
+Driver pay is intentionally tied to each firm's current rider-facing price so
+supply responds directly to pricing policy rather than a separate rate card.
 """
 
 from dataclasses import dataclass
@@ -27,14 +27,9 @@ import numpy as np
 
 @dataclass
 class DriverPayPolicy:
-    """Driver compensation policy, separated from rider fare for Option B later."""
+    """Simple driver compensation policy linked to the firm's current fare."""
 
     fare_share: float = 0.72
-    base_pay: float = 1.25
-    per_mile_pay: Optional[float] = 0.90
-    per_minute_pay: Optional[float] = 0.20
-    pickup_minute_pay: float = 0.08
-    airport_bonus: float = 1.00
     minimum_pay: float = 3.50
 
 
@@ -43,14 +38,12 @@ class DriverSupplyConfig:
     base_active_drivers: int = 260
     reservation_wage_per_hour: float = 24.0
     operating_cost_per_mile: float = 0.35
-    acceptance_temperature: float = 5.0
+    acceptance_ratio_threshold: float = 1.0
     max_pickup_minutes: float = 16.0
     base_pickup_minutes: float = 3.5
     supply_elasticity: float = 0.35
     online_temperature: float = 12.0
     platform_variable_cost: float = 0.45
-    acceptance_mode: str = "expected"  # "expected" removes per-dispatch Bernoulli noise for faster RL convergence.
-    expected_acceptance_cutoff: float = 0.35
     state_smoothing_alpha: float = 0.35
     pickup_noise_sigma: float = 0.10
     
@@ -168,7 +161,6 @@ class DriverSupplyLayer:
         self.last_states = {"Firm1": FirmDriverBatchState(), "Firm2": FirmDriverBatchState()}
         self.smoothed_states = {"Firm1": FirmDriverBatchState(), "Firm2": FirmDriverBatchState()}
         self._batch_states = {"Firm1": FirmDriverBatchState(), "Firm2": FirmDriverBatchState()}
-        self._expected_acceptance_credit = {"Firm1": 0.0, "Firm2": 0.0}
 
     def begin_batch(self, customers_per_step: int, hour: int, weather: str) -> None:
         self._batch_states = {}
@@ -210,21 +202,45 @@ class DriverSupplyLayer:
         pickup_minutes: float,
         airport: bool,
     ) -> float:
+        del distance_miles, duration_minutes, pickup_minutes, airport
         policy = self.pay_policies[firm]
-        per_mile = policy.per_mile_pay if policy.per_mile_pay is not None else 0.90
-        per_min = policy.per_minute_pay if policy.per_minute_pay is not None else 0.20
-        rate_card_pay = (
-            policy.base_pay
-            + float(per_mile) * max(0.0, float(distance_miles))
-            + float(per_min) * max(0.0, float(duration_minutes))
-            + policy.pickup_minute_pay * max(0.0, float(pickup_minutes))
-            + (policy.airport_bonus if airport else 0.0)
+        return float(max(policy.minimum_pay, policy.fare_share * max(0.0, float(rider_fare))))
+
+    def driver_acceptance_ratio(
+        self,
+        driver_pay: float,
+        distance_miles: float,
+        duration_minutes: float,
+        pickup_minutes: float,
+        weather: str = "clear",
+    ) -> float:
+        """Return net earnings divided by required earnings for the ride context."""
+        weather_penalty = {"clear": 1.0, "cloudy": 1.03, "rain": 1.18, "snow": 1.32, "storm": 1.40}.get(str(weather).lower(), 1.0)
+        miles = max(0.0, float(distance_miles))
+        pickup = max(0.0, float(pickup_minutes))
+        minutes = max(0.0, float(duration_minutes)) + pickup
+        operating_cost = self.config.operating_cost_per_mile * (miles + max(0.1, pickup * 0.28))
+        net_earnings = max(0.0, float(driver_pay) - operating_cost)
+        required_earnings = self.config.reservation_wage_per_hour * (minutes / 60.0) * weather_penalty
+        return float(net_earnings / max(1e-6, required_earnings))
+
+    def driver_acceptance_probability(
+        self,
+        driver_pay: float,
+        distance_miles: float,
+        duration_minutes: float,
+        pickup_minutes: float,
+        weather: str = "clear",
+    ) -> float:
+        """Map the earnings/ride-nature ratio directly to willingness to accept."""
+        ratio = self.driver_acceptance_ratio(
+            driver_pay=driver_pay,
+            distance_miles=distance_miles,
+            duration_minutes=duration_minutes,
+            pickup_minutes=pickup_minutes,
+            weather=weather,
         )
-        # Fare share and the rate card are alternative compensation floors.
-        # Adding several fare-derived formulas together paid more than 100% of
-        # fare on ordinary trips and made positive platform profit impossible.
-        fare_share_pay = policy.fare_share * max(0.0, float(rider_fare))
-        return float(max(policy.minimum_pay, fare_share_pay, rate_card_pay))
+        return float(np.clip(ratio / max(1e-6, self.config.acceptance_ratio_threshold), 0.0, 1.0))
 
     def dispatch(
         self,
@@ -233,31 +249,27 @@ class DriverSupplyLayer:
         distance_miles: float,
         duration_minutes: float,
         airport: bool = False,
+        weather: str = "clear",
     ) -> DispatchResult:
         state = self._batch_states.setdefault(firm, FirmDriverBatchState(active_drivers=1, idle_drivers=1))
         state.offered_dispatches += 1
         pickup_minutes = self.estimate_pickup_minutes(firm, airport=airport)
         pickup_miles = max(0.1, pickup_minutes * 0.28)
         driver_pay = self.quote_driver_pay(firm, rider_fare, distance_miles, duration_minutes, pickup_minutes, airport)
-        driver_cost = self.config.operating_cost_per_mile * (pickup_miles + max(0.0, float(distance_miles)))
-        total_time_hours = max(1e-6, (pickup_minutes + max(0.0, float(duration_minutes))) / 60.0)
-        implied_hourly = (driver_pay - driver_cost) / total_time_hours
-        utility_gap = implied_hourly - self.config.reservation_wage_per_hour
-        accept_prob = float(1.0 / (1.0 + np.exp(-utility_gap / max(1e-6, self.config.acceptance_temperature))))
+        accept_prob = self.driver_acceptance_probability(
+            driver_pay=driver_pay,
+            distance_miles=distance_miles,
+            duration_minutes=duration_minutes,
+            pickup_minutes=pickup_minutes,
+            weather=weather,
+        )
         feasible = state.idle_drivers > 0 and pickup_minutes <= self.config.max_pickup_minutes
         state.total_acceptance_probability += accept_prob if feasible else 0.0
-        if str(self.config.acceptance_mode).lower() == "stochastic":
-            accepted = bool(feasible and self.rng.random() < accept_prob)
-        else:
-            # Deterministic weighted-round-robin preserves the expected number
-            # of accepted offers without the discontinuity of a hard cutoff.
-            credit = self._expected_acceptance_credit.get(firm, 0.0) + (accept_prob if feasible else 0.0)
-            accepted = bool(feasible and credit >= 1.0)
-            self._expected_acceptance_credit[firm] = credit - 1.0 if accepted else credit
+        accepted = bool(feasible and accept_prob >= 1.0)
         if not accepted:
             state.rejected_dispatches += 1
             state.unfulfilled_requests += 1
-            reason = "NO_IDLE_DRIVER" if state.idle_drivers <= 0 else "LOW_DRIVER_UTILITY_OR_LONG_PICKUP"
+            reason = "NO_IDLE_DRIVER" if state.idle_drivers <= 0 else "LOW_EARNINGS_RATIO_OR_LONG_PICKUP"
             return DispatchResult(
                 fulfilled=False,
                 driver_pay=0.0,

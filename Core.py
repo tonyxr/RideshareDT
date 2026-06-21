@@ -2471,7 +2471,7 @@ class Core:
             if choice == "Firm1":
                 firm1.chosen += 1
                 if self.enable_driver_supply:
-                    dispatch = self.driver_supply.dispatch("Firm1", p1, travel_distance, duration, airport=airport)
+                    dispatch = self.driver_supply.dispatch("Firm1", p1, travel_distance, duration, airport=airport, weather=weather)
                     firm1.dispatch_offers += 1
                     acceptance_prob = float(dispatch.acceptance_probability)
                     pickup_minutes = float(dispatch.pickup_minutes)
@@ -2502,7 +2502,7 @@ class Core:
             elif choice == "Firm2":
                 firm2.chosen += 1
                 if self.enable_driver_supply:
-                    dispatch = self.driver_supply.dispatch("Firm2", p2, travel_distance, duration, airport=airport)
+                    dispatch = self.driver_supply.dispatch("Firm2", p2, travel_distance, duration, airport=airport, weather=weather)
                     firm2.dispatch_offers += 1
                     acceptance_prob = float(dispatch.acceptance_probability)
                     pickup_minutes = float(dispatch.pickup_minutes)
