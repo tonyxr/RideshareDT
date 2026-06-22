@@ -367,6 +367,7 @@ class Core:
         reward_underprice_weight: float = 0.15,
         reward_acceptable_discount: float = 2.00,
         min_profit_margin: float = 0.08,
+        reward_action_change_weight: float = 0.02,
         driver_cost_per_mile: float = 0.85,
         driver_cost_per_minute: float = 0.12,
         fixed_trip_cost: float = 1.25,
@@ -381,6 +382,7 @@ class Core:
         driver_reward_fulfillment_weight: float = 0.06,
         driver_reward_wait_weight: float = 0.04,
         driver_reward_reject_weight: float = 0.03,
+        driver_reward_unfulfilled_weight: float = 0.12,
         driver_reward_warmup_fraction: float = 0.30,
         ppo_batch_size: int = 128,
         ppo_update_epochs: int = 5,
@@ -578,9 +580,11 @@ class Core:
         # non-potential momentum rewards can change the optimal pricing policy
         # and keep PPO chasing short-lived deltas instead of the business target.
         self.reward_momentum_weight = self.reward_trend_weight
+        self.reward_action_change_weight = float(max(0.0, reward_action_change_weight))
         self.driver_reward_fulfillment_weight = float(max(0.0, driver_reward_fulfillment_weight))
         self.driver_reward_wait_weight = float(max(0.0, driver_reward_wait_weight))
         self.driver_reward_reject_weight = float(max(0.0, driver_reward_reject_weight))
+        self.driver_reward_unfulfilled_weight = float(max(0.0, driver_reward_unfulfilled_weight))
         self.driver_reward_warmup_fraction = float(np.clip(driver_reward_warmup_fraction, 0.0, 1.0))
         self.driver_reward_scale_current = 1.0 if self.driver_reward_warmup_fraction <= 0.0 else 0.0
         
@@ -603,6 +607,8 @@ class Core:
             f"driver_fulfillment={self.driver_reward_fulfillment_weight:.2f}, "
             f"driver_wait={self.driver_reward_wait_weight:.2f}, "
             f"driver_reject={self.driver_reward_reject_weight:.2f}, "
+            f"driver_unfulfilled={self.driver_reward_unfulfilled_weight:.2f}, "
+            f"action_change={self.reward_action_change_weight:.2f}, "
             f"driver_warmup={self.driver_reward_warmup_fraction:.2f}"
         )
         
@@ -770,6 +776,7 @@ class Core:
         fulfillment_rate: float = 1.0,
         avg_wait_minutes: float = 0.0,
         driver_acceptance_rate: float = 1.0,
+        action_change_magnitude: float = 0.0,
     ) -> Dict[str, float]:
         """Return a small, robust reward for the customer-driver-firm loop.
 
@@ -840,6 +847,10 @@ class Core:
             * self.driver_reward_reject_weight
             * (1.0 - float(np.clip(driver_acceptance_rate, 0.0, 1.0)))
         )
+        direct_unfulfilled_penalty = driver_scale * self.driver_reward_unfulfilled_weight * unfulfilled_penalty
+        action_change_penalty = self.reward_action_change_weight * float(
+            np.clip(self._finite_float(action_change_magnitude), 0.0, 1.0)
+        )
 
         raw = (
             share_component
@@ -848,6 +859,8 @@ class Core:
             - price_gap_component
             - wait_penalty
             - rejection_penalty
+            - direct_unfulfilled_penalty
+            - action_change_penalty
         )
         base = float(np.clip(raw, -1.0, 1.0))
         return {
@@ -865,6 +878,8 @@ class Core:
             "reward_profit_term": float(profit_term),
             "reward_served_share": float(served_share),
             "reward_driver_unfulfilled_penalty": float(unfulfilled_penalty),
+            "reward_driver_unfulfilled_component": float(direct_unfulfilled_penalty),
+            "reward_action_change_penalty": float(action_change_penalty),
             "reward_driver_fulfillment_component": float(fulfillment_component),
             "reward_driver_wait_penalty": float(wait_penalty),
             "reward_driver_rejection_penalty": float(rejection_penalty),
@@ -880,6 +895,7 @@ class Core:
         fulfillment_rate: float = 1.0,
         avg_wait_minutes: float = 0.0,
         driver_acceptance_rate: float = 1.0,
+        action_change_magnitude: float = 0.0,
     ) -> float:
         """Balanced business reward: completed market share plus signed profit."""
         return float(
@@ -892,6 +908,7 @@ class Core:
                 fulfillment_rate=fulfillment_rate,
                 avg_wait_minutes=avg_wait_minutes,
                 driver_acceptance_rate=driver_acceptance_rate,
+                action_change_magnitude=action_change_magnitude,
             )["reward_base"]
         )
 
@@ -909,6 +926,7 @@ class Core:
         fulfillment_rate: float = 1.0,
         avg_wait_minutes: float = 0.0,
         driver_acceptance_rate: float = 1.0,
+        action_change_magnitude: float = 0.0,
     ) -> Dict[str, float]:
         """Return shaped reward and component diagnostics for trajectory analysis."""
         share_f = float(np.clip(share, 0.0, 1.0))
@@ -926,6 +944,7 @@ class Core:
             fulfillment_rate=fulfillment_rate,
             avg_wait_minutes=avg_wait_minutes,
             driver_acceptance_rate=driver_acceptance_rate,
+            action_change_magnitude=action_change_magnitude,
         )
         base_reward = float(components["reward_base"])
         
@@ -986,6 +1005,7 @@ class Core:
             fulfillment_rate=float(m1.fulfillment_rate),
             avg_wait_minutes=float(m1.avg_wait_minutes),
             driver_acceptance_rate=float(m1.driver_acceptance_rate),
+            action_change_magnitude=0.0,
             prev_share=float(self.last_share),
             prev_rev_per_request=float(self.last_revpr),
             prev_profit_per_request=float(self.last_profitpr),
@@ -1443,7 +1463,6 @@ class Core:
         self._initialize_run_distributions()
         if self.firm1_mode == "RL":
             self.firm1.reset_state_history()
-        self._refresh_profile_pool(rides_per_timestep=train_customers_per_step)
         
         if stochastic_training:
             exp_seed = int(np.random.SeedSequence().generate_state(1)[0])
@@ -1457,7 +1476,7 @@ class Core:
             self._initialize_run_distributions()
             if self.firm1_mode == "RL":
                 self.firm1.reset_state_history()
-            self._refresh_profile_pool(rides_per_timestep=train_customers_per_step)
+        self._refresh_profile_pool(rides_per_timestep=train_customers_per_step)
 
         print(
             f">>> Synthetic setup: profile_pool={self.agent_gen.total_customers}, "
@@ -1565,6 +1584,12 @@ class Core:
                 if self.firm2_mode != "static":
                     self.firm2.update(metrics=m2, price_gap_mean=mean_gap)
                     
+                action_movement = 0.0
+                if self.firm1_mode == "RL" and rl_step is not None:
+                    action_movement = float(
+                        sum(abs(v) for v in getattr(self.firm1, "last_action_normalized_gap", {}).values())
+                    )
+                    
                 reward_diag = self._reward_diagnostics(
                     share=float(m1.share),
                     rev_per_request=float(m1.rev_per_request),
@@ -1578,6 +1603,7 @@ class Core:
                     fulfillment_rate=float(m1.fulfillment_rate),
                     avg_wait_minutes=float(m1.avg_wait_minutes),
                     driver_acceptance_rate=float(m1.driver_acceptance_rate),
+                    action_change_magnitude=action_movement,
                 )
 
                 if self.firm1_mode == "RL" and rl_step is not None:
@@ -1599,6 +1625,7 @@ class Core:
                             city_airport=float(base.airport_fee),
                             profit_per_request=float(m1.profit_per_request),
                             fulfillment_rate=float(m1.fulfillment_rate),
+                            target_price_gap=float(self.reward_target_price_gap),
                         )
                         after_base = getattr(self.firm1.overrides, "base_fare", None)
                         after_pmin = getattr(self.firm1.overrides, "per_minute", None)
@@ -1628,6 +1655,8 @@ class Core:
                     "reward_price_gap_penalty",
                     "reward_served_share",
                     "reward_driver_unfulfilled_penalty",
+                    "reward_driver_unfulfilled_component",
+                    "reward_action_change_penalty",
                     "reward_driver_fulfillment_component",
                     "reward_driver_wait_penalty",
                     "reward_driver_rejection_penalty",
@@ -1816,6 +1845,12 @@ class Core:
                 sampled_profiles=sampled_profiles,
                 collect_rows=False,
             )
+            
+            action_movement = 0.0
+            if self.firm1_mode == "RL":
+                action_movement = float(
+                    sum(abs(v) for v in getattr(self.firm1, "last_action_normalized_gap", {}).values())
+                )
                 
             # Use the same shaped reward family as training for consistent trajectory logs.
             # Compute with local baselines to avoid mutating training history state.
@@ -1834,6 +1869,7 @@ class Core:
                 fulfillment_rate=float(m1.fulfillment_rate),
                 avg_wait_minutes=float(m1.avg_wait_minutes),
                 driver_acceptance_rate=float(m1.driver_acceptance_rate),
+                action_change_magnitude=action_movement,
             )
             eval_reward = float(reward_diag["reward"])
             
@@ -1854,6 +1890,7 @@ class Core:
                     city_airport=float(base.airport_fee),
                     profit_per_request=float(m1.profit_per_request),
                     fulfillment_rate=float(m1.fulfillment_rate),
+                    target_price_gap=float(self.reward_target_price_gap),
                 )
 
             eval_last_share = float(share)
@@ -2327,6 +2364,7 @@ class Core:
                 city_airport=float(self.market.curr_market.airport_fee),
                 profit_per_request=float(m1.profit_per_request),
                 fulfillment_rate=float(m1.fulfillment_rate),
+                target_price_gap=float(self.reward_target_price_gap),
             )
         
         self.last_share = float(m1.share)
@@ -2679,6 +2717,11 @@ class Core:
                     self.firm2.update(metrics=m2, price_gap_mean=mean_gap)   # Firm2 - Firm1
                     
                 # RL memory + reward shaping
+                action_movement = 0.0
+                if self.firm1_mode == "RL" and rl_step is not None:
+                    action_movement = float(
+                        sum(abs(v) for v in getattr(self.firm1, "last_action_normalized_gap", {}).values())
+                    )
                 reward_diag = self._reward_diagnostics(
                     share=float(m1.share),
                     rev_per_request=float(m1.rev_per_request),
@@ -2692,6 +2735,7 @@ class Core:
                     fulfillment_rate=float(m1.fulfillment_rate),
                     avg_wait_minutes=float(m1.avg_wait_minutes),
                     driver_acceptance_rate=float(m1.driver_acceptance_rate),
+                    action_change_magnitude=action_movement,
                 )
                 if self.firm1_mode == "RL" and rl_step is not None:
                     action, s_ts, logits, val = rl_step
@@ -2710,6 +2754,7 @@ class Core:
                             city_airport=float(base.airport_fee),
                             profit_per_request=float(m1.profit_per_request),
                             fulfillment_rate=float(m1.fulfillment_rate),
+                            target_price_gap=float(self.reward_target_price_gap),
                         )
                     reward_sum += float(reward)
                 for component_key in (
@@ -2724,6 +2769,8 @@ class Core:
                     "reward_price_gap_penalty",
                     "reward_served_share",
                     "reward_driver_unfulfilled_penalty",
+                    "reward_driver_unfulfilled_component",
+                    "reward_action_change_penalty",
                     "reward_driver_fulfillment_component",
                     "reward_driver_wait_penalty",
                     "reward_driver_rejection_penalty",
@@ -3480,6 +3527,7 @@ def main():
     parser.add_argument("--reward_acceptable_discount", type=float, default=2.0, help="Firm1 may be this many dollars cheaper than Firm2 before underpricing penalty starts.")
     parser.add_argument("--min_profit_margin", type=float, default=0.08, help="Minimum contribution margin target used by the margin discipline penalty.")
     parser.add_argument("--driver_cost_per_mile", type=float, default=0.85, help="Approximate per-mile contribution cost for completed rides.")
+    parser.add_argument("--reward_action_change_weight", type=float, default=0.02, help="Penalty weight for repeated/incremental coefficient movement by the RL pricing action.")
     parser.add_argument("--driver_cost_per_minute", type=float, default=0.12, help="Approximate per-minute contribution cost for completed rides.")
     parser.add_argument("--fixed_trip_cost", type=float, default=1.25, help="Approximate fixed platform/driver cost for completed rides.")
     parser.add_argument("--airport_cost", type=float, default=2.0, help="Approximate extra cost for airport rides.")
@@ -3493,6 +3541,7 @@ def main():
     parser.add_argument("--driver_reward_fulfillment_weight", type=float, default=0.06, help="Reward bonus weight for completed/chosen fulfillment when driver supply is enabled.")
     parser.add_argument("--driver_reward_wait_weight", type=float, default=0.04, help="Reward penalty weight for long average pickup wait when driver supply is enabled.")
     parser.add_argument("--driver_reward_reject_weight", type=float, default=0.03, help="Reward penalty weight for driver rejection when driver supply is enabled.")
+    parser.add_argument("--driver_reward_unfulfilled_weight", type=float, default=0.12, help="Direct penalty weight for fulfillment shortfall below the driver-service target.")
     parser.add_argument("--driver_reward_warmup_fraction", type=float, default=0.30, help="Fraction of training over which driver reward terms ramp from zero to full strength.")
     parser.add_argument("--threshold_cache_path", type=str, default="", help="Optional JSONL path for cached GPT/fallback threshold-enriched profiles.")
     parser.add_argument("--threshold_profile_source", type=str, default="generated", choices=["generated", "cached"], help="Use completely newly generated threshold profiles, or load threshold profiles from --threshold_cache_path.")
@@ -3574,6 +3623,7 @@ def main():
         reward_underprice_weight=args.reward_underprice_weight,
         reward_acceptable_discount=args.reward_acceptable_discount,
         min_profit_margin=args.min_profit_margin,
+        reward_action_change_weight=args.reward_action_change_weight,
         driver_cost_per_mile=args.driver_cost_per_mile,
         driver_cost_per_minute=args.driver_cost_per_minute,
         fixed_trip_cost=args.fixed_trip_cost,
@@ -3588,6 +3638,7 @@ def main():
         driver_reward_fulfillment_weight=args.driver_reward_fulfillment_weight,
         driver_reward_wait_weight=args.driver_reward_wait_weight,
         driver_reward_reject_weight=args.driver_reward_reject_weight,
+        driver_reward_unfulfilled_weight=args.driver_reward_unfulfilled_weight,
         driver_reward_warmup_fraction=args.driver_reward_warmup_fraction,
         ppo_batch_size=args.ppo_batch_size,
         ppo_update_epochs=args.ppo_update_epochs,

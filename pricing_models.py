@@ -316,6 +316,10 @@ class FirmRLPricer:
         self.base_step_scale = 0.95
         self.converged_step_scale = 0.5
         self.step_scale = self.base_step_scale
+        self.repeat_action_decay = 0.55
+        self.repeat_action_min_scale = 0.20
+        self._last_applied_action = -1
+        self._repeat_action_count = 0
         self.base_max_relative_dev = 0.35
         self.converged_max_relative_dev = 0.25
         self.max_relative_dev = self.base_max_relative_dev
@@ -386,8 +390,11 @@ class FirmRLPricer:
         )
         
     def reset_state_history(self) -> None:
-        """Clear stacked observation history at train/eval episode boundaries."""
+        """Clear stacked observation/action history at train/eval episode boundaries."""
         self._state_history.clear()
+        self._last_applied_action = -1
+        self._repeat_action_count = 0
+        self.last_action_normalized_gap = {}
 
     def stack_state(self, state: np.ndarray) -> np.ndarray:
         """Return a fixed-width frame stack ending with the current state.
@@ -442,6 +449,8 @@ class FirmRLPricer:
         city_airport: Optional[float] = None,
         profit_per_request: float = 0.0,
         fulfillment_rate: float = 1.0,
+        target_price_gap: float = 0.0,
+        target_gap_tolerance: float = 0.35,
     ) -> None:
         """Guard against extreme dynamic-market failure modes.
 
@@ -455,7 +464,11 @@ class FirmRLPricer:
         gap = float(price_gap_f2_minus_f1)
         profit = float(profit_per_request)
         fulfill = float(np.clip(fulfillment_rate, 0.0, 1.0))
-        overpricing = share_f < self.recovery_share_threshold or gap < self.recovery_gap_threshold
+        target_gap = float(target_price_gap)
+        gap_tol = float(max(0.05, target_gap_tolerance))
+        lower_gap = min(target_gap - gap_tol, target_gap)
+        upper_gap = target_gap + gap_tol
+        overpricing = share_f < self.recovery_share_threshold or gap < max(self.recovery_gap_threshold, lower_gap)
         loss_buying_share = profit < 0.0 and share_f >= self.recovery_share_threshold and gap >= -0.50
         supply_stress = fulfill < 0.75 and profit >= -0.50
         if not (overpricing or loss_buying_share or supply_stress):
@@ -506,13 +519,16 @@ class FirmRLPricer:
             return
 
         if supply_stress:
-            # Temper demand and support acceptance with small variable increases;
-            # avoid abrupt fixed-fee shocks that can collapse demand.
-            move("per_minute", +1, 0.5)
-            move("per_mile", +1, 0.5)
+            # Temper demand only when Firm1 is at or above its intended discount
+            # band.  Otherwise this guardrail becomes a one-way variable-fare
+            # ratchet that can erase competitiveness and trigger oscillations.
+            if gap >= upper_gap:
+                move("per_minute", +1, 0.25)
+                move("per_mile", +1, 0.25)
             
     def apply_action(self, action: int, market_interaction) -> None:
         """Map discrete steps back into concrete market coefficient overrides."""
+        self.last_action_normalized_gap = {}
         if action not in self.action_to_steps:
             return
         
@@ -522,9 +538,23 @@ class FirmRLPricer:
         
         step_map = {k: v for k, v in self.action_to_steps[action].items() if k in self.opt_keys}
         if not step_map:
+            self._last_applied_action = int(action)
+            self._repeat_action_count = 0
             return
         
-        scaled_steps = {k: self.config.step[k] * self.step_scale for k in step_map.keys()}
+        if int(action) == self._last_applied_action and int(action) != 0:
+            self._repeat_action_count += 1
+        else:
+            self._last_applied_action = int(action)
+            self._repeat_action_count = 1 if int(action) != 0 else 0
+        repeat_scale = 1.0
+        if self._repeat_action_count > 1:
+            repeat_scale = max(
+                self.repeat_action_min_scale,
+                self.repeat_action_decay ** float(self._repeat_action_count - 1),
+            )
+
+        scaled_steps = {k: self.config.step[k] * self.step_scale * repeat_scale for k in step_map.keys()}
         bounds = {k: self.config.bounds[k] for k in step_map.keys()}
         # Detailed normalized one-unit gap per coefficient:
         # one step => config.step[k], normalized by feasible range width.

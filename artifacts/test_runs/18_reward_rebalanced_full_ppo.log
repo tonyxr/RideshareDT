@@ -1,0 +1,90 @@
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+[ChoiceModel] GPT price-threshold mode enabled (thresholds consumed from profile).
+Using random seed: 2026
+[RewardConfig] share=0.50, profit=0.50, price_gap_penalty=0.35, target_gap(F2-F1)=$0.50, profit_scale=4.00, dominance=0.00, trend=0.00, momentum=0.00, driver_fulfillment=0.12, driver_wait=0.06, driver_reject=0.08, driver_warmup=0.50
+[Calibration] Applied preset=nyc_public for market=New York City.
+[Calibration] {
+  "sample_size": 12000000,
+  "market": {
+    "weather_probs": {
+      "clear": 0.58,
+      "rain": 0.29,
+      "snow": 0.13
+    },
+    "service_probs": {
+      "economy": 0.88,
+      "premium": 0.12
+    },
+    "airport_prob": 0.19
+  },
+  "agent": {
+    "age_mean": 36.8,
+    "age_std": 12.4,
+    "income_probs": {
+      "<50k": 0.21,
+      "50k-100k": 0.34,
+      "100k-200k": 0.29,
+      "200k+": 0.16
+    },
+    "household_lambda": 1.95,
+    "p_new": 0.34
+  },
+  "choice": {
+    "price_sensitivity_scale": 1.12,
+    "loyalty_scale": 0.97,
+    "reliability_scale": 1.08
+  }
+}
+>>> Price-threshold bootstrap sources (batch_size=20): gpt=20000 (100.0%)
+>>> GPT threshold API utilization: batches_total=1000, batches_attempted=1000, batches_succeeded=1000, profiles_requested=20000, profiles_gpt=20000, batch_success_rate=100.0%, profile_gpt_rate=100.0%, profile_fallback_rate=0.0%
+>>> run_experiment stochastic seed=24648195 (independent of --seed for robustness)
+>>> Price-threshold bootstrap sources (batch_size=20): gpt=20000 (100.0%)
+>>> GPT threshold API utilization: batches_total=1000, batches_attempted=1000, batches_succeeded=1000, profiles_requested=20000, profiles_gpt=20000, batch_success_rate=100.0%, profile_gpt_rate=100.0%, profile_fallback_rate=0.0%
+>>> Synthetic setup: profile_pool=20000, train days=1000 x 10 steps/day x 5000 rides, eval timesteps=200 x 1000 rides
+>>> PPO rollout/update cadence: 5 day(s) per optimizer step (~50 transitions/update).
+>>> Training RL agent on synthetic NYC-calibrated sampling (day/timestep cadence)...
+  [train 100/1000] reward=0.071 moving_avg20=0.073 share=0.288 revPR=6.59 profitPR=1.34 gap(F2-F1)=0.26 fulfill=0.585 accept=0.585 KL=0.0012 clip=0.000
+  [train 200/1000] reward=0.126 moving_avg20=0.086 share=0.287 revPR=7.03 profitPR=1.46 gap(F2-F1)=0.18 fulfill=0.576 accept=0.576 KL=0.0111 clip=0.172
+  [train 300/1000] reward=-0.034 moving_avg20=-0.064 share=0.256 revPR=5.17 profitPR=1.00 gap(F2-F1)=0.13 fulfill=0.518 accept=0.518 KL=0.0063 clip=0.092
+  [train 400/1000] reward=0.063 moving_avg20=0.017 share=0.281 revPR=5.96 profitPR=1.17 gap(F2-F1)=0.12 fulfill=0.574 accept=0.574 KL=0.0020 clip=0.000
+  [train 500/1000] reward=-0.010 moving_avg20=0.001 share=0.273 revPR=5.29 profitPR=1.00 gap(F2-F1)=-0.22 fulfill=0.607 accept=0.607 KL=0.0056 clip=0.044
+  [train 600/1000] reward=-0.090 moving_avg20=0.044 share=0.250 revPR=4.73 profitPR=0.89 gap(F2-F1)=-0.22 fulfill=0.556 accept=0.556 KL=0.0008 clip=0.000
+  [train 700/1000] reward=0.301 moving_avg20=0.061 share=0.336 revPR=8.27 profitPR=1.72 gap(F2-F1)=0.23 fulfill=0.684 accept=0.684 KL=0.0022 clip=0.040
+  [train 800/1000] reward=-0.143 moving_avg20=0.003 share=0.236 revPR=4.49 profitPR=0.84 gap(F2-F1)=-0.10 fulfill=0.509 accept=0.509 KL=0.0010 clip=0.000
+  [train 900/1000] reward=0.283 moving_avg20=0.110 share=0.346 revPR=8.09 profitPR=1.67 gap(F2-F1)=0.60 fulfill=0.655 accept=0.655 KL=0.0037 clip=0.024
+  [train 1000/1000] reward=0.077 moving_avg20=0.227 share=0.300 revPR=5.52 profitPR=1.04 gap(F2-F1)=0.10 fulfill=0.597 accept=0.597 KL=0.0000 clip=0.000
+>>> Evaluating RL agent against static/heuristic opponent with shared profile pool...
+  [eval 20/200] reward=0.467 moving_avg20=0.315 share=0.390 revPR=8.17 gap(F2-F1)=0.05
+  [eval 40/200] reward=0.527 moving_avg20=0.280 share=0.409 revPR=7.86 gap(F2-F1)=0.02
+  [eval 60/200] reward=0.564 moving_avg20=0.397 share=0.414 revPR=8.28 gap(F2-F1)=0.24
+  [eval 80/200] reward=0.626 moving_avg20=0.444 share=0.419 revPR=10.62 gap(F2-F1)=0.88
+  [eval 100/200] reward=0.642 moving_avg20=0.434 share=0.437 revPR=9.52 gap(F2-F1)=0.35
+  [eval 120/200] reward=0.365 moving_avg20=0.298 share=0.375 revPR=6.84 gap(F2-F1)=-0.44
+  [eval 140/200] reward=0.268 moving_avg20=0.330 share=0.357 revPR=5.99 gap(F2-F1)=-0.30
+  [eval 160/200] reward=0.048 moving_avg20=0.348 share=0.304 revPR=4.99 gap(F2-F1)=-0.29
+  [eval 180/200] reward=0.326 moving_avg20=0.345 share=0.371 revPR=6.18 gap(F2-F1)=-0.63
+  [eval 200/200] reward=0.569 moving_avg20=0.251 share=0.421 revPR=8.81 gap(F2-F1)=0.28
+>>> Saved sampled profiles -> artifacts/test_runs/18_reward_rebalanced_full_ppo_profiles.csv (rows=200000)
+>>> Profile export capped at profiles_log_limit=200000 rows.
+>>> Training reward trajectory summary: min=-0.359, max=0.545, final=0.077
+>>> Testing reward trajectory summary: min=-0.377, max=0.734, final=0.569
+Experiment Complete.
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_training_diagnostics.csv
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_evaluation_diagnostics.csv
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_price_threshold_distribution.csv
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_dist_PriceThreshold.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_reward_training.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_reward_evaluation.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_training_business_diagnostics.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_training_ppo_diagnostics.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_training_coeff_airport_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_training_coeff_base_fare_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_training_coeff_booking_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_training_coeff_per_mile_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_training_coeff_per_minute_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_evaluation_business_diagnostics.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_evaluation_coeff_airport_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_evaluation_coeff_base_fare_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_evaluation_coeff_booking_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_evaluation_coeff_per_mile_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/test_runs/18_reward_rebalanced_full_ppo_evaluation_coeff_per_minute_trajectory.png
