@@ -2667,7 +2667,9 @@ class Core:
                 if self.firm1_mode == "RL":
                     s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
                     s_vec = self.firm1.stack_state(s_vec)
-                    action, s_ts, logits, val = self.firm1.agent.act(s_vec)
+                    # Evaluation/deployment runs should reflect the learned policy,
+                    # not PPO's training-time uniform exploration mixture.
+                    action, s_ts, logits, val = self.firm1.agent.act(s_vec, deterministic=True)
                     self.firm1.apply_action(action, self.market)
                     action_counts[int(action)] += 1
                     last_action = int(action)
@@ -2742,7 +2744,9 @@ class Core:
                     reward = float(reward_diag["reward"])
                     self.last_reward = reward
                     done = (t == timesteps_per_day - 1)
-                    self.firm1.agent.store(s_ts, action, float(reward), done, None, logits, val)
+                    # Do not append evaluation transitions to the PPO rollout buffer;
+                    # optimizer updates are training-only, and stale eval samples can
+                    # contaminate a later training continuation.
                     if done:
                         self.firm1.stabilize_after_batch(
                             share=float(m1.share),

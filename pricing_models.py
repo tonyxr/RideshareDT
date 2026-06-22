@@ -156,21 +156,31 @@ class FirmHeuristicPricer:
             chosen = preferred
             direction = +1
         else:
-            if "base_fare" in self.managed_keys and abs(float(self.overrides.base_fare) - base_target) > 0.15:
-                chosen = "base"
-                direction = +1 if float(self.overrides.base_fare) < base_target else -1
-            elif "per_minute" in self.managed_keys and abs(float(self.overrides.per_minute) - pmin_target) > 0.02:
-                chosen = "pmin"
-                direction = +1 if float(self.overrides.per_minute) < pmin_target else -1
-            elif "per_mile" in self.managed_keys and abs(float(self.overrides.per_mile) - pmile_target) > 0.08:
-                chosen = "pmile"
-                direction = +1 if float(self.overrides.per_mile) < pmile_target else -1
-            elif "booking_fee" in self.managed_keys and abs(float(self.overrides.booking_fee) - booking_target) > 0.12:
-                chosen = "booking"
-                direction = +1 if float(self.overrides.booking_fee) < booking_target else -1
-            elif "airport_fee" in self.managed_keys and abs(float(self.overrides.airport_fee) - airport_target) > 0.20:
-                chosen = "airport"
-                direction = +1 if float(self.overrides.airport_fee) < airport_target else -1
+            # Pick the most off-target managed coefficient instead of walking a
+            # fixed if/elif priority list.  The old priority meant base/minute
+            # corrections could permanently starve booking and airport fees,
+            # leaving them flat in coefficient trajectory plots even though they
+            # were listed as managed keys.
+            target_specs = [
+                ("base", "base_fare", base_target, 0.15),
+                ("pmin", "per_minute", pmin_target, 0.02),
+                ("pmile", "per_mile", pmile_target, 0.08),
+                ("booking", "booking_fee", booking_target, 0.04),
+                ("airport", "airport_fee", airport_target, 0.10),
+            ]
+            candidates = []
+            for action_name, coeff_name, target, tolerance in target_specs:
+                if coeff_name not in self.managed_keys:
+                    continue
+                curr = getattr(self.overrides, coeff_name)
+                if curr is None:
+                    continue
+                delta = float(target) - float(curr)
+                if abs(delta) >= float(tolerance):
+                    candidates.append((abs(delta) / max(float(tolerance), 1e-6), action_name, delta))
+            if candidates:
+                _, chosen, delta = max(candidates, key=lambda x: x[0])
+                direction = +1 if delta > 0.0 else -1
         
         if preferred == "base" and "base_fare" not in self.managed_keys:
             chosen = "pmin" if "per_minute" in self.managed_keys else None
@@ -199,6 +209,21 @@ class FirmHeuristicPricer:
         elif chosen == "airport" and "airport_fee" in self.managed_keys:
             self.overrides.airport_fee = float(np.clip(
                 float(self.overrides.airport_fee) + direction * self.step_airport_fee, *self.airport_bounds
+            ))
+        if "per_mile" in self.managed_keys and self.overrides.per_mile is not None:
+            self.overrides.per_mile = float(np.clip(
+                float(self.overrides.per_mile) + direction * (0.5 * self.step_per_mile),
+                *self.pmile_bounds,
+            ))
+        if "booking_fee" in self.managed_keys and self.overrides.booking_fee is not None:
+            self.overrides.booking_fee = float(np.clip(
+                float(self.overrides.booking_fee) + direction * (0.5 * self.step_booking_fee),
+                *self.booking_bounds,
+            ))
+        if "airport_fee" in self.managed_keys and self.overrides.airport_fee is not None:
+            self.overrides.airport_fee = float(np.clip(
+                float(self.overrides.airport_fee) + direction * (0.5 * self.step_airport_fee),
+                *self.airport_bounds,
             ))
 
         self.cooldown = self.cooldown_H
@@ -339,14 +364,20 @@ class FirmRLPricer:
 
         self.action_to_steps: Dict[int, Dict[str, int]] = {0: zero_steps()}
         macro_specs = [
+            {"base_fare": -1},
+            {"base_fare": +1},
+            {"booking_fee": -1},
+            {"booking_fee": +1},
             {"base_fare": -1, "booking_fee": -1},
             {"base_fare": +1, "booking_fee": +1},
             {"per_minute": -1, "per_mile": -1},
             {"per_minute": +1, "per_mile": +1},
-            {"base_fare": -1, "per_minute": -1, "per_mile": -1, "booking_fee": -1},
-            {"base_fare": +1, "per_minute": +1, "per_mile": +1, "booking_fee": +1},
             {"airport_fee": -1},
             {"airport_fee": +1},
+            {"base_fare": -1, "booking_fee": -1, "airport_fee": -1},
+            {"base_fare": +1, "booking_fee": +1, "airport_fee": +1},
+            {"base_fare": -1, "per_minute": -1, "per_mile": -1, "booking_fee": -1, "airport_fee": -1},
+            {"base_fare": +1, "per_minute": +1, "per_mile": +1, "booking_fee": +1, "airport_fee": +1},
         ]
         a_idx = 1
         for spec in macro_specs:
@@ -385,8 +416,8 @@ class FirmRLPricer:
             final_exploration_rate=0.01,
             exploration_fraction=0.80,
             exploration_warmup_fraction=0.20,
-            min_action_visits=12,
-            exploration_rescue_rate=0.15,
+            min_action_visits=20,
+            exploration_rescue_rate=0.18,
         )
         
     def reset_state_history(self) -> None:
@@ -469,9 +500,10 @@ class FirmRLPricer:
         lower_gap = min(target_gap - gap_tol, target_gap)
         upper_gap = target_gap + gap_tol
         overpricing = share_f < self.recovery_share_threshold or gap < max(self.recovery_gap_threshold, lower_gap)
+        over_discounting = gap > 1.50 and share_f >= self.recovery_share_threshold
         loss_buying_share = profit < 0.0 and share_f >= self.recovery_share_threshold and gap >= -0.50
         supply_stress = fulfill < 0.75 and profit >= -0.50
-        if not (overpricing or loss_buying_share or supply_stress):
+        if not (overpricing or over_discounting or loss_buying_share or supply_stress):
             return
 
         anchors = {
@@ -508,6 +540,17 @@ class FirmRLPricer:
                 move("airport_fee", -1)
             if gap < -2.00:
                 move("per_mile", -1, 0.75)
+            return
+        
+        if over_discounting:
+            # If the realized market gap is already wider than the intended
+            # modest discount, lift broad/fixed fare levers before allowing the
+            # policy to keep compensating through one distance-heavy coefficient.
+            move("base_fare", +1)
+            move("booking_fee", +1)
+            move("per_minute", +1, 0.5)
+            if gap > 2.25:
+                move("per_mile", +1, 0.5)
             return
 
         if loss_buying_share:
