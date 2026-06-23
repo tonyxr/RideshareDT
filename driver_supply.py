@@ -31,7 +31,7 @@ class DriverPayPolicy:
 
     fare_share: float = 0.72
     minimum_pay: float = 3.50
-
+    incentive_multiplier: float = 1.0
 
 @dataclass
 class DriverSupplyConfig:
@@ -220,7 +220,8 @@ class DriverSupplyLayer:
     ) -> float:
         del distance_miles, duration_minutes, pickup_minutes, airport
         policy = self.pay_policies[firm]
-        return float(max(policy.minimum_pay, policy.fare_share * max(0.0, float(rider_fare))))
+        base_pay = max(policy.minimum_pay, policy.fare_share * max(0.0, float(rider_fare)))
+        return float(max(policy.minimum_pay, base_pay * float(np.clip(policy.incentive_multiplier, 0.85, 1.25))))
 
     def driver_acceptance_ratio(
         self,

@@ -1731,6 +1731,7 @@ class Core:
                 "avg_wait_minutes": avg_wait,
                 "driver_acceptance_rate": avg_driver_accept,
                 "driver_pay_per_request": avg_driver_paypr,
+                "firm1_supply_incentive_multiplier": float(getattr(self.firm1, "supply_incentive_multiplier", 1.0)),
                 "driver_reward_scale": float(self.driver_reward_scale_current),
                 "last_action": int(last_action),
                 "dominant_action": dominant_action,
@@ -2442,6 +2443,10 @@ class Core:
         
         profiles = sampled_profiles if sampled_profiles is not None else self.agent_gen.sample_profiles(customers_per_step)
         if self.enable_driver_supply:
+            if self.firm1_mode == "RL" and hasattr(self.firm1, "supply_incentive_multiplier"):
+                self.driver_supply.pay_policies["Firm1"].incentive_multiplier = float(
+                    np.clip(self.firm1.supply_incentive_multiplier, 0.85, 1.25)
+                )
             self.driver_supply.begin_batch(customers_per_step=customers_per_step, hour=hour, weather=weather)
 
         for profile in profiles:

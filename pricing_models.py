@@ -348,14 +348,21 @@ class FirmRLPricer:
         self.base_max_relative_dev = 0.35
         self.converged_max_relative_dev = 0.25
         self.max_relative_dev = self.base_max_relative_dev
+        # Optional direct supply-side control: a bounded Firm1 driver-pay multiplier.
+        # This gives PPO one explicit lever for fulfillment/acceptance failures instead
+        # of forcing it to raise rider prices and lose demand whenever supply is tight.
+        self.supply_incentive_multiplier = 1.0
+        self.supply_step = 0.025
+        self.supply_min_multiplier = 0.90
+        self.supply_max_multiplier = 1.15
         self.recovery_share_threshold = 0.30
         self.recovery_gap_threshold = -0.05
         self.aggressive_actions = set()
         self.allow_aggressive_actions = True
         
         # Use a compact macro-action space so rewards map to clear pricing moves.
-        # The driver layer is observed but external: all actions still change only
-        # rider-facing fare coefficients, never driver-pay policy.
+        # The driver layer is observed, and PPO also gets a small direct
+        # supply-incentive action for driver-pay tuning when fulfillment fails.
         
         all_keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
         active_keys = [k for k in all_keys if k in self.opt_keys]
@@ -378,12 +385,16 @@ class FirmRLPricer:
             {"base_fare": +1, "booking_fee": +1, "airport_fee": +1},
             {"base_fare": -1, "per_minute": -1, "per_mile": -1, "booking_fee": -1, "airport_fee": -1},
             {"base_fare": +1, "per_minute": +1, "per_mile": +1, "booking_fee": +1, "airport_fee": +1},
+            {"supply_incentive": -1},
+            {"supply_incentive": +1},
         ]
         a_idx = 1
         for spec in macro_specs:
             action = zero_steps()
             for key, step in spec.items():
                 if key in action:
+                    action[key] = int(step)
+                elif key == "supply_incentive":
                     action[key] = int(step)
             if any(v != 0 for v in action.values()):
                 self.action_to_steps[a_idx] = action
@@ -579,7 +590,7 @@ class FirmRLPricer:
         if (not self.allow_aggressive_actions) and action in self.aggressive_actions:
             action = 0
         
-        step_map = {k: v for k, v in self.action_to_steps[action].items() if k in self.opt_keys}
+        step_map = dict(self.action_to_steps[action])
         if not step_map:
             self._last_applied_action = int(action)
             self._repeat_action_count = 0
@@ -597,23 +608,37 @@ class FirmRLPricer:
                 self.repeat_action_decay ** float(self._repeat_action_count - 1),
             )
 
-        scaled_steps = {k: self.config.step[k] * self.step_scale * repeat_scale for k in step_map.keys()}
-        bounds = {k: self.config.bounds[k] for k in step_map.keys()}
+        fare_step_map = {k: v for k, v in step_map.items() if k in self.opt_keys}
+        supply_step = int(step_map.get("supply_incentive", 0))
+        if supply_step:
+            self.supply_incentive_multiplier = float(np.clip(
+                self.supply_incentive_multiplier + supply_step * self.supply_step * self.step_scale * repeat_scale,
+                self.supply_min_multiplier,
+                self.supply_max_multiplier,
+            ))
+        if not fare_step_map:
+            self.last_action_normalized_gap = {"supply_incentive": float(supply_step) * self.supply_step} if supply_step else {}
+            return
+
+        scaled_steps = {k: self.config.step[k] * self.step_scale * repeat_scale for k in fare_step_map.keys()}
+        bounds = {k: self.config.bounds[k] for k in fare_step_map.keys()}
         # Detailed normalized one-unit gap per coefficient:
         # one step => config.step[k], normalized by feasible range width.
         self.last_action_normalized_gap = {
-            k: float(step_map[k]) * float(scaled_steps[k]) / max(1e-6, float(bounds[k][1] - bounds[k][0]))
-            for k in step_map.keys()
+            k: float(fare_step_map[k]) * float(scaled_steps[k]) / max(1e-6, float(bounds[k][1] - bounds[k][0]))
+            for k in fare_step_map.keys()
         }
+        if supply_step:
+            self.last_action_normalized_gap["supply_incentive"] = float(supply_step) * self.supply_step
         market_interaction.apply_step_actions_to_overrides(
             overrides=self.overrides,
-            action_steps=step_map,
+            action_steps=fare_step_map,
             step_size=scaled_steps,
             bounds=bounds,
         )
         
         base = market_interaction.curr_market
-        for key in step_map:
+        for key in fare_step_map:
             anchor = float(getattr(base, key))
             lb, ub = bounds[key]
             current = float(getattr(self.overrides, key))
