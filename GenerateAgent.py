@@ -40,6 +40,9 @@ class GenerateAgent:
             "p_new": 0.27,
         },
         "New York City": {
+            # NYC case-study prior from the calibration layer.  Other markets can
+            # use their own city entries, --calibration_csv, or no preset without
+            # changing the RL/MDP/optimizer code.
             "age_mean": float(NYC_AGENT_CAL.get("age_mean", 36.0)),
             "age_std": float(NYC_AGENT_CAL.get("age_std", 12.5)),
             "income_probs": [

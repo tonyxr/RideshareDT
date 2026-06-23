@@ -87,6 +87,7 @@ class PPOAgent:
         gamma: float = 0.99,
         lam: float = 0.95,
         clip_eps: float = 0.2,
+        final_clip_eps: float = 0.10,
         v_coeff: float = 0.5,
         ent_coeff: float = 0.01,
         min_ent_coeff: float = 0.001,
@@ -114,11 +115,14 @@ class PPOAgent:
         self.base_lr = float(lr)
         self.curr_lr = float(lr)
         self.min_lr = float(max(1e-6, min_lr))
-        self.max_lr = float(max_lr if max_lr is not None else max(lr, 6e-4))
+        self.initial_max_lr = float(max_lr if max_lr is not None else max(lr, 6e-4))
+        self.max_lr = self.initial_max_lr
 
         self.gamma = gamma
         self.lam = lam
-        self.clip_eps = clip_eps
+        self.initial_clip_eps = float(max(0.01, clip_eps))
+        self.final_clip_eps = float(np.clip(final_clip_eps, 0.01, self.initial_clip_eps))
+        self.clip_eps = self.initial_clip_eps
         self.v_coeff = v_coeff
         self.ent_coeff = ent_coeff
         self.max_ent_coeff = float(max(ent_coeff, min_ent_coeff))
@@ -235,7 +239,33 @@ class PPOAgent:
         if reward_converged:
             target = max(self.min_ent_coeff, 0.75 * target)
         self.ent_coeff = float(np.clip(min(self.ent_coeff, target), self.min_ent_coeff, self.max_ent_coeff))
+    
+    def adapt_optimization(self, progress: float, reward_converged: bool) -> None:
+        """Apply a conservative late-training schedule for PPO updates.
 
+        The environment can discover good pricing regimes but remain noisy.  A
+        cosine learning-rate cap lets early training move quickly while forcing
+        late updates to consolidate.  The clip range follows the same direction
+        so final policy edits are less disruptive.  KL/clip-based adaptation in
+        ``update`` can still lower the rate further, but cannot grow beyond the
+        scheduled cap.
+        """
+        p = float(np.clip(progress, 0.0, 1.0))
+        cosine = 0.5 * (1.0 + np.cos(np.pi * p))
+        scheduled_lr_cap = self.min_lr + (self.base_lr - self.min_lr) * cosine
+        if reward_converged:
+            scheduled_lr_cap = min(scheduled_lr_cap, self.min_lr * 1.5)
+        self.max_lr = float(np.clip(scheduled_lr_cap, self.min_lr, self.initial_max_lr))
+        if self.curr_lr > self.max_lr:
+            self.curr_lr = self.max_lr
+            for group in self.opt.param_groups:
+                group["lr"] = self.curr_lr
+
+        self.clip_eps = float(
+            self.final_clip_eps + (self.initial_clip_eps - self.final_clip_eps) * cosine
+        )
+        if reward_converged:
+            self.clip_eps = min(self.clip_eps, self.final_clip_eps)
 
     @torch.no_grad()
     def act(self, s_np: np.ndarray, deterministic: bool = False) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -322,6 +352,9 @@ class PPOAgent:
                 "entropy": 0.0,
                 "policy_entropy": 0.0,
                 "policy_entropy_fraction": float(self.last_policy_entropy_fraction),
+                "ent_coeff": float(self.ent_coeff),
+                "clip_eps": float(self.clip_eps),
+                "lr": float(self.curr_lr),
                 "exploration_rate": float(self.exploration_rate),
                 "action_coverage": self._action_coverage(),
             }
@@ -353,6 +386,7 @@ class PPOAgent:
             "clipfrac": 0.0,
             "explained_variance": 0.0,
             "ent_coeff": float(self.ent_coeff),
+            "clip_eps": float(self.clip_eps),
             "lr": float(self.curr_lr),
             "stopped_early_kl": False,
             "exploration_rate": float(self.exploration_rate),
@@ -471,6 +505,7 @@ class PPOAgent:
         self.ent_coeff = max(self.min_ent_coeff, self.ent_coeff * self.ent_decay)
 
         last["ent_coeff"] = float(self.ent_coeff)
+        last["clip_eps"] = float(self.clip_eps)
         last["lr"] = float(self.curr_lr)
         last["stopped_early_kl"] = bool(stop_for_kl)
         last["exploration_rate"] = float(self.exploration_rate)

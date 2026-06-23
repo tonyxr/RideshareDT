@@ -414,7 +414,8 @@ class FirmRLPricer:
             state_dim=state_dim,
             action_dim=action_dim,
             hidden_dim=192,
-            clip_eps=0.2,
+            clip_eps=0.20,
+            final_clip_eps=0.10,
             max_grad_norm=0.8,
             ent_coeff=0.030,
             min_ent_coeff=0.0008,
@@ -473,6 +474,7 @@ class FirmRLPricer:
         self.allow_aggressive_actions = not stable
         self.step_scale = self.converged_step_scale if stable else self.base_step_scale
         self.max_relative_dev = self.converged_max_relative_dev if stable else self.base_max_relative_dev
+        self.agent.adapt_optimization(progress=p, reward_converged=stable)
         self.agent.adapt_entropy(progress=p, reward_converged=stable)
         self.agent.adapt_exploration(
             progress=p,

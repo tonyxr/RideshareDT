@@ -387,6 +387,11 @@ class Core:
         constrained_reward: bool = True,
         constraint_lr: float = 0.03,
         constraint_penalty_scale: float = 0.35,
+        constraint_curriculum_start_scale: float = 0.25,
+        constraint_curriculum_mid_scale: float = 0.60,
+        constraint_curriculum_end_scale: float = 1.00,
+        gap_band_fraction: float = 0.75,
+        gap_penalty_scale_fraction: float = 0.75,
         ppo_batch_size: int = 128,
         ppo_update_epochs: int = 5,
         state_frame_stack: int = 4,
@@ -593,6 +598,11 @@ class Core:
         self.constrained_reward = bool(constrained_reward)
         self.constraint_lr = float(max(0.0, constraint_lr))
         self.constraint_penalty_scale = float(max(0.0, constraint_penalty_scale))
+        self.constraint_curriculum_start_scale = float(max(0.0, constraint_curriculum_start_scale))
+        self.constraint_curriculum_mid_scale = float(max(0.0, constraint_curriculum_mid_scale))
+        self.constraint_curriculum_end_scale = float(max(0.0, constraint_curriculum_end_scale))
+        self.gap_band_fraction = float(max(1e-6, gap_band_fraction))
+        self.gap_penalty_scale_fraction = float(max(1e-6, gap_penalty_scale_fraction))
         self.constraint_curriculum_scale = 1.0
         # Adaptive Lagrange multipliers for safety/service constraints.  These
         # make the reward a constrained-MDP objective instead of a fixed weighted
@@ -631,7 +641,11 @@ class Core:
             f"driver_warmup={self.driver_reward_warmup_fraction:.2f}, "
             f"constrained={int(self.constrained_reward)}, "
             f"constraint_lr={self.constraint_lr:.3f}, "
-            f"constraint_scale={self.constraint_penalty_scale:.2f}"
+            f"constraint_scale={self.constraint_penalty_scale:.2f}, "
+            f"constraint_curriculum=({self.constraint_curriculum_start_scale:.2f},"
+            f"{self.constraint_curriculum_mid_scale:.2f},{self.constraint_curriculum_end_scale:.2f}), "
+            f"gap_band_fraction={self.gap_band_fraction:.2f}, "
+            f"gap_penalty_scale_fraction={self.gap_penalty_scale_fraction:.2f}"
         )
         
     
@@ -803,7 +817,16 @@ class Core:
         fulfill = float(np.clip(self._finite_float(fulfillment_rate, 1.0), 0.0, 1.0))
         wait = max(0.0, self._finite_float(avg_wait_minutes))
         target_gap = float(self.reward_target_price_gap)
-        gap_band = max(0.75, float(self.reward_acceptable_discount))
+        # Keep the constrained-MDP gap band proportional to the configured
+        # acceptable-discount range rather than to any particular cached profile
+        # or one-off evaluation trajectory.
+        gap_band = float(
+            np.clip(
+                self.gap_band_fraction * float(self.reward_acceptable_discount),
+                0.25 * float(self.reward_acceptable_discount),
+                float(self.reward_acceptable_discount),
+            )
+        )
         return {
             "share_floor": self._smooth_positive_penalty(0.18 - share_f, scale=0.18),
             "fulfillment_floor": self._smooth_positive_penalty(0.78 - fulfill, scale=0.35),
@@ -827,12 +850,25 @@ class Core:
     def _configure_constraint_curriculum(self, progress: float) -> None:
         """Ramp constrained-RL pressure from easy curriculum to full realism."""
         p = float(np.clip(progress, 0.0, 1.0))
+        # Use a smooth, configurable curriculum instead of thresholds fitted to
+        # one cached profile pool.  The defaults ramp to the user-provided base
+        # penalty; callers can set a stronger end scale for stricter studies.
         if p < 0.25:
-            self.constraint_curriculum_scale = 0.25
+            self.constraint_curriculum_scale = self.constraint_curriculum_start_scale
         elif p < 0.60:
-            self.constraint_curriculum_scale = 0.60
+            mid_progress = (p - 0.25) / 0.35
+            self.constraint_curriculum_scale = float(
+                self.constraint_curriculum_start_scale
+                + (self.constraint_curriculum_mid_scale - self.constraint_curriculum_start_scale)
+                * np.clip(mid_progress, 0.0, 1.0)
+            )
         else:
-            self.constraint_curriculum_scale = 1.0
+            late_progress = (p - 0.60) / 0.40
+            self.constraint_curriculum_scale = float(
+                self.constraint_curriculum_mid_scale
+                + (self.constraint_curriculum_end_scale - self.constraint_curriculum_mid_scale)
+                * np.clip(late_progress, 0.0, 1.0)
+            )
 
 
     def _reward_components(
@@ -882,8 +918,17 @@ class Core:
         # the acceptable discount is $2. This gives the agent one clear target
         # instead of separate and potentially conflicting over/underprice rules.
         price_gap_deviation = float(gap - self.reward_target_price_gap)
+        # Penalize target-gap drift at a scale tied to the configured acceptable
+        # discount, not to the particular threshold sample used in one run.
+        gap_penalty_scale = float(
+            np.clip(
+                self.gap_penalty_scale_fraction * self.reward_acceptable_discount,
+                0.25 * self.reward_acceptable_discount,
+                self.reward_acceptable_discount,
+            )
+        )
         price_gap_penalty = self._smooth_positive_penalty(
-            abs(price_gap_deviation), scale=max(1.0, self.reward_acceptable_discount)
+            abs(price_gap_deviation), scale=gap_penalty_scale
         )
         margin_shortfall = float(
             max(0.0, self.min_profit_margin - margin) / max(self.min_profit_margin, 1e-6)
@@ -964,6 +1009,10 @@ class Core:
             "reward_target_price_gap": float(self.reward_target_price_gap),
             "reward_price_gap_deviation": float(price_gap_deviation),
             "reward_price_gap_penalty": float(price_gap_penalty),
+            "reward_gap_penalty_scale": float(gap_penalty_scale),
+            "reward_price_gap_abs_error": float(abs(price_gap_deviation)),
+            "reward_gap_violation_025": float(abs(price_gap_deviation) > 0.25),
+            "reward_gap_violation_050": float(abs(price_gap_deviation) > 0.50),
             "reward_fulfillment_term": float(fulfillment_term),
             "reward_profit_term": float(profit_term),
             "reward_served_share": float(served_share),
@@ -1586,7 +1635,7 @@ class Core:
                 f"(~{update_every * max(1, int(train_steps_per_day))} transitions/update)."
             )
         
-        print(">>> Training RL agent on synthetic NYC-calibrated sampling (day/timestep cadence)...")
+        print(f">>> Training RL agent on synthetic {self.market_name} sampling (day/timestep cadence)...")
         reward_history: List[float] = []
         sampled_profile_rows: List[Dict[str, Any]] = []
         profile_limit_reached = False
@@ -1753,6 +1802,10 @@ class Core:
                     "reward_price_discipline_penalty",
                     "reward_price_gap_deviation",
                     "reward_price_gap_penalty",
+                    "reward_gap_penalty_scale",
+                    "reward_price_gap_abs_error",
+                    "reward_gap_violation_025",
+                    "reward_gap_violation_050",
                     "reward_served_share",
                     "reward_driver_unfulfilled_penalty",
                     "reward_driver_unfulfilled_component",
@@ -1835,6 +1888,10 @@ class Core:
                 "avg_rev_per_request": avg_revpr,
                 "avg_profit_per_request": avg_profitpr,
                 "avg_price_gap_f2_minus_f1": avg_gap,
+                "avg_price_gap_abs_error": float(abs(avg_gap - self.reward_target_price_gap)),
+                "avg_gap_violation_025": float(abs(avg_gap - self.reward_target_price_gap) > 0.25),
+                "avg_gap_violation_050": float(abs(avg_gap - self.reward_target_price_gap) > 0.50),
+                "constraint_curriculum_scale": float(self.constraint_curriculum_scale),
                 "avg_fulfillment_rate": avg_fulfillment,
                 "avg_wait_minutes": avg_wait,
                 "driver_acceptance_rate": avg_driver_accept,
@@ -1855,6 +1912,7 @@ class Core:
                 "ppo_policy_entropy": float(ppo_metrics.get("policy_entropy", 0.0)),
                 "ppo_policy_entropy_fraction": float(ppo_metrics.get("policy_entropy_fraction", 1.0)),
                 "ppo_ent_coeff": float(ppo_metrics.get("ent_coeff", 0.0)),
+                "ppo_clip_eps": float(ppo_metrics.get("clip_eps", 0.0)),
                 "ppo_exploration_rate": float(ppo_metrics.get("exploration_rate", 0.0)),
                 "ppo_action_coverage": float(ppo_metrics.get("action_coverage", 0.0)),
                 "ppo_explained_variance": float(ppo_metrics.get("explained_variance", 0.0)),
@@ -2028,6 +2086,10 @@ class Core:
                 "reward_share_component": float(reward_diag.get("reward_share_component", 0.0)),
                 "reward_profit_component": float(reward_diag.get("reward_profit_component", 0.0)),
                 "reward_price_gap_penalty": float(reward_diag.get("reward_price_gap_penalty", 0.0)),
+                "reward_gap_penalty_scale": float(reward_diag.get("reward_gap_penalty_scale", 0.0)),
+                "reward_price_gap_abs_error": float(reward_diag.get("reward_price_gap_abs_error", 0.0)),
+                "reward_gap_violation_025": float(reward_diag.get("reward_gap_violation_025", 0.0)),
+                "reward_gap_violation_050": float(reward_diag.get("reward_gap_violation_050", 0.0)),
                 "reward_driver_unfulfilled_component": float(reward_diag.get("reward_driver_unfulfilled_component", 0.0)),
                 "reward_collapse_component": float(reward_diag.get("reward_collapse_component", 0.0)),
                 "reward_adaptive_constraint_penalty": float(reward_diag.get("reward_adaptive_constraint_penalty", 0.0)),
@@ -2051,6 +2113,10 @@ class Core:
                 "rl_driver_pay_per_request": float(m1.driver_pay / max(1, m1.total)),
                 "driver_reward_scale": float(self.driver_reward_scale_current),
                 "price_gap_f2_minus_f1": float(mean_gap),
+                "price_gap_abs_error": float(abs(float(mean_gap) - self.reward_target_price_gap)),
+                "gap_violation_025": float(abs(float(mean_gap) - self.reward_target_price_gap) > 0.25),
+                "gap_violation_050": float(abs(float(mean_gap) - self.reward_target_price_gap) > 0.50),
+                "constraint_curriculum_scale": float(self.constraint_curriculum_scale),
                 "action": int(action),
             }
             for k in self.shared_edit_keys:
@@ -2942,6 +3008,10 @@ class Core:
                     "reward_price_discipline_penalty",
                     "reward_price_gap_deviation",
                     "reward_price_gap_penalty",
+                    "reward_gap_penalty_scale",
+                    "reward_price_gap_abs_error",
+                    "reward_gap_violation_025",
+                    "reward_gap_violation_050",
                     "reward_served_share",
                     "reward_driver_unfulfilled_penalty",
                     "reward_driver_unfulfilled_component",
@@ -3038,6 +3108,10 @@ class Core:
                 "avg_revpr": float(avg_revpr),
                 "avg_profitpr": float(avg_profitpr),
                 "avg_gap": float(avg_gap),
+                "avg_gap_abs_error": float(abs(avg_gap - self.reward_target_price_gap)),
+                "avg_gap_violation_025": float(abs(avg_gap - self.reward_target_price_gap) > 0.25),
+                "avg_gap_violation_050": float(abs(avg_gap - self.reward_target_price_gap) > 0.50),
+                "constraint_curriculum_scale": float(self.constraint_curriculum_scale),
                 "avg_no_ride_share": float(avg_no_ride_share),
                 "avg_fulfillment_rate": float(avg_fulfillment),
                 "avg_wait_minutes": float(avg_wait),
@@ -3059,6 +3133,7 @@ class Core:
                 "ppo_policy_entropy": float(ppo_metrics.get("policy_entropy", 0.0)),
                 "ppo_policy_entropy_fraction": float(ppo_metrics.get("policy_entropy_fraction", 1.0)),
                 "ppo_ent_coeff": float(ppo_metrics.get("ent_coeff", 0.0)),
+                "ppo_clip_eps": float(ppo_metrics.get("clip_eps", 0.0)),
                 "ppo_exploration_rate": float(ppo_metrics.get("exploration_rate", 0.0)),
                 "ppo_action_coverage": float(ppo_metrics.get("action_coverage", 0.0)),
                 "ppo_explained_variance": float(ppo_metrics.get("explained_variance", 0.0)),
@@ -3729,6 +3804,11 @@ def main():
     parser.add_argument("--disable_constrained_reward", action="store_true", help="Disable adaptive Lagrangian constraint penalties in the RL reward.")
     parser.add_argument("--constraint_lr", type=float, default=0.03, help="Learning rate for adaptive constrained-RL Lagrange multipliers.")
     parser.add_argument("--constraint_penalty_scale", type=float, default=0.35, help="Global scale for adaptive constrained-RL penalties.")
+    parser.add_argument("--constraint_curriculum_start_scale", type=float, default=0.25, help="Constraint curriculum scale used during early exploration.")
+    parser.add_argument("--constraint_curriculum_mid_scale", type=float, default=0.60, help="Constraint curriculum scale reached by mid-training.")
+    parser.add_argument("--constraint_curriculum_end_scale", type=float, default=1.00, help="Constraint curriculum scale at the end of training; increase above 1 for stricter final consolidation.")
+    parser.add_argument("--gap_band_fraction", type=float, default=0.75, help="Fraction of reward_acceptable_discount allowed before adaptive gap-band violations activate.")
+    parser.add_argument("--gap_penalty_scale_fraction", type=float, default=0.75, help="Fraction of reward_acceptable_discount used as the smooth direct price-gap penalty scale.")
     parser.add_argument("--threshold_cache_path", type=str, default="", help="Optional JSONL path for cached GPT/fallback threshold-enriched profiles.")
     parser.add_argument("--threshold_profile_source", type=str, default="generated", choices=["generated", "cached"], help="Use completely newly generated threshold profiles, or load threshold profiles from --threshold_cache_path.")
     parser.add_argument("--reuse_threshold_cache", action="store_true", help="Deprecated alias for --threshold_profile_source cached.")
@@ -3741,7 +3821,7 @@ def main():
     parser.add_argument("--gpt_threshold_failure_pause", type=float, default=1.0, help="Seconds to pause after a failed GPT threshold batch before sending the next batch; helps avoid connection-refused cascades.")
     parser.add_argument("--calibration_csv", type=str, default="", help="Optional historical CSV used to calibrate priors and choice sensitivity.")
     parser.add_argument("--calibration_city", type=str, default="", help="Optional city filter for --calibration_csv; defaults to --market if omitted.")
-    parser.add_argument("--calibration_preset", type=str, default="nyc_public", choices=["", "nyc_public"], help="Built-in preset calibration. Defaults to nyc_public (NYC TLC + ACS + weather priors).")
+    parser.add_argument("--calibration_preset", type=str, default="", choices=["", "nyc_public"], help="Optional built-in calibration preset. Use nyc_public explicitly for NYC TLC + ACS + weather priors.")
     parser.add_argument("--compare_with_dataset", action="store_true", help="After training/run, compare RL-implied prices against actual paid prices in the Kaggle rideshare dataset files.")
     parser.add_argument("--dataset_glob", type=str, default="*.parquet", help="Glob for dataset file discovery under kagglehub download path.")
     parser.add_argument(
@@ -3829,6 +3909,11 @@ def main():
         constrained_reward=not args.disable_constrained_reward,
         constraint_lr=args.constraint_lr,
         constraint_penalty_scale=args.constraint_penalty_scale,
+        constraint_curriculum_start_scale=args.constraint_curriculum_start_scale,
+        constraint_curriculum_mid_scale=args.constraint_curriculum_mid_scale,
+        constraint_curriculum_end_scale=args.constraint_curriculum_end_scale,
+        gap_band_fraction=args.gap_band_fraction,
+        gap_penalty_scale_fraction=args.gap_penalty_scale_fraction,
         ppo_batch_size=args.ppo_batch_size,
         ppo_update_epochs=args.ppo_update_epochs,
         state_frame_stack=args.state_frame_stack,
