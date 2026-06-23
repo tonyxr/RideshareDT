@@ -401,13 +401,12 @@ class FirmRLPricer:
                 a_idx += 1
         action_dim = len(self.action_to_steps)
         
-        # State encoder emits 20 target-centered market/service features, eight
-        # direct supply-state features, plus normalized fare-coefficient deltas
-        # for the active rider-price knobs.  Frame stacking appends recent encoded
-        # states so PPO can infer short-run trends in driver supply, fulfillment,
-        # competitor response, and previous price pressure without requiring an
-        # LSTM/recurrent policy.
-        self.single_state_dim = 28 + len(active_keys)
+        # direct supply-state features, five normalized fare-coefficient deltas,
+        # ten belief/action-memory stress features, and seven constrained-MDP
+        # context features. Frame stacking appends recent encoded states so PPO
+        # can infer hidden demand/supply feedback without requiring a recurrent
+        # policy.
+        self.single_state_dim = 50
         state_dim = self.single_state_dim * self.state_frame_stack
 
         # Initialize PPO agent.
@@ -429,6 +428,16 @@ class FirmRLPricer:
             exploration_warmup_fraction=0.20,
             min_action_visits=20,
             exploration_rescue_rate=0.18,
+        )
+        
+    def last_action_magnitude(self) -> float:
+        """Return the normalized size of the most recently applied action."""
+        return float(
+            np.clip(
+                sum(abs(v) for v in getattr(self, "last_action_normalized_gap", {}).values()),
+                0.0,
+                1.0,
+            )
         )
         
     def reset_state_history(self) -> None:

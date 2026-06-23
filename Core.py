@@ -384,6 +384,9 @@ class Core:
         driver_reward_reject_weight: float = 0.03,
         driver_reward_unfulfilled_weight: float = 0.12,
         driver_reward_warmup_fraction: float = 0.30,
+        constrained_reward: bool = True,
+        constraint_lr: float = 0.03,
+        constraint_penalty_scale: float = 0.35,
         ppo_batch_size: int = 128,
         ppo_update_epochs: int = 5,
         state_frame_stack: int = 4,
@@ -587,6 +590,22 @@ class Core:
         self.driver_reward_unfulfilled_weight = float(max(0.0, driver_reward_unfulfilled_weight))
         self.driver_reward_warmup_fraction = float(np.clip(driver_reward_warmup_fraction, 0.0, 1.0))
         self.driver_reward_scale_current = 1.0 if self.driver_reward_warmup_fraction <= 0.0 else 0.0
+        self.constrained_reward = bool(constrained_reward)
+        self.constraint_lr = float(max(0.0, constraint_lr))
+        self.constraint_penalty_scale = float(max(0.0, constraint_penalty_scale))
+        self.constraint_curriculum_scale = 1.0
+        # Adaptive Lagrange multipliers for safety/service constraints.  These
+        # make the reward a constrained-MDP objective instead of a fixed weighted
+        # sum: pressure rises only when the observed stochastic layer violates a
+        # service floor, then decays when the policy recovers.
+        self.constraint_lambdas: Dict[str, float] = {
+            "share_floor": 0.10,
+            "fulfillment_floor": 0.08,
+            "wait_limit": 0.04,
+            "gap_band": 0.08,
+            "margin_floor": 0.06,
+        }
+        self.constraint_lambda_max = 0.60
         
         # Keep PPO optimization controls explicit so longer rollout windows can
         # use minibatches instead of silently falling back to full-batch updates.
@@ -609,7 +628,10 @@ class Core:
             f"driver_reject={self.driver_reward_reject_weight:.2f}, "
             f"driver_unfulfilled={self.driver_reward_unfulfilled_weight:.2f}, "
             f"action_change={self.reward_action_change_weight:.2f}, "
-            f"driver_warmup={self.driver_reward_warmup_fraction:.2f}"
+            f"driver_warmup={self.driver_reward_warmup_fraction:.2f}, "
+            f"constrained={int(self.constrained_reward)}, "
+            f"constraint_lr={self.constraint_lr:.3f}, "
+            f"constraint_scale={self.constraint_penalty_scale:.2f}"
         )
         
     
@@ -765,6 +787,53 @@ class Core:
         except (TypeError, ValueError):
             return float(default)
         return out if np.isfinite(out) else float(default)
+    
+    def _constraint_violations(
+        self,
+        share: float,
+        price_gap_f2_minus_f1: float,
+        profit_margin: float,
+        fulfillment_rate: float,
+        avg_wait_minutes: float,
+    ) -> Dict[str, float]:
+        """Return normalized constrained-MDP violations from observable outputs."""
+        share_f = float(np.clip(self._finite_float(share), 0.0, 1.0))
+        gap = self._finite_float(price_gap_f2_minus_f1)
+        margin = self._finite_float(profit_margin)
+        fulfill = float(np.clip(self._finite_float(fulfillment_rate, 1.0), 0.0, 1.0))
+        wait = max(0.0, self._finite_float(avg_wait_minutes))
+        target_gap = float(self.reward_target_price_gap)
+        gap_band = max(0.75, float(self.reward_acceptable_discount))
+        return {
+            "share_floor": self._smooth_positive_penalty(0.18 - share_f, scale=0.18),
+            "fulfillment_floor": self._smooth_positive_penalty(0.78 - fulfill, scale=0.35),
+            "wait_limit": self._smooth_positive_penalty(wait - 7.0, scale=7.0),
+            "gap_band": self._smooth_positive_penalty(abs(gap - target_gap) - gap_band, scale=gap_band),
+            "margin_floor": self._smooth_positive_penalty(
+                max(0.0, self.min_profit_margin - margin) / max(self.min_profit_margin, 1e-6),
+                scale=1.0,
+            ),
+        }
+
+    def _update_constraint_multipliers(self, reward_diag: Dict[str, float]) -> None:
+        """Lagrangian update for observed service/safety constraint pressure."""
+        if not self.constrained_reward or self.constraint_lr <= 0.0:
+            return
+        for key in list(self.constraint_lambdas.keys()):
+            violation = float(reward_diag.get(f"constraint_violation_{key}", 0.0))
+            new_value = (0.995 * float(self.constraint_lambdas[key])) + self.constraint_lr * violation
+            self.constraint_lambdas[key] = float(np.clip(new_value, 0.0, self.constraint_lambda_max))
+
+    def _configure_constraint_curriculum(self, progress: float) -> None:
+        """Ramp constrained-RL pressure from easy curriculum to full realism."""
+        p = float(np.clip(progress, 0.0, 1.0))
+        if p < 0.25:
+            self.constraint_curriculum_scale = 0.25
+        elif p < 0.60:
+            self.constraint_curriculum_scale = 0.60
+        else:
+            self.constraint_curriculum_scale = 1.0
+
 
     def _reward_components(
         self,
@@ -820,6 +889,24 @@ class Core:
             max(0.0, self.min_profit_margin - margin) / max(self.min_profit_margin, 1e-6)
         )
         unfulfilled_penalty = self._smooth_positive_penalty(0.75 - fulfillment_term, scale=0.35)
+        collapse_penalty = self._smooth_positive_penalty(0.12 - served_share, scale=0.12)
+        constraint_violations = self._constraint_violations(
+            share=served_share,
+            price_gap_f2_minus_f1=gap,
+            profit_margin=margin,
+            fulfillment_rate=fulfillment_term,
+            avg_wait_minutes=avg_wait_minutes,
+        )
+        adaptive_constraint_penalty = 0.0
+        if self.constrained_reward:
+            adaptive_constraint_penalty = float(
+                self.constraint_penalty_scale
+                * self.constraint_curriculum_scale
+                * sum(
+                    float(self.constraint_lambdas.get(k, 0.0)) * float(v)
+                    for k, v in constraint_violations.items()
+                )
+            )
         margin_penalty = self._smooth_positive_penalty(margin_shortfall, scale=1.0)
         price_discipline_penalty = max(price_gap_penalty, margin_penalty)
         # The average is deliberately the complete business objective: completed
@@ -848,6 +935,7 @@ class Core:
             * (1.0 - float(np.clip(driver_acceptance_rate, 0.0, 1.0)))
         )
         direct_unfulfilled_penalty = driver_scale * self.driver_reward_unfulfilled_weight * unfulfilled_penalty
+        collapse_component = 0.10 * collapse_penalty
         action_change_penalty = self.reward_action_change_weight * float(
             np.clip(self._finite_float(action_change_magnitude), 0.0, 1.0)
         )
@@ -860,6 +948,8 @@ class Core:
             - wait_penalty
             - rejection_penalty
             - direct_unfulfilled_penalty
+            - collapse_component
+            - adaptive_constraint_penalty
             - action_change_penalty
         )
         base = float(np.clip(raw, -1.0, 1.0))
@@ -879,6 +969,11 @@ class Core:
             "reward_served_share": float(served_share),
             "reward_driver_unfulfilled_penalty": float(unfulfilled_penalty),
             "reward_driver_unfulfilled_component": float(direct_unfulfilled_penalty),
+            "reward_collapse_penalty": float(collapse_penalty),
+            "reward_collapse_component": float(collapse_component),
+            "reward_adaptive_constraint_penalty": float(adaptive_constraint_penalty),
+            **{f"constraint_violation_{k}": float(v) for k, v in constraint_violations.items()},
+            **{f"constraint_lambda_{k}": float(v) for k, v in self.constraint_lambdas.items()},
             "reward_action_change_penalty": float(action_change_penalty),
             "reward_driver_fulfillment_component": float(fulfillment_component),
             "reward_driver_wait_penalty": float(wait_penalty),
@@ -1013,6 +1108,7 @@ class Core:
         )
         reward = float(diagnostics["reward"])
         self.last_reward = reward
+        self._update_constraint_multipliers(diagnostics)
         return reward
     
     def _initialize_run_distributions(self) -> None:
@@ -1522,6 +1618,8 @@ class Core:
         }
 
         for d in range(train_timesteps):
+            train_progress = float(d + 1) / max(1.0, float(train_timesteps))
+            self._configure_constraint_curriculum(train_progress)
             warmup_days = max(1.0, float(train_timesteps) * self.driver_reward_warmup_fraction)
             self.driver_reward_scale_current = float(np.clip((d + 1) / warmup_days, 0.0, 1.0)) if self.enable_driver_supply else 0.0
             day_ctx = self.market.sample_day_context()
@@ -1557,6 +1655,7 @@ class Core:
                     s_vec = self.firm1.stack_state(s_vec)
                     action, s_ts, logits, val = self.firm1.agent.act(s_vec)
                     self.firm1.apply_action(action, self.market)
+                    self._project_rl_action_before_batch(base)
                     action_counts[int(action)] += 1
                     last_action = int(action)
                     rl_step = (action, s_ts, logits, val)
@@ -1610,6 +1709,7 @@ class Core:
                     action, s_ts, logits, val = rl_step
                     reward = float(reward_diag["reward"])
                     self.last_reward = reward
+                    self._update_constraint_multipliers(reward_diag)
                     done = (t == len(hours) - 1)
                     self.firm1.agent.store(s_ts, action, reward, done, None, logits, val)
                     if done:
@@ -1656,6 +1756,14 @@ class Core:
                     "reward_served_share",
                     "reward_driver_unfulfilled_penalty",
                     "reward_driver_unfulfilled_component",
+                    "reward_collapse_penalty",
+                    "reward_collapse_component",
+                    "reward_adaptive_constraint_penalty",
+                    "constraint_violation_share_floor",
+                    "constraint_violation_fulfillment_floor",
+                    "constraint_violation_wait_limit",
+                    "constraint_violation_gap_band",
+                    "constraint_violation_margin_floor",
                     "reward_action_change_penalty",
                     "reward_driver_fulfillment_component",
                     "reward_driver_wait_penalty",
@@ -1831,6 +1939,7 @@ class Core:
                 s_vec = self.firm1.stack_state(s_vec)
                 action, *_ = self.firm1.agent.act(s_vec, deterministic=True)
                 self.firm1.apply_action(action, self.market)
+                self._project_rl_action_before_batch(base)
                 action = int(action)
             elif self.firm1_mode != "static":
                 self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
@@ -1916,6 +2025,20 @@ class Core:
                 "reward_share_delta": float(reward_diag["reward_share_delta"]),
                 "reward_rev_delta": float(reward_diag["reward_rev_delta"]),
                 "reward_efficiency_term": float(reward_diag["reward_efficiency_term"]),
+                "reward_share_component": float(reward_diag.get("reward_share_component", 0.0)),
+                "reward_profit_component": float(reward_diag.get("reward_profit_component", 0.0)),
+                "reward_price_gap_penalty": float(reward_diag.get("reward_price_gap_penalty", 0.0)),
+                "reward_driver_unfulfilled_component": float(reward_diag.get("reward_driver_unfulfilled_component", 0.0)),
+                "reward_collapse_component": float(reward_diag.get("reward_collapse_component", 0.0)),
+                "reward_adaptive_constraint_penalty": float(reward_diag.get("reward_adaptive_constraint_penalty", 0.0)),
+                "constraint_violation_share_floor": float(reward_diag.get("constraint_violation_share_floor", 0.0)),
+                "constraint_violation_fulfillment_floor": float(
+                    reward_diag.get("constraint_violation_fulfillment_floor", 0.0)
+                ),
+                "constraint_violation_wait_limit": float(reward_diag.get("constraint_violation_wait_limit", 0.0)),
+                "constraint_violation_gap_band": float(reward_diag.get("constraint_violation_gap_band", 0.0)),
+                "constraint_violation_margin_floor": float(reward_diag.get("constraint_violation_margin_floor", 0.0)),
+                "reward_action_change_penalty": float(reward_diag.get("reward_action_change_penalty", 0.0)),
                 "rl_share": float(m1.share),
                 "heuristic_share": float(m2.share),
                 "rl_revenue": float(m1.rev_per_request),
@@ -2340,6 +2463,7 @@ class Core:
             s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
             action, s_ts, logits, val = self.firm1.agent.act(s_vec)
             self.firm1.apply_action(action, self.market)
+            self._project_rl_action_before_batch(self.market.curr_market)
             rl_step = (action, s_ts, logits, val)
         elif self.firm1_mode != "static":
             self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
@@ -2421,6 +2545,44 @@ class Core:
             firm1_last_wait=float(self.last_wait),
             firm1_last_driver_paypr=float(self.last_driver_paypr),
             driver_state_vec=self.driver_supply.state_features_for_firm1() if self.enable_driver_supply else None,
+            supply_incentive_multiplier=float(getattr(self.firm1, "supply_incentive_multiplier", 1.0)),
+            last_action_magnitude=float(
+                self.firm1.last_action_magnitude() if hasattr(self.firm1, "last_action_magnitude") else 0.0
+            ),
+            repeat_action_count=float(getattr(self.firm1, "_repeat_action_count", 0)),
+            max_relative_dev=float(getattr(self.firm1, "max_relative_dev", 0.35)),
+            constraint_multipliers=np.asarray(
+                [
+                    self.constraint_lambdas[k] / max(self.constraint_lambda_max, 1e-6)
+                    for k in sorted(self.constraint_lambdas)
+                ],
+                dtype=np.float32,
+            ),
+            constraint_curriculum_scale=float(self.constraint_curriculum_scale),
+        )
+
+    def _project_rl_action_before_batch(self, base) -> None:
+        """Project cumulative RL controls back toward a safe operating region.
+
+        The simulator has hidden supply/demand dynamics and delayed reactions.
+        This pre-simulation projection uses only the last observable subsystem
+        outputs, so it preserves the POMDP setting while preventing deterministic
+        repeated actions from walking prices into a collapsed state before the
+        reward can teach recovery.
+        """
+        if self.firm1_mode != "RL" or not hasattr(self.firm1, "stabilize_after_batch"):
+            return
+        self.firm1.stabilize_after_batch(
+            share=float(self.last_share),
+            price_gap_f2_minus_f1=float(self.last_gap),
+            city_base=float(base.base_fare),
+            city_pmin=float(base.per_minute),
+            city_pmile=float(base.per_mile),
+            city_booking=float(base.booking_fee),
+            city_airport=float(base.airport_fee),
+            profit_per_request=float(self.last_profitpr),
+            fulfillment_rate=float(self.last_fulfillment),
+            target_price_gap=float(self.reward_target_price_gap),
         )
 
     def simulate_batch(
@@ -2641,6 +2803,8 @@ class Core:
         self.driver_reward_scale_current = 1.0 if self.enable_driver_supply else 0.0
         
         for d in range(days):
+            train_progress = float(d + 1) / max(1.0, float(days))
+            self._configure_constraint_curriculum(train_progress)
             day_ctx = self.market.sample_day_context()
             hours = [self.market.sample_timestep_hour().hour for _ in range(timesteps_per_day)]
 
@@ -2676,6 +2840,7 @@ class Core:
                     # not PPO's training-time uniform exploration mixture.
                     action, s_ts, logits, val = self.firm1.agent.act(s_vec, deterministic=True)
                     self.firm1.apply_action(action, self.market)
+                    self._project_rl_action_before_batch(base)
                     action_counts[int(action)] += 1
                     last_action = int(action)
                     rl_step = (action, s_ts, logits, val)
@@ -2748,6 +2913,7 @@ class Core:
                     action, s_ts, logits, val = rl_step
                     reward = float(reward_diag["reward"])
                     self.last_reward = reward
+                    self._update_constraint_multipliers(reward_diag)
                     done = (t == timesteps_per_day - 1)
                     # Do not append evaluation transitions to the PPO rollout buffer;
                     # optimizer updates are training-only, and stale eval samples can
@@ -2779,6 +2945,14 @@ class Core:
                     "reward_served_share",
                     "reward_driver_unfulfilled_penalty",
                     "reward_driver_unfulfilled_component",
+                    "reward_collapse_penalty",
+                    "reward_collapse_component",
+                    "reward_adaptive_constraint_penalty",
+                    "constraint_violation_share_floor",
+                    "constraint_violation_fulfillment_floor",
+                    "constraint_violation_wait_limit",
+                    "constraint_violation_gap_band",
+                    "constraint_violation_margin_floor",
                     "reward_action_change_penalty",
                     "reward_driver_fulfillment_component",
                     "reward_driver_wait_penalty",
@@ -3552,6 +3726,9 @@ def main():
     parser.add_argument("--driver_reward_reject_weight", type=float, default=0.03, help="Reward penalty weight for driver rejection when driver supply is enabled.")
     parser.add_argument("--driver_reward_unfulfilled_weight", type=float, default=0.12, help="Direct penalty weight for fulfillment shortfall below the driver-service target.")
     parser.add_argument("--driver_reward_warmup_fraction", type=float, default=0.30, help="Fraction of training over which driver reward terms ramp from zero to full strength.")
+    parser.add_argument("--disable_constrained_reward", action="store_true", help="Disable adaptive Lagrangian constraint penalties in the RL reward.")
+    parser.add_argument("--constraint_lr", type=float, default=0.03, help="Learning rate for adaptive constrained-RL Lagrange multipliers.")
+    parser.add_argument("--constraint_penalty_scale", type=float, default=0.35, help="Global scale for adaptive constrained-RL penalties.")
     parser.add_argument("--threshold_cache_path", type=str, default="", help="Optional JSONL path for cached GPT/fallback threshold-enriched profiles.")
     parser.add_argument("--threshold_profile_source", type=str, default="generated", choices=["generated", "cached"], help="Use completely newly generated threshold profiles, or load threshold profiles from --threshold_cache_path.")
     parser.add_argument("--reuse_threshold_cache", action="store_true", help="Deprecated alias for --threshold_profile_source cached.")
@@ -3649,6 +3826,9 @@ def main():
         driver_reward_reject_weight=args.driver_reward_reject_weight,
         driver_reward_unfulfilled_weight=args.driver_reward_unfulfilled_weight,
         driver_reward_warmup_fraction=args.driver_reward_warmup_fraction,
+        constrained_reward=not args.disable_constrained_reward,
+        constraint_lr=args.constraint_lr,
+        constraint_penalty_scale=args.constraint_penalty_scale,
         ppo_batch_size=args.ppo_batch_size,
         ppo_update_epochs=args.ppo_update_epochs,
         state_frame_stack=args.state_frame_stack,

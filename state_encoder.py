@@ -45,6 +45,12 @@ def build_state_vector(
     firm1_last_wait: float = 0.0,
     firm1_last_driver_paypr: float = 0.0,
     driver_state_vec: Optional[np.ndarray] = None,
+    supply_incentive_multiplier: float = 1.0,
+    last_action_magnitude: float = 0.0,
+    repeat_action_count: float = 0.0,
+    max_relative_dev: float = 0.35,
+    constraint_multipliers: Optional[np.ndarray] = None,
+    constraint_curriculum_scale: float = 1.0,
 ) -> np.ndarray:
     
     ride_ctx = np.asarray(ride_ctx_vec, dtype=np.float32).reshape(-1)
@@ -70,6 +76,7 @@ def build_state_vector(
 
     while len(coef_feats) < 5:
         coef_feats.append(0.0)
+    coef_arr = np.asarray(coef_feats[:5], dtype=np.float32)
         
     share = float(np.clip(firm1_last_share, 0.0, 1.0))
     fulfillment = float(np.clip(firm1_last_fulfillment, 0.0, 1.0))
@@ -102,4 +109,47 @@ def build_state_vector(
         float(np.clip((0.30 - served_share) / 0.30, 0.0, 1.0)),
         float(np.clip((0.60 - acceptance) / 0.60, 0.0, 1.0)),
     ]
-    return np.array(fixed + supply.tolist() + coef_feats, dtype=np.float32)
+    # Belief/POMDP proxy features: expose current policy posture and subsystem
+    # stress so a feed-forward PPO policy can infer hidden supply/demand
+    # feedback from direct outputs.  Frame stacking adds temporal derivatives;
+    # these features make the current frame itself Markov-closer by encoding
+    # action memory, price distance-to-anchor, and collapse risk.
+    avg_abs_coef_dev = float(
+        np.clip(np.mean(np.abs(coef_arr)) / max(float(max_relative_dev), 1e-6), 0.0, 1.0)
+    )
+    max_abs_coef_dev = float(
+        np.clip(np.max(np.abs(coef_arr)) / max(float(max_relative_dev), 1e-6), 0.0, 1.0)
+    )
+    overpricing_stress = float(np.clip((0.15 - gap) / 3.0, 0.0, 1.0))
+    overdiscount_stress = float(np.clip((gap - 1.50) / 3.0, 0.0, 1.0))
+    service_stress = float(np.clip(max(0.75 - fulfillment, 0.0) / 0.75, 0.0, 1.0))
+    wait_stress = float(np.clip((firm1_last_wait - 5.0) / 15.0, 0.0, 1.0))
+    profit_stress = float(np.clip((-profitpr) / 6.0, 0.0, 1.0))
+    collapse_stress = float(np.clip((0.12 - served_share) / 0.12, 0.0, 1.0))
+    action_memory = [
+        float(np.clip((supply_incentive_multiplier - 0.90) / 0.30, 0.0, 1.0)),
+        float(np.clip(last_action_magnitude, 0.0, 1.0)),
+        float(np.clip(repeat_action_count / 10.0, 0.0, 1.0)),
+        avg_abs_coef_dev,
+        max_abs_coef_dev,
+        overpricing_stress,
+        overdiscount_stress,
+        service_stress,
+        wait_stress,
+        max(profit_stress, collapse_stress),
+    ]
+    constraints = np.asarray(
+        constraint_multipliers if constraint_multipliers is not None else np.zeros(5),
+        dtype=np.float32,
+    ).reshape(-1)
+    if constraints.size < 5:
+        constraints = np.pad(constraints, (0, 5 - constraints.size), mode="constant")
+    constraints = np.clip(constraints[:5], 0.0, 1.0)
+    constrained_context = [
+        float(np.clip(constraint_curriculum_scale, 0.0, 1.0)),
+        float(np.clip(np.mean(constraints), 0.0, 1.0)),
+    ]
+    return np.array(
+        fixed + supply.tolist() + coef_feats + action_memory + constraints.tolist() + constrained_context,
+        dtype=np.float32,
+    )
