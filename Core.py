@@ -356,6 +356,7 @@ class Core:
         firm1_static_values: str = "",
         firm2_static_values: str = "",
         total_customers_pool: int = 20000,
+        simulation_sample_cap: int = 2000,
         deterministic_torch: bool = False,
         reward_share_weight: float = 0.34,
         reward_revenue_weight: float = 0.33,
@@ -378,6 +379,7 @@ class Core:
         driver_base_active: int = 260,
         driver_reservation_wage: float = 24.0,
         driver_acceptance_mode: str = "expected",
+        driver_expected_acceptance_cutoff: float = 0.65,
         driver_state_smoothing: float = 0.35,
         driver_reward_fulfillment_weight: float = 0.02,
         driver_reward_wait_weight: float = 0.0,
@@ -410,6 +412,7 @@ class Core:
         self.market = MarketInteraction(city_name=market_name, seed=seed)
         self.seed = int(seed) if seed is not None else int(np.random.SeedSequence().generate_state(1)[0])
         self.total_customers_pool = int(total_customers_pool)
+        self.simulation_sample_cap = int(max(0, simulation_sample_cap))
         
         self._seed_all_rngs(self.seed, deterministic_torch=deterministic_torch)
         self.rng = np.random.default_rng(self.seed)
@@ -551,6 +554,7 @@ class Core:
                 operating_cost_per_mile=self.driver_cost_per_mile,
                 platform_variable_cost=self.fixed_trip_cost,
                 acceptance_mode=str(driver_acceptance_mode),
+                expected_acceptance_cutoff=float(np.clip(driver_expected_acceptance_cutoff, 0.0, 1.0)),
                 state_smoothing_alpha=float(np.clip(driver_state_smoothing, 0.0, 1.0)),
             ),
             use_osmnx=bool(use_osmnx),
@@ -912,7 +916,7 @@ class Core:
         # Simpler optimization target: completed share and signed profit only.
         # A linear share term avoids a sharp dominance threshold that can make
         # advantages flip sign when stochastic supply nudges share around 0.30.
-        market_term = float(2.0 * served_share - 1.0)
+        market_term = float(np.clip((served_share - 0.30) / 0.20, -1.0, 1.0))
 
         # Firm objective: signed and bounded contribution profit per request.
         profit_term = float(np.tanh(profitpr / self.reward_profit_scale))
@@ -956,7 +960,7 @@ class Core:
                 )
             )
         margin_penalty = self._smooth_positive_penalty(margin_shortfall, scale=1.0)
-        price_discipline_penalty = max(price_gap_penalty, margin_penalty)
+        price_discipline_penalty = 0.75 * price_gap_penalty + 0.25 * margin_penalty
         # The average is deliberately the complete business objective: completed
         # customer share captures riders and driver supply, while signed
         # contribution profit captures the firm and driver compensation.  The
@@ -972,7 +976,7 @@ class Core:
         fulfillment_component = (
             driver_scale
             * self.driver_reward_fulfillment_weight
-            * max(0.0, fulfillment_term - 0.70) / 0.30
+            * np.clip((fulfillment_term - 0.78) / 0.22, -1.0, 1.0)
         )
         wait_penalty = (
             driver_scale
@@ -985,7 +989,7 @@ class Core:
             * (1.0 - float(np.clip(driver_acceptance_rate, 0.0, 1.0)))
         )
         direct_unfulfilled_penalty = driver_scale * self.driver_reward_unfulfilled_weight * unfulfilled_penalty
-        collapse_component = 0.05 * collapse_penalty
+        collapse_component = 0.06 * collapse_penalty
         action_change_penalty = self.reward_action_change_weight * float(
             np.clip(self._finite_float(action_change_magnitude), 0.0, 1.0)
         )
@@ -1596,6 +1600,13 @@ class Core:
         # Simulation and choice models treat profiles as read-only. Reusing the
         # pool dictionaries avoids thousands of allocations per timestep.
         return [self.synthetic_profile_pool[int(i)] for i in idx]
+    
+    def _effective_simulation_sample_size(self, requested: int, collect_rows: bool = False) -> int:
+        """Return the Monte Carlo profile count used for aggregate simulations."""
+        requested_i = int(max(0, requested))
+        if collect_rows or self.simulation_sample_cap <= 0:
+            return requested_i
+        return int(min(requested_i, self.simulation_sample_cap))
 
     def run_experiment(
         self,
@@ -1627,11 +1638,14 @@ class Core:
             if self.firm1_mode == "RL":
                 self.firm1.reset_state_history()
         self._refresh_profile_pool(rides_per_timestep=train_customers_per_step)
+        train_profile_sample_size = self._effective_simulation_sample_size(train_customers_per_step, collect_rows=False)
+        eval_profile_sample_size = self._effective_simulation_sample_size(eval_customers_per_step, collect_rows=False)
 
         print(
             f">>> Synthetic setup: profile_pool={self.agent_gen.total_customers}, "
             f"train days={train_timesteps} x {train_steps_per_day} steps/day x {train_customers_per_step} rides, "
-            f"eval timesteps={eval_timesteps} x {eval_customers_per_step} rides"
+            f"eval timesteps={eval_timesteps} x {eval_customers_per_step} rides, "
+            f"mc_samples(train/eval)={train_profile_sample_size}/{eval_profile_sample_size}"
         )
         if self.firm1_mode == "RL":
             update_every = int(max(1, ppo_update_interval_days))
@@ -1718,7 +1732,7 @@ class Core:
 
                 self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
-                sampled_profiles = self._sample_profiles_from_pool(train_customers_per_step)
+                sampled_profiles = self._sample_profiles_from_pool(train_profile_sample_size)
                 if profiles_out and not profile_limit_reached:
                     remaining = int(max(0, profiles_log_limit - len(sampled_profile_rows)))
                     if remaining > 0:
@@ -1901,7 +1915,6 @@ class Core:
                 "avg_wait_minutes": avg_wait,
                 "driver_acceptance_rate": avg_driver_accept,
                 "driver_pay_per_request": avg_driver_paypr,
-                "firm1_supply_incentive_multiplier": float(getattr(self.firm1, "supply_incentive_multiplier", 1.0)),
                 "driver_reward_scale": float(self.driver_reward_scale_current),
                 "last_action": int(last_action),
                 "dominant_action": dominant_action,
@@ -1988,7 +2001,7 @@ class Core:
         for t in range(eval_timesteps):
             day_ctx = self.market.sample_day_context()
             hour = self.market.sample_timestep_hour().hour
-            sampled_profiles = self._sample_profiles_from_pool(eval_customers_per_step)
+            sampled_profiles = self._sample_profiles_from_pool(eval_profile_sample_size)
             if profiles_out and not profile_limit_reached:
                 remaining = int(max(0, profiles_log_limit - len(sampled_profile_rows)))
                 if remaining > 0:
