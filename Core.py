@@ -379,12 +379,12 @@ class Core:
         driver_reservation_wage: float = 24.0,
         driver_acceptance_mode: str = "expected",
         driver_state_smoothing: float = 0.35,
-        driver_reward_fulfillment_weight: float = 0.06,
-        driver_reward_wait_weight: float = 0.04,
-        driver_reward_reject_weight: float = 0.03,
-        driver_reward_unfulfilled_weight: float = 0.12,
-        driver_reward_warmup_fraction: float = 0.30,
-        constrained_reward: bool = True,
+        driver_reward_fulfillment_weight: float = 0.02,
+        driver_reward_wait_weight: float = 0.0,
+        driver_reward_reject_weight: float = 0.0,
+        driver_reward_unfulfilled_weight: float = 0.04,
+        driver_reward_warmup_fraction: float = 0.60,
+        constrained_reward: bool = False,
         constraint_lr: float = 0.03,
         constraint_penalty_scale: float = 0.35,
         constraint_curriculum_start_scale: float = 0.25,
@@ -393,7 +393,7 @@ class Core:
         gap_band_fraction: float = 0.75,
         gap_penalty_scale_fraction: float = 0.75,
         ppo_batch_size: int = 128,
-        ppo_update_epochs: int = 5,
+        ppo_update_epochs: int = 8,
         state_frame_stack: int = 4,
         threshold_cache_path: str = "",
         reuse_threshold_cache: bool = False,
@@ -909,7 +909,10 @@ class Core:
         # multiply it by fulfillment again: that previously squared supply
         # failures and overwhelmed both the market signal and PPO advantages.
         served_share = share_f
-        market_term = float(np.tanh((served_share - self.reward_dominance_threshold) / 0.15))
+        # Simpler optimization target: completed share and signed profit only.
+        # A linear share term avoids a sharp dominance threshold that can make
+        # advantages flip sign when stochastic supply nudges share around 0.30.
+        market_term = float(2.0 * served_share - 1.0)
 
         # Firm objective: signed and bounded contribution profit per request.
         profit_term = float(np.tanh(profitpr / self.reward_profit_scale))
@@ -961,13 +964,15 @@ class Core:
         share_component = self.reward_share_weight * market_term
         profit_component = self.reward_revenue_weight * profit_term
         price_gap_weight = max(self.reward_overprice_weight, self.reward_underprice_weight)
-        price_gap_component = price_gap_weight * price_discipline_penalty
+        # Keep price discipline gentle; convergence is easier when the primary
+        # gradient is share/profit and gap control is a secondary regularizer.
+        price_gap_component = 0.50 * price_gap_weight * price_discipline_penalty
 
         driver_scale = float(np.clip(self.driver_reward_scale_current, 0.0, 1.0))
         fulfillment_component = (
             driver_scale
             * self.driver_reward_fulfillment_weight
-            * (2.0 * fulfillment_term - 1.0)
+            * max(0.0, fulfillment_term - 0.70) / 0.30
         )
         wait_penalty = (
             driver_scale
@@ -980,7 +985,7 @@ class Core:
             * (1.0 - float(np.clip(driver_acceptance_rate, 0.0, 1.0)))
         )
         direct_unfulfilled_penalty = driver_scale * self.driver_reward_unfulfilled_weight * unfulfilled_penalty
-        collapse_component = 0.10 * collapse_penalty
+        collapse_component = 0.05 * collapse_penalty
         action_change_penalty = self.reward_action_change_weight * float(
             np.clip(self._finite_float(action_change_magnitude), 0.0, 1.0)
         )
@@ -1594,14 +1599,14 @@ class Core:
 
     def run_experiment(
         self,
-        train_timesteps: int = 1000,
+        train_timesteps: int = 1500,
         train_customers_per_step: int = 5000,
         eval_timesteps: int = 200,
         eval_customers_per_step: int = 1000,
         profiles_out: Optional[str] = None,
         profiles_log_limit: int = 200000,
         train_steps_per_day: int = 10,
-        ppo_update_interval_days: int = 20,
+        ppo_update_interval_days: int = 10,
         stochastic_training: bool = True,
     ):
         """Run workflow: synthetic-data RL training (day/timestep cadence), then held-out evaluation."""
@@ -3762,12 +3767,12 @@ def main():
     
     parser.add_argument("--report_prefix", type=str, default="artifacts/report")
     parser.add_argument("--run_experiment", action="store_true", help="Run workflow-aligned training/eval experiment")
-    parser.add_argument("--train_timesteps", type=int, default=1000)
+    parser.add_argument("--train_timesteps", type=int, default=1500)
     parser.add_argument("--train_customers", type=int, default=5000)
     parser.add_argument("--train_steps_per_day", type=int, default=10, help="Synthetic training timesteps per day (run_experiment mode).")
-    parser.add_argument("--ppo_update_interval_days", type=int, default=20, help="How many synthetic training days to collect before each PPO optimizer update; larger values produce longer, lower-variance PPO rollouts.")
+    parser.add_argument("--ppo_update_interval_days", type=int, default=10, help="How many synthetic training days to collect before each PPO optimizer update; larger values produce longer, lower-variance PPO rollouts.")
     parser.add_argument("--ppo_batch_size", type=int, default=128, help="PPO minibatch size used when optimizing each rollout buffer.")
-    parser.add_argument("--ppo_update_epochs", type=int, default=5, help="Number of optimization epochs per PPO rollout buffer.")
+    parser.add_argument("--ppo_update_epochs", type=int, default=8, help="Number of optimization epochs per PPO rollout buffer.")
     parser.add_argument("--state_frame_stack", type=int, default=4, help="Number of recent encoded RL states to concatenate for history-aware PPO observations.")
     parser.add_argument("--deterministic_experiment_seed", action="store_true", help="If set, keep run_experiment fully deterministic with --seed.")
     parser.add_argument("--eval_timesteps", type=int, default=200)
@@ -3796,12 +3801,13 @@ def main():
     parser.add_argument("--driver_reservation_wage", type=float, default=24.0, help="Driver reservation wage used by acceptance and online-supply response.")
     parser.add_argument("--driver_acceptance_mode", type=str, default="expected", choices=["expected", "stochastic"], help="Use deterministic expected driver acceptance for faster RL convergence, or stochastic Bernoulli acceptance for realism.")
     parser.add_argument("--driver_state_smoothing", type=float, default=0.35, help="EMA smoothing alpha for driver features fed into the RL state.")
-    parser.add_argument("--driver_reward_fulfillment_weight", type=float, default=0.06, help="Reward bonus weight for completed/chosen fulfillment when driver supply is enabled.")
-    parser.add_argument("--driver_reward_wait_weight", type=float, default=0.04, help="Reward penalty weight for long average pickup wait when driver supply is enabled.")
-    parser.add_argument("--driver_reward_reject_weight", type=float, default=0.03, help="Reward penalty weight for driver rejection when driver supply is enabled.")
-    parser.add_argument("--driver_reward_unfulfilled_weight", type=float, default=0.12, help="Direct penalty weight for fulfillment shortfall below the driver-service target.")
-    parser.add_argument("--driver_reward_warmup_fraction", type=float, default=0.30, help="Fraction of training over which driver reward terms ramp from zero to full strength.")
-    parser.add_argument("--disable_constrained_reward", action="store_true", help="Disable adaptive Lagrangian constraint penalties in the RL reward.")
+    parser.add_argument("--driver_reward_fulfillment_weight", type=float, default=0.02, help="Small reward bonus for completed/chosen fulfillment when driver supply is enabled.")
+    parser.add_argument("--driver_reward_wait_weight", type=float, default=0.0, help="Reward penalty for long average pickup wait when driver supply is enabled; default off for simpler PPO optimization.")
+    parser.add_argument("--driver_reward_reject_weight", type=float, default=0.0, help="Reward penalty for driver rejection; default off for simpler PPO optimization.")
+    parser.add_argument("--driver_reward_unfulfilled_weight", type=float, default=0.04, help="Small direct penalty for fulfillment shortfall below the driver-service target.")
+    parser.add_argument("--driver_reward_warmup_fraction", type=float, default=0.60, help="Fraction of training over which driver reward terms ramp from zero to full strength.")
+    parser.add_argument("--enable_constrained_reward", action="store_true", help="Enable adaptive Lagrangian constraint penalties in the RL reward.")
+    parser.add_argument("--disable_constrained_reward", action="store_true", help="Deprecated compatibility flag; constrained reward is off by default unless --enable_constrained_reward is set.")
     parser.add_argument("--constraint_lr", type=float, default=0.03, help="Learning rate for adaptive constrained-RL Lagrange multipliers.")
     parser.add_argument("--constraint_penalty_scale", type=float, default=0.35, help="Global scale for adaptive constrained-RL penalties.")
     parser.add_argument("--constraint_curriculum_start_scale", type=float, default=0.25, help="Constraint curriculum scale used during early exploration.")
@@ -3906,7 +3912,7 @@ def main():
         driver_reward_reject_weight=args.driver_reward_reject_weight,
         driver_reward_unfulfilled_weight=args.driver_reward_unfulfilled_weight,
         driver_reward_warmup_fraction=args.driver_reward_warmup_fraction,
-        constrained_reward=not args.disable_constrained_reward,
+        constrained_reward=bool(args.enable_constrained_reward and not args.disable_constrained_reward),
         constraint_lr=args.constraint_lr,
         constraint_penalty_scale=args.constraint_penalty_scale,
         constraint_curriculum_start_scale=args.constraint_curriculum_start_scale,

@@ -348,9 +348,9 @@ class FirmRLPricer:
         self.base_max_relative_dev = 0.35
         self.converged_max_relative_dev = 0.25
         self.max_relative_dev = self.base_max_relative_dev
-        # Optional direct supply-side control: a bounded Firm1 driver-pay multiplier.
-        # This gives PPO one explicit lever for fulfillment/acceptance failures instead
-        # of forcing it to raise rider prices and lose demand whenever supply is tight.
+        # Keep supply-side control available as an internal multiplier, but do
+        # not expose it as a PPO action by default.  Early optimization is
+        # easier when PPO only credits rider-facing price moves.
         self.supply_incentive_multiplier = 1.0
         self.supply_step = 0.025
         self.supply_min_multiplier = 0.90
@@ -360,43 +360,22 @@ class FirmRLPricer:
         self.aggressive_actions = set()
         self.allow_aggressive_actions = True
         
-        # Use a compact macro-action space so rewards map to clear pricing moves.
-        # The driver layer is observed, and PPO also gets a small direct
-        # supply-incentive action for driver-pay tuning when fulfillment fails.
-        
+        # Use one-coefficient actions: firms may manage all configured price
+        # coefficients over time, but each PPO decision changes at most one
+        # rider-facing coefficient.  This keeps credit assignment local while
+        # preserving long-run pricing flexibility.
         all_keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
         active_keys = [k for k in all_keys if k in self.opt_keys]
         def zero_steps() -> Dict[str, int]:
             return {k: 0 for k in active_keys}
 
         self.action_to_steps: Dict[int, Dict[str, int]] = {0: zero_steps()}
-        macro_specs = [
-            {"base_fare": -1},
-            {"base_fare": +1},
-            {"booking_fee": -1},
-            {"booking_fee": +1},
-            {"base_fare": -1, "booking_fee": -1},
-            {"base_fare": +1, "booking_fee": +1},
-            {"per_minute": -1, "per_mile": -1},
-            {"per_minute": +1, "per_mile": +1},
-            {"airport_fee": -1},
-            {"airport_fee": +1},
-            {"base_fare": -1, "booking_fee": -1, "airport_fee": -1},
-            {"base_fare": +1, "booking_fee": +1, "airport_fee": +1},
-            {"base_fare": -1, "per_minute": -1, "per_mile": -1, "booking_fee": -1, "airport_fee": -1},
-            {"base_fare": +1, "per_minute": +1, "per_mile": +1, "booking_fee": +1, "airport_fee": +1},
-            {"supply_incentive": -1},
-            {"supply_incentive": +1},
-        ]
+        
         a_idx = 1
-        for spec in macro_specs:
-            action = zero_steps()
-            for key, step in spec.items():
-                if key in action:
-                    action[key] = int(step)
-                elif key == "supply_incentive":
-                    action[key] = int(step)
-            if any(v != 0 for v in action.values()):
+        for key in active_keys:
+            for direction in (-1, +1):
+                action = zero_steps()
+                action[key] = int(direction)
                 self.action_to_steps[a_idx] = action
                 a_idx += 1
         action_dim = len(self.action_to_steps)
@@ -417,18 +396,18 @@ class FirmRLPricer:
             clip_eps=0.20,
             final_clip_eps=0.10,
             max_grad_norm=0.8,
-            ent_coeff=0.030,
-            min_ent_coeff=0.0008,
-            ent_decay=0.990,
-            target_kl=0.030,
-            max_lr=7e-4,
-            value_clip_eps=0.20,
-            initial_exploration_rate=0.40,
-            final_exploration_rate=0.01,
-            exploration_fraction=0.80,
-            exploration_warmup_fraction=0.20,
-            min_action_visits=20,
-            exploration_rescue_rate=0.18,
+            ent_coeff=0.024,
+            min_ent_coeff=0.0005,
+            ent_decay=0.992,
+            target_kl=0.050,
+            max_lr=1.2e-3,
+            value_clip_eps=0.30,
+            initial_exploration_rate=0.58,
+            final_exploration_rate=0.02,
+            exploration_fraction=0.90,
+            exploration_warmup_fraction=0.35,
+            min_action_visits=35,
+            exploration_rescue_rate=0.25,
         )
         
     def last_action_magnitude(self) -> float:

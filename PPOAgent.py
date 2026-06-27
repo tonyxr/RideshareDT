@@ -224,11 +224,11 @@ class PPOAgent:
         """Keep exploration high early, then tighten as training converges."""
         p = float(np.clip(progress, 0.0, 1.0))
         if p <= 0.35 and not reward_converged:
-            self.ent_coeff = float(max(self.ent_coeff, 0.80 * self.max_ent_coeff))
+            self.ent_coeff = float(max(self.ent_coeff, 0.65 * self.max_ent_coeff))
             return
 
         if p <= 0.55 and not reward_converged:
-            self.ent_coeff = float(max(self.ent_coeff, 0.55 * self.max_ent_coeff))
+            self.ent_coeff = float(max(self.ent_coeff, 0.40 * self.max_ent_coeff))
             return
 
         # The driver-supply environment is non-stationary and high variance, so
@@ -241,18 +241,20 @@ class PPOAgent:
         self.ent_coeff = float(np.clip(min(self.ent_coeff, target), self.min_ent_coeff, self.max_ent_coeff))
     
     def adapt_optimization(self, progress: float, reward_converged: bool) -> None:
-        """Apply a conservative late-training schedule for PPO updates.
+        """Apply an exploration-first schedule for PPO updates.
 
-        The environment can discover good pricing regimes but remain noisy.  A
-        cosine learning-rate cap lets early training move quickly while forcing
-        late updates to consolidate.  The clip range follows the same direction
-        so final policy edits are less disruptive.  KL/clip-based adaptation in
-        ``update`` can still lower the rate further, but cannot grow beyond the
-        scheduled cap.
+        Early training keeps the learning-rate cap and clip range wide so the
+        policy can move out of weak initial logits.  Later training decays both
+        controls for consolidation.  KL/clip-based adaptation in ``update`` can
+        still lower the rate further, but cannot grow beyond the scheduled cap.
         """
         p = float(np.clip(progress, 0.0, 1.0))
-        cosine = 0.5 * (1.0 + np.cos(np.pi * p))
-        scheduled_lr_cap = self.min_lr + (self.base_lr - self.min_lr) * cosine
+        # Keep early optimization deliberately less conservative.  The cap stays
+        # at the initial maximum through the first third of training, then uses a
+        # cosine decay for consolidation.
+        decay_p = float(np.clip((p - 0.35) / 0.65, 0.0, 1.0))
+        cosine = 0.5 * (1.0 + np.cos(np.pi * decay_p))
+        scheduled_lr_cap = self.min_lr + (self.initial_max_lr - self.min_lr) * cosine
         if reward_converged:
             scheduled_lr_cap = min(scheduled_lr_cap, self.min_lr * 1.5)
         self.max_lr = float(np.clip(scheduled_lr_cap, self.min_lr, self.initial_max_lr))
@@ -260,9 +262,10 @@ class PPOAgent:
             self.curr_lr = self.max_lr
             for group in self.opt.param_groups:
                 group["lr"] = self.curr_lr
-
+        
+        early_clip = max(self.initial_clip_eps, 0.25)
         self.clip_eps = float(
-            self.final_clip_eps + (self.initial_clip_eps - self.final_clip_eps) * cosine
+            self.final_clip_eps + (early_clip - self.final_clip_eps) * cosine
         )
         if reward_converged:
             self.clip_eps = min(self.clip_eps, self.final_clip_eps)
@@ -441,7 +444,7 @@ class PPOAgent:
                 approx_kl = ((torch.exp(logratio) - 1.0) - logratio).mean()
                 clipfrac = ((ratio - 1.0).abs() > self.clip_eps).float().mean()
 
-                if float(approx_kl.item()) > 1.5 * self.target_kl:
+                if float(approx_kl.item()) > 2.0 * self.target_kl:
                     stop_for_kl = True
                     break
                 # Entropy regularizes the learned policy, not the externally
@@ -485,12 +488,12 @@ class PPOAgent:
                 
         final_clipfrac = float(last.get("clipfrac", 0.0))
         final_kl = float(last.get("approx_kl", 0.0))
-        if final_clipfrac > 0.30 or final_kl > self.target_kl:
+        if final_clipfrac > 0.40 or final_kl > 1.25 * self.target_kl:
             self.curr_lr = float(max(self.min_lr, self.curr_lr * self.lr_decay_on_spike))
             for g in self.opt.param_groups:
                 g["lr"] = self.curr_lr
             self.low_update_streak = 0
-        elif final_clipfrac < 0.02 and final_kl < 0.25 * self.target_kl:
+        elif final_clipfrac < 0.03 and final_kl < 0.35 * self.target_kl:
             self.low_update_streak += 1
             if self.low_update_streak >= 2 and self.curr_lr < self.max_lr:
                 self.curr_lr = float(min(self.max_lr, self.curr_lr * self.lr_growth_on_stall))

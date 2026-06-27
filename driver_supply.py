@@ -49,11 +49,11 @@ class DriverSupplyConfig:
     acceptance_ratio_threshold: float = 1.0
     max_pickup_minutes: float = 16.0
     base_pickup_minutes: float = 3.5
-    supply_elasticity: float = 0.35
-    online_temperature: float = 12.0
+    supply_elasticity: float = 0.20
+    online_temperature: float = 18.0
     platform_variable_cost: float = 0.45
     state_smoothing_alpha: float = 0.35
-    pickup_noise_sigma: float = 0.10
+    pickup_noise_sigma: float = 0.03
     
     acceptance_mode: str = "expected"
 
@@ -266,7 +266,11 @@ class DriverSupplyLayer:
         probability = float(np.clip(acceptance_probability, 0.0, 1.0))
         if self.config.acceptance_mode == "stochastic":
             return bool(self.rng.random() < probability)
-        return bool(probability >= 1.0)
+        # Expected mode is deterministic for lower-variance PPO training, but use
+        # a soft acceptability cutoff instead of requiring probability saturation.
+        # This keeps fulfillment from becoming an all-or-nothing cliff around the
+        # earnings threshold.
+        return bool(probability >= 0.50)
 
     def dispatch(
         self,
