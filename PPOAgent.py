@@ -26,8 +26,25 @@ import torch.nn as nn
 import torch.optim as optim
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden: int = 192):
+    """Actor-critic network with response, constraint, and risk heads.
+
+    The policy head scores feasible centralized interventions.  The reward
+    head estimates long-run operational benefit; constraint heads estimate
+    future service/safety pressure; the risk head estimates tail-risk pressure;
+    and the response head predicts next aggregate crowd/system response.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden: int = 192,
+        constraint_dim: int = 5,
+        response_dim: int = 4,
+    ):
         super().__init__()
+        self.constraint_dim = int(max(1, constraint_dim))
+        self.response_dim = int(max(1, response_dim))
         self.trunk = nn.Sequential(
             nn.Linear(state_dim, hidden),
             nn.LayerNorm(hidden),
@@ -36,15 +53,18 @@ class ActorCritic(nn.Module):
             nn.LayerNorm(hidden),
             nn.SiLU(),
         )
-        self.pi_head = nn.Sequential(
+        self.pi_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, action_dim))
+        self.v_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, 1))
+        self.constraint_head = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.SiLU(),
-            nn.Linear(hidden, action_dim),
+            nn.Linear(hidden, self.constraint_dim),
         )
-        self.v_head = nn.Sequential(
+        self.risk_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, 1))
+        self.response_head = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.SiLU(),
-            nn.Linear(hidden, 1),
+            nn.Linear(hidden, self.response_dim),
         )
         self._init_weights()
 
@@ -55,17 +75,26 @@ class ActorCritic(nn.Module):
                 nn.init.orthogonal_(module.weight, gain=np.sqrt(2.0))
                 nn.init.constant_(module.bias, 0.0)
 
-        # PPO convention: smaller final policy logits, unit-scale value head.
         if isinstance(self.pi_head[-1], nn.Linear):
             nn.init.orthogonal_(self.pi_head[-1].weight, gain=0.01)
             nn.init.constant_(self.pi_head[-1].bias, 0.0)
-        if isinstance(self.v_head[-1], nn.Linear):
-            nn.init.orthogonal_(self.v_head[-1].weight, gain=1.0)
-            nn.init.constant_(self.v_head[-1].bias, 0.0)
+        
+        for head in (self.v_head, self.constraint_head, self.risk_head, self.response_head):
+            if isinstance(head[-1], nn.Linear):
+                nn.init.orthogonal_(head[-1].weight, gain=1.0)
+                nn.init.constant_(head[-1].bias, 0.0)
 
-    def forward(self, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, s: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         z = self.trunk(s)
-        return self.pi_head(z), self.v_head(z).squeeze(-1)
+        return (
+            self.pi_head(z),
+            self.v_head(z).squeeze(-1),
+            self.constraint_head(z),
+            self.risk_head(z).squeeze(-1),
+            self.response_head(z),
+        )
     
 @dataclass
 class Transition:
@@ -76,7 +105,11 @@ class Transition:
     old_logp: torch.Tensor
     old_value: torch.Tensor
     exploration_rate: float
-
+    constraint_costs: torch.Tensor
+    risk_cost: float
+    response_target: torch.Tensor
+    old_constraint_values: torch.Tensor
+    old_risk_value: torch.Tensor
 
 class PPOAgent:
     def __init__(
@@ -107,10 +140,24 @@ class PPOAgent:
         exploration_warmup_fraction: float = 0.20,
         min_action_visits: int = 8,
         exploration_rescue_rate: float = 0.12,
+        constraint_dim: int = 5,
+        response_dim: int = 4,
+        constraint_value_coeff: float = 0.25,
+        risk_value_coeff: float = 0.15,
+        response_coeff: float = 0.05,
+        risk_coeff: float = 0.10,
         device: Optional[str] = None,
     ):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.net = ActorCritic(state_dim, action_dim, hidden=hidden_dim).to(self.device)
+        self.constraint_dim = int(max(1, constraint_dim))
+        self.response_dim = int(max(1, response_dim))
+        self.net = ActorCritic(
+            state_dim,
+            action_dim,
+            hidden=hidden_dim,
+            constraint_dim=self.constraint_dim,
+            response_dim=self.response_dim,
+        ).to(self.device)
         self.opt = optim.Adam(self.net.parameters(), lr=lr)
         self.base_lr = float(lr)
         self.curr_lr = float(lr)
@@ -124,6 +171,11 @@ class PPOAgent:
         self.final_clip_eps = float(np.clip(final_clip_eps, 0.01, self.initial_clip_eps))
         self.clip_eps = self.initial_clip_eps
         self.v_coeff = v_coeff
+        self.constraint_value_coeff = float(max(0.0, constraint_value_coeff))
+        self.risk_value_coeff = float(max(0.0, risk_value_coeff))
+        self.response_coeff = float(max(0.0, response_coeff))
+        self.risk_coeff = float(max(0.0, risk_coeff))
+        self.constraint_lambdas = torch.zeros(self.constraint_dim, dtype=torch.float32, device=self.device)
         self.ent_coeff = ent_coeff
         self.max_ent_coeff = float(max(ent_coeff, min_ent_coeff))
         self.min_ent_coeff = float(max(0.0, min_ent_coeff))
@@ -156,7 +208,26 @@ class PPOAgent:
         self.last_policy_entropy_fraction = 1.0
 
         self.buf: List[Transition] = []
-        
+        self.last_constraint_values = torch.zeros(self.constraint_dim, dtype=torch.float32, device=self.device)
+        self.last_risk_value = torch.zeros((), dtype=torch.float32, device=self.device)
+        self.last_response_pred = torch.zeros(self.response_dim, dtype=torch.float32, device=self.device)
+    
+    def set_optimization_context(
+        self,
+        constraint_lambdas: Optional[np.ndarray | List[float] | Tuple[float, ...]] = None,
+        risk_coeff: Optional[float] = None,
+    ) -> None:
+        """Update Lagrangian pressure used by the structured PPO actor."""
+        if constraint_lambdas is not None:
+            arr = np.asarray(constraint_lambdas, dtype=np.float32).reshape(-1)
+            padded = np.zeros(self.constraint_dim, dtype=np.float32)
+            width = min(self.constraint_dim, arr.size)
+            if width > 0:
+                padded[:width] = np.maximum(arr[:width], 0.0)
+            self.constraint_lambdas = torch.tensor(padded, dtype=torch.float32, device=self.device)
+        if risk_coeff is not None:
+            self.risk_coeff = float(max(0.0, risk_coeff))
+            
     def adapt_exploration(
         self,
         progress: float,
@@ -278,7 +349,7 @@ class PPOAgent:
         if s.shape[-1] != expected_dim:
             raise ValueError(f"State dim mismatch: got {s.shape[-1]}, expected {expected_dim}")
         
-        logits, value = self.net(s)
+        logits, value, constraint_values, risk_value, response_pred = self.net(s)
         logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         if not torch.isfinite(logits).all():
             logits = torch.zeros_like(logits)
@@ -286,7 +357,15 @@ class PPOAgent:
         dist = self._exploratory_distribution(logits, exploration_rate)
         a = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
         logp = dist.log_prob(a)
-        self.last_action_exploration_rate = float(exploration_rate)
+        self.last_constraint_values = torch.nan_to_num(
+            constraint_values.squeeze(0), nan=0.0, posinf=0.0, neginf=0.0
+        ).detach()
+        self.last_risk_value = torch.nan_to_num(
+            risk_value.squeeze(0), nan=0.0, posinf=0.0, neginf=0.0
+        ).detach()
+        self.last_response_pred = torch.nan_to_num(
+            response_pred.squeeze(0), nan=0.0, posinf=0.0, neginf=0.0
+        ).detach()
         if not deterministic:
             self.action_visits[int(a.item())] += 1
         return int(a.item()), s.squeeze(0), logp.squeeze(0), value.squeeze(0)
@@ -300,8 +379,33 @@ class PPOAgent:
         s_next: Optional[torch.Tensor],
         old_logp: torch.Tensor,
         old_value: torch.Tensor,
+        constraint_costs: Optional[np.ndarray | List[float] | Tuple[float, ...] | torch.Tensor] = None,
+        risk_cost: float = 0.0,
+        response_target: Optional[np.ndarray | List[float] | Tuple[float, ...] | torch.Tensor] = None,
     ) -> None:
         del s_next
+        if constraint_costs is None:
+            constraint_tensor = torch.zeros(self.constraint_dim, dtype=torch.float32, device=self.device)
+        else:
+            constraint_tensor = torch.as_tensor(constraint_costs, dtype=torch.float32, device=self.device).reshape(-1)
+            if constraint_tensor.numel() != self.constraint_dim:
+                padded = torch.zeros(self.constraint_dim, dtype=torch.float32, device=self.device)
+                width = min(self.constraint_dim, constraint_tensor.numel())
+                if width > 0:
+                    padded[:width] = constraint_tensor[:width]
+                constraint_tensor = padded
+        if response_target is None:
+            response_tensor = self.last_response_pred.detach().clone()
+        else:
+            response_tensor = torch.as_tensor(response_target, dtype=torch.float32, device=self.device).reshape(-1)
+            if response_tensor.numel() != self.response_dim:
+                padded = torch.zeros(self.response_dim, dtype=torch.float32, device=self.device)
+                width = min(self.response_dim, response_tensor.numel())
+                if width > 0:
+                    padded[:width] = response_tensor[:width]
+                response_tensor = padded
+        constraint_tensor = torch.nan_to_num(constraint_tensor, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0)
+        response_tensor = torch.nan_to_num(response_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
         
         self.buf.append(
             Transition(
@@ -314,26 +418,35 @@ class PPOAgent:
                 exploration_rate=float(
                     np.clip(getattr(self, "last_action_exploration_rate", 0.0), 0.0, 1.0)
                 ),
+                constraint_costs=constraint_tensor.detach(),
+                risk_cost=float(max(0.0, np.nan_to_num(risk_cost, nan=0.0, posinf=1.0, neginf=0.0))),
+                response_target=response_tensor.detach(),
+                old_constraint_values=self.last_constraint_values.detach().clone(),
+                old_risk_value=self.last_risk_value.detach().clone(),
             )
         )
 
     @torch.no_grad()
-    def _gae(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        t_size = len(self.buf)
+    def _gae_scalar(
+        self,
+        rewards: torch.Tensor,
+        old_values: torch.Tensor,
+        dones: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generalized advantage estimation for reward, constraint, or risk streams."""
+        t_size = rewards.numel()
         adv = torch.zeros(t_size, dtype=torch.float32, device=self.device)
         ret = torch.zeros(t_size, dtype=torch.float32, device=self.device)
 
         gae = torch.zeros((), dtype=torch.float32, device=self.device)
         next_v = torch.zeros((), dtype=torch.float32, device=self.device)
         for t in reversed(range(t_size)):
-            tr = self.buf[t]
-            v_t = tr.old_value
-            continuation = 0.0 if tr.done else 1.0
-            delta = tr.r + self.gamma * next_v * continuation - v_t
+            continuation = 1.0 - float(dones[t].item())
+            delta = rewards[t] + self.gamma * next_v * continuation - old_values[t]
             gae = delta + self.gamma * self.lam * continuation * gae
             adv[t] = gae
-            ret[t] = adv[t] + v_t
-            next_v = v_t
+            ret[t] = adv[t] + old_values[t]
+            next_v = old_values[t]
 
         adv_mean = adv.mean()
         adv_std = adv.std(unbiased=False)
@@ -352,6 +465,13 @@ class PPOAgent:
                 "loss": 0.0,
                 "policy_loss": 0.0,
                 "value_loss": 0.0,
+                "constraint_value_loss": 0.0,
+                "risk_value_loss": 0.0,
+                "response_loss": 0.0,
+                "lagrangian_adv_mean": 0.0,
+                "lagrangian_adv_std": 0.0,
+                "constraint_lambda_mean": 0.0,
+                "risk_coeff": float(self.risk_coeff),
                 "entropy": 0.0,
                 "policy_entropy": 0.0,
                 "policy_entropy_fraction": float(self.last_policy_entropy_fraction),
@@ -362,15 +482,41 @@ class PPOAgent:
                 "action_coverage": self._action_coverage(),
             }
 
-        adv, ret = self._gae()
+        reward_all = torch.tensor([tr.r for tr in self.buf], dtype=torch.float32, device=self.device)
+        done_all = torch.tensor([float(tr.done) for tr in self.buf], dtype=torch.float32, device=self.device)
+        old_reward_values_all = torch.stack([tr.old_value for tr in self.buf], dim=0).detach()
+        old_reward_values_all = torch.nan_to_num(old_reward_values_all, nan=0.0, posinf=0.0, neginf=0.0)
+        adv, ret = self._gae_scalar(reward_all, old_reward_values_all, done_all)
+        constraint_costs_all = torch.stack([tr.constraint_costs for tr in self.buf], dim=0).detach()
+        old_constraint_values_all = torch.stack([tr.old_constraint_values for tr in self.buf], dim=0).detach()
+        constraint_adv_cols = []
+        constraint_ret_cols = []
+        for k in range(self.constraint_dim):
+            adv_k, ret_k = self._gae_scalar(constraint_costs_all[:, k], old_constraint_values_all[:, k], done_all)
+            constraint_adv_cols.append(adv_k)
+            constraint_ret_cols.append(ret_k)
+        constraint_adv_all = torch.stack(constraint_adv_cols, dim=1)
+        constraint_ret_all = torch.stack(constraint_ret_cols, dim=1)
+        risk_cost_all = torch.tensor([tr.risk_cost for tr in self.buf], dtype=torch.float32, device=self.device)
+        old_risk_value_all = torch.stack([tr.old_risk_value for tr in self.buf], dim=0).detach()
+        risk_adv_all, risk_ret_all = self._gae_scalar(risk_cost_all, old_risk_value_all, done_all)
+        response_target_all = torch.stack([tr.response_target for tr in self.buf], dim=0).detach()
+        lambda_vec = self.constraint_lambdas.detach().to(self.device)
+        lagrangian_adv = adv - torch.sum(constraint_adv_all * lambda_vec.unsqueeze(0), dim=1) - self.risk_coeff * risk_adv_all
+        lagrangian_adv = torch.nan_to_num(lagrangian_adv, nan=0.0, posinf=0.0, neginf=0.0)
+        lag_mean = lagrangian_adv.mean()
+        lag_std = lagrangian_adv.std(unbiased=False)
+        if torch.isfinite(lag_std) and float(lag_std.item()) > 1e-8:
+            lagrangian_adv = (lagrangian_adv - lag_mean) / (lag_std + 1e-8)
+        else:
+            lagrangian_adv = lagrangian_adv - lag_mean
 
         s_all = torch.stack([tr.s for tr in self.buf], dim=0)
         s_all = torch.nan_to_num(s_all, nan=0.0, posinf=1e3, neginf=-1e3)
         a_all = torch.stack([tr.a for tr in self.buf], dim=0)
         old_logp_all = torch.stack([tr.old_logp for tr in self.buf], dim=0)
         old_logp_all = torch.nan_to_num(old_logp_all, nan=0.0, posinf=20.0, neginf=-20.0)
-        old_value_all = torch.stack([tr.old_value for tr in self.buf], dim=0).detach()
-        old_value_all = torch.nan_to_num(old_value_all, nan=0.0, posinf=0.0, neginf=0.0)
+        old_value_all = old_reward_values_all
         exploration_all = torch.tensor(
             [tr.exploration_rate for tr in self.buf],
             dtype=torch.float32,
@@ -382,6 +528,13 @@ class PPOAgent:
             "loss": 0.0,
             "policy_loss": 0.0,
             "value_loss": 0.0,
+            "constraint_value_loss": 0.0,
+            "risk_value_loss": 0.0,
+            "response_loss": 0.0,
+            "lagrangian_adv_mean": float(lag_mean.item()),
+            "lagrangian_adv_std": float(lag_std.item()),
+            "constraint_lambda_mean": float(lambda_vec.mean().item()),
+            "risk_coeff": float(self.risk_coeff),
             "entropy": 0.0,
             "policy_entropy": 0.0,
             "policy_entropy_fraction": float(self.last_policy_entropy_fraction),
@@ -401,6 +554,9 @@ class PPOAgent:
             "loss": 0.0,
             "policy_loss": 0.0,
             "value_loss": 0.0,
+            "constraint_value_loss": 0.0,
+            "risk_value_loss": 0.0,
+            "response_loss": 0.0,
             "entropy": 0.0,
             "policy_entropy": 0.0,
             "approx_kl": 0.0,
@@ -415,13 +571,16 @@ class PPOAgent:
                 j = idx[start : start + batch_size]
                 s_b = s_all[j]
                 a_b = a_all[j]
-                adv_b = adv[j].detach().clamp(-self.adv_clip, self.adv_clip)
+                adv_b = lagrangian_adv[j].detach().clamp(-self.adv_clip, self.adv_clip)
                 ret_b = ret[j].detach()
+                constraint_ret_b = constraint_ret_all[j].detach()
+                risk_ret_b = risk_ret_all[j].detach()
+                response_target_b = response_target_all[j].detach()
                 old_logp_b = old_logp_all[j].detach()
                 old_value_b = old_value_all[j].detach()
                 exploration_b = exploration_all[j].detach()
 
-                logits, v = self.net(s_b)
+                logits, v, constraint_v, risk_v, response_pred = self.net(s_b)
                 logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
                 if not torch.isfinite(logits).all():
                     continue
@@ -438,6 +597,9 @@ class PPOAgent:
                 v_clipped = old_value_b + torch.clamp(v - old_value_b, -self.value_clip_eps, self.value_clip_eps)
                 value_clipped = (v_clipped - ret_b) ** 2
                 value_loss = torch.max(value_unclipped, value_clipped).mean()
+                constraint_value_loss = torch.mean((constraint_v - constraint_ret_b) ** 2)
+                risk_value_loss = torch.mean((risk_v - risk_ret_b) ** 2)
+                response_loss = torch.mean((response_pred - response_target_b) ** 2)
                 entropy = dist.entropy().mean()
                 policy_entropy = policy_dist.entropy().mean()
                 logratio = logp - old_logp_b
@@ -449,7 +611,14 @@ class PPOAgent:
                     break
                 # Entropy regularizes the learned policy, not the externally
                 # forced uniform mixture. Otherwise epsilon can hide collapse.
-                loss = policy_loss + self.v_coeff * value_loss - self.ent_coeff * policy_entropy
+                loss = (
+                    policy_loss
+                    + self.v_coeff * value_loss
+                    + self.constraint_value_coeff * constraint_value_loss
+                    + self.risk_value_coeff * risk_value_loss
+                    + self.response_coeff * response_loss
+                    - self.ent_coeff * policy_entropy
+                )
                 if not torch.isfinite(loss):
                     continue
 
@@ -461,6 +630,9 @@ class PPOAgent:
                 metric_sums["loss"] += float(loss.item())
                 metric_sums["policy_loss"] += float(policy_loss.item())
                 metric_sums["value_loss"] += float(value_loss.item())
+                metric_sums["constraint_value_loss"] += float(constraint_value_loss.item())
+                metric_sums["risk_value_loss"] += float(risk_value_loss.item())
+                metric_sums["response_loss"] += float(response_loss.item())
                 metric_sums["entropy"] += float(entropy.item())
                 metric_sums["policy_entropy"] += float(policy_entropy.item())
                 metric_sums["approx_kl"] += float(approx_kl.item())

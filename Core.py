@@ -386,7 +386,7 @@ class Core:
         driver_reward_reject_weight: float = 0.0,
         driver_reward_unfulfilled_weight: float = 0.04,
         driver_reward_warmup_fraction: float = 0.60,
-        constrained_reward: bool = False,
+        constrained_reward: bool = True,
         constraint_lr: float = 0.03,
         constraint_penalty_scale: float = 0.35,
         constraint_curriculum_start_scale: float = 0.25,
@@ -850,6 +850,43 @@ class Core:
             violation = float(reward_diag.get(f"constraint_violation_{key}", 0.0))
             new_value = (0.995 * float(self.constraint_lambdas[key])) + self.constraint_lr * violation
             self.constraint_lambdas[key] = float(np.clip(new_value, 0.0, self.constraint_lambda_max))
+            
+    def _constraint_vector_from_diag(self, reward_diag: Dict[str, float]) -> np.ndarray:
+        """Ordered constraint-cost vector for PPO constraint critics."""
+        keys = sorted(self.constraint_lambdas.keys())
+        values = [float(reward_diag.get(f"constraint_violation_{key}", 0.0)) for key in keys]
+        return np.asarray(np.nan_to_num(values, nan=0.0, posinf=1.0, neginf=0.0), dtype=np.float32)
+
+    def _risk_cost_from_diag(self, reward_diag: Dict[str, float]) -> float:
+        """Tail-risk proxy used by the PPO risk critic and Lagrangian advantage."""
+        risk_terms = [
+            reward_diag.get("reward_demand_loss", 0.0),
+            reward_diag.get("reward_collapse_penalty", 0.0),
+            reward_diag.get("reward_price_gap_penalty", 0.0),
+            reward_diag.get("constraint_violation_wait_limit", 0.0),
+            reward_diag.get("constraint_violation_fulfillment_floor", 0.0),
+        ]
+        return float(np.clip(max(float(self._finite_float(v)) for v in risk_terms), 0.0, 1.0))
+
+    def _response_target_from_metrics(self, m1: FirmMetrics, m2: FirmMetrics, mean_gap: float) -> np.ndarray:
+        """Aggregate response target: share, demand loss, wait, and availability."""
+        total_platform_share = float(np.clip(float(m1.share) + float(m2.share), 0.0, 1.0))
+        demand_loss = float(np.clip(1.0 - total_platform_share, 0.0, 1.0))
+        wait_scaled = float(np.clip(float(m1.avg_wait_minutes) / 20.0, 0.0, 1.0))
+        availability = float(np.clip(float(m1.fulfillment_rate) * float(m1.driver_acceptance_rate), 0.0, 1.0))
+        del mean_gap
+        # Keep the default response dimension at four while encoding the most
+        # decision-relevant crowd/environment effects requested by the MDP:
+        # market share, demand abandonment, service delay, and driver availability.
+        return np.asarray([float(m1.share), demand_loss, wait_scaled, availability], dtype=np.float32)
+
+    def _sync_agent_optimization_context(self) -> None:
+        """Push current Lagrange multipliers and risk weight into the PPO agent."""
+        if self.firm1_mode != "RL" or not hasattr(getattr(self.firm1, "agent", None), "set_optimization_context"):
+            return
+        lambdas = [float(self.constraint_lambdas[key]) for key in sorted(self.constraint_lambdas.keys())]
+        risk_coeff = max(0.0, float(self.constraint_penalty_scale) * float(self.constraint_curriculum_scale))
+        self.firm1.agent.set_optimization_context(lambdas, risk_coeff=risk_coeff)
 
     def _configure_constraint_curriculum(self, progress: float) -> None:
         """Ramp constrained-RL pressure from easy curriculum to full realism."""
@@ -873,6 +910,32 @@ class Core:
                 + (self.constraint_curriculum_end_scale - self.constraint_curriculum_mid_scale)
                 * np.clip(late_progress, 0.0, 1.0)
             )
+            
+    @staticmethod
+    def _policy_action_diagnostics(logits: torch.Tensor, action: int) -> Dict[str, float]:
+        """Return compact deterministic-policy diagnostics for eval logs."""
+        with torch.no_grad():
+            probs_t = torch.softmax(logits.detach().float(), dim=-1).reshape(-1)
+            probs = probs_t.cpu().numpy()
+        if probs.size == 0:
+            return {
+                "policy_action_prob": 0.0,
+                "policy_top_action": -1.0,
+                "policy_top_prob": 0.0,
+                "policy_entropy": 0.0,
+                "policy_hold_prob": 0.0,
+            }
+        safe_probs = np.clip(probs.astype(float), 1e-12, 1.0)
+        top_action = int(np.argmax(probs))
+        action_i = int(action)
+        action_prob = float(probs[action_i]) if 0 <= action_i < probs.size else 0.0
+        return {
+            "policy_action_prob": action_prob,
+            "policy_top_action": float(top_action),
+            "policy_top_prob": float(probs[top_action]),
+            "policy_entropy": float(-np.sum(safe_probs * np.log(safe_probs))),
+            "policy_hold_prob": float(probs[0]) if probs.size > 0 else 0.0,
+        }
 
     def _reward_components(
         self,
@@ -896,8 +959,8 @@ class Core:
         operational improvement, while service, price-deviation, margin, demand
         loss, wait, and instability remain constraint pressures.  When a
         competitor/baseline is available from the same stochastic batch, the
-        reward is relative to that baseline; otherwise it falls back to raw
-        opportunity-normalized performance for backward-compatible callers.
+        reward is relative to that baseline; reward is relative to that baseline; when no competitor row is supplied
+        it uses neutral business targets instead of raw output magnitude.
         """
         
         share_f = float(np.clip(self._finite_float(share), 0.0, 1.0))
@@ -936,6 +999,7 @@ class Core:
         profit_term = profit_improvement
         target_gap = float(self.reward_target_price_gap)
         price_gap_deviation = float(gap - target_gap)
+        
         gap_penalty_scale = float(
             np.clip(
                 self.gap_penalty_scale_fraction * float(self.reward_acceptable_discount),
@@ -1160,7 +1224,7 @@ class Core:
             **components,
         }
 
-    def _compute_rl_reward(self, m1: FirmMetrics, mean_gap: float) -> float:
+    def _compute_rl_reward(self, m1: FirmMetrics, mean_gap: float, m2: Optional[FirmMetrics] = None) -> float:
         """Low-complexity reward shaping for better PPO learning signal."""
         diagnostics = self._reward_diagnostics(
             share=float(m1.share),
@@ -1172,6 +1236,9 @@ class Core:
             avg_wait_minutes=float(m1.avg_wait_minutes),
             driver_acceptance_rate=float(m1.driver_acceptance_rate),
             action_change_magnitude=0.0,
+            baseline_share=float(m2.share) if m2 is not None else 0.0,
+            baseline_rev_per_request=float(m2.rev_per_request) if m2 is not None else 0.0,
+            baseline_profit_per_request=float(m2.profit_per_request) if m2 is not None else 0.0,
             prev_share=float(self.last_share),
             prev_rev_per_request=float(self.last_revpr),
             prev_profit_per_request=float(self.last_profitpr),
@@ -1179,6 +1246,7 @@ class Core:
         )
         reward = float(diagnostics["reward"])
         self.last_reward = reward
+        self.last_reward_diagnostics = dict(diagnostics)
         self._update_constraint_multipliers(diagnostics)
         return reward
     
@@ -1685,6 +1753,13 @@ class Core:
             "loss": 0.0,
             "policy_loss": 0.0,
             "value_loss": 0.0,
+            "constraint_value_loss": 0.0,
+            "risk_value_loss": 0.0,
+            "response_loss": 0.0,
+            "lagrangian_adv_mean": 0.0,
+            "lagrangian_adv_std": 0.0,
+            "constraint_lambda_mean": 0.0,
+            "risk_coeff": 0.0,
             "approx_kl": 0.0,
             "clipfrac": 0.0,
             "entropy": 0.0,
@@ -1796,7 +1871,18 @@ class Core:
                     self.last_reward = reward
                     self._update_constraint_multipliers(reward_diag)
                     done = (t == len(hours) - 1)
-                    self.firm1.agent.store(s_ts, action, reward, done, None, logits, val)
+                    self.firm1.agent.store(
+                        s_ts,
+                        action,
+                        reward,
+                        done,
+                        None,
+                        logits,
+                        val,
+                        constraint_costs=self._constraint_vector_from_diag(reward_diag),
+                        risk_cost=self._risk_cost_from_diag(reward_diag),
+                        response_target=self._response_target_from_metrics(m1, m2, mean_gap),
+                    )
                     if done:
                         before_base = getattr(self.firm1.overrides, "base_fare", None)
                         before_pmin = getattr(self.firm1.overrides, "per_minute", None)
@@ -1890,6 +1976,7 @@ class Core:
             if self.firm1_mode == "RL":
                 should_update = ((d + 1) % update_every == 0) or ((d + 1) == train_timesteps)
                 if should_update:
+                    self._sync_agent_optimization_context()
                     ppo_metrics = self.firm1.agent.update(epochs=self.ppo_update_epochs, batch_size=self.ppo_batch_size)
                     last_ppo_metrics = dict(ppo_metrics)
                 
@@ -1969,6 +2056,13 @@ class Core:
                 "loss": float(ppo_metrics.get("loss", 0.0)),
                 "ppo_policy_loss": float(ppo_metrics.get("policy_loss", 0.0)),
                 "ppo_value_loss": float(ppo_metrics.get("value_loss", 0.0)),
+                "ppo_constraint_value_loss": float(ppo_metrics.get("constraint_value_loss", 0.0)),
+                "ppo_risk_value_loss": float(ppo_metrics.get("risk_value_loss", 0.0)),
+                "ppo_response_loss": float(ppo_metrics.get("response_loss", 0.0)),
+                "ppo_lagrangian_adv_mean": float(ppo_metrics.get("lagrangian_adv_mean", 0.0)),
+                "ppo_lagrangian_adv_std": float(ppo_metrics.get("lagrangian_adv_std", 0.0)),
+                "ppo_constraint_lambda_mean": float(ppo_metrics.get("constraint_lambda_mean", 0.0)),
+                "ppo_risk_coeff": float(ppo_metrics.get("risk_coeff", 0.0)),
                 "ppo_approx_kl": float(ppo_metrics.get("approx_kl", 0.0)),
                 "ppo_clipfrac": float(ppo_metrics.get("clipfrac", 0.0)),
                 "ppo_entropy": float(ppo_metrics.get("entropy", 0.0)),
@@ -2622,12 +2716,24 @@ class Core:
 
         results, m1, m2, gap, air, dist = self.simulate_batch(day_ctx.day_of_week, day_ctx.weather, hour, rides)
         
-        reward = self._compute_rl_reward(m1, gap)
+        reward = self._compute_rl_reward(m1, gap, m2=m2)
 
 
         if is_training and self.firm1_mode == "RL" and rl_step is not None:
             action, s_ts, logits, val = rl_step
-            self.firm1.agent.store(s_ts, action, float(reward), True, None, logits, val)
+            reward_diag = getattr(self, "last_reward_diagnostics", {})
+            self.firm1.agent.store(
+                s_ts,
+                action,
+                float(reward),
+                True,
+                None,
+                logits,
+                val,
+                constraint_costs=self._constraint_vector_from_diag(reward_diag),
+                risk_cost=self._risk_cost_from_diag(reward_diag),
+                response_target=self._response_target_from_metrics(m1, m2, gap),
+            )
             self.firm1.stabilize_after_batch(
                 share=float(m1.share),
                 price_gap_f2_minus_f1=float(gap),
@@ -3152,8 +3258,16 @@ class Core:
                 "policy_entropy_fraction": 1.0,
                 "action_coverage": 0.0,
                 "explained_variance": 0.0,
+                "constraint_value_loss": 0.0,
+                "risk_value_loss": 0.0,
+                "response_loss": 0.0,
+                "lagrangian_adv_mean": 0.0,
+                "lagrangian_adv_std": 0.0,
+                "constraint_lambda_mean": 0.0,
+                "risk_coeff": 0.0,
             }
             if self.firm1_mode == "RL":
+                self._sync_agent_optimization_context()
                 ppo_metrics = self.firm1.agent.update(epochs=self.ppo_update_epochs, batch_size=self.ppo_batch_size)
                 
             #print("firm 1 revenue per request sum", str(revpr_sum))
@@ -3243,6 +3357,13 @@ class Core:
                 "ppo_exploration_rate": float(ppo_metrics.get("exploration_rate", 0.0)),
                 "ppo_action_coverage": float(ppo_metrics.get("action_coverage", 0.0)),
                 "ppo_explained_variance": float(ppo_metrics.get("explained_variance", 0.0)),
+                "ppo_constraint_value_loss": float(ppo_metrics.get("constraint_value_loss", 0.0)),
+                "ppo_risk_value_loss": float(ppo_metrics.get("risk_value_loss", 0.0)),
+                "ppo_response_loss": float(ppo_metrics.get("response_loss", 0.0)),
+                "ppo_lagrangian_adv_mean": float(ppo_metrics.get("lagrangian_adv_mean", 0.0)),
+                "ppo_lagrangian_adv_std": float(ppo_metrics.get("lagrangian_adv_std", 0.0)),
+                "ppo_constraint_lambda_mean": float(ppo_metrics.get("constraint_lambda_mean", 0.0)),
+                "ppo_risk_coeff": float(ppo_metrics.get("risk_coeff", 0.0)),
             })
             for k in self.shared_edit_keys:
                 self.run_logs[-1][f"firm1_{k}"] = float(get_coeff(base, self.firm1.overrides, k))
