@@ -233,7 +233,7 @@ class FirmMarginGuardrailPricer(FirmHeuristicPricer):
     def __init__(self, seed: Optional[int] = None, managed_keys: Optional[List[str]] = None):
         super().__init__(seed=seed, managed_keys=managed_keys)
         self.min_rev_per_request = 6.00
-        self.high_share_threshold = 0.62
+        self.high_share_threshold = 0.5
         self.low_share_threshold = 0.38
         self.guardrail_cooldown_H = 2
 
