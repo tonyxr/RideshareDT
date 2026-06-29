@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Deque, Optional, Dict, List, Tuple
 import numpy as np
 from collections import deque
+from itertools import product
 
 from PPOAgent import PPOAgent
 from Market_models import CoefficientOverrides
@@ -353,25 +354,32 @@ class FirmRLPricer:
         self.aggressive_actions = set()
         self.allow_aggressive_actions = True
         
-        # Use one-coefficient actions: firms may manage all configured price
-        # coefficients over time, but each PPO decision changes at most one
-        # rider-facing coefficient.  This keeps credit assignment local while
-        # preserving long-run pricing flexibility.
+        # Response-aware MDP action: a centralized pricing intervention is a
+        # bounded vector of coefficient adjustments, not a command to one rider
+        # and not a one-knob nudge.  Use the discrete product {-1, 0, +1}^d so
+        # PPO can learn coordinated fare updates across all managed coefficients
+        # in one decision while projection below enforces feasibility.
         all_keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
         active_keys = [k for k in all_keys if k in self.opt_keys]
-        def zero_steps() -> Dict[str, int]:
-            return {k: 0 for k in active_keys}
-
-        self.action_to_steps: Dict[int, Dict[str, int]] = {0: zero_steps()}
         
-        a_idx = 1
-        for key in active_keys:
-            for direction in (-1, +1):
-                action = zero_steps()
-                action[key] = int(direction)
-                self.action_to_steps[a_idx] = action
-                a_idx += 1
+
+        self.action_to_steps: Dict[int, Dict[str, int]] = {}
+        for a_idx, step_tuple in enumerate(product((-1, 0, 1), repeat=len(active_keys))):
+            self.action_to_steps[a_idx] = {
+                key: int(step) for key, step in zip(active_keys, step_tuple)
+            }
+        # Put the hold action at index 0 for stable cold starts and diagnostics.
+        hold_idx = next(
+            (idx for idx, steps in self.action_to_steps.items() if all(v == 0 for v in steps.values())),
+            0,
+        )
+        if hold_idx != 0:
+            self.action_to_steps[0], self.action_to_steps[hold_idx] = (
+                self.action_to_steps[hold_idx],
+                self.action_to_steps[0],
+            )
         action_dim = len(self.action_to_steps)
+        self.action_keys = list(active_keys)
         
         # direct supply-state features, five normalized fare-coefficient deltas,
         # ten belief/action-memory stress features, and seven constrained-MDP
@@ -399,9 +407,20 @@ class FirmRLPricer:
             final_exploration_rate=0.02,
             exploration_fraction=0.90,
             exploration_warmup_fraction=0.35,
-            min_action_visits=35,
+            min_action_visits=2,
             exploration_rescue_rate=0.25,
         )
+    
+    def action_steps(self, action: int) -> Dict[str, int]:
+        """Return the decoded bounded coefficient intervention for diagnostics."""
+        return dict(self.action_to_steps.get(int(action), {}))
+
+    def action_label(self, action: int) -> str:
+        """Compact human-readable label for a discrete vector action."""
+        steps = self.action_steps(action)
+        if not steps or all(int(v) == 0 for v in steps.values()):
+            return "hold"
+        return ",".join(f"{k}:{int(v):+d}" for k, v in steps.items() if int(v) != 0)
         
     def last_action_magnitude(self) -> float:
         """Return the normalized size of the most recently applied action."""
@@ -574,9 +593,10 @@ class FirmRLPricer:
             action = 0
         
         step_map = dict(self.action_to_steps[action])
-        if not step_map:
+        if not any(int(v) != 0 for v in step_map.values()):
             self._last_applied_action = int(action)
             self._repeat_action_count = 0
+            self.last_action_steps = step_map
             return
         
         if int(action) == self._last_applied_action and int(action) != 0:
@@ -591,7 +611,8 @@ class FirmRLPricer:
                 self.repeat_action_decay ** float(self._repeat_action_count - 1),
             )
 
-        fare_step_map = {k: v for k, v in step_map.items() if k in self.opt_keys}
+        self.last_action_steps = dict(step_map)
+        fare_step_map = {k: v for k, v in step_map.items() if k in self.opt_keys and int(v) != 0}
         supply_step = int(step_map.get("supply_incentive", 0))
         if supply_step:
             self.supply_incentive_multiplier = float(np.clip(

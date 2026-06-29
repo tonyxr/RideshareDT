@@ -874,7 +874,6 @@ class Core:
                 * np.clip(late_progress, 0.0, 1.0)
             )
 
-
     def _reward_components(
         self,
         share: float,
@@ -902,59 +901,66 @@ class Core:
         """
         
         share_f = float(np.clip(self._finite_float(share), 0.0, 1.0))
-        profitpr = self._finite_float(
-            rev_per_request if profit_per_request is None else profit_per_request
-        )
-        comp_share = float(np.clip(self._finite_float(competitor_share), 0.0, 1.0))
-        comp_profitpr = self._finite_float(competitor_profit_per_request)
+        baseline_share_f = float(np.clip(self._finite_float(baseline_share), 0.0, 1.0))
+        revpr = max(0.0, self._finite_float(rev_per_request))
+        baseline_revpr = max(0.0, self._finite_float(baseline_rev_per_request))
+        profitpr = self._finite_float(rev_per_request if profit_per_request is None else profit_per_request)
+        baseline_profitpr = self._finite_float(baseline_profit_per_request)
+        
         margin = self._finite_float(profit_margin)
         gap = self._finite_float(price_gap_f2_minus_f1)
         fulfillment_term = float(np.clip(self._finite_float(fulfillment_rate, 1.0), 0.0, 1.0))
-        # FirmMetrics.share is already completed rides / all requests. Do not
-        # multiply it by fulfillment again: that previously squared supply
-        # failures and overwhelmed both the market signal and PPO advantages.
+        
+        wait = max(0.0, self._finite_float(avg_wait_minutes))
+        driver_accept = float(np.clip(self._finite_float(driver_acceptance_rate, 1.0), 0.0, 1.0))
+        
         served_share = share_f
-        # Simpler optimization target: completed share and signed profit only.
-        # A linear share term avoids a sharp dominance threshold that can make
-        # advantages flip sign when stochastic supply nudges share around 0.30.
-        absolute_share_term = float(np.clip((served_share - 0.30) / 0.20, -1.0, 1.0))
-        relative_share_term = float(np.tanh((served_share - comp_share) / 0.15))
-        market_term = float(0.65 * absolute_share_term + 0.35 * relative_share_term)
+        
+        # Baseline-normalized improvement: compare against the same stochastic
+        # scenario's competitor whenever available so high/low demand shocks do
+        # not masquerade as policy quality.
+        revenue_opportunity = max(self.reward_rev_scale, baseline_revpr, revpr, 1.0)
+        profit_opportunity = max(self.reward_profit_scale, abs(baseline_profitpr), abs(profitpr), 1.0)
+        if baseline_revpr > 0.0 or baseline_share_f > 0.0 or abs(baseline_profitpr) > 1e-9:
+            revenue_improvement = float(np.clip((revpr - baseline_revpr) / revenue_opportunity, -1.0, 1.0))
+            profit_improvement = float(np.clip((profitpr - baseline_profitpr) / profit_opportunity, -1.0, 1.0))
+            share_improvement = float(np.clip((share_f - baseline_share_f) / 0.25, -1.0, 1.0))
+            demand_loss = float(np.clip(max(0.0, baseline_share_f - share_f) / 0.25, 0.0, 1.0))
+        else:
+            revenue_improvement = float(np.clip(revpr / revenue_opportunity, 0.0, 1.0))
+            profit_improvement = float(np.tanh(profitpr / max(self.reward_profit_scale, 1e-6)))
+            share_improvement = float(np.clip((share_f - 0.30) / 0.20, -1.0, 1.0))
+            demand_loss = float(np.clip(max(0.0, 0.30 - share_f) / 0.30, 0.0, 1.0))
 
-        # Firm objective: signed and bounded contribution profit per request,
-        # with a modest relative-performance component so Firm1 learns to keep
-        # revenue/profit momentum against Firm2 rather than merely surviving.
-        own_profit_term = float(np.tanh(profitpr / self.reward_profit_scale))
-        relative_profit_term = float(np.tanh((profitpr - comp_profitpr) / self.reward_profit_scale))
-        profit_term = float(0.75 * own_profit_term + 0.25 * relative_profit_term)
-        # Use one symmetric price-gap objective. A positive gap means Firm1 is
-        # cheaper than Firm2, so the default target is a modest $1 discount when
-        # the acceptable discount is $2. This gives the agent one clear target
-        # instead of separate and potentially conflicting over/underprice rules.
-        price_gap_deviation = float(gap - self.reward_target_price_gap)
-        # Penalize target-gap drift at a scale tied to the configured acceptable
-        # discount, not to the particular threshold sample used in one run.
+        market_term = share_improvement
+        profit_term = profit_improvement
+        target_gap = float(self.reward_target_price_gap)
+        price_gap_deviation = float(gap - target_gap)
         gap_penalty_scale = float(
             np.clip(
-                self.gap_penalty_scale_fraction * self.reward_acceptable_discount,
-                0.25 * self.reward_acceptable_discount,
-                self.reward_acceptable_discount,
+                self.gap_penalty_scale_fraction * float(self.reward_acceptable_discount),
+                0.25 * float(self.reward_acceptable_discount),
+                float(self.reward_acceptable_discount),
             )
         )
-        price_gap_penalty = self._smooth_positive_penalty(
-            abs(price_gap_deviation), scale=gap_penalty_scale
-        )
+        price_gap_penalty = self._smooth_positive_penalty(abs(price_gap_deviation), scale=gap_penalty_scale)
         margin_shortfall = float(
             max(0.0, self.min_profit_margin - margin) / max(self.min_profit_margin, 1e-6)
         )
-        unfulfilled_penalty = self._smooth_positive_penalty(0.75 - fulfillment_term, scale=0.35)
+        margin_penalty = self._smooth_positive_penalty(margin_shortfall, scale=1.0)
+        unfulfilled_penalty = self._smooth_positive_penalty(0.78 - fulfillment_term, scale=0.35)
+        wait_penalty_unit = self._smooth_positive_penalty(wait - 6.0, scale=6.0)
+        rejection_penalty_unit = 1.0 - driver_accept
         collapse_penalty = self._smooth_positive_penalty(0.12 - served_share, scale=0.12)
+        action_change_penalty = self.reward_action_change_weight * float(
+            np.clip(self._finite_float(action_change_magnitude), 0.0, 2.0)
+        )
         constraint_violations = self._constraint_violations(
             share=served_share,
             price_gap_f2_minus_f1=gap,
             profit_margin=margin,
             fulfillment_rate=fulfillment_term,
-            avg_wait_minutes=avg_wait_minutes,
+            avg_wait_minutes=wait,
         )
         adaptive_constraint_penalty = 0.0
         if self.constrained_reward:
@@ -966,63 +972,53 @@ class Core:
                     for k, v in constraint_violations.items()
                 )
             )
-        margin_penalty = self._smooth_positive_penalty(margin_shortfall, scale=1.0)
-        price_discipline_penalty = 0.75 * price_gap_penalty + 0.25 * margin_penalty
-        # The average is deliberately the complete business objective: completed
-        # customer share captures riders and driver supply, while signed
-        # contribution profit captures the firm and driver compensation.  The
-        # gap term is only price discipline, not a competing business objective.
-        share_component = self.reward_share_weight * market_term
-        profit_component = self.reward_revenue_weight * profit_term
-        price_gap_weight = max(self.reward_overprice_weight, self.reward_underprice_weight)
-        # Keep price discipline gentle; convergence is easier when the primary
-        # gradient is share/profit and gap control is a secondary regularizer.
-        price_gap_component = 0.50 * price_gap_weight * price_discipline_penalty
-
-        driver_scale = float(np.clip(self.driver_reward_scale_current, 0.0, 1.0))
-        fulfillment_component = (
-            driver_scale
-            * self.driver_reward_fulfillment_weight
-            * np.clip((fulfillment_term - 0.78) / 0.22, -1.0, 1.0)
+            
+        # Main objective: controllable system-level improvement.  Keep price,
+        # service, and stability as costs/constraints instead of letting raw
+        # market share alone dominate the optimization.
+        revenue_component = self.reward_revenue_weight * revenue_improvement
+        share_component = self.reward_share_weight * share_improvement
+        profit_component = 0.35 * self.reward_revenue_weight * profit_improvement
+        demand_loss_component = 0.30 * demand_loss
+        price_gap_component = max(self.reward_overprice_weight, self.reward_underprice_weight) * price_gap_penalty
+        service_component = (
+            self.driver_reward_unfulfilled_weight * unfulfilled_penalty
+            + self.driver_reward_wait_weight * wait_penalty_unit
+            + self.driver_reward_reject_weight * rejection_penalty_unit
         )
-        wait_penalty = (
-            driver_scale
-            * self.driver_reward_wait_weight
-            * self._smooth_positive_penalty(max(0.0, avg_wait_minutes - 5.0), scale=5.0)
-        )
-        rejection_penalty = (
-            driver_scale
-            * self.driver_reward_reject_weight
-            * (1.0 - float(np.clip(driver_acceptance_rate, 0.0, 1.0)))
-        )
-        direct_unfulfilled_penalty = driver_scale * self.driver_reward_unfulfilled_weight * unfulfilled_penalty
-        collapse_component = 0.06 * collapse_penalty
-        action_change_penalty = self.reward_action_change_weight * float(
-            np.clip(self._finite_float(action_change_magnitude), 0.0, 1.0)
-        )
+        collapse_component = 0.08 * collapse_penalty
 
         raw = (
-            share_component
+            revenue_component
+            + share_component
             + profit_component
-            + fulfillment_component
+            - demand_loss_component
             - price_gap_component
-            - wait_penalty
-            - rejection_penalty
-            - direct_unfulfilled_penalty
+            - service_component
             - collapse_component
             - adaptive_constraint_penalty
             - action_change_penalty
         )
         base = float(np.clip(raw, -1.0, 1.0))
+        price_discipline_penalty = 0.75 * price_gap_penalty + 0.25 * margin_penalty
         return {
             "reward_base": base,
             "reward_base_unclipped": float(raw),
+            "reward_revenue_component": float(revenue_component),
             "reward_share_component": float(share_component),
             "reward_profit_component": float(profit_component),
+            "reward_demand_loss_component": float(demand_loss_component),
+            "reward_baseline_share": float(baseline_share_f),
+            "reward_baseline_rev_per_request": float(baseline_revpr),
+            "reward_baseline_profit_per_request": float(baseline_profitpr),
+            "reward_revenue_improvement": float(revenue_improvement),
+            "reward_share_improvement": float(share_improvement),
+            "reward_profit_improvement": float(profit_improvement),
+            "reward_demand_loss": float(demand_loss),
             "reward_margin_penalty": float(margin_penalty),
             "reward_price_discipline_penalty": float(price_discipline_penalty),
             "reward_price_gap": float(gap),
-            "reward_target_price_gap": float(self.reward_target_price_gap),
+            "reward_target_price_gap": float(target_gap),
             "reward_price_gap_deviation": float(price_gap_deviation),
             "reward_price_gap_penalty": float(price_gap_penalty),
             "reward_gap_penalty_scale": float(gap_penalty_scale),
@@ -1031,20 +1027,18 @@ class Core:
             "reward_gap_violation_050": float(abs(price_gap_deviation) > 0.50),
             "reward_fulfillment_term": float(fulfillment_term),
             "reward_profit_term": float(profit_term),
-            "reward_relative_share_term": float(relative_share_term),
-            "reward_relative_profit_term": float(relative_profit_term),
             "reward_served_share": float(served_share),
             "reward_driver_unfulfilled_penalty": float(unfulfilled_penalty),
-            "reward_driver_unfulfilled_component": float(direct_unfulfilled_penalty),
+            "reward_driver_unfulfilled_component": float(self.driver_reward_unfulfilled_weight * unfulfilled_penalty),
             "reward_collapse_penalty": float(collapse_penalty),
             "reward_collapse_component": float(collapse_component),
             "reward_adaptive_constraint_penalty": float(adaptive_constraint_penalty),
             **{f"constraint_violation_{k}": float(v) for k, v in constraint_violations.items()},
             **{f"constraint_lambda_{k}": float(v) for k, v in self.constraint_lambdas.items()},
             "reward_action_change_penalty": float(action_change_penalty),
-            "reward_driver_fulfillment_component": float(fulfillment_component),
-            "reward_driver_wait_penalty": float(wait_penalty),
-            "reward_driver_rejection_penalty": float(rejection_penalty),
+            "reward_driver_fulfillment_component": float(self.driver_reward_fulfillment_weight * (fulfillment_term - 0.78)),
+            "reward_driver_wait_penalty": float(self.driver_reward_wait_weight * wait_penalty_unit),
+            "reward_driver_rejection_penalty": float(self.driver_reward_reject_weight * rejection_penalty_unit),
         }
 
     def _reward_base(
@@ -1093,8 +1087,9 @@ class Core:
         avg_wait_minutes: float = 0.0,
         driver_acceptance_rate: float = 1.0,
         action_change_magnitude: float = 0.0,
-        competitor_share: float = 0.0,
-        competitor_profit_per_request: float = 0.0,
+        baseline_share: float = 0.0,
+        baseline_rev_per_request: float = 0.0,
+        baseline_profit_per_request: float = 0.0,
     ) -> Dict[str, float]:
         """Return shaped reward and component diagnostics for trajectory analysis."""
         share_f = float(np.clip(share, 0.0, 1.0))
@@ -1113,8 +1108,9 @@ class Core:
             avg_wait_minutes=avg_wait_minutes,
             driver_acceptance_rate=driver_acceptance_rate,
             action_change_magnitude=action_change_magnitude,
-            competitor_share=competitor_share,
-            competitor_profit_per_request=competitor_profit_per_request,
+            baseline_share=baseline_share,
+            baseline_rev_per_request=baseline_rev_per_request,
+            baseline_profit_per_request=baseline_profit_per_request,
         )
         base_reward = float(components["reward_base"])
         
@@ -1125,10 +1121,10 @@ class Core:
         prev_profit = float(profitpr if prev_profit_per_request is None else prev_profit_per_request)
         profit_delta = float(np.clip((profitpr - prev_profit) / self.reward_profit_scale, -0.20, 0.20) / 0.20)
         prev_gap_f = float(gap if prev_gap is None else prev_gap)
-        # Positive gap movement usually means Firm1 is becoming less overpriced or
-        # more strategically discounted.  Cap it because extreme discounts are
-        # already penalized by the base reward.
-        gap_delta = float(np.clip((gap - prev_gap_f) / 2.0, -1.0, 1.0))
+        # Reward movement toward the target price gap rather than movement in a
+        # fixed signed direction; otherwise PPO can learn to keep widening a
+        # discount long after it has become demand-destructive.
+        gap_delta = float(np.clip((abs(prev_gap_f - self.reward_target_price_gap) - abs(gap - self.reward_target_price_gap)) / 2.0, -1.0, 1.0))
         trend_term = float(0.40 * share_delta + 0.35 * profit_delta + 0.25 * gap_delta)
         pricing_discipline = float(
             1.0 - 2.0 * components["reward_price_gap_penalty"]
@@ -1676,12 +1672,13 @@ class Core:
         sampled_profile_rows: List[Dict[str, Any]] = []
         profile_limit_reached = False
 
-        # If evaluation opponent is static, use the default dynamic heuristic during training
-        # to match the long-horizon `run` behavior. Preserve explicit dynamic alternatives.
-        orig_firm2, orig_firm2_mode = self.firm2, self.firm2_mode
-        if self.firm2_mode == "static":
-            self.firm2 = FirmHeuristicPricer(seed=self.seed + 1, managed_keys=self.shared_edit_keys)
-            self.firm2_mode = "heuristic"
+        # Keep the competitor at the same strategy level in training and
+        # evaluation.  A static competitor remains static; a heuristic competitor
+        # remains heuristic.  This avoids the previous train/eval distribution
+        # shift where RL trained against a heuristic opponent but evaluated
+        # against a static opponent.
+        opponent_mode = str(self.firm2_mode)
+        print(f">>> Competitor mode for both training and evaluation: {opponent_mode}")
         
         update_every = int(max(1, ppo_update_interval_days))
         last_ppo_metrics = {
@@ -1788,8 +1785,9 @@ class Core:
                     avg_wait_minutes=float(m1.avg_wait_minutes),
                     driver_acceptance_rate=float(m1.driver_acceptance_rate),
                     action_change_magnitude=action_movement,
-                    competitor_share=float(m2.share),
-                    competitor_profit_per_request=float(m2.profit_per_request),
+                    baseline_share=float(m2.share),
+                    baseline_rev_per_request=float(m2.rev_per_request),
+                    baseline_profit_per_request=float(m2.profit_per_request),
                 )
 
                 if self.firm1_mode == "RL" and rl_step is not None:
@@ -1831,10 +1829,17 @@ class Core:
                 rev_delta_sum += float(reward_diag["reward_rev_delta"])
                 efficiency_sum += float(reward_diag["reward_efficiency_term"])
                 for component_key in (
+                    "reward_revenue_component",
                     "reward_share_component",
                     "reward_profit_component",
-                    "reward_relative_share_term",
-                    "reward_relative_profit_term",
+                    "reward_demand_loss_component",
+                    "reward_revenue_improvement",
+                    "reward_share_improvement",
+                    "reward_profit_improvement",
+                    "reward_demand_loss",
+                    "reward_baseline_share",
+                    "reward_baseline_rev_per_request",
+                    "reward_baseline_profit_per_request",
                     "reward_momentum_component",
                     "reward_profit_delta",
                     "reward_gap_delta",
@@ -1905,6 +1910,22 @@ class Core:
             avg_driver_paypr = float(driver_paypr_sum / n_steps)
             dominant_action = int(action_counts.most_common(1)[0][0]) if action_counts else -1
             dominant_action_rate = float(action_counts.most_common(1)[0][1] / n_steps) if action_counts else 0.0
+            
+            dominant_action_steps = (
+                self.firm1.action_steps(dominant_action)
+                if self.firm1_mode == "RL" and hasattr(self.firm1, "action_steps")
+                else {}
+            )
+            dominant_action_label = (
+                self.firm1.action_label(dominant_action)
+                if self.firm1_mode == "RL" and hasattr(self.firm1, "action_label")
+                else ""
+            )
+            last_action_steps = (
+                self.firm1.action_steps(last_action)
+                if self.firm1_mode == "RL" and hasattr(self.firm1, "action_steps")
+                else {}
+            )
 
             log_row = {
                 "batch": d,
@@ -1938,7 +1959,10 @@ class Core:
                 "driver_pay_per_request": avg_driver_paypr,
                 "driver_reward_scale": float(self.driver_reward_scale_current),
                 "last_action": int(last_action),
+                "last_action_steps": json.dumps(last_action_steps, sort_keys=True),
                 "dominant_action": dominant_action,
+                "dominant_action_label": dominant_action_label,
+                "dominant_action_steps": json.dumps(dominant_action_steps, sort_keys=True),
                 "dominant_action_rate": dominant_action_rate,
                 "action_counts": json.dumps(dict(sorted(action_counts.items())), sort_keys=True),
                 "recovery_guardrail_count": int(recovery_guardrail_count),
@@ -2004,11 +2028,8 @@ class Core:
                     f"KL={float(ppo_metrics.get('approx_kl', 0.0)):.4f} "
                     f"clip={float(ppo_metrics.get('clipfrac', 0.0)):.3f}"
                 )
-                
-            
-        self.firm2, self.firm2_mode = orig_firm2, orig_firm2_mode
         
-        print(">>> Evaluating RL agent against static/heuristic opponent with shared profile pool...")
+        print(f">>> Evaluating RL agent against same-level {opponent_mode} opponent with shared profile pool...")
         if self.firm1_mode == "RL":
             self.firm1.reset_state_history()
         self.driver_reward_scale_current = 1.0 if self.enable_driver_supply else 0.0
@@ -2077,8 +2098,9 @@ class Core:
                 avg_wait_minutes=float(m1.avg_wait_minutes),
                 driver_acceptance_rate=float(m1.driver_acceptance_rate),
                 action_change_magnitude=action_movement,
-                competitor_share=float(m2.share),
-                competitor_profit_per_request=float(m2.profit_per_request),
+                baseline_share=float(m2.share),
+                baseline_rev_per_request=float(m2.rev_per_request),
+                baseline_profit_per_request=float(m2.profit_per_request),
             )
             eval_reward = float(reward_diag["reward"])
             
@@ -2126,8 +2148,15 @@ class Core:
                 "reward_efficiency_term": float(reward_diag["reward_efficiency_term"]),
                 "reward_share_component": float(reward_diag.get("reward_share_component", 0.0)),
                 "reward_profit_component": float(reward_diag.get("reward_profit_component", 0.0)),
-                "reward_relative_share_term": float(reward_diag.get("reward_relative_share_term", 0.0)),
-                "reward_relative_profit_term": float(reward_diag.get("reward_relative_profit_term", 0.0)),
+                "reward_revenue_component": float(reward_diag.get("reward_revenue_component", 0.0)),
+                "reward_demand_loss_component": float(reward_diag.get("reward_demand_loss_component", 0.0)),
+                "reward_revenue_improvement": float(reward_diag.get("reward_revenue_improvement", 0.0)),
+                "reward_share_improvement": float(reward_diag.get("reward_share_improvement", 0.0)),
+                "reward_profit_improvement": float(reward_diag.get("reward_profit_improvement", 0.0)),
+                "reward_demand_loss": float(reward_diag.get("reward_demand_loss", 0.0)),
+                "reward_baseline_share": float(reward_diag.get("reward_baseline_share", 0.0)),
+                "reward_baseline_rev_per_request": float(reward_diag.get("reward_baseline_rev_per_request", 0.0)),
+                "reward_baseline_profit_per_request": float(reward_diag.get("reward_baseline_profit_per_request", 0.0)),
                 "reward_price_gap_penalty": float(reward_diag.get("reward_price_gap_penalty", 0.0)),
                 "reward_gap_penalty_scale": float(reward_diag.get("reward_gap_penalty_scale", 0.0)),
                 "reward_price_gap_abs_error": float(reward_diag.get("reward_price_gap_abs_error", 0.0)),
@@ -2161,6 +2190,17 @@ class Core:
                 "gap_violation_050": float(abs(float(mean_gap) - self.reward_target_price_gap) > 0.50),
                 "constraint_curriculum_scale": float(self.constraint_curriculum_scale),
                 "action": int(action),
+                "action_label": (
+                    self.firm1.action_label(action)
+                    if self.firm1_mode == "RL" and hasattr(self.firm1, "action_label")
+                    else ""
+                ),
+                "action_steps": json.dumps(
+                    self.firm1.action_steps(action)
+                    if self.firm1_mode == "RL" and hasattr(self.firm1, "action_steps")
+                    else {},
+                    sort_keys=True,
+                ),
             }
             for k in self.shared_edit_keys:
                 log_row[f"firm1_{k}"] = float(get_coeff(self.market.curr_market, self.firm1.overrides, k))
@@ -3137,6 +3177,21 @@ class Core:
                 if action_counts
                 else 0.0
             )
+            dominant_action_steps = (
+                self.firm1.action_steps(dominant_action)
+                if self.firm1_mode == "RL" and hasattr(self.firm1, "action_steps")
+                else {}
+            )
+            dominant_action_label = (
+                self.firm1.action_label(dominant_action)
+                if self.firm1_mode == "RL" and hasattr(self.firm1, "action_label")
+                else ""
+            )
+            last_action_steps = (
+                self.firm1.action_steps(last_action)
+                if self.firm1_mode == "RL" and hasattr(self.firm1, "action_steps")
+                else {}
+            )
             avg_reward = (
                 (reward_sum / max(1, timesteps_per_day))
                 if self.firm1_mode == "RL"
@@ -3172,7 +3227,10 @@ class Core:
                     for k, v in sorted(reward_component_sums.items())
                 },
                 "last_action": int(last_action),
+                "last_action_steps": json.dumps(last_action_steps, sort_keys=True),
                 "dominant_action": dominant_action,
+                "dominant_action_label": dominant_action_label,
+                "dominant_action_steps": json.dumps(dominant_action_steps, sort_keys=True),
                 "dominant_action_rate": dominant_action_rate,
                 "action_counts": json.dumps(dict(sorted(action_counts.items())), sort_keys=True),
                 "ppo_approx_kl": float(ppo_metrics.get("approx_kl", 0.0)),
@@ -3843,6 +3901,7 @@ def main():
     parser.add_argument("--driver_base_active", type=int, default=260, help="Baseline active drivers for the batch-level driver supply model.")
     parser.add_argument("--driver_reservation_wage", type=float, default=24.0, help="Driver reservation wage used by acceptance and online-supply response.")
     parser.add_argument("--driver_acceptance_mode", type=str, default="expected", choices=["expected", "stochastic"], help="Use deterministic expected driver acceptance for faster RL convergence, or stochastic Bernoulli acceptance for realism.")
+    parser.add_argument("--driver_expected_acceptance_cutoff", type=float, default=0.65, help="Minimum expected driver acceptance probability required to count an offered ride as accepted in expected driver acceptance mode.")
     parser.add_argument("--driver_state_smoothing", type=float, default=0.35, help="EMA smoothing alpha for driver features fed into the RL state.")
     parser.add_argument("--driver_reward_fulfillment_weight", type=float, default=0.02, help="Small reward bonus for completed/chosen fulfillment when driver supply is enabled.")
     parser.add_argument("--driver_reward_wait_weight", type=float, default=0.0, help="Reward penalty for long average pickup wait when driver supply is enabled; default off for simpler PPO optimization.")
@@ -3949,6 +4008,7 @@ def main():
         driver_base_active=args.driver_base_active,
         driver_reservation_wage=args.driver_reservation_wage,
         driver_acceptance_mode=args.driver_acceptance_mode,
+        driver_expected_acceptance_cutoff=args.driver_expected_acceptance_cutoff,
         driver_state_smoothing=args.driver_state_smoothing,
         driver_reward_fulfillment_weight=args.driver_reward_fulfillment_weight,
         driver_reward_wait_weight=args.driver_reward_wait_weight,
