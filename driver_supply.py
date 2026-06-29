@@ -49,6 +49,7 @@ class DriverSupplyConfig:
     acceptance_ratio_threshold: float = 1.0
     max_pickup_minutes: float = 16.0
     base_pickup_minutes: float = 3.5
+    osmnx_pickup_minutes_factor: float = 1.0
     supply_elasticity: float = 0.20
     online_temperature: float = 18.0
     platform_variable_cost: float = 0.45
@@ -56,6 +57,7 @@ class DriverSupplyConfig:
     pickup_noise_sigma: float = 0.03
     
     acceptance_mode: str = "expected"
+    expected_acceptance_cutoff: float = 0.55
 
     def __post_init__(self) -> None:
         self.acceptance_mode = str(self.acceptance_mode).lower().strip()
@@ -64,6 +66,7 @@ class DriverSupplyConfig:
                 "DriverSupplyConfig.acceptance_mode must be either "
                 "'expected' or 'stochastic'"
             )
+        self.expected_acceptance_cutoff = float(np.clip(self.expected_acceptance_cutoff, 0.0, 1.0))
 
 @dataclass
 class FirmDriverBatchState:
@@ -144,11 +147,38 @@ class OpenStreetMapRouter:
         self.network_type = str(network_type)
         self.use_osmnx = bool(use_osmnx)
         self.graph = None
+        self.network_pickup_factor = 1.0
         if self.use_osmnx and importlib.util.find_spec("osmnx") is not None:
             ox = importlib.import_module("osmnx")
             self.graph = ox.graph_from_place(self.place_name, network_type=self.network_type)
             self.graph = ox.add_edge_speeds(self.graph)
             self.graph = ox.add_edge_travel_times(self.graph)
+            self.network_pickup_factor = self._estimate_pickup_factor()
+
+    def _estimate_pickup_factor(self) -> float:
+        """Estimate a stable pickup-time factor from the OSMnx drive graph.
+
+        The simulator does not route every synthetic pickup because that would be
+        too slow for PPO rollouts.  Instead, OSMnx supplies a city-specific
+        network friction scalar derived from edge speed and circuity.
+        """
+        if self.graph is None:
+            return 1.0
+        speeds = []
+        circuities = []
+        for _, _, data in self.graph.edges(data=True):
+            length = float(data.get("length", 0.0) or 0.0)
+            speed = float(data.get("speed_kph", 0.0) or 0.0)
+            travel_time = float(data.get("travel_time", 0.0) or 0.0)
+            if speed > 0.0:
+                speeds.append(speed)
+            if length > 0.0 and travel_time > 0.0 and speed > 0.0:
+                implied = (speed * 1000.0 / 3600.0) * travel_time
+                circuities.append(implied / max(length, 1e-6))
+        median_speed = float(np.median(speeds)) if speeds else 22.0
+        median_circuity = float(np.median(circuities)) if circuities else 1.15
+        speed_factor = 24.0 / max(8.0, median_speed)
+        return float(np.clip(speed_factor * median_circuity, 0.75, 1.75))
 
     @property
     def enabled(self) -> bool:
@@ -202,7 +232,9 @@ class DriverSupplyLayer:
         scarcity = 1.0 / max(0.08, supply_ratio)
         airport_factor = 1.18 if airport else 1.0
         noise = float(self.rng.lognormal(mean=0.0, sigma=max(0.0, self.config.pickup_noise_sigma)))
-        return float(np.clip(self.config.base_pickup_minutes * scarcity * airport_factor * noise, 1.0, 25.0))
+        network_factor = float(getattr(self.router, "network_pickup_factor", 1.0))
+        config_factor = float(np.clip(self.config.osmnx_pickup_minutes_factor, 0.5, 2.0))
+        return float(np.clip(self.config.base_pickup_minutes * scarcity * airport_factor * network_factor * config_factor * noise, 1.0, 25.0))
 
     def estimate_service_quality(self, firm: str, airport: bool = False) -> Dict[str, float]:
         pickup = self.estimate_pickup_minutes(firm, airport=airport)
@@ -270,7 +302,7 @@ class DriverSupplyLayer:
         # a soft acceptability cutoff instead of requiring probability saturation.
         # This keeps fulfillment from becoming an all-or-nothing cliff around the
         # earnings threshold.
-        return bool(probability >= 0.50)
+        return bool(probability >= float(self.config.expected_acceptance_cutoff))
 
     def dispatch(
         self,

@@ -210,21 +210,9 @@ class FirmHeuristicPricer:
             self.overrides.airport_fee = float(np.clip(
                 float(self.overrides.airport_fee) + direction * self.step_airport_fee, *self.airport_bounds
             ))
-        if "per_mile" in self.managed_keys and self.overrides.per_mile is not None:
-            self.overrides.per_mile = float(np.clip(
-                float(self.overrides.per_mile) + direction * (0.5 * self.step_per_mile),
-                *self.pmile_bounds,
-            ))
-        if "booking_fee" in self.managed_keys and self.overrides.booking_fee is not None:
-            self.overrides.booking_fee = float(np.clip(
-                float(self.overrides.booking_fee) + direction * (0.5 * self.step_booking_fee),
-                *self.booking_bounds,
-            ))
-        if "airport_fee" in self.managed_keys and self.overrides.airport_fee is not None:
-            self.overrides.airport_fee = float(np.clip(
-                float(self.overrides.airport_fee) + direction * (0.5 * self.step_airport_fee),
-                *self.airport_bounds,
-            ))
+        # One-price-coefficient action constraint: the dynamic competitor may
+        # manage all five coefficients over time, but this decision point only
+        # changes the single selected coefficient above.
 
         self.cooldown = self.cooldown_H
 
@@ -268,17 +256,22 @@ class FirmMarginGuardrailPricer(FirmHeuristicPricer):
             return
 
         direction = 1 if increase_for_margin else -1
+        # Respect the same one-coefficient-per-decision constraint as the PPO
+        # controller.  Prefer base fare for broad margin/share corrections, then
+        # fall back to per-minute if base fare is not managed.
         if "base_fare" in self.managed_keys and self.overrides.base_fare is not None:
             self.overrides.base_fare = float(np.clip(
                 float(self.overrides.base_fare) + direction * (0.5 * self.step_base_fare),
                 *self.base_bounds,
             ))
+            self.cooldown = self.guardrail_cooldown_H
+            return
         if "per_minute" in self.managed_keys and self.overrides.per_minute is not None:
             self.overrides.per_minute = float(np.clip(
                 float(self.overrides.per_minute) + direction * (0.5 * self.step_per_minute),
                 *self.pmin_bounds,
             ))
-        self.cooldown = self.guardrail_cooldown_H
+            self.cooldown = self.guardrail_cooldown_H
 
 
 class FirmRandomWalkPricer(FirmHeuristicPricer):

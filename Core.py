@@ -886,26 +886,27 @@ class Core:
         avg_wait_minutes: float = 0.0,
         driver_acceptance_rate: float = 1.0,
         action_change_magnitude: float = 0.0,
+        baseline_share: float = 0.0,
+        baseline_rev_per_request: float = 0.0,
+        baseline_profit_per_request: float = 0.0,
     ) -> Dict[str, float]:
-        """Return a small, robust reward for the customer-driver-firm loop.
+        """Response-aware reward components for a centralized pricing planner.
 
-        The reward intentionally has two primary terms:
-        1. **Market term**: completed customer share, so riders choosing the firm
-           only counts when driver supply can fulfill those rides.
-        2. **Profit term**: signed profit per request, so losses are penalized and
-           profitable operation is rewarded.
-
-        This avoids corner-case incentives where the agent can maximize share by
-        destructive underpricing, maximize margin with no customers, or improve
-        driver acceptance by raising prices without serving demand.  All inputs
-        are clipped/sanitized before use so empty batches, NaNs, infinities, zero
-        revenue, and extreme prices still produce a finite reward in [-1, 1].
+        The policy should learn controllable improvement, not raw scenario
+        outcomes.  The main reward is therefore baseline/opportunity normalized
+        operational improvement, while service, price-deviation, margin, demand
+        loss, wait, and instability remain constraint pressures.  When a
+        competitor/baseline is available from the same stochastic batch, the
+        reward is relative to that baseline; otherwise it falls back to raw
+        opportunity-normalized performance for backward-compatible callers.
         """
         
         share_f = float(np.clip(self._finite_float(share), 0.0, 1.0))
         profitpr = self._finite_float(
             rev_per_request if profit_per_request is None else profit_per_request
         )
+        comp_share = float(np.clip(self._finite_float(competitor_share), 0.0, 1.0))
+        comp_profitpr = self._finite_float(competitor_profit_per_request)
         margin = self._finite_float(profit_margin)
         gap = self._finite_float(price_gap_f2_minus_f1)
         fulfillment_term = float(np.clip(self._finite_float(fulfillment_rate, 1.0), 0.0, 1.0))
@@ -916,10 +917,16 @@ class Core:
         # Simpler optimization target: completed share and signed profit only.
         # A linear share term avoids a sharp dominance threshold that can make
         # advantages flip sign when stochastic supply nudges share around 0.30.
-        market_term = float(np.clip((served_share - 0.30) / 0.20, -1.0, 1.0))
+        absolute_share_term = float(np.clip((served_share - 0.30) / 0.20, -1.0, 1.0))
+        relative_share_term = float(np.tanh((served_share - comp_share) / 0.15))
+        market_term = float(0.65 * absolute_share_term + 0.35 * relative_share_term)
 
-        # Firm objective: signed and bounded contribution profit per request.
-        profit_term = float(np.tanh(profitpr / self.reward_profit_scale))
+        # Firm objective: signed and bounded contribution profit per request,
+        # with a modest relative-performance component so Firm1 learns to keep
+        # revenue/profit momentum against Firm2 rather than merely surviving.
+        own_profit_term = float(np.tanh(profitpr / self.reward_profit_scale))
+        relative_profit_term = float(np.tanh((profitpr - comp_profitpr) / self.reward_profit_scale))
+        profit_term = float(0.75 * own_profit_term + 0.25 * relative_profit_term)
         # Use one symmetric price-gap objective. A positive gap means Firm1 is
         # cheaper than Firm2, so the default target is a modest $1 discount when
         # the acceptable discount is $2. This gives the agent one clear target
@@ -1024,6 +1031,8 @@ class Core:
             "reward_gap_violation_050": float(abs(price_gap_deviation) > 0.50),
             "reward_fulfillment_term": float(fulfillment_term),
             "reward_profit_term": float(profit_term),
+            "reward_relative_share_term": float(relative_share_term),
+            "reward_relative_profit_term": float(relative_profit_term),
             "reward_served_share": float(served_share),
             "reward_driver_unfulfilled_penalty": float(unfulfilled_penalty),
             "reward_driver_unfulfilled_component": float(direct_unfulfilled_penalty),
@@ -1049,6 +1058,8 @@ class Core:
         avg_wait_minutes: float = 0.0,
         driver_acceptance_rate: float = 1.0,
         action_change_magnitude: float = 0.0,
+        competitor_share: float = 0.0,
+        competitor_profit_per_request: float = 0.0,
     ) -> float:
         """Balanced business reward: completed market share plus signed profit."""
         return float(
@@ -1062,6 +1073,8 @@ class Core:
                 avg_wait_minutes=avg_wait_minutes,
                 driver_acceptance_rate=driver_acceptance_rate,
                 action_change_magnitude=action_change_magnitude,
+                competitor_share=competitor_share,
+                competitor_profit_per_request=competitor_profit_per_request,
             )["reward_base"]
         )
 
@@ -1080,6 +1093,8 @@ class Core:
         avg_wait_minutes: float = 0.0,
         driver_acceptance_rate: float = 1.0,
         action_change_magnitude: float = 0.0,
+        competitor_share: float = 0.0,
+        competitor_profit_per_request: float = 0.0,
     ) -> Dict[str, float]:
         """Return shaped reward and component diagnostics for trajectory analysis."""
         share_f = float(np.clip(share, 0.0, 1.0))
@@ -1098,6 +1113,8 @@ class Core:
             avg_wait_minutes=avg_wait_minutes,
             driver_acceptance_rate=driver_acceptance_rate,
             action_change_magnitude=action_change_magnitude,
+            competitor_share=competitor_share,
+            competitor_profit_per_request=competitor_profit_per_request,
         )
         base_reward = float(components["reward_base"])
         
@@ -1617,7 +1634,7 @@ class Core:
         profiles_out: Optional[str] = None,
         profiles_log_limit: int = 200000,
         train_steps_per_day: int = 10,
-        ppo_update_interval_days: int = 10,
+        ppo_update_interval_days: int = 20,
         stochastic_training: bool = True,
     ):
         """Run workflow: synthetic-data RL training (day/timestep cadence), then held-out evaluation."""
@@ -1771,6 +1788,8 @@ class Core:
                     avg_wait_minutes=float(m1.avg_wait_minutes),
                     driver_acceptance_rate=float(m1.driver_acceptance_rate),
                     action_change_magnitude=action_movement,
+                    competitor_share=float(m2.share),
+                    competitor_profit_per_request=float(m2.profit_per_request),
                 )
 
                 if self.firm1_mode == "RL" and rl_step is not None:
@@ -1814,6 +1833,8 @@ class Core:
                 for component_key in (
                     "reward_share_component",
                     "reward_profit_component",
+                    "reward_relative_share_term",
+                    "reward_relative_profit_term",
                     "reward_momentum_component",
                     "reward_profit_delta",
                     "reward_gap_delta",
@@ -2056,6 +2077,8 @@ class Core:
                 avg_wait_minutes=float(m1.avg_wait_minutes),
                 driver_acceptance_rate=float(m1.driver_acceptance_rate),
                 action_change_magnitude=action_movement,
+                competitor_share=float(m2.share),
+                competitor_profit_per_request=float(m2.profit_per_request),
             )
             eval_reward = float(reward_diag["reward"])
             
@@ -2103,6 +2126,8 @@ class Core:
                 "reward_efficiency_term": float(reward_diag["reward_efficiency_term"]),
                 "reward_share_component": float(reward_diag.get("reward_share_component", 0.0)),
                 "reward_profit_component": float(reward_diag.get("reward_profit_component", 0.0)),
+                "reward_relative_share_term": float(reward_diag.get("reward_relative_share_term", 0.0)),
+                "reward_relative_profit_term": float(reward_diag.get("reward_relative_profit_term", 0.0)),
                 "reward_price_gap_penalty": float(reward_diag.get("reward_price_gap_penalty", 0.0)),
                 "reward_gap_penalty_scale": float(reward_diag.get("reward_gap_penalty_scale", 0.0)),
                 "reward_price_gap_abs_error": float(reward_diag.get("reward_price_gap_abs_error", 0.0)),
@@ -2629,7 +2654,6 @@ class Core:
             firm1_last_wait=float(self.last_wait),
             firm1_last_driver_paypr=float(self.last_driver_paypr),
             driver_state_vec=self.driver_supply.state_features_for_firm1() if self.enable_driver_supply else None,
-            supply_incentive_multiplier=float(getattr(self.firm1, "supply_incentive_multiplier", 1.0)),
             last_action_magnitude=float(
                 self.firm1.last_action_magnitude() if hasattr(self.firm1, "last_action_magnitude") else 0.0
             ),
@@ -2687,12 +2711,14 @@ class Core:
         airport_count = 0
         dist_sum = 0.0
         
-        profiles = sampled_profiles if sampled_profiles is not None else self.agent_gen.sample_profiles(customers_per_step)
+        profile_sample_size = self._effective_simulation_sample_size(customers_per_step, collect_rows=collect_rows)
+        if sampled_profiles is None:
+            profiles = self.agent_gen.sample_profiles(profile_sample_size)
+        elif collect_rows or len(sampled_profiles) <= profile_sample_size:
+            profiles = sampled_profiles
+        else:
+            profiles = sampled_profiles[:profile_sample_size]
         if self.enable_driver_supply:
-            if self.firm1_mode == "RL" and hasattr(self.firm1, "supply_incentive_multiplier"):
-                self.driver_supply.pay_policies["Firm1"].incentive_multiplier = float(
-                    np.clip(self.firm1.supply_incentive_multiplier, 0.85, 1.25)
-                )
             self.driver_supply.begin_batch(customers_per_step=customers_per_step, hour=hour, weather=weather)
 
         for profile in profiles:
@@ -2992,6 +3018,8 @@ class Core:
                     avg_wait_minutes=float(m1.avg_wait_minutes),
                     driver_acceptance_rate=float(m1.driver_acceptance_rate),
                     action_change_magnitude=action_movement,
+                    competitor_share=float(m2.share),
+                    competitor_profit_per_request=float(m2.profit_per_request),
                 )
                 if self.firm1_mode == "RL" and rl_step is not None:
                     action, s_ts, logits, val = rl_step
@@ -3019,6 +3047,8 @@ class Core:
                 for component_key in (
                     "reward_share_component",
                     "reward_profit_component",
+                    "reward_relative_share_term",
+                    "reward_relative_profit_term",
                     "reward_momentum_component",
                     "reward_profit_delta",
                     "reward_gap_delta",
