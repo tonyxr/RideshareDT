@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from typing import Deque, Optional, Dict, List, Tuple
 import numpy as np
 from collections import deque
-from itertools import product
 
 from PPOAgent import PPOAgent
 from Market_models import CoefficientOverrides
@@ -320,7 +319,17 @@ class FirmRLPricer:
             self.config = default_specs_for(self.opt_keys)
     
     def __init__(self, seed: Optional[int], opt_keys: List[str], state_frame_stack: int = 4):
-        # Shared action manipulates up to five pricing coefficients per step.
+        # Hierarchical response-aware action design:
+        #   1) the PPO actor is the high-level option policy and selects which
+        #      single price coefficient/direction to intervene on;
+        #   2) the heuristic action-realizer below converts that option into a
+        #      bounded coefficient magnitude using recent market stress;
+        #   3) the simulator then provides the realized response target used by
+        #      the PPO response head/world-model auxiliary loss.
+        #
+        # This intentionally avoids a flat actor that emits a full coefficient
+        # vector.  The learned policy owns "what to manipulate"; the lower layer
+        # owns "how much to manipulate" subject to feasibility and stability.
         self.opt_keys = list(opt_keys[: self.MAX_MANIPULATED_COEFFS])
         if len(opt_keys) > self.MAX_MANIPULATED_COEFFS:
             print(
@@ -354,30 +363,22 @@ class FirmRLPricer:
         self.aggressive_actions = set()
         self.allow_aggressive_actions = True
         
-        # Response-aware MDP action: a centralized pricing intervention is a
-        # bounded vector of coefficient adjustments, not a command to one rider
-        # and not a one-knob nudge.  Use the discrete product {-1, 0, +1}^d so
-        # PPO can learn coordinated fare updates across all managed coefficients
-        # in one decision while projection below enforces feasibility.
+        # High-level option actions.  Index 0 is hold/status quo; every other
+        # action chooses exactly one coefficient and one direction.  The action
+        # realizer later chooses the concrete step magnitude.
         all_keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
         active_keys = [k for k in all_keys if k in self.opt_keys]
         
 
         self.action_to_steps: Dict[int, Dict[str, int]] = {}
-        for a_idx, step_tuple in enumerate(product((-1, 0, 1), repeat=len(active_keys))):
-            self.action_to_steps[a_idx] = {
-                key: int(step) for key, step in zip(active_keys, step_tuple)
-            }
-        # Put the hold action at index 0 for stable cold starts and diagnostics.
-        hold_idx = next(
-            (idx for idx, steps in self.action_to_steps.items() if all(v == 0 for v in steps.values())),
-            0,
-        )
-        if hold_idx != 0:
-            self.action_to_steps[0], self.action_to_steps[hold_idx] = (
-                self.action_to_steps[hold_idx],
-                self.action_to_steps[0],
-            )
+        self.action_to_steps[0] = {key: 0 for key in active_keys}
+        action_idx = 1
+        for key in active_keys:
+            for step in (-1, 1):
+                self.action_to_steps[action_idx] = {
+                    k: (int(step) if k == key else 0) for k in active_keys
+                }
+                action_idx += 1
         action_dim = len(self.action_to_steps)
         self.action_keys = list(active_keys)
         
@@ -438,6 +439,12 @@ class FirmRLPricer:
         self._last_applied_action = -1
         self._repeat_action_count = 0
         self.last_action_normalized_gap = {}
+        
+    def update_response_context(self, share: float, gap: float, fulfillment: float) -> None:
+        """Provide the action-realizer with latest observed environment response."""
+        self._last_share_hint = float(np.clip(share, 0.0, 1.0))
+        self._last_gap_hint = float(np.nan_to_num(gap, nan=0.0, posinf=3.0, neginf=-3.0))
+        self._last_fulfillment_hint = float(np.clip(fulfillment, 0.0, 1.0))
 
     def stack_state(self, state: np.ndarray) -> np.ndarray:
         """Return a fixed-width frame stack ending with the current state.
@@ -581,6 +588,45 @@ class FirmRLPricer:
             if gap >= upper_gap:
                 move("per_minute", +1, 0.25)
                 move("per_mile", +1, 0.25)
+                
+    def _heuristic_magnitude_multiplier(self, coeff_key: str, direction: int) -> float:
+        """Low-level action-realizer for the selected high-level option.
+
+        PPO selects the coefficient and direction.  This deterministic heuristic
+        chooses the concrete bounded magnitude from recent response signals,
+        making the primitive action feasible, interpretable, and less brittle
+        than asking the policy to learn every continuous step size directly.
+        """
+        share = float(np.clip(getattr(self, "_last_share_hint", 0.50), 0.0, 1.0))
+        gap = float(getattr(self, "_last_gap_hint", 0.0))
+        fulfillment = float(np.clip(getattr(self, "_last_fulfillment_hint", 1.0), 0.0, 1.0))
+        repeat_count = float(max(0, getattr(self, "_repeat_action_count", 0)))
+
+        multiplier = 1.0
+        if share < self.recovery_share_threshold:
+            # When share is under stress, make defensive discounts meaningful
+            # but make price increases conservative.
+            multiplier *= 1.25 if int(direction) < 0 else 0.55
+        if gap < -0.75:
+            # Firm1 is materially more expensive than Firm2.
+            multiplier *= 1.20 if int(direction) < 0 else 0.60
+        elif gap > 1.25:
+            # Firm1 has room to narrow excessive discounting.
+            multiplier *= 1.20 if int(direction) > 0 else 0.70
+        if fulfillment < 0.75 and coeff_key in {"per_minute", "per_mile"}:
+            # Supply stress can justify small variable-price pressure, but avoid
+            # aggressive variable discounts that worsen fulfillment.
+            multiplier *= 1.15 if int(direction) > 0 else 0.65
+        if coeff_key == "airport_fee":
+            # Airport fee is segment-specific and can create large visible gaps;
+            # keep it more conservative than broad fare coefficients.
+            multiplier *= 0.70
+        if repeat_count > 1:
+            multiplier *= max(
+                self.repeat_action_min_scale,
+                self.repeat_action_decay ** float(repeat_count - 1),
+            )
+        return float(np.clip(multiplier, 0.20, 1.35))
             
     def apply_action(self, action: int, market_interaction) -> None:
         """Map discrete steps back into concrete market coefficient overrides."""
@@ -604,19 +650,14 @@ class FirmRLPricer:
         else:
             self._last_applied_action = int(action)
             self._repeat_action_count = 1 if int(action) != 0 else 0
-        repeat_scale = 1.0
-        if self._repeat_action_count > 1:
-            repeat_scale = max(
-                self.repeat_action_min_scale,
-                self.repeat_action_decay ** float(self._repeat_action_count - 1),
-            )
+        
 
         self.last_action_steps = dict(step_map)
         fare_step_map = {k: v for k, v in step_map.items() if k in self.opt_keys and int(v) != 0}
         supply_step = int(step_map.get("supply_incentive", 0))
         if supply_step:
             self.supply_incentive_multiplier = float(np.clip(
-                self.supply_incentive_multiplier + supply_step * self.supply_step * self.step_scale * repeat_scale,
+                self.supply_incentive_multiplier + supply_step * self.supply_step * self.step_scale,
                 self.supply_min_multiplier,
                 self.supply_max_multiplier,
             ))
@@ -624,7 +665,12 @@ class FirmRLPricer:
             self.last_action_normalized_gap = {"supply_incentive": float(supply_step) * self.supply_step} if supply_step else {}
             return
 
-        scaled_steps = {k: self.config.step[k] * self.step_scale * repeat_scale for k in fare_step_map.keys()}
+        scaled_steps = {
+            k: self.config.step[k]
+            * self.step_scale
+            * self._heuristic_magnitude_multiplier(k, int(fare_step_map[k]))
+            for k in fare_step_map.keys()
+        }
         bounds = {k: self.config.bounds[k] for k in fare_step_map.keys()}
         # Detailed normalized one-unit gap per coefficient:
         # one step => config.step[k], normalized by feasible range width.

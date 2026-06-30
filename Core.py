@@ -2766,6 +2766,12 @@ class Core:
         """Build state vector for Firm1 RL controller from current market + recent summaries."""
         f2_ema_share = getattr(self.firm2, "ema_share", 0.5)
         f2_ema_gap = getattr(self.firm2, "ema_gap", 0.0)
+        if hasattr(self.firm1, "update_response_context"):
+            self.firm1.update_response_context(
+                share=float(self.last_share),
+                gap=float(self.last_gap),
+                fulfillment=float(self.last_fulfillment),
+            )
         
         f2_cooldown = float(getattr(self.firm2, "cooldown", 0))
 
