@@ -41,10 +41,13 @@ class ActorCritic(nn.Module):
         hidden: int = 192,
         constraint_dim: int = 5,
         response_dim: int = 4,
+        action_feature_dim: int = 0,
     ):
         super().__init__()
         self.constraint_dim = int(max(1, constraint_dim))
         self.response_dim = int(max(1, response_dim))
+        self.action_dim = int(max(1, action_dim))
+        self.action_feature_dim = int(max(0, action_feature_dim))
         self.trunk = nn.Sequential(
             nn.Linear(state_dim, hidden),
             nn.LayerNorm(hidden),
@@ -53,7 +56,25 @@ class ActorCritic(nn.Module):
             nn.LayerNorm(hidden),
             nn.SiLU(),
         )
-        self.pi_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, action_dim))
+        self.action_encoder = None
+        self.action_score_head = None
+        self.action_q_head = None
+        if self.action_feature_dim > 0:
+            # Action-conditioned scoring lets PPO evaluate the causal footprint of
+            # each option (target coefficient, direction, realized heuristic step,
+            # and expected crowd segment exposure) instead of treating actions as
+            # opaque integer IDs.
+            self.action_encoder = nn.Sequential(
+                nn.Linear(self.action_feature_dim, hidden // 2),
+                nn.SiLU(),
+                nn.Linear(hidden // 2, hidden // 2),
+                nn.SiLU(),
+            )
+            self.action_score_head = nn.Sequential(nn.Linear(hidden + hidden // 2, hidden), nn.SiLU(), nn.Linear(hidden, 1))
+            self.action_q_head = nn.Sequential(nn.Linear(hidden + hidden // 2, hidden), nn.SiLU(), nn.Linear(hidden, 1))
+            self.pi_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, action_dim))
+        else:
+            self.pi_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, action_dim))
         self.v_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, 1))
         self.constraint_head = nn.Sequential(
             nn.Linear(hidden, hidden),
@@ -85,15 +106,28 @@ class ActorCritic(nn.Module):
                 nn.init.constant_(head[-1].bias, 0.0)
 
     def forward(
-        self, s: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, s: torch.Tensor, action_features: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         z = self.trunk(s)
+        q_values = torch.empty(0, dtype=z.dtype, device=z.device)
+        if self.action_feature_dim > 0 and action_features is not None and self.action_encoder is not None:
+            af = torch.nan_to_num(action_features, nan=0.0, posinf=1.0, neginf=-1.0).to(dtype=z.dtype, device=z.device)
+            if af.ndim == 2:
+                af = af.unsqueeze(0)
+            a_emb = self.action_encoder(af)
+            z_expanded = z.unsqueeze(1).expand(-1, a_emb.shape[1], -1)
+            joint = torch.cat([z_expanded, a_emb], dim=-1)
+            logits = self.action_score_head(joint).squeeze(-1)
+            q_values = self.action_q_head(joint).squeeze(-1)
+        else:
+            logits = self.pi_head(z)
         return (
-            self.pi_head(z),
+            logits,
             self.v_head(z).squeeze(-1),
             self.constraint_head(z),
             self.risk_head(z).squeeze(-1),
             self.response_head(z),
+            q_values,
         )
     
 @dataclass
@@ -108,6 +142,8 @@ class Transition:
     constraint_costs: torch.Tensor
     risk_cost: float
     response_target: torch.Tensor
+    action_features: torch.Tensor
+    action_trace: torch.Tensor
     old_constraint_values: torch.Tensor
     old_risk_value: torch.Tensor
 
@@ -142,6 +178,9 @@ class PPOAgent:
         exploration_rescue_rate: float = 0.12,
         constraint_dim: int = 5,
         response_dim: int = 4,
+        action_feature_dim: int = 0,
+        action_trace_dim: int = 8,
+        action_q_coeff: float = 0.08,
         constraint_value_coeff: float = 0.25,
         risk_value_coeff: float = 0.15,
         response_coeff: float = 0.05,
@@ -151,12 +190,15 @@ class PPOAgent:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.constraint_dim = int(max(1, constraint_dim))
         self.response_dim = int(max(1, response_dim))
+        self.action_dim = int(max(1, action_dim))
+        self.action_feature_dim = int(max(0, action_feature_dim))
         self.net = ActorCritic(
             state_dim,
             action_dim,
             hidden=hidden_dim,
             constraint_dim=self.constraint_dim,
             response_dim=self.response_dim,
+            action_feature_dim=action_feature_dim,
         ).to(self.device)
         self.opt = optim.Adam(self.net.parameters(), lr=lr)
         self.base_lr = float(lr)
@@ -171,6 +213,9 @@ class PPOAgent:
         self.final_clip_eps = float(np.clip(final_clip_eps, 0.01, self.initial_clip_eps))
         self.clip_eps = self.initial_clip_eps
         self.v_coeff = v_coeff
+        self.action_feature_dim = int(max(0, action_feature_dim))
+        self.action_trace_dim = int(max(1, action_trace_dim))
+        self.action_q_coeff = float(max(0.0, action_q_coeff))
         self.constraint_value_coeff = float(max(0.0, constraint_value_coeff))
         self.risk_value_coeff = float(max(0.0, risk_value_coeff))
         self.response_coeff = float(max(0.0, response_coeff))
@@ -342,18 +387,28 @@ class PPOAgent:
             self.clip_eps = min(self.clip_eps, self.final_clip_eps)
 
     @torch.no_grad()
-    def act(self, s_np: np.ndarray, deterministic: bool = False) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def act(
+        self,
+        s_np: np.ndarray,
+        deterministic: bool = False,
+        action_features: Optional[np.ndarray] = None,
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         s = torch.tensor(s_np, dtype=torch.float32, device=self.device).unsqueeze(0)
         s = torch.nan_to_num(s, nan=0.0, posinf=1e3, neginf=-1e3)
         expected_dim = self.net.trunk[0].in_features
         if s.shape[-1] != expected_dim:
             raise ValueError(f"State dim mismatch: got {s.shape[-1]}, expected {expected_dim}")
         
-        logits, value, constraint_values, risk_value, response_pred = self.net(s)
+        af_tensor = None
+        if self.action_feature_dim > 0 and action_features is not None:
+            af_tensor = torch.as_tensor(action_features, dtype=torch.float32, device=self.device)
+            af_tensor = af_tensor.reshape(1, af_tensor.shape[-2], af_tensor.shape[-1])
+        logits, value, constraint_values, risk_value, response_pred, _ = self.net(s, af_tensor)
         logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         if not torch.isfinite(logits).all():
             logits = torch.zeros_like(logits)
         exploration_rate = 0.0 if deterministic else self.exploration_rate
+        self.last_action_exploration_rate = float(exploration_rate)
         dist = self._exploratory_distribution(logits, exploration_rate)
         a = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
         logp = dist.log_prob(a)
@@ -368,7 +423,8 @@ class PPOAgent:
         ).detach()
         if not deterministic:
             self.action_visits[int(a.item())] += 1
-        return int(a.item()), s.squeeze(0), logp.squeeze(0), value.squeeze(0)
+        af_out = af_tensor.squeeze(0).detach() if af_tensor is not None else torch.empty(0, dtype=torch.float32, device=self.device)
+        return int(a.item()), s.squeeze(0), logp.squeeze(0), value.squeeze(0), af_out
     
     def store(
         self,
@@ -382,6 +438,8 @@ class PPOAgent:
         constraint_costs: Optional[np.ndarray | List[float] | Tuple[float, ...] | torch.Tensor] = None,
         risk_cost: float = 0.0,
         response_target: Optional[np.ndarray | List[float] | Tuple[float, ...] | torch.Tensor] = None,
+        action_features: Optional[np.ndarray | List[List[float]] | torch.Tensor] = None,
+        action_trace: Optional[np.ndarray | List[float] | Tuple[float, ...] | torch.Tensor] = None,
     ) -> None:
         del s_next
         if constraint_costs is None:
@@ -404,8 +462,33 @@ class PPOAgent:
                 if width > 0:
                     padded[:width] = response_tensor[:width]
                 response_tensor = padded
+        
+        if action_features is None or self.action_feature_dim <= 0:
+            action_feature_tensor = torch.empty(0, dtype=torch.float32, device=self.device)
+        else:
+            action_feature_tensor = torch.as_tensor(action_features, dtype=torch.float32, device=self.device)
+            action_feature_tensor = action_feature_tensor.reshape(-1, action_feature_tensor.shape[-1])
+            if action_feature_tensor.shape[-1] != self.action_feature_dim:
+                fixed = torch.zeros((self.action_visits.size, self.action_feature_dim), dtype=torch.float32, device=self.device)
+                rows = min(fixed.shape[0], action_feature_tensor.shape[0])
+                cols = min(fixed.shape[1], action_feature_tensor.shape[1])
+                fixed[:rows, :cols] = action_feature_tensor[:rows, :cols]
+                action_feature_tensor = fixed
+        if action_trace is None:
+            action_trace_tensor = torch.zeros(self.action_trace_dim, dtype=torch.float32, device=self.device)
+        else:
+            action_trace_tensor = torch.as_tensor(action_trace, dtype=torch.float32, device=self.device).reshape(-1)
+            if action_trace_tensor.numel() != self.action_trace_dim:
+                fixed_trace = torch.zeros(self.action_trace_dim, dtype=torch.float32, device=self.device)
+                width = min(self.action_trace_dim, action_trace_tensor.numel())
+                fixed_trace[:width] = action_trace_tensor[:width]
+                action_trace_tensor = fixed_trace
+                
         constraint_tensor = torch.nan_to_num(constraint_tensor, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0)
         response_tensor = torch.nan_to_num(response_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        action_feature_tensor = torch.nan_to_num(action_feature_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
+        action_trace_tensor = torch.nan_to_num(action_trace_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
         
         self.buf.append(
             Transition(
@@ -421,6 +504,8 @@ class PPOAgent:
                 constraint_costs=constraint_tensor.detach(),
                 risk_cost=float(max(0.0, np.nan_to_num(risk_cost, nan=0.0, posinf=1.0, neginf=0.0))),
                 response_target=response_tensor.detach(),
+                action_features=action_feature_tensor.detach(),
+                action_trace=action_trace_tensor.detach(),
                 old_constraint_values=self.last_constraint_values.detach().clone(),
                 old_risk_value=self.last_risk_value.detach().clone(),
             )
@@ -468,6 +553,7 @@ class PPOAgent:
                 "constraint_value_loss": 0.0,
                 "risk_value_loss": 0.0,
                 "response_loss": 0.0,
+                "action_q_loss": 0.0,
                 "lagrangian_adv_mean": 0.0,
                 "lagrangian_adv_std": 0.0,
                 "constraint_lambda_mean": 0.0,
@@ -501,6 +587,9 @@ class PPOAgent:
         old_risk_value_all = torch.stack([tr.old_risk_value for tr in self.buf], dim=0).detach()
         risk_adv_all, risk_ret_all = self._gae_scalar(risk_cost_all, old_risk_value_all, done_all)
         response_target_all = torch.stack([tr.response_target for tr in self.buf], dim=0).detach()
+        action_feature_items = [tr.action_features for tr in self.buf]
+        has_action_features = bool(action_feature_items and action_feature_items[0].numel() > 0)
+        action_features_all = torch.stack(action_feature_items, dim=0).detach() if has_action_features else None
         lambda_vec = self.constraint_lambdas.detach().to(self.device)
         lagrangian_adv = adv - torch.sum(constraint_adv_all * lambda_vec.unsqueeze(0), dim=1) - self.risk_coeff * risk_adv_all
         lagrangian_adv = torch.nan_to_num(lagrangian_adv, nan=0.0, posinf=0.0, neginf=0.0)
@@ -531,6 +620,7 @@ class PPOAgent:
             "constraint_value_loss": 0.0,
             "risk_value_loss": 0.0,
             "response_loss": 0.0,
+            "action_q_loss": 0.0,
             "lagrangian_adv_mean": float(lag_mean.item()),
             "lagrangian_adv_std": float(lag_std.item()),
             "constraint_lambda_mean": float(lambda_vec.mean().item()),
@@ -557,6 +647,7 @@ class PPOAgent:
             "constraint_value_loss": 0.0,
             "risk_value_loss": 0.0,
             "response_loss": 0.0,
+            "action_q_loss": 0.0,
             "entropy": 0.0,
             "policy_entropy": 0.0,
             "approx_kl": 0.0,
@@ -576,11 +667,12 @@ class PPOAgent:
                 constraint_ret_b = constraint_ret_all[j].detach()
                 risk_ret_b = risk_ret_all[j].detach()
                 response_target_b = response_target_all[j].detach()
+                action_features_b = action_features_all[j].detach() if action_features_all is not None else None
                 old_logp_b = old_logp_all[j].detach()
                 old_value_b = old_value_all[j].detach()
                 exploration_b = exploration_all[j].detach()
 
-                logits, v, constraint_v, risk_v, response_pred = self.net(s_b)
+                logits, v, constraint_v, risk_v, response_pred, q_values = self.net(s_b, action_features_b)
                 logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
                 if not torch.isfinite(logits).all():
                     continue
@@ -600,6 +692,10 @@ class PPOAgent:
                 constraint_value_loss = torch.mean((constraint_v - constraint_ret_b) ** 2)
                 risk_value_loss = torch.mean((risk_v - risk_ret_b) ** 2)
                 response_loss = torch.mean((response_pred - response_target_b) ** 2)
+                action_q_loss = torch.zeros((), dtype=torch.float32, device=self.device)
+                if q_values.numel() > 0:
+                    chosen_q = q_values.gather(1, a_b.reshape(-1, 1)).squeeze(1)
+                    action_q_loss = torch.mean((chosen_q - ret_b) ** 2)
                 entropy = dist.entropy().mean()
                 policy_entropy = policy_dist.entropy().mean()
                 logratio = logp - old_logp_b
@@ -617,6 +713,7 @@ class PPOAgent:
                     + self.constraint_value_coeff * constraint_value_loss
                     + self.risk_value_coeff * risk_value_loss
                     + self.response_coeff * response_loss
+                    + self.action_q_coeff * action_q_loss
                     - self.ent_coeff * policy_entropy
                 )
                 if not torch.isfinite(loss):
@@ -633,6 +730,7 @@ class PPOAgent:
                 metric_sums["constraint_value_loss"] += float(constraint_value_loss.item())
                 metric_sums["risk_value_loss"] += float(risk_value_loss.item())
                 metric_sums["response_loss"] += float(response_loss.item())
+                metric_sums["action_q_loss"] += float(action_q_loss.item())
                 metric_sums["entropy"] += float(entropy.item())
                 metric_sums["policy_entropy"] += float(policy_entropy.item())
                 metric_sums["approx_kl"] += float(approx_kl.item())

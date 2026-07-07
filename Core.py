@@ -869,16 +869,36 @@ class Core:
         return float(np.clip(max(float(self._finite_float(v)) for v in risk_terms), 0.0, 1.0))
 
     def _response_target_from_metrics(self, m1: FirmMetrics, m2: FirmMetrics, mean_gap: float) -> np.ndarray:
-        """Aggregate response target: share, demand loss, wait, and availability."""
+        """Crowd/system response target for PPO's auxiliary world-model head.
+
+        The first four entries preserve aggregate response semantics: share,
+        demand abandonment, wait, and availability.  The remaining entries expose
+        how the chosen price option moved the crowd's parametric distribution:
+        price-threshold mass near the realized gap, threshold moments, low-income
+        and airport/peak segment exposure, outside-option use, and gap level.
+        """
+        stats = getattr(self, "last_crowd_response_stats", {}) or {}
         total_platform_share = float(np.clip(float(m1.share) + float(m2.share), 0.0, 1.0))
         demand_loss = float(np.clip(1.0 - total_platform_share, 0.0, 1.0))
         wait_scaled = float(np.clip(float(m1.avg_wait_minutes) / 20.0, 0.0, 1.0))
         availability = float(np.clip(float(m1.fulfillment_rate) * float(m1.driver_acceptance_rate), 0.0, 1.0))
-        del mean_gap
-        # Keep the default response dimension at four while encoding the most
-        # decision-relevant crowd/environment effects requested by the MDP:
-        # market share, demand abandonment, service delay, and driver availability.
-        return np.asarray([float(m1.share), demand_loss, wait_scaled, availability], dtype=np.float32)
+        return np.asarray(
+            [
+                float(np.clip(m1.share, 0.0, 1.0)),
+                demand_loss,
+                wait_scaled,
+                availability,
+                float(np.clip(stats.get("near_threshold_share", 0.0), 0.0, 1.0)),
+                float(np.clip(stats.get("price_threshold_mean", 1.5) / 8.0, 0.0, 1.0)),
+                float(np.clip(stats.get("price_threshold_std", 0.0) / 4.0, 0.0, 1.0)),
+                float(np.clip(stats.get("low_income_share", 0.0), 0.0, 1.0)),
+                float(np.clip(stats.get("airport_rate", 0.0), 0.0, 1.0)),
+                float(np.clip(stats.get("peak_context", 0.0), 0.0, 1.0)),
+                float(np.clip(stats.get("no_ride_rate", 0.0), 0.0, 1.0)),
+                float(np.clip((float(mean_gap) + 6.0) / 12.0, 0.0, 1.0)),
+            ],
+            dtype=np.float32,
+        )
 
     def _sync_agent_optimization_context(self) -> None:
         """Push current Lagrange multipliers and risk weight into the PPO agent."""
@@ -1131,8 +1151,8 @@ class Core:
                 avg_wait_minutes=avg_wait_minutes,
                 driver_acceptance_rate=driver_acceptance_rate,
                 action_change_magnitude=action_change_magnitude,
-                competitor_share=competitor_share,
-                competitor_profit_per_request=competitor_profit_per_request,
+                baseline_share=competitor_share,
+                baseline_profit_per_request=competitor_profit_per_request,
             )["reward_base"]
         )
 
@@ -1195,7 +1215,37 @@ class Core:
         )
         efficiency_term = float(0.5 * trend_term + 0.5 * pricing_discipline)
         momentum_component = float(self.reward_momentum_weight * self.reward_trend_scale * trend_term)
-        raw_reward = float(base_reward + momentum_component)
+        # Credit assignment for hierarchical actions: reward the selected option
+        # for the response path it was supposed to influence, then charge the
+        # lower realizer only for avoidable hidden clipping/oversized movement.
+        action_desc = getattr(getattr(self, "firm1", None), "last_action_descriptor", None)
+        action_direction = int(getattr(action_desc, "direction", 0) or 0)
+        action_target = str(getattr(action_desc, "target", "hold") or "hold")
+        realized_norm = float(np.clip(abs(getattr(action_desc, "realized_delta_norm", 0.0) or 0.0), 0.0, 1.0))
+        clipped_action = bool(getattr(action_desc, "was_clipped", False))
+        stats = getattr(self, "last_crowd_response_stats", {}) or {}
+        near_threshold = float(np.clip(stats.get("near_threshold_share", 0.0), 0.0, 1.0))
+        no_ride_rate = float(np.clip(stats.get("no_ride_rate", 0.0), 0.0, 1.0))
+        airport_rate = float(np.clip(stats.get("airport_rate", 0.0), 0.0, 1.0))
+        threshold_focus = near_threshold * (1.0 - no_ride_rate)
+        if action_direction < 0:
+            # Price cuts should be credited through demand recovery and gap repair,
+            # especially when many riders are near their price-salience threshold.
+            response_component = 0.10 * threshold_focus * max(0.0, share_delta) + 0.06 * max(0.0, gap_delta)
+            response_component -= 0.05 * max(0.0, -profit_delta) * max(0.25, realized_norm)
+        elif action_direction > 0:
+            # Price increases should be credited through unit economics and
+            # discount narrowing without triggering crowd exit.
+            response_component = 0.10 * max(0.0, profit_delta) + 0.06 * max(0.0, gap_delta)
+            response_component -= 0.08 * max(0.0, -share_delta) * max(0.25, near_threshold)
+        else:
+            response_component = 0.03 * pricing_discipline
+        if action_target == "airport_fee":
+            response_component *= max(0.35, airport_rate)
+        elif action_target in {"per_mile", "per_minute"}:
+            response_component *= max(0.50, float(np.clip(stats.get("long_trip_share", 0.0), 0.0, 1.0)) + 0.50)
+        action_realization_penalty = 0.04 * realized_norm + (0.04 if clipped_action and action_direction != 0 else 0.0)
+        raw_reward = float(base_reward + momentum_component + response_component - action_realization_penalty)
         # The base terms are already smoothly bounded. A second tanh compressed
         # useful differences between good and excellent outcomes and weakened
         # PPO's advantage signal without changing safety.
@@ -1214,6 +1264,11 @@ class Core:
             "reward_profit_delta": profit_delta,
             "reward_gap_delta": gap_delta,
             "reward_momentum_component": momentum_component,
+            "reward_response_component": float(response_component),
+            "reward_action_realization_penalty": float(action_realization_penalty),
+            "reward_action_target_airport_context": float(airport_rate),
+            "reward_crowd_near_threshold_share": float(near_threshold),
+            "reward_crowd_no_ride_rate": float(no_ride_rate),
             "reward_pricing_discipline": pricing_discipline,
             "reward_efficiency_term": efficiency_term,
             "reward_profit_per_request": profitpr,
@@ -1254,6 +1309,7 @@ class Core:
         """Run-level slight variations to demographics/weather/ride nature priors."""
         self.agent_gen.apply_probability_variation(jitter_scale=0.05)
         self.market.refresh_run_probabilities(jitter_scale=0.05)
+        self.last_crowd_response_stats = {}
 
     def _refresh_profile_pool(self, rides_per_timestep: int) -> None:
         """Generate synthetic customer profiles at t=0 with minimum 2x timestep demand."""
@@ -1810,12 +1866,13 @@ class Core:
                 if self.firm1_mode == "RL":
                     s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
                     s_vec = self.firm1.stack_state(s_vec)
-                    action, s_ts, logits, val = self.firm1.agent.act(s_vec)
+                    action_features = self.firm1.build_action_feature_matrix(self.market, getattr(self, "last_crowd_response_stats", {}))
+                    action, s_ts, logits, val, af_ts = self.firm1.agent.act(s_vec, action_features=action_features)
                     self.firm1.apply_action(action, self.market)
                     self._project_rl_action_before_batch(base)
                     action_counts[int(action)] += 1
                     last_action = int(action)
-                    rl_step = (action, s_ts, logits, val)
+                    rl_step = (action, s_ts, logits, val, af_ts)
                 elif self.firm1_mode != "static":
                     self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
@@ -1866,7 +1923,7 @@ class Core:
                 )
 
                 if self.firm1_mode == "RL" and rl_step is not None:
-                    action, s_ts, logits, val = rl_step
+                    action, s_ts, logits, val, af_ts = rl_step
                     reward = float(reward_diag["reward"])
                     self.last_reward = reward
                     self._update_constraint_multipliers(reward_diag)
@@ -1882,6 +1939,8 @@ class Core:
                         constraint_costs=self._constraint_vector_from_diag(reward_diag),
                         risk_cost=self._risk_cost_from_diag(reward_diag),
                         response_target=self._response_target_from_metrics(m1, m2, mean_gap),
+                        action_features=af_ts,
+                        action_trace=self.firm1.action_descriptor_vector(),
                     )
                     if done:
                         before_base = getattr(self.firm1.overrides, "base_fare", None)
@@ -2149,7 +2208,8 @@ class Core:
             if self.firm1_mode == "RL":
                 s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
                 s_vec = self.firm1.stack_state(s_vec)
-                action, *_ = self.firm1.agent.act(s_vec, deterministic=True)
+                action_features = self.firm1.build_action_feature_matrix(self.market, getattr(self, "last_crowd_response_stats", {}))
+                action, *_ = self.firm1.agent.act(s_vec, deterministic=True, action_features=action_features)
                 self.firm1.apply_action(action, self.market)
                 self._project_rl_action_before_batch(base)
                 action = int(action)
@@ -2704,10 +2764,11 @@ class Core:
         rl_step = None
         if self.firm1_mode == "RL":
             s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
-            action, s_ts, logits, val = self.firm1.agent.act(s_vec)
+            action_features = self.firm1.build_action_feature_matrix(self.market, getattr(self, "last_crowd_response_stats", {}))
+            action, s_ts, logits, val, af_ts = self.firm1.agent.act(s_vec, action_features=action_features)
             self.firm1.apply_action(action, self.market)
             self._project_rl_action_before_batch(self.market.curr_market)
-            rl_step = (action, s_ts, logits, val)
+            rl_step = (action, s_ts, logits, val, af_ts)
         elif self.firm1_mode != "static":
             self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
@@ -2720,7 +2781,7 @@ class Core:
 
 
         if is_training and self.firm1_mode == "RL" and rl_step is not None:
-            action, s_ts, logits, val = rl_step
+            action, s_ts, logits, val, af_ts = rl_step
             reward_diag = getattr(self, "last_reward_diagnostics", {})
             self.firm1.agent.store(
                 s_ts,
@@ -2733,6 +2794,8 @@ class Core:
                 constraint_costs=self._constraint_vector_from_diag(reward_diag),
                 risk_cost=self._risk_cost_from_diag(reward_diag),
                 response_target=self._response_target_from_metrics(m1, m2, gap),
+                action_features=af_ts,
+                action_trace=self.firm1.action_descriptor_vector(),
             )
             self.firm1.stabilize_after_batch(
                 share=float(m1.share),
@@ -2862,6 +2925,11 @@ class Core:
 
         airport_count = 0
         dist_sum = 0.0
+        threshold_values: List[float] = []
+        low_income_count = 0
+        near_threshold_count = 0
+        no_ride_count = 0
+        long_trip_count = 0
         
         profile_sample_size = self._effective_simulation_sample_size(customers_per_step, collect_rows=collect_rows)
         if sampled_profiles is None:
@@ -2923,9 +2991,16 @@ class Core:
                 "CancelRiskFirm1": cancel_risk1,
                 "CancelRiskFirm2": cancel_risk2,
             }
+            
+            threshold = float(np.clip(float(profile.get("PriceThreshold", 1.50) or 1.50), 0.25, 8.00))
+            threshold_values.append(threshold)
+            low_income_count += int(str(profile.get("IncomeBracket", "")).strip() == "<50k")
+            near_threshold_count += int(0.75 <= abs(float(p2 - p1)) / max(threshold, 1e-6) <= 1.25)
+            long_trip_count += int(float(travel_distance) >= 8.0)
 
             choice_res: ChoiceResult = self.choice_model.choose(profile, scenario, p1, p2)
             choice = choice_res.choice
+            no_ride_count += int(choice == "NoRide")
 
             firm1.total += 1
             firm2.total += 1
@@ -3029,6 +3104,18 @@ class Core:
         if self.enable_driver_supply:
             self.driver_supply.end_batch()
         denominator = max(1, profile_count)
+        threshold_arr = np.asarray(threshold_values or [1.5], dtype=float)
+        self.last_crowd_response_stats = {
+            "price_threshold_mean": float(np.mean(threshold_arr)),
+            "price_threshold_std": float(np.std(threshold_arr)),
+            "near_threshold_share": float(near_threshold_count / denominator),
+            "low_income_share": float(low_income_count / denominator),
+            "airport_rate": float(airport_count / denominator),
+            "long_trip_share": float(long_trip_count / denominator),
+            "peak_context": float((7 <= int(hour) < 10) or (16 <= int(hour) < 19)),
+            "no_ride_rate": float(no_ride_count / denominator),
+        }
+        denominator = max(1, profile_count)
         mean_gap = float(gap_sum / denominator)
         airport_rate = float(airport_count / denominator)
         mean_dist = float(dist_sum / denominator)
@@ -3100,12 +3187,13 @@ class Core:
                     s_vec = self.firm1.stack_state(s_vec)
                     # Evaluation/deployment runs should reflect the learned policy,
                     # not PPO's training-time uniform exploration mixture.
-                    action, s_ts, logits, val = self.firm1.agent.act(s_vec, deterministic=True)
+                    action_features = self.firm1.build_action_feature_matrix(self.market, getattr(self, "last_crowd_response_stats", {}))
+                    action, s_ts, logits, val, af_ts = self.firm1.agent.act(s_vec, deterministic=True, action_features=action_features)
                     self.firm1.apply_action(action, self.market)
                     self._project_rl_action_before_batch(base)
                     action_counts[int(action)] += 1
                     last_action = int(action)
-                    rl_step = (action, s_ts, logits, val)
+                    rl_step = (action, s_ts, logits, val, af_ts)
                 elif self.firm1_mode != "static":
                     self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
@@ -3170,11 +3258,12 @@ class Core:
                     avg_wait_minutes=float(m1.avg_wait_minutes),
                     driver_acceptance_rate=float(m1.driver_acceptance_rate),
                     action_change_magnitude=action_movement,
-                    competitor_share=float(m2.share),
-                    competitor_profit_per_request=float(m2.profit_per_request),
+                    baseline_share=float(m2.share),
+                    baseline_rev_per_request=float(m2.rev_per_request),
+                    baseline_profit_per_request=float(m2.profit_per_request),
                 )
                 if self.firm1_mode == "RL" and rl_step is not None:
-                    action, s_ts, logits, val = rl_step
+                    action, s_ts, logits, val, af_ts = rl_step
                     reward = float(reward_diag["reward"])
                     self.last_reward = reward
                     self._update_constraint_multipliers(reward_diag)

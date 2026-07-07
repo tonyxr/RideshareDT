@@ -20,6 +20,32 @@ from Market_models import CoefficientOverrides
 from optim_config import default_specs_for
 
 @dataclass
+class ActionDescriptor:
+    """Executed high-level option and lower-level realization metadata.
+
+    The magnitude realizer follows a bounded, monotone adjustment rule: PPO
+    chooses the option target/direction, while the heuristic chooses a smooth
+    step size from visible market-response signals.  This mirrors classic
+    discrete price-adjustment/tatonnement and revenue-management guardrail
+    practice: make local, bounded moves, dampen repeated moves, and shrink moves
+    near feasibility bounds so price experiments remain identifiable.
+    """
+
+    action_id: int = 0
+    target: str = "hold"
+    direction: int = 0
+    intended_step: float = 0.0
+    realized_delta: float = 0.0
+    realized_delta_norm: float = 0.0
+    pre_value: float = 0.0
+    post_value: float = 0.0
+    lower_distance: float = 1.0
+    upper_distance: float = 1.0
+    magnitude_multiplier: float = 0.0
+    repeat_count: int = 0
+    was_clipped: bool = False
+
+@dataclass
 class FirmMetrics:
     revenue: float = 0.0
     profit: float = 0.0
@@ -358,6 +384,9 @@ class FirmRLPricer:
         self.supply_step = 0.025
         self.supply_min_multiplier = 0.90
         self.supply_max_multiplier = 1.15
+        self.action_feature_dim = 19
+        self.action_trace_dim = 8
+        self.last_action_descriptor = ActionDescriptor()
         self.recovery_share_threshold = 0.30
         self.recovery_gap_threshold = -0.05
         self.aggressive_actions = set()
@@ -406,6 +435,10 @@ class FirmRLPricer:
             value_clip_eps=0.30,
             initial_exploration_rate=0.58,
             final_exploration_rate=0.02,
+            action_feature_dim=self.action_feature_dim,
+            action_trace_dim=self.action_trace_dim,
+            response_dim=12,
+            action_q_coeff=0.10,
             exploration_fraction=0.90,
             exploration_warmup_fraction=0.35,
             min_action_visits=2,
@@ -439,6 +472,7 @@ class FirmRLPricer:
         self._last_applied_action = -1
         self._repeat_action_count = 0
         self.last_action_normalized_gap = {}
+        self.last_action_descriptor = ActionDescriptor()
         
     def update_response_context(self, share: float, gap: float, fulfillment: float) -> None:
         """Provide the action-realizer with latest observed environment response."""
@@ -463,6 +497,81 @@ class FirmRLPricer:
         while len(frames) < self.state_frame_stack:
             frames.insert(0, current.copy())
         return np.concatenate(frames[-self.state_frame_stack:]).astype(np.float32, copy=False)
+    
+    def action_descriptor_vector(self) -> np.ndarray:
+        """Compact vector describing the last executed option for PPO auxiliary credit."""
+        d = getattr(self, "last_action_descriptor", ActionDescriptor())
+        target_idx = -1 if d.target == "hold" else self.action_keys.index(d.target) if d.target in self.action_keys else -1
+        return np.asarray(
+            [
+                float(d.direction),
+                float((target_idx + 1) / max(1, len(self.action_keys))),
+                float(np.clip(d.realized_delta_norm, -1.0, 1.0)),
+                float(np.clip(d.magnitude_multiplier, 0.0, 2.0) / 2.0),
+                float(np.clip(d.lower_distance, 0.0, 1.0)),
+                float(np.clip(d.upper_distance, 0.0, 1.0)),
+                float(np.clip(d.repeat_count / 10.0, 0.0, 1.0)),
+                1.0 if d.was_clipped else 0.0,
+            ],
+            dtype=np.float32,
+        )
+
+    def build_action_feature_matrix(self, market_interaction, crowd_context: Optional[Dict[str, float]] = None) -> np.ndarray:
+        """Return per-option causal features used by the action-conditioned PPO head.
+
+        Features expose the option identity, the heuristic's visible magnitude,
+        expected price impact on short/long/airport/peak trips, bound pressure,
+        and recent crowd-response distribution summaries.
+        """
+        ctx = crowd_context or {}
+        base = market_interaction.curr_market
+        rows: List[List[float]] = []
+        max_keys = max(1, len(self.action_keys))
+        near_threshold = float(np.clip(ctx.get("near_threshold_share", 0.0), 0.0, 1.0))
+        threshold_mean = float(np.clip(ctx.get("price_threshold_mean", 1.5) / 8.0, 0.0, 1.0))
+        no_ride_rate = float(np.clip(ctx.get("no_ride_rate", 0.0), 0.0, 1.0))
+        peak = float(np.clip(ctx.get("peak_context", 0.0), 0.0, 1.0))
+        airport_rate = float(np.clip(ctx.get("airport_rate", 0.0), 0.0, 1.0))
+        for action in range(len(self.action_to_steps)):
+            step_map = self.action_steps(action)
+            active = [(k, int(v)) for k, v in step_map.items() if int(v) != 0 and k in self.action_keys]
+            if not active:
+                rows.append([1.0, 0.0, *([0.0] * 5), 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, near_threshold, threshold_mean, no_ride_rate, peak, airport_rate])
+                continue
+            key, direction = active[0]
+            key_onehot = [1.0 if key == k else 0.0 for k in ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]]
+            curr = getattr(self.overrides, key)
+            anchor = float(getattr(base, key))
+            curr_f = anchor if curr is None else float(curr)
+            lb, ub = self.config.bounds[key]
+            width = max(1e-6, float(ub - lb))
+            rel_dev = float(np.clip((curr_f - anchor) / max(abs(anchor), 1e-6), -1.0, 1.0))
+            lower_dist = float(np.clip((curr_f - lb) / width, 0.0, 1.0))
+            upper_dist = float(np.clip((ub - curr_f) / width, 0.0, 1.0))
+            mult = self._heuristic_magnitude_multiplier(key, direction)
+            delta = float(direction) * self.config.step[key] * self.step_scale * mult
+            # Approximate heterogeneous price exposure before time/weather/service multipliers.
+            short_impact = delta if key in {"base_fare", "booking_fee"} else delta * (2.0 if key == "per_mile" else 8.0 if key == "per_minute" else 0.0)
+            long_impact = delta if key in {"base_fare", "booking_fee"} else delta * (10.0 if key == "per_mile" else 28.0 if key == "per_minute" else 0.0)
+            airport_impact = delta if key == "airport_fee" else short_impact
+            rows.append([
+                0.0,
+                float(direction),
+                *key_onehot,
+                rel_dev,
+                lower_dist,
+                upper_dist,
+                float(np.clip(delta / width, -1.0, 1.0)),
+                float(np.clip(short_impact / 8.0, -1.0, 1.0)),
+                float(np.clip(long_impact / 20.0, -1.0, 1.0)),
+                float(np.clip(airport_impact / 12.0, -1.0, 1.0)),
+                near_threshold,
+                threshold_mean,
+                no_ride_rate,
+                peak,
+                airport_rate,
+            ])
+        return np.asarray(rows, dtype=np.float32)
         
     def configure_training_controls(self, progress: float, reward_converged: bool, reward_std: float) -> None:
         """Adapt exploration and action aggressiveness across training phases."""
@@ -631,9 +740,9 @@ class FirmRLPricer:
     def apply_action(self, action: int, market_interaction) -> None:
         """Map discrete steps back into concrete market coefficient overrides."""
         self.last_action_normalized_gap = {}
+        self.last_action_descriptor = ActionDescriptor(action_id=int(action))
         if action not in self.action_to_steps:
             return
-        
         
         if (not self.allow_aggressive_actions) and action in self.aggressive_actions:
             action = 0
@@ -643,6 +752,7 @@ class FirmRLPricer:
             self._last_applied_action = int(action)
             self._repeat_action_count = 0
             self.last_action_steps = step_map
+            self.last_action_descriptor = ActionDescriptor(action_id=int(action), target="hold", direction=0)
             return
         
         if int(action) == self._last_applied_action and int(action) != 0:
@@ -664,13 +774,18 @@ class FirmRLPricer:
         if not fare_step_map:
             self.last_action_normalized_gap = {"supply_incentive": float(supply_step) * self.supply_step} if supply_step else {}
             return
-
+        
+        multipliers = {k: self._heuristic_magnitude_multiplier(k, int(fare_step_map[k])) for k in fare_step_map.keys()}
         scaled_steps = {
             k: self.config.step[k]
             * self.step_scale
-            * self._heuristic_magnitude_multiplier(k, int(fare_step_map[k]))
+            * multipliers[k]
             for k in fare_step_map.keys()
         }
+        pre_values = {}
+        for k in fare_step_map.keys():
+            curr = getattr(self.overrides, k)
+            pre_values[k] = float(getattr(market_interaction.curr_market, k) if curr is None else curr)
         bounds = {k: self.config.bounds[k] for k in fare_step_map.keys()}
         # Detailed normalized one-unit gap per coefficient:
         # one step => config.step[k], normalized by feasible range width.
@@ -692,9 +807,24 @@ class FirmRLPricer:
             anchor = float(getattr(base, key))
             lb, ub = bounds[key]
             current = float(getattr(self.overrides, key))
-            setattr(
-                self.overrides,
-                key,
-                self._bounded_relative_move(current, anchor, self.max_relative_dev, lb, ub),
+            bounded = self._bounded_relative_move(current, anchor, self.max_relative_dev, lb, ub)
+            setattr(self.overrides, key, bounded)
+            width = max(1e-6, float(ub - lb))
+            pre = float(pre_values.get(key, anchor))
+            realized = float(bounded - pre)
+            intended = float(np.sign(fare_step_map[key]) * scaled_steps[key])
+            self.last_action_descriptor = ActionDescriptor(
+                action_id=int(action),
+                target=str(key),
+                direction=int(np.sign(fare_step_map[key])),
+                intended_step=float(intended),
+                realized_delta=realized,
+                realized_delta_norm=float(realized / width),
+                pre_value=pre,
+                post_value=float(bounded),
+                lower_distance=float(np.clip((bounded - lb) / width, 0.0, 1.0)),
+                upper_distance=float(np.clip((ub - bounded) / width, 0.0, 1.0)),
+                magnitude_multiplier=float(multipliers[key]),
+                repeat_count=int(self._repeat_action_count),
+                was_clipped=bool(abs(realized - intended) > 1e-8),
             )
-
