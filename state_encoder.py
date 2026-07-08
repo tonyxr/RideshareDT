@@ -45,19 +45,48 @@ def build_state_vector(
     firm1_last_acceptance: float = 1.0,
     firm1_last_wait: float = 0.0,
     firm1_last_driver_paypr: float = 0.0,
+    demand_context_vec: Optional[np.ndarray] = None,
+    wtp_context_vec: Optional[np.ndarray] = None,
+    recent_context_vec: Optional[np.ndarray] = None,
     driver_state_vec: Optional[np.ndarray] = None,
     supply_incentive_multiplier: float = 1.0,
     last_action_magnitude: float = 0.0,
     repeat_action_count: float = 0.0,
+    reversal_count: float = 0.0,
+    last_action_reversal: float = 0.0,
     max_relative_dev: float = 0.35,
     constraint_multipliers: Optional[np.ndarray] = None,
     constraint_curriculum_scale: float = 1.0,
 ) -> np.ndarray:
     
     ride_ctx = np.asarray(ride_ctx_vec, dtype=np.float32).reshape(-1)
-    if ride_ctx.size < 3:
-        ride_ctx = np.pad(ride_ctx, (0, 3 - ride_ctx.size), mode="constant")
-    ride_ctx = ride_ctx[:3]
+    if ride_ctx.size < 8:
+        ride_ctx = np.pad(ride_ctx, (0, 8 - ride_ctx.size), mode="constant")
+    ride_ctx = np.nan_to_num(ride_ctx[:8], nan=0.0, posinf=1.0, neginf=-1.0)
+    demand_ctx = np.asarray(
+        demand_context_vec if demand_context_vec is not None else np.zeros(10),
+        dtype=np.float32,
+    ).reshape(-1)
+    if demand_ctx.size < 10:
+        demand_ctx = np.pad(demand_ctx, (0, 10 - demand_ctx.size), mode="constant")
+    demand_ctx = np.nan_to_num(demand_ctx[:10], nan=0.0, posinf=1.0, neginf=0.0)
+    demand_ctx = np.clip(demand_ctx, 0.0, 1.0)
+    wtp_ctx = np.asarray(
+        wtp_context_vec if wtp_context_vec is not None else np.zeros(9),
+        dtype=np.float32,
+    ).reshape(-1)
+    if wtp_ctx.size < 9:
+        wtp_ctx = np.pad(wtp_ctx, (0, 9 - wtp_ctx.size), mode="constant")
+    wtp_ctx = np.nan_to_num(wtp_ctx[:9], nan=0.0, posinf=1.0, neginf=0.0)
+    wtp_ctx = np.clip(wtp_ctx, 0.0, 1.0)
+    recent_ctx = np.asarray(
+        recent_context_vec if recent_context_vec is not None else np.zeros(8),
+        dtype=np.float32,
+    ).reshape(-1)
+    if recent_ctx.size < 8:
+        recent_ctx = np.pad(recent_ctx, (0, 8 - recent_ctx.size), mode="constant")
+    recent_ctx = np.nan_to_num(recent_ctx[:8], nan=0.0, posinf=1.0, neginf=0.0)
+    recent_ctx = np.clip(recent_ctx, 0.0, 1.0)
     supply = np.asarray(
         driver_state_vec if driver_state_vec is not None else np.zeros(8),
         dtype=np.float32,
@@ -89,9 +118,14 @@ def build_state_vector(
     profitpr = float(firm1_last_profitpr)
 
     fixed = [
-        float(np.clip(ride_ctx[0], 0.0, 1.0)),
-        float(np.clip(ride_ctx[1], 0.0, 1.0)),
-        float(np.clip(ride_ctx[2], 0.0, 1.0)),
+        float(np.clip((ride_ctx[0] + 1.0) / 2.0, 0.0, 1.0)),
+        float(np.clip((ride_ctx[1] + 1.0) / 2.0, 0.0, 1.0)),
+        float(np.clip((ride_ctx[2] + 1.0) / 2.0, 0.0, 1.0)),
+        float(np.clip((ride_ctx[3] + 1.0) / 2.0, 0.0, 1.0)),
+        float(np.clip(ride_ctx[4], 0.0, 1.0)),
+        float(np.clip(ride_ctx[5], 0.0, 1.0)),
+        float(np.clip(ride_ctx[6], 0.0, 1.0)),
+        float(np.clip(ride_ctx[7], 0.0, 1.0)),
         share,
         float(np.clip(firm2_ema_share, 0.0, 1.0)),
         float(np.clip(served_share / 0.50, 0.0, 1.0)),
@@ -131,6 +165,8 @@ def build_state_vector(
         float(np.clip((supply_incentive_multiplier - 0.90) / 0.30, 0.0, 1.0)),
         float(np.clip(last_action_magnitude, 0.0, 1.0)),
         float(np.clip(repeat_action_count / 10.0, 0.0, 1.0)),
+        float(np.clip(reversal_count / 5.0, 0.0, 1.0)),
+        float(np.clip(last_action_reversal, 0.0, 1.0)),
         avg_abs_coef_dev,
         max_abs_coef_dev,
         overpricing_stress,
@@ -151,6 +187,14 @@ def build_state_vector(
         float(np.clip(np.mean(constraints), 0.0, 1.0)),
     ]
     return np.array(
-        fixed + supply.tolist() + coef_feats + action_memory + constraints.tolist() + constrained_context,
+        fixed
+        + demand_ctx.tolist()
+        + wtp_ctx.tolist()
+        + recent_ctx.tolist()
+        + supply.tolist()
+        + coef_feats
+        + action_memory
+        + constraints.tolist()
+        + constrained_context,
         dtype=np.float32,
     )

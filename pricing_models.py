@@ -44,6 +44,8 @@ class ActionDescriptor:
     magnitude_level: float = 0.0
     repeat_count: int = 0
     was_clipped: bool = False
+    is_reversal: bool = False
+    reversal_count: int = 0
 
 @dataclass
 class FirmMetrics:
@@ -385,6 +387,9 @@ class FirmRLPricer:
         self.action_feature_dim = 19
         self.action_trace_dim = 8
         self.last_action_descriptor = ActionDescriptor()
+        self._last_action_target = "hold"
+        self._last_action_direction = 0
+        self._reversal_count = 0
         self.recovery_share_threshold = 0.25
         self.recovery_gap_threshold = -0.05
         self.aggressive_actions = set()
@@ -409,12 +414,13 @@ class FirmRLPricer:
         action_dim = len(self.action_to_steps)
         self.action_keys = list(active_keys)
         
-        # direct supply-state features, five normalized fare-coefficient deltas,
-        # ten belief/action-memory stress features, and seven constrained-MDP
-        # context features. Frame stacking appends recent encoded states so PPO
-        # can infer hidden demand/supply feedback without requiring a recurrent
-        # policy.
-        self.single_state_dim = 50
+        # State includes cyclical/flag time context, richer demand/WTP context,
+        # recent EMA/delta features, direct supply state, five normalized fare-
+        # coefficient deltas, action-memory/oscillation stress features, and
+        # constrained-MDP context. Frame stacking appends recent encoded states so
+        # PPO can infer hidden demand/supply feedback without requiring a
+        # recurrent policy.
+        self.single_state_dim = 84
         state_dim = self.single_state_dim * self.state_frame_stack
 
         # Initialize PPO agent.
@@ -422,13 +428,13 @@ class FirmRLPricer:
             state_dim=state_dim,
             action_dim=action_dim,
             hidden_dim=192,
-            clip_eps=0.20,
-            final_clip_eps=0.10,
+            clip_eps=0.60,
+            final_clip_eps=0.35,
             max_grad_norm=0.8,
             ent_coeff=0.024,
             min_ent_coeff=0.0005,
             ent_decay=0.992,
-            target_kl=0.050,
+            target_kl=0.500,
             max_lr=1.2e-3,
             value_clip_eps=0.30,
             initial_exploration_rate=0.58,
@@ -469,6 +475,9 @@ class FirmRLPricer:
         self._state_history.clear()
         self._last_applied_action = -1
         self._repeat_action_count = 0
+        self._last_action_target = "hold"
+        self._last_action_direction = 0
+        self._reversal_count = 0
         self.last_action_normalized_gap = {}
         self.last_action_descriptor = ActionDescriptor()
         
@@ -712,6 +721,9 @@ class FirmRLPricer:
         if not any(int(v) != 0 for v in step_map.values()):
             self._last_applied_action = int(action)
             self._repeat_action_count = 0
+            self._last_action_target = "hold"
+            self._last_action_direction = 0
+            self._reversal_count = 0
             self.last_action_steps = step_map
             self.last_action_descriptor = ActionDescriptor(action_id=int(action), target="hold", direction=0)
             return
@@ -775,10 +787,19 @@ class FirmRLPricer:
             pre = float(pre_values.get(key, anchor))
             realized = float(bounded - pre)
             intended = float(np.sign(fare_step_map[key]) * scaled_steps[key])
+            direction = int(np.sign(fare_step_map[key]))
+            is_reversal = bool(
+                str(key) == str(getattr(self, "_last_action_target", "hold"))
+                and direction != 0
+                and direction == -int(getattr(self, "_last_action_direction", 0) or 0)
+            )
+            self._reversal_count = int(getattr(self, "_reversal_count", 0) + 1) if is_reversal else 0
+            self._last_action_target = str(key)
+            self._last_action_direction = int(direction)
             self.last_action_descriptor = ActionDescriptor(
                 action_id=int(action),
                 target=str(key),
-                direction=int(np.sign(fare_step_map[key])),
+                direction=direction,
                 intended_step=float(intended),
                 realized_delta=realized,
                 realized_delta_norm=float(realized / width),
@@ -790,4 +811,6 @@ class FirmRLPricer:
                 magnitude_level=float(multipliers[key]),
                 repeat_count=int(self._repeat_action_count),
                 was_clipped=bool(abs(realized - intended) > 1e-8),
+                is_reversal=is_reversal,
+                reversal_count=int(self._reversal_count),
             )

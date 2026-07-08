@@ -358,11 +358,11 @@ class Core:
         total_customers_pool: int = 20000,
         simulation_sample_cap: int = 2000,
         deterministic_torch: bool = False,
-        reward_share_weight: float = 0.34,
-        reward_revenue_weight: float = 0.33,
+        reward_share_weight: float = 0.40,
+        reward_revenue_weight: float = 0.35,
         reward_overprice_weight: float = 0.20,
         reward_rev_scale: float = 25.0,
-        reward_competitive_weight: float = 0.33,
+        reward_competitive_weight: float = 0.15,
         reward_trend_weight: float = 0.0,
         reward_profit_scale: float = 12.0,
         reward_underprice_weight: float = 0.15,
@@ -381,10 +381,10 @@ class Core:
         driver_acceptance_mode: str = "expected",
         driver_expected_acceptance_cutoff: float = 0.65,
         driver_state_smoothing: float = 0.35,
-        driver_reward_fulfillment_weight: float = 0.02,
+        driver_reward_fulfillment_weight: float = 0.15,
         driver_reward_wait_weight: float = 0.0,
         driver_reward_reject_weight: float = 0.0,
-        driver_reward_unfulfilled_weight: float = 0.04,
+        driver_reward_unfulfilled_weight: float = 0.05,
         driver_reward_warmup_fraction: float = 0.60,
         constrained_reward: bool = True,
         constraint_lr: float = 0.03,
@@ -394,7 +394,7 @@ class Core:
         constraint_curriculum_end_scale: float = 1.00,
         gap_band_fraction: float = 0.75,
         gap_penalty_scale_fraction: float = 0.75,
-        ppo_batch_size: int = 128,
+        ppo_batch_size: int = 256,
         ppo_update_epochs: int = 8,
         state_frame_stack: int = 4,
         threshold_cache_path: str = "",
@@ -525,6 +525,12 @@ class Core:
         self.last_acceptance = 1.0
         self.last_wait = 0.0
         self.last_driver_paypr = 0.0
+        self.ema_share = 0.5
+        self.ema_revpr = 0.0
+        self.ema_profitpr = 0.0
+        self.ema_gap = 0.0
+        self.ema_fulfillment = 1.0
+        self.prev_action_target = "hold"
         
         self.training_logs = []
         self.evaluation_logs = []
@@ -562,25 +568,19 @@ class Core:
         )
         self.reward_rev_scale = float(max(1e-6, reward_rev_scale))
         self.reward_profit_scale = float(max(1e-6, reward_profit_scale))
-        # Kept as the CLI/API name for backward compatibility; this weight is
-        # folded into the simple market-share objective below.
         self.reward_competitive_weight = float(max(0.0, reward_competitive_weight))
         self.reward_trend_weight = float(max(0.0, reward_trend_weight))
 
-        # Simple balanced reward: normalize the two decision objectives only.
-        # ``reward_competitive_weight`` is kept for CLI/API compatibility and is
-        # folded into the customer/market-share side instead of adding a third
-        # objective that can reward dominance without profit.
-        self.reward_share_weight += self.reward_competitive_weight
-        denom = self.reward_share_weight + self.reward_revenue_weight
+        # Keep the core reward aligned with the screenshot design: market-share
+        # balance and revenue improvement are the main terms, acceptance/service is
+        # explicit, and competitive dominance is smaller momentum support.  Do not
+        # renormalize these weights; their defaults are intended as interpretable
+        # reward coefficients and the final reward is clipped for PPO stability.
+        denom = self.reward_revenue_weight + self.reward_share_weight + self.reward_competitive_weight
         if denom <= 0.0:
-            self.reward_share_weight = 0.50
-            self.reward_revenue_weight = 0.50
-            denom = 1.0
-
-        self.reward_share_weight /= denom
-        self.reward_revenue_weight /= denom
-        self.reward_competitive_weight = 0.0
+            self.reward_share_weight = 0.40
+            self.reward_revenue_weight = 0.35
+            self.reward_competitive_weight = 0.15
 
         # In a three-option market (Firm1/Firm2/NoRide), sustainable dominance
         # starts well below 50% absolute request share.  Reward dominance as a
@@ -629,8 +629,8 @@ class Core:
         
         print(
             "[RewardConfig] "
+            f"revenue_profit={self.reward_revenue_weight:.2f}, "
             f"share={self.reward_share_weight:.2f}, "
-            f"profit={self.reward_revenue_weight:.2f}, "
             f"price_gap_penalty={max(self.reward_overprice_weight, self.reward_underprice_weight):.2f}, "
             f"target_gap(F2-F1)=${self.reward_target_price_gap:.2f}, "
             f"profit_scale={self.reward_profit_scale:.2f}, "
@@ -1015,8 +1015,51 @@ class Core:
             share_improvement = float(np.clip((share_f - 0.30) / 0.20, -1.0, 1.0))
             demand_loss = float(np.clip(max(0.0, 0.30 - share_f) / 0.30, 0.0, 1.0))
 
-        market_term = share_improvement
-        profit_term = profit_improvement
+        positive_revenue_improvement = float(max(0.0, revenue_improvement))
+        positive_profit_improvement = float(max(0.0, profit_improvement))
+        positive_share_improvement = float(max(0.0, share_improvement))
+        revenue_level = float(np.clip(revpr / revenue_opportunity, 0.0, 1.0))
+        profit_level = float(np.clip((profitpr + self.reward_profit_scale) / (2.0 * self.reward_profit_scale), 0.0, 1.0))
+        share_level = float(np.clip((share_f - 0.20) / 0.30, 0.0, 1.0))
+        if baseline_revpr > 0.0 or baseline_share_f > 0.0 or abs(baseline_profitpr) > 1e-9:
+            dominance_advantage = float(np.clip((share_f - baseline_share_f) / 0.25, -1.0, 1.0))
+        else:
+            dominance_advantage = float(
+                np.clip(
+                    (share_f - self.reward_dominance_threshold)
+                    / max(1e-6, self.reward_dominance_full_credit_share - self.reward_dominance_threshold),
+                    -1.0,
+                    1.0,
+                )
+            )
+        positive_dominance_advantage = float(max(0.0, dominance_advantage))
+        dominance_level = float(
+            np.clip(
+                (share_f - self.reward_dominance_threshold)
+                / max(1e-6, self.reward_dominance_full_credit_share - self.reward_dominance_threshold),
+                0.0,
+                1.0,
+            )
+        )
+        fulfillment_objective = float(np.clip((fulfillment_term - 0.65) / 0.30, 0.0, 1.0))
+        revenue_objective = float(
+            np.clip(
+                0.45 * positive_revenue_improvement
+                + 0.35 * positive_profit_improvement
+                + 0.12 * revenue_level
+                + 0.08 * profit_level,
+                0.0,
+                1.0,
+            )
+        )
+        share_objective = float(
+            np.clip(0.70 * positive_share_improvement + 0.30 * share_level, 0.0, 1.0)
+        )
+        dominance_objective = float(
+            np.clip(0.65 * positive_dominance_advantage + 0.35 * dominance_level, 0.0, 1.0)
+        )
+        market_term = share_objective
+        profit_term = revenue_objective
         target_gap = float(self.reward_target_price_gap)
         price_gap_deviation = float(gap - target_gap)
         
@@ -1057,25 +1100,29 @@ class Core:
                 )
             )
             
-        # Main objective: controllable system-level improvement.  Keep price,
-        # service, and stability as costs/constraints instead of letting raw
-        # market share alone dominate the optimization.
-        revenue_component = self.reward_revenue_weight * revenue_improvement
-        share_component = self.reward_share_weight * share_improvement
-        profit_component = 0.35 * self.reward_revenue_weight * profit_improvement
-        demand_loss_component = 0.30 * demand_loss
-        price_gap_component = max(self.reward_overprice_weight, self.reward_underprice_weight) * price_gap_penalty
+        # Screenshot-aligned reward: balanced competitive share and revenue,
+        # explicit acceptance/fulfillment feasibility, then small realism penalties.
+        # Keep dominance as a modest momentum term instead of a fourth large
+        # objective so reward remains interpretable and bounded for PPO.
+        revenue_component = self.reward_revenue_weight * revenue_objective
+        share_component = self.reward_share_weight * share_objective
+        dominance_component = self.reward_competitive_weight * dominance_objective
+        profit_component = 0.0
+        fulfillment_component = self.driver_reward_fulfillment_weight * fulfillment_objective
+        demand_loss_component = 0.10 * demand_loss
+        price_gap_component = 0.05 * price_gap_penalty
         service_component = (
             self.driver_reward_unfulfilled_weight * unfulfilled_penalty
             + self.driver_reward_wait_weight * wait_penalty_unit
             + self.driver_reward_reject_weight * rejection_penalty_unit
         )
-        collapse_component = 0.08 * collapse_penalty
+        collapse_component = 0.05 * collapse_penalty
 
         raw = (
-            revenue_component
-            + share_component
-            + profit_component
+            share_component
+            + revenue_component
+            + dominance_component
+            + fulfillment_component
             - demand_loss_component
             - price_gap_component
             - service_component
@@ -1091,13 +1138,23 @@ class Core:
             "reward_revenue_component": float(revenue_component),
             "reward_share_component": float(share_component),
             "reward_profit_component": float(profit_component),
+            "reward_dominance_component": float(dominance_component),
+            "reward_fulfillment_component": float(fulfillment_component),
             "reward_demand_loss_component": float(demand_loss_component),
             "reward_baseline_share": float(baseline_share_f),
             "reward_baseline_rev_per_request": float(baseline_revpr),
             "reward_baseline_profit_per_request": float(baseline_profitpr),
             "reward_revenue_improvement": float(revenue_improvement),
+            "reward_positive_revenue_improvement": float(positive_revenue_improvement),
             "reward_share_improvement": float(share_improvement),
+            "reward_positive_share_improvement": float(positive_share_improvement),
             "reward_profit_improvement": float(profit_improvement),
+            "reward_positive_profit_improvement": float(positive_profit_improvement),
+            "reward_revenue_objective": float(revenue_objective),
+            "reward_share_objective": float(share_objective),
+            "reward_dominance_objective": float(dominance_objective),
+            "reward_dominance_advantage": float(dominance_advantage),
+            "reward_fulfillment_objective": float(fulfillment_objective),
             "reward_demand_loss": float(demand_loss),
             "reward_margin_penalty": float(margin_penalty),
             "reward_price_discipline_penalty": float(price_discipline_penalty),
@@ -1252,7 +1309,10 @@ class Core:
             + 0.015 * magnitude_excess * max(0.25, realized_norm)
             + (0.04 if clipped_action and action_direction != 0 else 0.0)
         )
-        raw_reward = float(base_reward + momentum_component + response_component - action_realization_penalty)
+        action_reversal = float(1.0 if bool(getattr(action_desc, "is_reversal", False)) else 0.0)
+        reversal_count = float(np.clip(getattr(action_desc, "reversal_count", 0) or 0, 0, 5))
+        oscillation_penalty = 0.02 * action_reversal * (1.0 + 0.25 * reversal_count)
+        raw_reward = float(base_reward + momentum_component + response_component - action_realization_penalty - oscillation_penalty)
         # The base terms are already smoothly bounded. A second tanh compressed
         # useful differences between good and excellent outcomes and weakened
         # PPO's advantage signal without changing safety.
@@ -1273,6 +1333,9 @@ class Core:
             "reward_momentum_component": momentum_component,
             "reward_response_component": float(response_component),
             "reward_action_realization_penalty": float(action_realization_penalty),
+            "reward_action_reversal": float(action_reversal),
+            "reward_oscillation_count": float(reversal_count),
+            "reward_oscillation_penalty": float(oscillation_penalty),
             "reward_action_target_airport_context": float(airport_rate),
             "reward_crowd_near_threshold_share": float(near_threshold),
             "reward_crowd_no_ride_rate": float(no_ride_rate),
@@ -2083,6 +2146,7 @@ class Core:
                 wait_sum += float(m1.avg_wait_minutes)
                 driver_accept_sum += float(m1.driver_acceptance_rate)
                 driver_paypr_sum += float(m1.driver_pay / max(1, m1.total))
+                self._update_recent_response_emas(m1, mean_gap)
                 self.last_share = float(m1.share)
                 self.last_revpr = float(m1.rev_per_request)
                 self.last_gap = float(mean_gap)
@@ -2427,6 +2491,7 @@ class Core:
                 log_row[f"firm1_{k}"] = float(get_coeff(self.market.curr_market, self.firm1.overrides, k))
                 log_row[f"firm2_{k}"] = float(get_coeff(self.market.curr_market, self.firm2.overrides, k))
             self.evaluation_logs.append(log_row)
+            self._update_recent_response_emas(m1, mean_gap)
             self.last_share = float(m1.share)
             self.last_revpr = float(m1.rev_per_request)
             self.last_gap = float(mean_gap)
@@ -2877,6 +2942,7 @@ class Core:
                 target_price_gap=float(self.reward_target_price_gap),
             )
         
+        self._update_recent_response_emas(m1, gap)
         self.last_share = float(m1.share)
         self.last_revpr = float(m1.rev_per_request)
         self.last_gap = float(gap)
@@ -2890,7 +2956,15 @@ class Core:
         self.mean_distance_last = dist
 
         return results, m1, m2, float(reward)
-
+    
+    
+    def _update_recent_response_emas(self, m1: FirmMetrics, mean_gap: float, alpha: float = 0.20) -> None:
+        """Maintain short-term EMA features for the feed-forward PPO observation."""
+        self.ema_share = self._ema(float(m1.share), float(getattr(self, "ema_share", 0.5)), alpha)
+        self.ema_revpr = self._ema(float(m1.rev_per_request), float(getattr(self, "ema_revpr", 0.0)), alpha)
+        self.ema_profitpr = self._ema(float(m1.profit_per_request), float(getattr(self, "ema_profitpr", 0.0)), alpha)
+        self.ema_gap = self._ema(float(mean_gap), float(getattr(self, "ema_gap", 0.0)), alpha)
+        self.ema_fulfillment = self._ema(float(m1.fulfillment_rate), float(getattr(self, "ema_fulfillment", 1.0)), alpha)
     
     def _build_rl_state(self, day_of_week: int, hour: int, weather: str) -> np.ndarray:
         """Build state vector for Firm1 RL controller from current market + recent summaries."""
@@ -2905,13 +2979,68 @@ class Core:
         
         f2_cooldown = float(getattr(self.firm2, "cooldown", 0))
 
-        # Keep contextual encoding compact and low-variance.
+        # Cyclical calendar encoding plus explicit operational flags.  This
+        # avoids artificial discontinuities between hour 23/0 and day 6/0 while
+        # keeping rush-hour, night, and weekend context directly visible.
+        hour_f = float(int(hour) % 24)
+        day_f = float(int(day_of_week) % 7)
         weather_code = {"clear": 0.0, "cloudy": 0.33, "rain": 0.66, "snow": 1.0}.get(str(weather).lower(), 0.0)
+        rush_flag = float((7 <= int(hour_f) < 10) or (16 <= int(hour_f) < 19))
+        night_flag = float(int(hour_f) < 6 or int(hour_f) >= 22)
+        weekend_flag = float(int(day_f) >= 5)
         ride_ctx_vec = np.array(
             [
-                float(np.clip(day_of_week / 6.0, 0.0, 1.0)),
-                float(np.clip(hour / 23.0, 0.0, 1.0)),
+                np.sin(2.0 * np.pi * hour_f / 24.0),
+                np.cos(2.0 * np.pi * hour_f / 24.0),
+                np.sin(2.0 * np.pi * day_f / 7.0),
+                np.cos(2.0 * np.pi * day_f / 7.0),
+                weekend_flag,
+                rush_flag,
+                night_flag,
                 weather_code,
+            ],
+            dtype=np.float32,
+        )
+        stats = getattr(self, "last_crowd_response_stats", {}) or {}
+        demand_context_vec = np.array(
+            [
+                float(stats.get("distance_mean", self.mean_distance_last)) / 12.0,
+                float(stats.get("distance_std", 0.0)) / 8.0,
+                float(stats.get("distance_q25", self.mean_distance_last)) / 12.0,
+                float(stats.get("distance_q50", self.mean_distance_last)) / 12.0,
+                float(stats.get("distance_q75", self.mean_distance_last)) / 12.0,
+                float(stats.get("duration_mean", 0.0)) / 45.0,
+                float(stats.get("duration_std", 0.0)) / 30.0,
+                float(stats.get("airport_rate", self.airport_rate_last)),
+                float(stats.get("long_trip_share", 0.0)),
+                float(stats.get("premium_share", 0.0)),
+            ],
+            dtype=np.float32,
+        )
+        wtp_context_vec = np.array(
+            [
+                float(stats.get("price_threshold_mean", 1.5)) / 8.0,
+                float(stats.get("price_threshold_std", 0.0)) / 4.0,
+                float(stats.get("price_threshold_q25", 1.0)) / 8.0,
+                float(stats.get("price_threshold_q50", 1.5)) / 8.0,
+                float(stats.get("price_threshold_q75", 2.0)) / 8.0,
+                float(stats.get("firm1_price_below_wtp_share", 0.0)),
+                float(stats.get("near_threshold_share", 0.0)),
+                float(stats.get("low_income_share", 0.0)),
+                float(stats.get("no_ride_rate", 0.0)),
+            ],
+            dtype=np.float32,
+        )
+        recent_context_vec = np.array(
+            [
+                float(self.ema_share),
+                float(self.ema_revpr) / 30.0,
+                float(self.ema_profitpr + self.reward_profit_scale) / (2.0 * self.reward_profit_scale),
+                float(self.ema_gap + 3.0) / 6.0,
+                float(self.ema_fulfillment),
+                float(np.clip((self.last_share - self.ema_share + 0.20) / 0.40, 0.0, 1.0)),
+                float(np.clip((self.last_revpr - self.ema_revpr + self.reward_profit_scale) / (2.0 * self.reward_profit_scale), 0.0, 1.0)),
+                float(np.clip((self.last_gap - self.ema_gap + 3.0) / 6.0, 0.0, 1.0)),
             ],
             dtype=np.float32,
         )
@@ -2935,11 +3064,18 @@ class Core:
             firm1_last_acceptance=float(self.last_acceptance),
             firm1_last_wait=float(self.last_wait),
             firm1_last_driver_paypr=float(self.last_driver_paypr),
+            demand_context_vec=demand_context_vec,
+            wtp_context_vec=wtp_context_vec,
+            recent_context_vec=recent_context_vec,
             driver_state_vec=self.driver_supply.state_features_for_firm1() if self.enable_driver_supply else None,
             last_action_magnitude=float(
                 self.firm1.last_action_magnitude() if hasattr(self.firm1, "last_action_magnitude") else 0.0
             ),
             repeat_action_count=float(getattr(self.firm1, "_repeat_action_count", 0)),
+            reversal_count=float(getattr(self.firm1, "_reversal_count", 0)),
+            last_action_reversal=float(
+                1.0 if bool(getattr(getattr(self.firm1, "last_action_descriptor", None), "is_reversal", False)) else 0.0
+            ),
             max_relative_dev=float(getattr(self.firm1, "max_relative_dev", 0.35)),
             constraint_multipliers=np.asarray(
                 [
@@ -2993,10 +3129,14 @@ class Core:
         airport_count = 0
         dist_sum = 0.0
         threshold_values: List[float] = []
+        distance_values: List[float] = []
+        duration_values: List[float] = []
         low_income_count = 0
         near_threshold_count = 0
+        firm1_below_wtp_count = 0
         no_ride_count = 0
         long_trip_count = 0
+        premium_count = 0
         
         profile_sample_size = self._effective_simulation_sample_size(customers_per_step, collect_rows=collect_rows)
         if sampled_profiles is None:
@@ -3017,8 +3157,10 @@ class Core:
             service = self.market.sample_service()
             airport_count += int(airport)
             dist_sum += float(travel_distance)
+            distance_values.append(float(travel_distance))
 
             duration = self.estimate_duration(travel_distance, hour)
+            duration_values.append(float(duration))
 
             ctx = RideContext(
                 day_of_week=day_of_week,
@@ -3064,6 +3206,8 @@ class Core:
             low_income_count += int(str(profile.get("IncomeBracket", "")).strip() == "<50k")
             near_threshold_count += int(0.75 <= abs(float(p2 - p1)) / max(threshold, 1e-6) <= 1.25)
             long_trip_count += int(float(travel_distance) >= 8.0)
+            firm1_below_wtp_count += int(float(p1) <= threshold)
+            premium_count += int(str(service).lower() in {"premium", "xl", "black"})
 
             choice_res: ChoiceResult = self.choice_model.choose(profile, scenario, p1, p2)
             choice = choice_res.choice
@@ -3172,14 +3316,30 @@ class Core:
             self.driver_supply.end_batch()
         denominator = max(1, profile_count)
         threshold_arr = np.asarray(threshold_values or [1.5], dtype=float)
+        distance_arr = np.asarray(distance_values or [self.mean_distance_last], dtype=float)
+        duration_arr = np.asarray(duration_values or [0.0], dtype=float)
         self.last_crowd_response_stats = {
             "price_threshold_mean": float(np.mean(threshold_arr)),
             "price_threshold_std": float(np.std(threshold_arr)),
+            "price_threshold_q25": float(np.quantile(threshold_arr, 0.25)),
+            "price_threshold_q50": float(np.quantile(threshold_arr, 0.50)),
+            "price_threshold_q75": float(np.quantile(threshold_arr, 0.75)),
+            "firm1_price_below_wtp_share": float(firm1_below_wtp_count / denominator),
             "near_threshold_share": float(near_threshold_count / denominator),
             "low_income_share": float(low_income_count / denominator),
             "airport_rate": float(airport_count / denominator),
             "long_trip_share": float(long_trip_count / denominator),
+            "premium_share": float(premium_count / denominator),
+            "distance_mean": float(np.mean(distance_arr)),
+            "distance_std": float(np.std(distance_arr)),
+            "distance_q25": float(np.quantile(distance_arr, 0.25)),
+            "distance_q50": float(np.quantile(distance_arr, 0.50)),
+            "distance_q75": float(np.quantile(distance_arr, 0.75)),
+            "duration_mean": float(np.mean(duration_arr)),
+            "duration_std": float(np.std(duration_arr)),
             "peak_context": float((7 <= int(hour) < 10) or (16 <= int(hour) < 19)),
+            "night_context": float(int(hour) < 6 or int(hour) >= 22),
+            "weekend_context": float(int(day_of_week) >= 5),
             "no_ride_rate": float(no_ride_count / denominator),
         }
         denominator = max(1, profile_count)
@@ -3400,6 +3560,7 @@ class Core:
                 profit_sum_two += float(m2.profit_per_request)
                 no_ride_share_sum += float(max(0.0, 1.0 - float(m1.share) - float(m2.share)))
                 
+                self._update_recent_response_emas(m1, mean_gap)
                 self.last_share = float(m1.share)
                 self.last_revpr = float(m1.rev_per_request)
                 self.last_gap = float(mean_gap)
@@ -4156,10 +4317,10 @@ def main():
     parser.add_argument("--train_timesteps", type=int, default=1500)
     parser.add_argument("--train_customers", type=int, default=5000)
     parser.add_argument("--train_steps_per_day", type=int, default=10, help="Synthetic training timesteps per day (run_experiment mode).")
-    parser.add_argument("--ppo_update_interval_days", type=int, default=10, help="How many synthetic training days to collect before each PPO optimizer update; larger values produce longer, lower-variance PPO rollouts.")
+    parser.add_argument("--ppo_update_interval_days", type=int, default=20, help="How many synthetic training days to collect before each PPO optimizer update; larger values produce longer, lower-variance PPO rollouts.")
     parser.add_argument("--firm1_action_interval_steps", type=int, default=-1, help="Training/eval timesteps to hold each Firm1 PPO price action; <=0 means one PPO price decision per synthetic day.")
     parser.add_argument("--firm2_action_interval_days", type=int, default=-1, help="Synthetic training days between Firm2 heuristic price manipulations/EMA updates; <=0 aligns Firm2 to PPO update interval.")
-    parser.add_argument("--ppo_batch_size", type=int, default=128, help="PPO minibatch size used when optimizing each rollout buffer.")
+    parser.add_argument("--ppo_batch_size", type=int, default=256, help="PPO minibatch size used when optimizing each rollout buffer.")
     parser.add_argument("--ppo_update_epochs", type=int, default=8, help="Number of optimization epochs per PPO rollout buffer.")
     parser.add_argument("--state_frame_stack", type=int, default=4, help="Number of recent encoded RL states to concatenate for history-aware PPO observations.")
     parser.add_argument("--deterministic_experiment_seed", action="store_true", help="If set, keep run_experiment fully deterministic with --seed.")
@@ -4167,11 +4328,11 @@ def main():
     parser.add_argument("--eval_customers", type=int, default=1000)
     parser.add_argument("--profiles_out", type=str, default="artifacts/sampled_profiles.csv")
     parser.add_argument("--profiles_log_limit", type=int, default=200000)
-    parser.add_argument("--reward_share_weight", type=float, default=0.34, help="Positive reward weight for absolute market share; normalized with revenue and dominance weights.")
-    parser.add_argument("--reward_revenue_weight", type=float, default=0.33, help="Positive reward weight for revenue per request; normalized with share and dominance weights.")
+    parser.add_argument("--reward_share_weight", type=float, default=0.40, help="Positive reward weight for market-share level/improvement.")
+    parser.add_argument("--reward_revenue_weight", type=float, default=0.35, help="Positive reward weight for revenue/profit level and improvement.")
     parser.add_argument("--reward_overprice_weight", type=float, default=0.20, help="Penalty weight when Firm1 is more expensive than Firm2.")
     parser.add_argument("--reward_rev_scale", type=float, default=25.0, help="Revenue/request value that maps to full revenue reward credit.")
-    parser.add_argument("--reward_competitive_weight", type=float, default=0.33, help="Backward-compatible name for sustained-dominance reward weight; normalized with share and revenue weights.")
+    parser.add_argument("--reward_competitive_weight", type=float, default=0.15, help="Small positive reward weight for sustained dominance over the opponent.")
     parser.add_argument("--reward_trend_weight", type=float, default=0.0, help="Optional small trend-shaping weight for short-term share/profit improvements.")
     parser.add_argument("--reward_profit_scale", type=float, default=12.0, help="Profit/request value that maps to full profit reward credit.")
     parser.add_argument("--reward_underprice_weight", type=float, default=0.15, help="Penalty weight for destructive underpricing or sub-target profit margin.")
@@ -4190,10 +4351,10 @@ def main():
     parser.add_argument("--driver_acceptance_mode", type=str, default="expected", choices=["expected", "stochastic"], help="Use deterministic expected driver acceptance for faster RL convergence, or stochastic Bernoulli acceptance for realism.")
     parser.add_argument("--driver_expected_acceptance_cutoff", type=float, default=0.65, help="Minimum expected driver acceptance probability required to count an offered ride as accepted in expected driver acceptance mode.")
     parser.add_argument("--driver_state_smoothing", type=float, default=0.35, help="EMA smoothing alpha for driver features fed into the RL state.")
-    parser.add_argument("--driver_reward_fulfillment_weight", type=float, default=0.02, help="Small reward bonus for completed/chosen fulfillment when driver supply is enabled.")
+    parser.add_argument("--driver_reward_fulfillment_weight", type=float, default=0.15, help="Service-quality reward weight for fulfilled rides when driver supply is enabled.")
     parser.add_argument("--driver_reward_wait_weight", type=float, default=0.0, help="Reward penalty for long average pickup wait when driver supply is enabled; default off for simpler PPO optimization.")
     parser.add_argument("--driver_reward_reject_weight", type=float, default=0.0, help="Reward penalty for driver rejection; default off for simpler PPO optimization.")
-    parser.add_argument("--driver_reward_unfulfilled_weight", type=float, default=0.04, help="Small direct penalty for fulfillment shortfall below the driver-service target.")
+    parser.add_argument("--driver_reward_unfulfilled_weight", type=float, default=0.05, help="Service-quality penalty for fulfillment shortfall below the driver-service target.")
     parser.add_argument("--driver_reward_warmup_fraction", type=float, default=0.60, help="Fraction of training over which driver reward terms ramp from zero to full strength.")
     parser.add_argument("--enable_constrained_reward", action="store_true", help="Enable adaptive Lagrangian constraint penalties in the RL reward.")
     parser.add_argument("--disable_constrained_reward", action="store_true", help="Deprecated compatibility flag; constrained reward is off by default unless --enable_constrained_reward is set.")

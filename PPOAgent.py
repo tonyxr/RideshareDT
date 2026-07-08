@@ -166,15 +166,15 @@ class PPOAgent:
         lr: float = 3e-4,
         gamma: float = 0.99,
         lam: float = 0.95,
-        clip_eps: float = 0.2,
-        final_clip_eps: float = 0.10,
+        clip_eps: float = 0.60,
+        final_clip_eps: float = 0.35,
         v_coeff: float = 0.5,
         ent_coeff: float = 0.01,
         min_ent_coeff: float = 0.001,
         ent_decay: float = 0.995,
         max_grad_norm: float = 1.0,
         hidden_dim: int = 192,
-        target_kl: float = 0.02,
+        target_kl: float = 0.50,
         adv_clip: float = 4.0,
         lr_decay_on_spike: float = 0.85,
         lr_growth_on_stall: float = 1.08,
@@ -404,7 +404,7 @@ class PPOAgent:
         # Keep early optimization deliberately less conservative.  The cap stays
         # at the initial maximum through the first third of training, then uses a
         # cosine decay for consolidation.
-        decay_p = float(np.clip((p - 0.35) / 0.65, 0.0, 1.0))
+        decay_p = float(np.clip((p - 0.70) / 0.30, 0.0, 1.0))
         cosine = 0.5 * (1.0 + np.cos(np.pi * decay_p))
         scheduled_lr_cap = self.min_lr + (self.initial_max_lr - self.min_lr) * cosine
         if reward_converged:
@@ -415,9 +415,10 @@ class PPOAgent:
             for group in self.opt.param_groups:
                 group["lr"] = self.curr_lr
         
-        early_clip = max(self.initial_clip_eps, 0.25)
+        early_clip = max(self.initial_clip_eps, 0.60)
+        mid_clip = max(self.final_clip_eps, 0.35)
         self.clip_eps = float(
-            self.final_clip_eps + (early_clip - self.final_clip_eps) * cosine
+            mid_clip + (early_clip - mid_clip) * cosine
         )
         if reward_converged:
             self.clip_eps = min(self.clip_eps, self.final_clip_eps)
@@ -807,9 +808,9 @@ class PPOAgent:
                 approx_kl = ((torch.exp(logratio) - 1.0) - logratio).mean()
                 clipfrac = ((ratio - 1.0).abs() > self.clip_eps).float().mean()
 
-                if float(approx_kl.item()) > 2.0 * self.target_kl:
-                    stop_for_kl = True
-                    break
+                # KL is tracked as a diagnostic only.  Do not stop early here:
+                # the pricing policy needs room for larger PPO updates,
+                # especially in the early and middle phases of training.
                 # Entropy regularizes the learned policy, not the externally
                 # forced uniform mixture. Otherwise epsilon can hide collapse.
                 loss = (
@@ -883,12 +884,11 @@ class PPOAgent:
                 
         final_clipfrac = float(last.get("clipfrac", 0.0))
         final_kl = float(last.get("approx_kl", 0.0))
-        if final_clipfrac > 0.40 or final_kl > 1.25 * self.target_kl:
-            self.curr_lr = float(max(self.min_lr, self.curr_lr * self.lr_decay_on_spike))
-            for g in self.opt.param_groups:
-                g["lr"] = self.curr_lr
-            self.low_update_streak = 0
-        elif final_clipfrac < 0.03 and final_kl < 0.35 * self.target_kl:
+        # Treat KL/clip fraction as diagnostics rather than restrictive
+        # guardrails.  Do not shrink the learning rate because KL or clipfrac
+        # are high; PPO is allowed to take larger updates while the schedule
+        # controls only the broad late-training consolidation.
+        if final_clipfrac < 0.03 and final_kl < 0.35 * self.target_kl:
             self.low_update_streak += 1
             if self.low_update_streak >= 2 and self.curr_lr < self.max_lr:
                 self.curr_lr = float(min(self.max_lr, self.curr_lr * self.lr_growth_on_stall))
