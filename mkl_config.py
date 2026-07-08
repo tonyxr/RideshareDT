@@ -14,8 +14,6 @@ instruction policy is set before the native library is loaded.  Import this
 module before NumPy, Torch, SciPy, or scikit-learn in executable paths.
 """
 
-
-
 import os
 
 # Respect explicit user choices while providing quiet defaults for local runs.

@@ -1215,13 +1215,15 @@ class Core:
         )
         efficiency_term = float(0.5 * trend_term + 0.5 * pricing_discipline)
         momentum_component = float(self.reward_momentum_weight * self.reward_trend_scale * trend_term)
-        # Credit assignment for hierarchical actions: reward the selected option
-        # for the response path it was supposed to influence, then charge the
-        # lower realizer only for avoidable hidden clipping/oversized movement.
+        # Credit assignment for hybrid continuous actions: reward the selected
+        # coefficient/direction for the response path it was supposed to
+        # influence, then charge the continuous magnitude only when it creates
+        # excessive realized movement or clipping.
         action_desc = getattr(getattr(self, "firm1", None), "last_action_descriptor", None)
         action_direction = int(getattr(action_desc, "direction", 0) or 0)
         action_target = str(getattr(action_desc, "target", "hold") or "hold")
         realized_norm = float(np.clip(abs(getattr(action_desc, "realized_delta_norm", 0.0) or 0.0), 0.0, 1.0))
+        magnitude_level = float(np.clip(getattr(action_desc, "magnitude_level", 0.0) or 0.0, 0.0, 2.0))
         clipped_action = bool(getattr(action_desc, "was_clipped", False))
         stats = getattr(self, "last_crowd_response_stats", {}) or {}
         near_threshold = float(np.clip(stats.get("near_threshold_share", 0.0), 0.0, 1.0))
@@ -1244,7 +1246,12 @@ class Core:
             response_component *= max(0.35, airport_rate)
         elif action_target in {"per_mile", "per_minute"}:
             response_component *= max(0.50, float(np.clip(stats.get("long_trip_share", 0.0), 0.0, 1.0)) + 0.50)
-        action_realization_penalty = 0.04 * realized_norm + (0.04 if clipped_action and action_direction != 0 else 0.0)
+        magnitude_excess = max(0.0, magnitude_level - 1.0)
+        action_realization_penalty = (
+            0.025 * realized_norm
+            + 0.015 * magnitude_excess * max(0.25, realized_norm)
+            + (0.04 if clipped_action and action_direction != 0 else 0.0)
+        )
         raw_reward = float(base_reward + momentum_component + response_component - action_realization_penalty)
         # The base terms are already smoothly bounded. A second tanh compressed
         # useful differences between good and excellent outcomes and weakened
@@ -1290,7 +1297,7 @@ class Core:
             fulfillment_rate=float(m1.fulfillment_rate),
             avg_wait_minutes=float(m1.avg_wait_minutes),
             driver_acceptance_rate=float(m1.driver_acceptance_rate),
-            action_change_magnitude=0.0,
+            action_change_magnitude=float(getattr(getattr(self, "firm1", None), "last_action_magnitude", lambda: 0.0)()),
             baseline_share=float(m2.share) if m2 is not None else 0.0,
             baseline_rev_per_request=float(m2.rev_per_request) if m2 is not None else 0.0,
             baseline_profit_per_request=float(m2.profit_per_request) if m2 is not None else 0.0,

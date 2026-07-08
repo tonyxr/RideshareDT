@@ -17,6 +17,7 @@ health and supply stress, but it still only controls rider-facing price actions.
 """
 
 from typing import List, Optional
+import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
 import numpy as np
 
 from Market_models import MarketCoefficients, CoefficientOverrides

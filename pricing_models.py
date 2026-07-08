@@ -22,14 +22,12 @@ from optim_config import default_specs_for
 
 @dataclass
 class ActionDescriptor:
-    """Executed high-level option and lower-level realization metadata.
+    """Executed RL-selected coefficient intervention metadata.
 
-    The magnitude realizer follows a bounded, monotone adjustment rule: PPO
-    chooses the option target/direction, while the heuristic chooses a smooth
-    step size from visible market-response signals.  This mirrors classic
-    discrete price-adjustment/tatonnement and revenue-management guardrail
-    practice: make local, bounded moves, dampen repeated moves, and shrink moves
-    near feasibility bounds so price experiments remain identifiable.
+    PPO chooses hold, or exactly one rider-facing price coefficient together
+    with its direction and a continuous magnitude.  Bounds are still enforced
+    by the simulator-facing application step, but there is no separate lower-
+    layer heuristic deciding how large the selected manipulation should be.
     """
 
     action_id: int = 0
@@ -43,6 +41,7 @@ class ActionDescriptor:
     lower_distance: float = 1.0
     upper_distance: float = 1.0
     magnitude_multiplier: float = 0.0
+    magnitude_level: float = 0.0
     repeat_count: int = 0
     was_clipped: bool = False
 
@@ -346,17 +345,15 @@ class FirmRLPricer:
             self.config = default_specs_for(self.opt_keys)
     
     def __init__(self, seed: Optional[int], opt_keys: List[str], state_frame_stack: int = 4):
-        # Hierarchical response-aware action design:
-        #   1) the PPO actor is the high-level option policy and selects which
-        #      single price coefficient/direction to intervene on;
-        #   2) the heuristic action-realizer below converts that option into a
-        #      bounded coefficient magnitude using recent market stress;
-        #   3) the simulator then provides the realized response target used by
-        #      the PPO response head/world-model auxiliary loss.
-        #
-        # This intentionally avoids a flat actor that emits a full coefficient
-        # vector.  The learned policy owns "what to manipulate"; the lower layer
-        # owns "how much to manipulate" subject to feasibility and stability.
+        # Flat discrete response-aware action design:
+        #   1) the PPO actor selects hold, or one coefficient/direction pair;
+        #   2) the same PPO action also selects the magnitude bucket for that
+        #      intervention;
+        #   3) the simulator provides realized response targets used by the PPO
+        #      response head/world-model auxiliary loss.
+        # This removes the former lower-layer magnitude heuristic: the learned
+        # policy owns both "what to manipulate" and "how much to manipulate",
+        # while the application layer only clips to feasibility bounds.
         self.opt_keys = list(opt_keys[: self.MAX_MANIPULATED_COEFFS])
         if len(opt_keys) > self.MAX_MANIPULATED_COEFFS:
             print(
@@ -393,9 +390,9 @@ class FirmRLPricer:
         self.aggressive_actions = set()
         self.allow_aggressive_actions = True
         
-        # High-level option actions.  Index 0 is hold/status quo; every other
-        # action chooses exactly one coefficient and one direction.  The action
-        # realizer later chooses the concrete step magnitude.
+        # Hybrid manipulation actions.  Index 0 is hold/status quo; every
+        # other discrete action chooses exactly one coefficient and direction.
+        # PPO's continuous magnitude head supplies the step multiplier.
         all_keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
         active_keys = [k for k in all_keys if k in self.opt_keys]
         
@@ -442,7 +439,7 @@ class FirmRLPricer:
             action_q_coeff=0.10,
             exploration_fraction=0.90,
             exploration_warmup_fraction=0.35,
-            min_action_visits=2,
+            min_action_visits=1,
             exploration_rescue_rate=0.25,
         )
     
@@ -455,7 +452,7 @@ class FirmRLPricer:
         steps = self.action_steps(action)
         if not steps or all(int(v) == 0 for v in steps.values()):
             return "hold"
-        return ",".join(f"{k}:{int(v):+d}" for k, v in steps.items() if int(v) != 0)
+        return ",".join(f"{k}:{int(v):+d}@continuous" for k, v in steps.items() if int(v) != 0)
         
     def last_action_magnitude(self) -> float:
         """Return the normalized size of the most recently applied action."""
@@ -476,7 +473,7 @@ class FirmRLPricer:
         self.last_action_descriptor = ActionDescriptor()
         
     def update_response_context(self, share: float, gap: float, fulfillment: float) -> None:
-        """Provide the action-realizer with latest observed environment response."""
+        """Cache latest market response signals for state/action features."""
         self._last_share_hint = float(np.clip(share, 0.0, 1.0))
         self._last_gap_hint = float(np.nan_to_num(gap, nan=0.0, posinf=3.0, neginf=-3.0))
         self._last_fulfillment_hint = float(np.clip(fulfillment, 0.0, 1.0))
@@ -508,7 +505,7 @@ class FirmRLPricer:
                 float(d.direction),
                 float((target_idx + 1) / max(1, len(self.action_keys))),
                 float(np.clip(d.realized_delta_norm, -1.0, 1.0)),
-                float(np.clip(d.magnitude_multiplier, 0.0, 2.0) / 2.0),
+                float(np.clip(d.magnitude_level or d.magnitude_multiplier, 0.0, 2.0) / 2.0),
                 float(np.clip(d.lower_distance, 0.0, 1.0)),
                 float(np.clip(d.upper_distance, 0.0, 1.0)),
                 float(np.clip(d.repeat_count / 10.0, 0.0, 1.0)),
@@ -520,8 +517,8 @@ class FirmRLPricer:
     def build_action_feature_matrix(self, market_interaction, crowd_context: Optional[Dict[str, float]] = None) -> np.ndarray:
         """Return per-option causal features used by the action-conditioned PPO head.
 
-        Features expose the option identity, the heuristic's visible magnitude,
-        expected price impact on short/long/airport/peak trips, bound pressure,
+        Features expose the option identity, a neutral continuous-magnitude prior,
+        expected unit price impact on short/long/airport/peak trips, bound pressure,
         and recent crowd-response distribution summaries.
         """
         ctx = crowd_context or {}
@@ -549,8 +546,10 @@ class FirmRLPricer:
             rel_dev = float(np.clip((curr_f - anchor) / max(abs(anchor), 1e-6), -1.0, 1.0))
             lower_dist = float(np.clip((curr_f - lb) / width, 0.0, 1.0))
             upper_dist = float(np.clip((ub - curr_f) / width, 0.0, 1.0))
-            mult = self._heuristic_magnitude_multiplier(key, direction)
-            delta = float(direction) * self.config.step[key] * self.step_scale * mult
+            # The realized magnitude is sampled after this matrix is built. Use
+            # a neutral unit multiplier so action scoring stays about target/
+            # direction feasibility while the continuous head learns size.
+            delta = float(direction) * self.config.step[key] * self.step_scale
             # Approximate heterogeneous price exposure before time/weather/service multipliers.
             short_impact = delta if key in {"base_fare", "booking_fee"} else delta * (2.0 if key == "per_mile" else 8.0 if key == "per_minute" else 0.0)
             long_impact = delta if key in {"base_fare", "booking_fee"} else delta * (10.0 if key == "per_mile" else 28.0 if key == "per_minute" else 0.0)
@@ -698,45 +697,6 @@ class FirmRLPricer:
             if gap >= upper_gap:
                 move("per_minute", +1, 0.25)
                 move("per_mile", +1, 0.25)
-                
-    def _heuristic_magnitude_multiplier(self, coeff_key: str, direction: int) -> float:
-        """Low-level action-realizer for the selected high-level option.
-
-        PPO selects the coefficient and direction.  This deterministic heuristic
-        chooses the concrete bounded magnitude from recent response signals,
-        making the primitive action feasible, interpretable, and less brittle
-        than asking the policy to learn every continuous step size directly.
-        """
-        share = float(np.clip(getattr(self, "_last_share_hint", 0.50), 0.0, 1.0))
-        gap = float(getattr(self, "_last_gap_hint", 0.0))
-        fulfillment = float(np.clip(getattr(self, "_last_fulfillment_hint", 1.0), 0.0, 1.0))
-        repeat_count = float(max(0, getattr(self, "_repeat_action_count", 0)))
-
-        multiplier = 1.0
-        if share < self.recovery_share_threshold:
-            # When share is under stress, make defensive discounts meaningful
-            # but make price increases conservative.
-            multiplier *= 1.25 if int(direction) < 0 else 0.55
-        if gap < -0.75:
-            # Firm1 is materially more expensive than Firm2.
-            multiplier *= 1.20 if int(direction) < 0 else 0.60
-        elif gap > 1.25:
-            # Firm1 has room to narrow excessive discounting.
-            multiplier *= 1.20 if int(direction) > 0 else 0.70
-        if fulfillment < 0.75 and coeff_key in {"per_minute", "per_mile"}:
-            # Supply stress can justify small variable-price pressure, but avoid
-            # aggressive variable discounts that worsen fulfillment.
-            multiplier *= 1.15 if int(direction) > 0 else 0.65
-        if coeff_key == "airport_fee":
-            # Airport fee is segment-specific and can create large visible gaps;
-            # keep it more conservative than broad fare coefficients.
-            multiplier *= 0.90
-        if repeat_count > 1:
-            multiplier *= max(
-                self.repeat_action_min_scale,
-                self.repeat_action_decay ** float(repeat_count - 1),
-            )
-        return float(np.clip(multiplier, 0.35, 2.25))
             
     def apply_action(self, action: int, market_interaction) -> None:
         """Map discrete steps back into concrete market coefficient overrides."""
@@ -776,7 +736,8 @@ class FirmRLPricer:
             self.last_action_normalized_gap = {"supply_incentive": float(supply_step) * self.supply_step} if supply_step else {}
             return
         
-        multipliers = {k: self._heuristic_magnitude_multiplier(k, int(fare_step_map[k])) for k in fare_step_map.keys()}
+        action_magnitude = float(np.clip(getattr(self.agent, "last_continuous_magnitude", 1.0), 0.0, 2.0))
+        multipliers = {k: action_magnitude for k in fare_step_map.keys()}
         scaled_steps = {
             k: self.config.step[k]
             * self.step_scale
@@ -826,6 +787,7 @@ class FirmRLPricer:
                 lower_distance=float(np.clip((bounded - lb) / width, 0.0, 1.0)),
                 upper_distance=float(np.clip((ub - bounded) / width, 0.0, 1.0)),
                 magnitude_multiplier=float(multipliers[key]),
+                magnitude_level=float(multipliers[key]),
                 repeat_count=int(self._repeat_action_count),
                 was_clipped=bool(abs(realized - intended) > 1e-8),
             )

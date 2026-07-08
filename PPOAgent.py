@@ -7,7 +7,7 @@ Created on Sun Feb  8 15:58:46 2026
 
 @author: Xiaoru Shi
 
-PPO actor-critic for discrete pricing policies.
+PPO actor-critic for hybrid discrete/continuous pricing policies.
 
 This is designed for STABILITY:
 - advantage normalization
@@ -62,7 +62,7 @@ class ActorCritic(nn.Module):
         self.action_q_head = None
         if self.action_feature_dim > 0:
             # Action-conditioned scoring lets PPO evaluate the causal footprint of
-            # each option (target coefficient, direction, realized heuristic step,
+            # each option (target coefficient, direction, continuous magnitude,
             # and expected crowd segment exposure) instead of treating actions as
             # opaque integer IDs.
             self.action_encoder = nn.Sequential(
@@ -76,6 +76,8 @@ class ActorCritic(nn.Module):
             self.pi_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, action_dim))
         else:
             self.pi_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, action_dim))
+        self.mag_mean_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, action_dim))
+        self.mag_logstd = nn.Parameter(torch.full((action_dim,), -0.35))
         self.v_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, 1))
         self.constraint_head = nn.Sequential(
             nn.Linear(hidden, hidden),
@@ -100,6 +102,9 @@ class ActorCritic(nn.Module):
         if isinstance(self.pi_head[-1], nn.Linear):
             nn.init.orthogonal_(self.pi_head[-1].weight, gain=0.01)
             nn.init.constant_(self.pi_head[-1].bias, 0.0)
+        if isinstance(self.mag_mean_head[-1], nn.Linear):
+            nn.init.orthogonal_(self.mag_mean_head[-1].weight, gain=0.01)
+            nn.init.constant_(self.mag_mean_head[-1].bias, 0.0)
         
         for head in (self.v_head, self.constraint_head, self.risk_head, self.response_head):
             if isinstance(head[-1], nn.Linear):
@@ -108,7 +113,7 @@ class ActorCritic(nn.Module):
 
     def forward(
         self, s: torch.Tensor, action_features: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         z = self.trunk(s)
         q_values = torch.empty(0, dtype=z.dtype, device=z.device)
         if self.action_feature_dim > 0 and action_features is not None and self.action_encoder is not None:
@@ -122,8 +127,12 @@ class ActorCritic(nn.Module):
             q_values = self.action_q_head(joint).squeeze(-1)
         else:
             logits = self.pi_head(z)
+        mag_mean = torch.tanh(self.mag_mean_head(z))
+        mag_logstd = self.mag_logstd.clamp(-2.5, 0.75).expand_as(mag_mean)
         return (
             logits,
+            mag_mean,
+            mag_logstd,
             self.v_head(z).squeeze(-1),
             self.constraint_head(z),
             self.risk_head(z).squeeze(-1),
@@ -139,6 +148,7 @@ class Transition:
     done: bool
     old_logp: torch.Tensor
     old_value: torch.Tensor
+    magnitude: torch.Tensor
     exploration_rate: float
     constraint_costs: torch.Tensor
     risk_cost: float
@@ -186,6 +196,8 @@ class PPOAgent:
         risk_value_coeff: float = 0.15,
         response_coeff: float = 0.05,
         risk_coeff: float = 0.10,
+        delayed_reward_horizon: int = 6,
+        delayed_reward_blend: float = 0.35,
         device: Optional[str] = None,
     ):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -221,6 +233,8 @@ class PPOAgent:
         self.risk_value_coeff = float(max(0.0, risk_value_coeff))
         self.response_coeff = float(max(0.0, response_coeff))
         self.risk_coeff = float(max(0.0, risk_coeff))
+        self.delayed_reward_horizon = int(max(1, delayed_reward_horizon))
+        self.delayed_reward_blend = float(np.clip(delayed_reward_blend, 0.0, 1.0))
         self.constraint_lambdas = torch.zeros(self.constraint_dim, dtype=torch.float32, device=self.device)
         self.ent_coeff = ent_coeff
         self.max_ent_coeff = float(max(ent_coeff, min_ent_coeff))
@@ -252,6 +266,7 @@ class PPOAgent:
         self.last_action_exploration_rate = self.exploration_rate
         self.action_visits = np.zeros(int(action_dim), dtype=np.int64)
         self.last_policy_entropy_fraction = 1.0
+        self.last_continuous_magnitude = 0.0
 
         self.buf: List[Transition] = []
         self.last_constraint_values = torch.zeros(self.constraint_dim, dtype=torch.float32, device=self.device)
@@ -337,6 +352,26 @@ class PPOAgent:
         mixed_probs = (1.0 - eps) * policy_probs + eps / float(action_count)
         return torch.distributions.Categorical(probs=mixed_probs)
     
+    @staticmethod
+    def _magnitude_dist(mean: torch.Tensor, logstd: torch.Tensor) -> torch.distributions.Normal:
+        return torch.distributions.Normal(mean, torch.exp(logstd))
+
+    @staticmethod
+    def _squash_magnitude(raw: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(raw) * 2.0
+
+    @staticmethod
+    def _unsquash_magnitude(magnitude: torch.Tensor) -> torch.Tensor:
+        y = torch.clamp(magnitude / 2.0, 1e-6, 1.0 - 1e-6)
+        return torch.log(y) - torch.log1p(-y)
+
+    @classmethod
+    def _magnitude_log_prob(cls, dist: torch.distributions.Normal, magnitude: torch.Tensor) -> torch.Tensor:
+        raw = cls._unsquash_magnitude(magnitude)
+        y = torch.clamp(magnitude / 2.0, 1e-6, 1.0 - 1e-6)
+        log_abs_det = torch.log(torch.clamp(2.0 * y * (1.0 - y), min=1e-6))
+        return dist.log_prob(raw) - log_abs_det
+    
     def adapt_entropy(self, progress: float, reward_converged: bool) -> None:
         """Keep exploration high early, then tighten as training converges."""
         p = float(np.clip(progress, 0.0, 1.0))
@@ -404,7 +439,7 @@ class PPOAgent:
         if self.action_feature_dim > 0 and action_features is not None:
             af_tensor = torch.as_tensor(action_features, dtype=torch.float32, device=self.device)
             af_tensor = af_tensor.reshape(1, af_tensor.shape[-2], af_tensor.shape[-1])
-        logits, value, constraint_values, risk_value, response_pred, _ = self.net(s, af_tensor)
+        logits, mag_mean, mag_logstd, value, constraint_values, risk_value, response_pred, _ = self.net(s, af_tensor)
         logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         if not torch.isfinite(logits).all():
             logits = torch.zeros_like(logits)
@@ -412,7 +447,16 @@ class PPOAgent:
         self.last_action_exploration_rate = float(exploration_rate)
         dist = self._exploratory_distribution(logits, exploration_rate)
         a = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
-        logp = dist.log_prob(a)
+        chosen_mean = mag_mean.gather(1, a.reshape(-1, 1)).squeeze(1)
+        chosen_logstd = mag_logstd.gather(1, a.reshape(-1, 1)).squeeze(1)
+        mag_dist = self._magnitude_dist(chosen_mean, chosen_logstd)
+        if deterministic:
+            magnitude = self._squash_magnitude(chosen_mean)
+        else:
+            magnitude = self._squash_magnitude(mag_dist.rsample())
+        magnitude = torch.where(a == 0, torch.zeros_like(magnitude), magnitude)
+        logp = dist.log_prob(a) + torch.where(a == 0, torch.zeros_like(magnitude), self._magnitude_log_prob(mag_dist, magnitude))
+        self.last_continuous_magnitude = float(magnitude.squeeze(0).detach().cpu().item())
         self.last_constraint_values = torch.nan_to_num(
             constraint_values.squeeze(0), nan=0.0, posinf=0.0, neginf=0.0
         ).detach()
@@ -499,6 +543,7 @@ class PPOAgent:
                 done=bool(done),
                 old_logp=old_logp.detach(),
                 old_value=old_value.detach(),
+                magnitude=torch.tensor(float(getattr(self, "last_continuous_magnitude", 0.0)), dtype=torch.float32, device=self.device),
                 exploration_rate=float(
                     np.clip(getattr(self, "last_action_exploration_rate", 0.0), 0.0, 1.0)
                 ),
@@ -511,6 +556,40 @@ class PPOAgent:
                 old_risk_value=self.last_risk_value.detach().clone(),
             )
         )
+    
+    @torch.no_grad()
+    def _delayed_reward_credit(self, rewards: torch.Tensor, dones: torch.Tensor) -> torch.Tensor:
+        """Blend immediate rewards with bounded future-return credit.
+
+        Price manipulations can affect share and revenue several decision points
+        after the action is applied.  This light-weight reward redistribution
+        keeps the original immediate signal but adds a normalized, finite-horizon
+        future component before GAE, improving credit assignment without changing
+        PPO's on-policy objective.
+        """
+        if self.delayed_reward_blend <= 0.0 or rewards.numel() <= 1:
+            return rewards
+        t_size = rewards.numel()
+        future = torch.zeros_like(rewards)
+        for t in range(t_size):
+            acc = torch.zeros((), dtype=torch.float32, device=self.device)
+            discount = 1.0
+            for k in range(1, self.delayed_reward_horizon + 1):
+                idx = t + k
+                if idx >= t_size:
+                    break
+                if bool(dones[idx - 1].item()):
+                    break
+                discount *= float(self.gamma)
+                acc = acc + discount * rewards[idx]
+            future[t] = acc
+        if rewards.numel() > 1:
+            scale = torch.std(future, unbiased=False) + 1e-8
+            centered_future = (future - torch.mean(future)) / scale
+            reward_scale = torch.std(rewards, unbiased=False) + 1e-8
+            future = centered_future * reward_scale
+        blended = (1.0 - self.delayed_reward_blend) * rewards + self.delayed_reward_blend * future
+        return torch.nan_to_num(blended, nan=0.0, posinf=0.0, neginf=0.0)
 
     @torch.no_grad()
     def _gae_scalar(
@@ -571,9 +650,10 @@ class PPOAgent:
 
         reward_all = torch.tensor([tr.r for tr in self.buf], dtype=torch.float32, device=self.device)
         done_all = torch.tensor([float(tr.done) for tr in self.buf], dtype=torch.float32, device=self.device)
+        credited_reward_all = self._delayed_reward_credit(reward_all, done_all)
         old_reward_values_all = torch.stack([tr.old_value for tr in self.buf], dim=0).detach()
         old_reward_values_all = torch.nan_to_num(old_reward_values_all, nan=0.0, posinf=0.0, neginf=0.0)
-        adv, ret = self._gae_scalar(reward_all, old_reward_values_all, done_all)
+        adv, ret = self._gae_scalar(credited_reward_all, old_reward_values_all, done_all)
         constraint_costs_all = torch.stack([tr.constraint_costs for tr in self.buf], dim=0).detach()
         old_constraint_values_all = torch.stack([tr.old_constraint_values for tr in self.buf], dim=0).detach()
         constraint_adv_cols = []
@@ -604,6 +684,7 @@ class PPOAgent:
         s_all = torch.stack([tr.s for tr in self.buf], dim=0)
         s_all = torch.nan_to_num(s_all, nan=0.0, posinf=1e3, neginf=-1e3)
         a_all = torch.stack([tr.a for tr in self.buf], dim=0)
+        magnitude_all = torch.stack([tr.magnitude for tr in self.buf], dim=0).detach()
         # Rollout-local action diversity catches policy collapse that global
         # lifetime coverage cannot see.  A policy can have visited every action
         # early in training and still stop collecting informative on-policy
@@ -648,6 +729,12 @@ class PPOAgent:
             "action_coverage": self._action_coverage(),
             "rollout_action_diversity": float(unique_action_fraction),
             "rollout_reward_std": float(torch.std(reward_all, unbiased=False).item()) if reward_all.numel() > 1 else 0.0,
+            "credited_reward_std": float(torch.std(credited_reward_all, unbiased=False).item()) if credited_reward_all.numel() > 1 else 0.0,
+            "delayed_reward_blend": float(self.delayed_reward_blend),
+            "credited_reward_std": float(torch.std(credited_reward_all, unbiased=False).item()) if credited_reward_all.numel() > 1 else 0.0,
+            "delayed_reward_blend": float(self.delayed_reward_blend),
+            "continuous_magnitude_mean": float(torch.mean(magnitude_all).item()) if magnitude_all.numel() > 0 else 0.0,
+            "continuous_magnitude_std": float(torch.std(magnitude_all, unbiased=False).item()) if magnitude_all.numel() > 1 else 0.0,
             "learning_signal_ok": True,
             "optimizer_steps": 0,
         }
@@ -684,13 +771,18 @@ class PPOAgent:
                 old_value_b = old_value_all[j].detach()
                 exploration_b = exploration_all[j].detach()
 
-                logits, v, constraint_v, risk_v, response_pred, q_values = self.net(s_b, action_features_b)
+                magnitude_b = magnitude_all[j].detach()
+                logits, mag_mean, mag_logstd, v, constraint_v, risk_v, response_pred, q_values = self.net(s_b, action_features_b)
                 logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
                 if not torch.isfinite(logits).all():
                     continue
                 dist = self._exploratory_distribution(logits, exploration_b)
                 policy_dist = torch.distributions.Categorical(logits=logits)
-                logp = dist.log_prob(a_b)
+                chosen_mean = mag_mean.gather(1, a_b.reshape(-1, 1)).squeeze(1)
+                chosen_logstd = mag_logstd.gather(1, a_b.reshape(-1, 1)).squeeze(1)
+                mag_dist = self._magnitude_dist(chosen_mean, chosen_logstd)
+                mag_logp = torch.where(a_b == 0, torch.zeros_like(magnitude_b), self._magnitude_log_prob(mag_dist, magnitude_b))
+                logp = dist.log_prob(a_b) + mag_logp
                 
                 ratio = torch.exp(logp - old_logp_b)
                 ratio = torch.nan_to_num(ratio, nan=1.0, posinf=1.0 + self.clip_eps, neginf=1.0 - self.clip_eps)
@@ -708,8 +800,9 @@ class PPOAgent:
                 if q_values.numel() > 0:
                     chosen_q = q_values.gather(1, a_b.reshape(-1, 1)).squeeze(1)
                     action_q_loss = torch.mean((chosen_q - ret_b) ** 2)
-                entropy = dist.entropy().mean()
-                policy_entropy = policy_dist.entropy().mean()
+                mag_entropy = mag_dist.entropy().mean()
+                entropy = dist.entropy().mean() + mag_entropy
+                policy_entropy = policy_dist.entropy().mean() + mag_entropy
                 logratio = logp - old_logp_b
                 approx_kl = ((torch.exp(logratio) - 1.0) - logratio).mean()
                 clipfrac = ((ratio - 1.0).abs() > self.clip_eps).float().mean()
@@ -762,6 +855,10 @@ class PPOAgent:
         last["action_coverage"] = self._action_coverage()
         last["rollout_action_diversity"] = float(unique_action_fraction)
         last["rollout_reward_std"] = float(torch.std(reward_all, unbiased=False).item()) if reward_all.numel() > 1 else 0.0
+        last["credited_reward_std"] = float(torch.std(credited_reward_all, unbiased=False).item()) if credited_reward_all.numel() > 1 else 0.0
+        last["delayed_reward_blend"] = float(self.delayed_reward_blend)
+        last["continuous_magnitude_mean"] = float(torch.mean(magnitude_all).item()) if magnitude_all.numel() > 0 else 0.0
+        last["continuous_magnitude_std"] = float(torch.std(magnitude_all, unbiased=False).item()) if magnitude_all.numel() > 1 else 0.0
         # Preserve exploration when a rollout contains too little action contrast
         # or the optimizer made no usable update.  This avoids declaring success
         # after historical action coverage while the current on-policy data is
