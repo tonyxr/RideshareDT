@@ -9,6 +9,7 @@ from __future__ import annotations
 """
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
+import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
 import numpy as np
 
 

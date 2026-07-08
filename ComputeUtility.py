@@ -5,7 +5,7 @@
 
 
 """
-
+import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
 import pandas as pd
 import numpy as np
 

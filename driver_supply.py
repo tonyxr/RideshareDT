@@ -22,6 +22,7 @@ from typing import Any, Dict, Optional, Tuple
 import importlib
 import importlib.util
 
+import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
 import numpy as np
 
 

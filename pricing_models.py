@@ -12,6 +12,7 @@ Firm2: Heuristic dynamic pricing (schedule + competitive response + guardrails)
 
 from dataclasses import dataclass
 from typing import Deque, Optional, Dict, List, Tuple
+import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
 import numpy as np
 from collections import deque
 
@@ -127,12 +128,12 @@ class FirmHeuristicPricer:
         self.share_band = 0.03
         self.price_gap_threshold = 0.50  # Firm2 - Firm1
 
-        self.alpha = 0.2
+        self.alpha = 0.05
         self.ema_share = 0.50
         self.ema_gap = 0.0
 
         self.cooldown = 0
-        self.cooldown_H = 3
+        self.cooldown_H = 8
 
     @staticmethod
     def _ema(x: float, ema: float, a: float) -> float:
@@ -260,7 +261,7 @@ class FirmMarginGuardrailPricer(FirmHeuristicPricer):
         self.min_rev_per_request = 6.00
         self.high_share_threshold = 0.5
         self.low_share_threshold = 0.38
-        self.guardrail_cooldown_H = 2
+        self.guardrail_cooldown_H = 6
 
     def update(self, metrics: FirmMetrics, price_gap_mean: float):
         super().update(metrics=metrics, price_gap_mean=price_gap_mean)
@@ -367,15 +368,15 @@ class FirmRLPricer:
         self.state_frame_stack = int(max(1, state_frame_stack))
         self._state_history: Deque[np.ndarray] = deque(maxlen=self.state_frame_stack)
         
-        self.base_step_scale = 0.95
-        self.converged_step_scale = 0.5
+        self.base_step_scale = 1.75
+        self.converged_step_scale = 1.0
         self.step_scale = self.base_step_scale
-        self.repeat_action_decay = 0.55
-        self.repeat_action_min_scale = 0.20
+        self.repeat_action_decay = 0.85
+        self.repeat_action_min_scale = 0.50
         self._last_applied_action = -1
         self._repeat_action_count = 0
-        self.base_max_relative_dev = 0.35
-        self.converged_max_relative_dev = 0.25
+        self.base_max_relative_dev = 0.60
+        self.converged_max_relative_dev = 0.45
         self.max_relative_dev = self.base_max_relative_dev
         # Keep supply-side control available as an internal multiplier, but do
         # not expose it as a PPO action by default.  Early optimization is
@@ -387,7 +388,7 @@ class FirmRLPricer:
         self.action_feature_dim = 19
         self.action_trace_dim = 8
         self.last_action_descriptor = ActionDescriptor()
-        self.recovery_share_threshold = 0.30
+        self.recovery_share_threshold = 0.25
         self.recovery_gap_threshold = -0.05
         self.aggressive_actions = set()
         self.allow_aggressive_actions = True
@@ -628,10 +629,10 @@ class FirmRLPricer:
         gap_tol = float(max(0.05, target_gap_tolerance))
         lower_gap = min(target_gap - gap_tol, target_gap)
         upper_gap = target_gap + gap_tol
-        overpricing = share_f < self.recovery_share_threshold or gap < max(self.recovery_gap_threshold, lower_gap)
-        over_discounting = gap > 1.50 and share_f >= self.recovery_share_threshold
-        loss_buying_share = profit < 0.0 and share_f >= self.recovery_share_threshold and gap >= -0.50
-        supply_stress = fulfill < 0.75 and profit >= -0.50
+        overpricing = share_f < 0.22 or gap < (max(self.recovery_gap_threshold, lower_gap) - 0.50)
+        over_discounting = gap > 2.25 and share_f >= self.recovery_share_threshold
+        loss_buying_share = profit < -1.00 and share_f >= self.recovery_share_threshold and gap >= 0.00
+        supply_stress = fulfill < 0.60 and profit >= -0.50
         if not (overpricing or over_discounting or loss_buying_share or supply_stress):
             return
 
@@ -729,13 +730,13 @@ class FirmRLPricer:
         if coeff_key == "airport_fee":
             # Airport fee is segment-specific and can create large visible gaps;
             # keep it more conservative than broad fare coefficients.
-            multiplier *= 0.70
+            multiplier *= 0.90
         if repeat_count > 1:
             multiplier *= max(
                 self.repeat_action_min_scale,
                 self.repeat_action_decay ** float(repeat_count - 1),
             )
-        return float(np.clip(multiplier, 0.20, 1.35))
+        return float(np.clip(multiplier, 0.35, 2.25))
             
     def apply_action(self, action: int, market_interaction) -> None:
         """Map discrete steps back into concrete market coefficient overrides."""

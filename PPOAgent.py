@@ -20,6 +20,7 @@ This is designed for STABILITY:
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
 import numpy as np
 import torch
 import torch.nn as nn
@@ -603,6 +604,14 @@ class PPOAgent:
         s_all = torch.stack([tr.s for tr in self.buf], dim=0)
         s_all = torch.nan_to_num(s_all, nan=0.0, posinf=1e3, neginf=-1e3)
         a_all = torch.stack([tr.a for tr in self.buf], dim=0)
+        # Rollout-local action diversity catches policy collapse that global
+        # lifetime coverage cannot see.  A policy can have visited every action
+        # early in training and still stop collecting informative on-policy
+        # contrast later; PPO then has too little action-level signal to learn
+        # meaningful state/action preferences.
+        unique_action_fraction = float(
+            torch.unique(a_all.detach()).numel() / max(1, self.action_dim)
+        )
         old_logp_all = torch.stack([tr.old_logp for tr in self.buf], dim=0)
         old_logp_all = torch.nan_to_num(old_logp_all, nan=0.0, posinf=20.0, neginf=-20.0)
         old_value_all = old_reward_values_all
@@ -637,6 +646,9 @@ class PPOAgent:
             "stopped_early_kl": False,
             "exploration_rate": float(self.exploration_rate),
             "action_coverage": self._action_coverage(),
+            "rollout_action_diversity": float(unique_action_fraction),
+            "rollout_reward_std": float(torch.std(reward_all, unbiased=False).item()) if reward_all.numel() > 1 else 0.0,
+            "learning_signal_ok": True,
             "optimizer_steps": 0,
         }
         stop_for_kl = False
@@ -748,6 +760,22 @@ class PPOAgent:
         last["policy_entropy_fraction"] = self.last_policy_entropy_fraction
         last["optimizer_steps"] = int(optimizer_steps)
         last["action_coverage"] = self._action_coverage()
+        last["rollout_action_diversity"] = float(unique_action_fraction)
+        last["rollout_reward_std"] = float(torch.std(reward_all, unbiased=False).item()) if reward_all.numel() > 1 else 0.0
+        # Preserve exploration when a rollout contains too little action contrast
+        # or the optimizer made no usable update.  This avoids declaring success
+        # after historical action coverage while the current on-policy data is
+        # effectively one repeated action with weak credit assignment.
+        weak_rollout_signal = bool(
+            optimizer_steps <= 0
+            or unique_action_fraction < min(0.35, 3.0 / max(1.0, float(self.action_dim)))
+            or float(last.get("lagrangian_adv_std", 0.0)) < 1e-6
+        )
+        last["learning_signal_ok"] = not weak_rollout_signal
+        if weak_rollout_signal:
+            self.exploration_rate = float(max(self.exploration_rate, self.exploration_rescue_rate))
+            self.ent_coeff = float(max(self.ent_coeff, 0.35 * self.max_ent_coeff))
+            self.low_update_streak = 0
         with torch.no_grad():
             ret_var = torch.var(ret, unbiased=False)
             if torch.isfinite(ret_var) and float(ret_var.item()) > 1e-8:
@@ -775,7 +803,10 @@ class PPOAgent:
 
         self.buf.clear()
         self.update_calls += 1
-        self.ent_coeff = max(self.min_ent_coeff, self.ent_coeff * self.ent_decay)
+        if not bool(last.get("learning_signal_ok", True)):
+            self.ent_coeff = float(max(self.ent_coeff, 0.35 * self.max_ent_coeff))
+        else:
+            self.ent_coeff = max(self.min_ent_coeff, self.ent_coeff * self.ent_decay)
 
         last["ent_coeff"] = float(self.ent_coeff)
         last["clip_eps"] = float(self.clip_eps)

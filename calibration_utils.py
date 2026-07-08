@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 from typing import Dict, Any, List, Optional
 
+import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
 import numpy as np
 
 from calibration_presets import NYC_PUBLIC_2024

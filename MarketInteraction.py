@@ -16,6 +16,7 @@ rewritten Feb 6, 2026
 
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple, List
+import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
 import numpy as np
 
 from Market_models import MarketCoefficients, CoefficientOverrides

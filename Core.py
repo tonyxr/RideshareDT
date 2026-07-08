@@ -34,7 +34,7 @@ from typing import Dict, Any, List, Tuple, Optional
 
 # Suppress Intel oneMKL CPU deprecation warning on legacy (non-AVX) machines unless
 # the user has already chosen an instruction policy in the environment.
-os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "SSE4_2")
+import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
 
 import numpy as np
 import torch
@@ -1756,6 +1756,8 @@ class Core:
         train_steps_per_day: int = 10,
         ppo_update_interval_days: int = 20,
         stochastic_training: bool = True,
+        firm1_action_interval_steps: int = -1,
+        firm2_action_interval_days: int = -1,
     ):
         """Run workflow: synthetic-data RL training (day/timestep cadence), then held-out evaluation."""
         self._initialize_run_distributions()
@@ -1786,9 +1788,26 @@ class Core:
         )
         if self.firm1_mode == "RL":
             update_every = int(max(1, ppo_update_interval_days))
+            action_interval_steps = int(firm1_action_interval_steps)
+            if action_interval_steps <= 0:
+                action_interval_steps = max(1, int(train_steps_per_day))
+            action_interval_steps = int(max(1, action_interval_steps))
+            approx_decisions = int(np.ceil(max(1, int(train_steps_per_day)) / float(action_interval_steps)))
             print(
                 f">>> PPO rollout/update cadence: {update_every} day(s) per optimizer step "
-                f"(~{update_every * max(1, int(train_steps_per_day))} transitions/update)."
+                f"(~{update_every * approx_decisions} price decisions/update; "
+                f"Firm1 holds each price action for {action_interval_steps} step(s))."
+            )
+        else:
+            action_interval_steps = 1
+        firm2_interval_days = int(firm2_action_interval_days)
+        if firm2_interval_days <= 0:
+            firm2_interval_days = max(1, int(ppo_update_interval_days))
+        firm2_interval_days = int(max(1, firm2_interval_days))
+        if self.firm2_mode != "static":
+            print(
+                f">>> Firm2 heuristic cadence: manipulate/update at most once every "
+                f"{firm2_interval_days} training day(s), slower than Firm1/PPO rollouts."
             )
         
         print(f">>> Training RL agent on synthetic {self.market_name} sampling (day/timestep cadence)...")
@@ -1859,6 +1878,12 @@ class Core:
             action_counts: Counter[int] = Counter()
             last_action = -1
             recovery_guardrail_count = 0
+            pending_rl_step = None
+            pending_reward_sum = 0.0
+            pending_constraint_sum = np.zeros(5, dtype=np.float32)
+            pending_risk_sum = 0.0
+            pending_response_sum = np.zeros(12, dtype=np.float32)
+            pending_count = 0
 
             for t, hour in enumerate(hours):
                 base = self.market.curr_market
@@ -1866,17 +1891,28 @@ class Core:
                 if self.firm1_mode == "RL":
                     s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
                     s_vec = self.firm1.stack_state(s_vec)
-                    action_features = self.firm1.build_action_feature_matrix(self.market, getattr(self, "last_crowd_response_stats", {}))
-                    action, s_ts, logits, val, af_ts = self.firm1.agent.act(s_vec, action_features=action_features)
-                    self.firm1.apply_action(action, self.market)
-                    self._project_rl_action_before_batch(base)
-                    action_counts[int(action)] += 1
-                    last_action = int(action)
-                    rl_step = (action, s_ts, logits, val, af_ts)
+                    decision_due = (t % action_interval_steps) == 0
+                    if decision_due:
+                        action_features = self.firm1.build_action_feature_matrix(self.market, getattr(self, "last_crowd_response_stats", {}))
+                        action, s_ts, logits, val, af_ts = self.firm1.agent.act(s_vec, action_features=action_features)
+                        self.firm1.apply_action(action, self.market)
+                        self._project_rl_action_before_batch(base)
+                        action_counts[int(action)] += 1
+                        last_action = int(action)
+                        rl_step = (action, s_ts, logits, val, af_ts)
+                        pending_rl_step = rl_step
+                        pending_reward_sum = 0.0
+                        pending_constraint_sum = np.zeros(5, dtype=np.float32)
+                        pending_risk_sum = 0.0
+                        pending_response_sum = np.zeros(12, dtype=np.float32)
+                        pending_count = 0
+                    else:
+                        rl_step = None
                 elif self.firm1_mode != "static":
                     self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
-                self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+                if self.firm2_mode != "static" and (d % firm2_interval_days == 0 and t == 0):
+                    self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
                 sampled_profiles = self._sample_profiles_from_pool(train_profile_sample_size)
                 if profiles_out and not profile_limit_reached:
@@ -1894,7 +1930,11 @@ class Core:
                     collect_rows=False,
                 )
 
-                if self.firm2_mode != "static":
+                if (
+                    self.firm2_mode != "static"
+                    and t == len(hours) - 1
+                    and ((d + 1) % firm2_interval_days == 0 or (d + 1) == train_timesteps)
+                ):
                     self.firm2.update(metrics=m2, price_gap_mean=mean_gap)
                     
                 action_movement = 0.0
@@ -1922,26 +1962,40 @@ class Core:
                     baseline_profit_per_request=float(m2.profit_per_request),
                 )
 
-                if self.firm1_mode == "RL" and rl_step is not None:
-                    action, s_ts, logits, val, af_ts = rl_step
+                if self.firm1_mode == "RL" and pending_rl_step is not None:
                     reward = float(reward_diag["reward"])
                     self.last_reward = reward
                     self._update_constraint_multipliers(reward_diag)
+                    pending_reward_sum += reward
+                    pending_constraint_sum += self._constraint_vector_from_diag(reward_diag)
+                    pending_risk_sum += self._risk_cost_from_diag(reward_diag)
+                    pending_response_sum += self._response_target_from_metrics(m1, m2, mean_gap)
+                    pending_count += 1
                     done = (t == len(hours) - 1)
-                    self.firm1.agent.store(
-                        s_ts,
-                        action,
-                        reward,
-                        done,
-                        None,
-                        logits,
-                        val,
-                        constraint_costs=self._constraint_vector_from_diag(reward_diag),
-                        risk_cost=self._risk_cost_from_diag(reward_diag),
-                        response_target=self._response_target_from_metrics(m1, m2, mean_gap),
-                        action_features=af_ts,
-                        action_trace=self.firm1.action_descriptor_vector(),
-                    )
+                    interval_closed = ((t + 1) % action_interval_steps == 0) or done
+                    if interval_closed and pending_count > 0:
+                        action, s_ts, logits, val, af_ts = pending_rl_step
+                        avg_reward = float(pending_reward_sum / max(1, pending_count))
+                        self.firm1.agent.store(
+                            s_ts,
+                            action,
+                            avg_reward,
+                            done,
+                            None,
+                            logits,
+                            val,
+                            constraint_costs=pending_constraint_sum / max(1, pending_count),
+                            risk_cost=float(pending_risk_sum / max(1, pending_count)),
+                            response_target=pending_response_sum / max(1, pending_count),
+                            action_features=af_ts,
+                            action_trace=self.firm1.action_descriptor_vector(),
+                        )
+                        pending_rl_step = None
+                        pending_reward_sum = 0.0
+                        pending_constraint_sum = np.zeros(5, dtype=np.float32)
+                        pending_risk_sum = 0.0
+                        pending_response_sum = np.zeros(12, dtype=np.float32)
+                        pending_count = 0
                     if done:
                         before_base = getattr(self.firm1.overrides, "base_fare", None)
                         before_pmin = getattr(self.firm1.overrides, "per_minute", None)
@@ -2163,6 +2217,8 @@ class Core:
                     and convergence_std <= self.reward_convergence_tol
                     and convergence_delta <= self.reward_trend_tol
                     and float(ppo_metrics.get("action_coverage", 0.0)) >= 0.95
+                    and bool(ppo_metrics.get("learning_signal_ok", True))
+                    and float(ppo_metrics.get("rollout_action_diversity", 1.0)) >= 0.25
                     and float(ppo_metrics.get("policy_entropy_fraction", 1.0)) <= 0.40
                 )
                 self.firm1.configure_training_controls(
@@ -2206,17 +2262,21 @@ class Core:
             base = self.market.curr_market
             action = -1
             if self.firm1_mode == "RL":
-                s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
-                s_vec = self.firm1.stack_state(s_vec)
-                action_features = self.firm1.build_action_feature_matrix(self.market, getattr(self, "last_crowd_response_stats", {}))
-                action, *_ = self.firm1.agent.act(s_vec, deterministic=True, action_features=action_features)
-                self.firm1.apply_action(action, self.market)
-                self._project_rl_action_before_batch(base)
-                action = int(action)
+                if (t % action_interval_steps) == 0:
+                    s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
+                    s_vec = self.firm1.stack_state(s_vec)
+                    action_features = self.firm1.build_action_feature_matrix(self.market, getattr(self, "last_crowd_response_stats", {}))
+                    action, *_ = self.firm1.agent.act(s_vec, deterministic=True, action_features=action_features)
+                    self.firm1.apply_action(action, self.market)
+                    self._project_rl_action_before_batch(base)
+                    action = int(action)
+                else:
+                    action = -1
             elif self.firm1_mode != "static":
                 self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
-            if self.firm2_mode != "static":
+            firm2_eval_interval_steps = max(1, firm2_interval_days * max(1, int(train_steps_per_day)))
+            if self.firm2_mode != "static" and (t % firm2_eval_interval_steps) == 0:
                 self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
 
             _, m1, m2, mean_gap, _, _ = self.simulate_batch(
@@ -2229,7 +2289,7 @@ class Core:
             )
             
             action_movement = 0.0
-            if self.firm1_mode == "RL":
+            if self.firm1_mode == "RL" and action >= 0:
                 action_movement = float(
                     sum(abs(v) for v in getattr(self.firm1, "last_action_normalized_gap", {}).values())
                 )
@@ -3479,6 +3539,8 @@ class Core:
                 and float(ppo_metrics.get("approx_kl", 0.0)) <= 0.025
                 and float(ppo_metrics.get("clipfrac", 0.0)) <= 0.22
                 and float(ppo_metrics.get("action_coverage", 0.0)) >= 0.95
+                and bool(ppo_metrics.get("learning_signal_ok", True))
+                and float(ppo_metrics.get("rollout_action_diversity", 1.0)) >= 0.25
                 and float(ppo_metrics.get("policy_entropy_fraction", 1.0)) <= 0.40
             )
             
@@ -4088,6 +4150,8 @@ def main():
     parser.add_argument("--train_customers", type=int, default=5000)
     parser.add_argument("--train_steps_per_day", type=int, default=10, help="Synthetic training timesteps per day (run_experiment mode).")
     parser.add_argument("--ppo_update_interval_days", type=int, default=10, help="How many synthetic training days to collect before each PPO optimizer update; larger values produce longer, lower-variance PPO rollouts.")
+    parser.add_argument("--firm1_action_interval_steps", type=int, default=-1, help="Training/eval timesteps to hold each Firm1 PPO price action; <=0 means one PPO price decision per synthetic day.")
+    parser.add_argument("--firm2_action_interval_days", type=int, default=-1, help="Synthetic training days between Firm2 heuristic price manipulations/EMA updates; <=0 aligns Firm2 to PPO update interval.")
     parser.add_argument("--ppo_batch_size", type=int, default=128, help="PPO minibatch size used when optimizing each rollout buffer.")
     parser.add_argument("--ppo_update_epochs", type=int, default=8, help="Number of optimization epochs per PPO rollout buffer.")
     parser.add_argument("--state_frame_stack", type=int, default=4, help="Number of recent encoded RL states to concatenate for history-aware PPO observations.")
@@ -4279,6 +4343,8 @@ def main():
             train_steps_per_day=args.train_steps_per_day,
             ppo_update_interval_days=args.ppo_update_interval_days,
             stochastic_training=not args.deterministic_experiment_seed,
+            firm1_action_interval_steps=args.firm1_action_interval_steps,
+            firm2_action_interval_days=args.firm2_action_interval_days,
         )
         rows = []
     else:
