@@ -1147,7 +1147,6 @@ class Core:
         dominance_objective = float(
             np.clip(0.65 * positive_dominance_advantage + 0.35 * dominance_level, 0.0, 1.0)
         )
-        market_term = share_objective
         profit_term = 0.5 * (revenue_objective + profit_objective)
         target_gap = float(self.reward_target_price_gap)
         price_gap_deviation = float(gap - target_gap)
@@ -2054,7 +2053,6 @@ class Core:
             "explained_variance": 0.0,
             "optimizer_steps": 0,
             "lr": 0.0,
-            "stopped_early_kl": False,
         }
 
         for d in range(train_timesteps):
@@ -2209,7 +2207,6 @@ class Core:
                             risk_cost=float(pending_risk_sum / max(1, pending_count)),
                             response_target=pending_response_sum / max(1, pending_count),
                             action_features=af_ts,
-                            action_trace=self.firm1.action_descriptor_vector(),
                         )
                         pending_rl_step = None
                         pending_reward_sum = 0.0
@@ -2444,7 +2441,6 @@ class Core:
                 "ppo_explained_variance": float(ppo_metrics.get("explained_variance", 0.0)),
                 "ppo_optimizer_steps": int(ppo_metrics.get("optimizer_steps", 0)),
                 "ppo_lr": float(ppo_metrics.get("lr", 0.0)),
-                "ppo_stopped_early_kl": bool(ppo_metrics.get("stopped_early_kl", False)),
             }
             
             for bin_label in ("0_2", "2_5", "5_10", "10_plus"):
@@ -3153,7 +3149,6 @@ class Core:
                 risk_cost=self._risk_cost_from_diag(reward_diag),
                 response_target=self._response_target_from_metrics(m1, m2, gap),
                 action_features=af_ts,
-                action_trace=self.firm1.action_descriptor_vector(),
             )
             self.firm1.stabilize_after_batch(
                 share=float(m1.share),
@@ -4006,8 +4001,7 @@ class Core:
                         f"ent_coeff={float(ppo_metrics.get('ent_coeff', 0.0)):.4f} "
                         f"explore={float(ppo_metrics.get('exploration_rate', 0.0)):.3f} "
                         f"coverage={float(ppo_metrics.get('action_coverage', 0.0)):.2f} "
-                        f"lr={float(ppo_metrics.get('lr', 0.0)):.6f} "
-                        f"kl_stop={bool(ppo_metrics.get('stopped_early_kl', False))}"
+                        f"lr={float(ppo_metrics.get('lr', 0.0)):.6f}"
                     )
                     
             if self.firm1_mode == "RL":

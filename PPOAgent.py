@@ -154,7 +154,6 @@ class Transition:
     risk_cost: float
     response_target: torch.Tensor
     action_features: torch.Tensor
-    action_trace: torch.Tensor
     old_constraint_values: torch.Tensor
     old_risk_value: torch.Tensor
 
@@ -176,7 +175,6 @@ class PPOAgent:
         hidden_dim: int = 192,
         target_kl: float = 0.50,
         adv_clip: float = 4.0,
-        lr_decay_on_spike: float = 0.85,
         lr_growth_on_stall: float = 1.08,
         min_lr: float = 5e-5,
         max_lr: Optional[float] = None,
@@ -190,7 +188,6 @@ class PPOAgent:
         constraint_dim: int = 5,
         response_dim: int = 4,
         action_feature_dim: int = 0,
-        action_trace_dim: int = 8,
         action_q_coeff: float = 0.08,
         constraint_value_coeff: float = 0.25,
         risk_value_coeff: float = 0.15,
@@ -227,7 +224,6 @@ class PPOAgent:
         self.clip_eps = self.initial_clip_eps
         self.v_coeff = v_coeff
         self.action_feature_dim = int(max(0, action_feature_dim))
-        self.action_trace_dim = int(max(1, action_trace_dim))
         self.action_q_coeff = float(max(0.0, action_q_coeff))
         self.constraint_value_coeff = float(max(0.0, constraint_value_coeff))
         self.risk_value_coeff = float(max(0.0, risk_value_coeff))
@@ -245,7 +241,6 @@ class PPOAgent:
         self.update_calls = 0
         self.target_kl = float(max(1e-4, target_kl))
         self.adv_clip = float(max(1.0, adv_clip))
-        self.lr_decay_on_spike = float(np.clip(lr_decay_on_spike, 0.5, 0.99))
         self.lr_growth_on_stall = float(np.clip(lr_growth_on_stall, 1.0, 1.25))
         self.value_clip_eps = float(max(0.05, value_clip_eps))
         self.low_update_streak = 0
@@ -554,7 +549,6 @@ class PPOAgent:
         risk_cost: float = 0.0,
         response_target: Optional[np.ndarray | List[float] | Tuple[float, ...] | torch.Tensor] = None,
         action_features: Optional[np.ndarray | List[List[float]] | torch.Tensor] = None,
-        action_trace: Optional[np.ndarray | List[float] | Tuple[float, ...] | torch.Tensor] = None,
     ) -> None:
         del s_next
         if constraint_costs is None:
@@ -589,21 +583,11 @@ class PPOAgent:
                 cols = min(fixed.shape[1], action_feature_tensor.shape[1])
                 fixed[:rows, :cols] = action_feature_tensor[:rows, :cols]
                 action_feature_tensor = fixed
-        if action_trace is None:
-            action_trace_tensor = torch.zeros(self.action_trace_dim, dtype=torch.float32, device=self.device)
-        else:
-            action_trace_tensor = torch.as_tensor(action_trace, dtype=torch.float32, device=self.device).reshape(-1)
-            if action_trace_tensor.numel() != self.action_trace_dim:
-                fixed_trace = torch.zeros(self.action_trace_dim, dtype=torch.float32, device=self.device)
-                width = min(self.action_trace_dim, action_trace_tensor.numel())
-                fixed_trace[:width] = action_trace_tensor[:width]
-                action_trace_tensor = fixed_trace
-                
+    
         constraint_tensor = torch.nan_to_num(constraint_tensor, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0)
         response_tensor = torch.nan_to_num(response_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
         
         action_feature_tensor = torch.nan_to_num(action_feature_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
-        action_trace_tensor = torch.nan_to_num(action_trace_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
         
         self.buf.append(
             Transition(
@@ -621,7 +605,6 @@ class PPOAgent:
                 risk_cost=float(max(0.0, np.nan_to_num(risk_cost, nan=0.0, posinf=1.0, neginf=0.0))),
                 response_target=response_tensor.detach(),
                 action_features=action_feature_tensor.detach(),
-                action_trace=action_trace_tensor.detach(),
                 old_constraint_values=self.last_constraint_values.detach().clone(),
                 old_risk_value=self.last_risk_value.detach().clone(),
             )
@@ -794,13 +777,10 @@ class PPOAgent:
             "ent_coeff": float(self.ent_coeff),
             "clip_eps": float(self.clip_eps),
             "lr": float(self.curr_lr),
-            "stopped_early_kl": False,
             "exploration_rate": float(self.exploration_rate),
             "action_coverage": self._action_coverage(),
             "rollout_action_diversity": float(unique_action_fraction),
             "rollout_reward_std": float(torch.std(reward_all, unbiased=False).item()) if reward_all.numel() > 1 else 0.0,
-            "credited_reward_std": float(torch.std(credited_reward_all, unbiased=False).item()) if credited_reward_all.numel() > 1 else 0.0,
-            "delayed_reward_blend": float(self.delayed_reward_blend),
             "credited_reward_std": float(torch.std(credited_reward_all, unbiased=False).item()) if credited_reward_all.numel() > 1 else 0.0,
             "delayed_reward_blend": float(self.delayed_reward_blend),
             "continuous_magnitude_mean": float(torch.mean(magnitude_all).item()) if magnitude_all.numel() > 0 else 0.0,
@@ -808,7 +788,7 @@ class PPOAgent:
             "learning_signal_ok": True,
             "optimizer_steps": 0,
         }
-        stop_for_kl = False
+
         metric_sums: Dict[str, float] = {
             "loss": 0.0,
             "policy_loss": 0.0,
@@ -910,8 +890,6 @@ class PPOAgent:
                 metric_sums["policy_entropy"] += float(policy_entropy.item())
                 metric_sums["approx_kl"] += float(approx_kl.item())
                 metric_sums["clipfrac"] += float(clipfrac.item())
-            if stop_for_kl:
-                break
         
         if optimizer_steps > 0:
             for key, total in metric_sums.items():
@@ -977,7 +955,6 @@ class PPOAgent:
         last["ent_coeff"] = float(self.ent_coeff)
         last["clip_eps"] = float(self.clip_eps)
         last["lr"] = float(self.curr_lr)
-        last["stopped_early_kl"] = bool(stop_for_kl)
         last["exploration_rate"] = float(self.exploration_rate)
         return last
 

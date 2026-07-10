@@ -385,7 +385,6 @@ class FirmRLPricer:
         self.supply_min_multiplier = 0.90
         self.supply_max_multiplier = 1.15
         self.action_feature_dim = 19
-        self.action_trace_dim = 8
         self.last_action_descriptor = ActionDescriptor()
         self._last_action_target = "hold"
         self._last_action_direction = 0
@@ -415,12 +414,13 @@ class FirmRLPricer:
         self.action_keys = list(active_keys)
         
         # State includes cyclical/flag time context, richer demand/WTP context,
-        # recent EMA/delta features, direct supply state, five normalized fare-
+        # recent EMA/delta features, direct supply state, own and opponent fare-
         # coefficient deltas, action-memory/oscillation stress features, and
-        # constrained-MDP context. Frame stacking appends recent encoded states so
-        # PPO can infer hidden demand/supply feedback without requiring a
-        # recurrent policy.
-        self.single_state_dim = 84
+        # constrained-MDP context. Opponent deltas help PPO respond to heuristic
+        # rivals whose coefficients move before share/gap metrics fully react.
+        # Frame stacking appends recent encoded states so PPO can infer hidden
+        # demand/supply feedback without requiring a recurrent policy.
+        self.single_state_dim = 89
         state_dim = self.single_state_dim * self.state_frame_stack
 
         # Initialize PPO agent.
@@ -440,7 +440,6 @@ class FirmRLPricer:
             initial_exploration_rate=0.58,
             final_exploration_rate=0.02,
             action_feature_dim=self.action_feature_dim,
-            action_trace_dim=self.action_trace_dim,
             response_dim=12,
             action_q_coeff=0.10,
             exploration_fraction=0.90,
@@ -533,7 +532,6 @@ class FirmRLPricer:
         ctx = crowd_context or {}
         base = market_interaction.curr_market
         rows: List[List[float]] = []
-        max_keys = max(1, len(self.action_keys))
         near_threshold = float(np.clip(ctx.get("near_threshold_share", 0.0), 0.0, 1.0))
         threshold_mean = float(np.clip(ctx.get("price_threshold_mean", 1.5) / 8.0, 0.0, 1.0))
         no_ride_rate = float(np.clip(ctx.get("no_ride_rate", 0.0), 0.0, 1.0))

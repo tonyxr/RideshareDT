@@ -14,6 +14,9 @@ compact context + normalized demand/supply health + selected coefficient deltas.
 The state intentionally exposes target-centered signals instead of raw, redundant
 metrics.  Driver supply remains an external layer: the policy can observe service
 health and supply stress, but it still only controls rider-facing price actions.
+Dynamic-opponent coefficient deltas are included so PPO can condition on a
+heuristic rival's current price posture instead of reacting only after share/gap
+metrics move.
 """
 
 from typing import List, Optional
@@ -57,6 +60,7 @@ def build_state_vector(
     max_relative_dev: float = 0.35,
     constraint_multipliers: Optional[np.ndarray] = None,
     constraint_curriculum_scale: float = 1.0,
+    ov_firm2: Optional[CoefficientOverrides] = None,
 ) -> np.ndarray:
     
     ride_ctx = np.asarray(ride_ctx_vec, dtype=np.float32).reshape(-1)
@@ -107,6 +111,15 @@ def build_state_vector(
     while len(coef_feats) < 5:
         coef_feats.append(0.0)
     coef_arr = np.asarray(coef_feats[:5], dtype=np.float32)
+    
+    opponent_feats = []
+    opponent_overrides = ov_firm2 if ov_firm2 is not None else CoefficientOverrides()
+    for k in opt_keys[:5]:
+        opponent_cur = get_coeff(base, opponent_overrides, k)
+        base_val = get_coeff(base, base_empty, k)
+        opponent_feats.append((opponent_cur - base_val) / (abs(base_val) + 1e-6))
+    while len(opponent_feats) < 5:
+        opponent_feats.append(0.0)
         
     share = float(np.clip(firm1_last_share, 0.0, 1.0))
     fulfillment = float(np.clip(firm1_last_fulfillment, 0.0, 1.0))
@@ -193,6 +206,7 @@ def build_state_vector(
         + recent_ctx.tolist()
         + supply.tolist()
         + coef_feats
+        + opponent_feats
         + action_memory
         + constraints.tolist()
         + constrained_context,
