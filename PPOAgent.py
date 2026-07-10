@@ -422,13 +422,62 @@ class PPOAgent:
         )
         if reward_converged:
             self.clip_eps = min(self.clip_eps, self.final_clip_eps)
-
+    
+    @torch.no_grad()
+    def policy_diagnostics(
+        self,
+        s_np: np.ndarray,
+        action_features: Optional[np.ndarray] = None,
+        temperature: float = 1.0,
+    ) -> Dict[str, float]:
+        """Return raw-policy action diagnostics without the training exploration mix."""
+        s = torch.tensor(s_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+        s = torch.nan_to_num(s, nan=0.0, posinf=1e3, neginf=-1e3)
+        af_tensor = None
+        if self.action_feature_dim > 0 and action_features is not None:
+            af_tensor = torch.as_tensor(action_features, dtype=torch.float32, device=self.device)
+            af_tensor = af_tensor.reshape(1, af_tensor.shape[-2], af_tensor.shape[-1])
+        logits, mag_mean, mag_logstd, value, constraint_values, risk_value, response_pred, _ = self.net(s, af_tensor)
+        del mag_mean, mag_logstd, value, constraint_values, risk_value, response_pred
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).reshape(-1)
+        temp = float(max(1e-6, temperature))
+        probs_t = torch.softmax(logits / temp, dim=-1)
+        probs = probs_t.detach().cpu().numpy().astype(float)
+        if probs.size == 0:
+            return {
+                "policy_top_action": -1.0,
+                "policy_second_action": -1.0,
+                "policy_top_prob": 0.0,
+                "policy_second_prob": 0.0,
+                "policy_action_margin": 0.0,
+                "policy_hold_prob": 0.0,
+                "policy_entropy": 0.0,
+                "policy_temperature": temp,
+            }
+        order = np.argsort(-probs)
+        top = int(order[0])
+        second = int(order[1]) if probs.size > 1 else top
+        safe_probs = np.clip(probs, 1e-12, 1.0)
+        return {
+            "policy_top_action": float(top),
+            "policy_second_action": float(second),
+            "policy_top_prob": float(probs[top]),
+            "policy_second_prob": float(probs[second]) if second != top else 0.0,
+            "policy_action_margin": float(probs[top] - (probs[second] if second != top else 0.0)),
+            "policy_hold_prob": float(probs[0]) if probs.size > 0 else 0.0,
+            "policy_entropy": float(-np.sum(safe_probs * np.log(safe_probs))),
+            "policy_temperature": temp,
+        }
+    
     @torch.no_grad()
     def act(
         self,
         s_np: np.ndarray,
         deterministic: bool = False,
         action_features: Optional[np.ndarray] = None,
+        policy_mode: str = "argmax",
+        policy_temperature: float = 0.50,
+        top2_margin: float = 0.05,
     ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         s = torch.tensor(s_np, dtype=torch.float32, device=self.device).unsqueeze(0)
         s = torch.nan_to_num(s, nan=0.0, posinf=1e3, neginf=-1e3)
@@ -447,7 +496,27 @@ class PPOAgent:
         exploration_rate = 0.0 if deterministic else self.exploration_rate
         self.last_action_exploration_rate = float(exploration_rate)
         dist = self._exploratory_distribution(logits, exploration_rate)
-        a = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
+        if deterministic:
+            mode = str(policy_mode or "argmax").strip().lower()
+            raw_dist = torch.distributions.Categorical(logits=logits)
+            if mode == "sample_raw":
+                a = raw_dist.sample()
+            elif mode == "sample_low_temp":
+                temp = float(max(1e-6, policy_temperature))
+                a = torch.distributions.Categorical(logits=logits / temp).sample()
+            elif mode == "top2_margin":
+                probs = torch.softmax(logits, dim=-1)
+                top_probs, top_idx = torch.topk(probs, k=min(2, probs.shape[-1]), dim=-1)
+                if top_probs.shape[-1] < 2 or float((top_probs[:, 0] - top_probs[:, 1]).item()) >= float(max(0.0, top2_margin)):
+                    a = top_idx[:, 0]
+                else:
+                    pair_probs = top_probs / torch.clamp(top_probs.sum(dim=-1, keepdim=True), min=1e-12)
+                    pair_choice = torch.distributions.Categorical(probs=pair_probs).sample()
+                    a = top_idx.gather(1, pair_choice.reshape(-1, 1)).squeeze(1)
+            else:
+                a = torch.argmax(logits, dim=-1)
+        else:
+            a = dist.sample()
         chosen_mean = mag_mean.gather(1, a.reshape(-1, 1)).squeeze(1)
         chosen_logstd = mag_logstd.gather(1, a.reshape(-1, 1)).squeeze(1)
         mag_dist = self._magnitude_dist(chosen_mean, chosen_logstd)

@@ -620,15 +620,18 @@ class FirmRLPricer:
         fulfillment_rate: float = 1.0,
         target_price_gap: float = 0.0,
         target_gap_tolerance: float = 0.35,
-    ) -> None:
-        """Guard against extreme dynamic-market failure modes.
+    ) -> Dict[str, object]:
+        """Guard against extreme dynamic-market failure modes and report effects.
 
         The guardrail is intentionally small: PPO still owns the strategy, but
         it should not remain stuck in obviously dominated regions such as
         overpricing with collapsing share, negative-profit share buying, or
-        severe driver-fulfillment stress.  Adjust all rider-facing fare knobs
-        around market anchors instead of only base fare/per-minute.
+        severe driver-fulfillment stress.  Returning a structured diagnostic lets
+        evaluation separate learned RL actions from rule-based safety projection.
         """
+        before = {k: getattr(self.overrides, k) for k in self.opt_keys}
+        moved: Dict[str, float] = {}
+        reasons: List[str] = []
         share_f = float(np.clip(share, 0.0, 1.0))
         gap = float(price_gap_f2_minus_f1)
         profit = float(profit_per_request)
@@ -642,7 +645,7 @@ class FirmRLPricer:
         loss_buying_share = profit < -1.00 and share_f >= self.recovery_share_threshold and gap >= 0.00
         supply_stress = fulfill < 0.60 and profit >= -0.50
         if not (overpricing or over_discounting or loss_buying_share or supply_stress):
-            return
+            return {"applied": False, "reasons": [], "deltas": {}, "before": before, "after": dict(before)}
 
         anchors = {
             "base_fare": float(city_base),
@@ -661,14 +664,16 @@ class FirmRLPricer:
                 curr = anchor
             step = self.config.step[key] * self.step_scale * float(multiplier)
             lb, ub = self.config.bounds[key]
-            nudged = float(curr) + float(np.sign(direction)) * step
-            setattr(
-                self.overrides,
-                key,
-                self._bounded_relative_move(nudged, anchor, self.max_relative_dev, lb, ub),
-            )
+            old = float(curr)
+            nudged = old + float(np.sign(direction)) * step
+            new_value = self._bounded_relative_move(nudged, anchor, self.max_relative_dev, lb, ub)
+            setattr(self.overrides, key, new_value)
+            delta = float(new_value - old)
+            if abs(delta) > 1e-12:
+                moved[key] = moved.get(key, 0.0) + delta
         
         if overpricing:
+            reasons.append("overpricing")
             # Restore competitiveness first through fixed fees, then segment
             # levers if the mean gap shows a severe broad overprice.
             move("base_fare", -1)
@@ -678,9 +683,8 @@ class FirmRLPricer:
                 move("airport_fee", -1)
             if gap < -2.00:
                 move("per_mile", -1, 0.75)
-            return
-        
-        if over_discounting:
+        elif over_discounting:
+            reasons.append("over_discounting")
             # If the realized market gap is already wider than the intended
             # modest discount, lift broad/fixed fare levers before allowing the
             # policy to keep compensating through one distance-heavy coefficient.
@@ -689,23 +693,29 @@ class FirmRLPricer:
             move("per_minute", +1, 0.5)
             if gap > 2.25:
                 move("per_mile", +1, 0.5)
-            return
-
-        if loss_buying_share:
+        elif loss_buying_share:
+            reasons.append("loss_buying_share")
             # Repair unit economics without immediately giving up all share.
             move("per_mile", +1, 0.75)
             move("per_minute", +1, 0.75)
             if gap > 0.75:
                 move("booking_fee", +1, 0.5)
-            return
-
-        if supply_stress:
+        elif supply_stress:
+            reasons.append("supply_stress")
             # Temper demand only when Firm1 is at or above its intended discount
             # band.  Otherwise this guardrail becomes a one-way variable-fare
             # ratchet that can erase competitiveness and trigger oscillations.
             if gap >= upper_gap:
                 move("per_minute", +1, 0.25)
                 move("per_mile", +1, 0.25)
+        after = {k: getattr(self.overrides, k) for k in self.opt_keys}
+        return {
+            "applied": bool(moved),
+            "reasons": reasons,
+            "deltas": moved,
+            "before": before,
+            "after": after,
+        }
             
     def apply_action(self, action: int, market_interaction) -> None:
         """Map discrete steps back into concrete market coefficient overrides."""

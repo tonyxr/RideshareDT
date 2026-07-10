@@ -46,7 +46,7 @@ def build_state_vector(
     firm1_last_wait: float = 0.0,
     firm1_last_driver_paypr: float = 0.0,
     demand_context_vec: Optional[np.ndarray] = None,
-    wtp_context_vec: Optional[np.ndarray] = None,
+    price_gap_context_vec: Optional[np.ndarray] = None,
     recent_context_vec: Optional[np.ndarray] = None,
     driver_state_vec: Optional[np.ndarray] = None,
     supply_incentive_multiplier: float = 1.0,
@@ -71,14 +71,14 @@ def build_state_vector(
         demand_ctx = np.pad(demand_ctx, (0, 10 - demand_ctx.size), mode="constant")
     demand_ctx = np.nan_to_num(demand_ctx[:10], nan=0.0, posinf=1.0, neginf=0.0)
     demand_ctx = np.clip(demand_ctx, 0.0, 1.0)
-    wtp_ctx = np.asarray(
-        wtp_context_vec if wtp_context_vec is not None else np.zeros(9),
+    price_gap_ctx = np.asarray(
+        price_gap_context_vec if price_gap_context_vec is not None else np.zeros(9),
         dtype=np.float32,
     ).reshape(-1)
-    if wtp_ctx.size < 9:
-        wtp_ctx = np.pad(wtp_ctx, (0, 9 - wtp_ctx.size), mode="constant")
-    wtp_ctx = np.nan_to_num(wtp_ctx[:9], nan=0.0, posinf=1.0, neginf=0.0)
-    wtp_ctx = np.clip(wtp_ctx, 0.0, 1.0)
+    if price_gap_ctx.size < 9:
+        price_gap_ctx = np.pad(price_gap_ctx, (0, 9 - price_gap_ctx.size), mode="constant")
+    price_gap_ctx = np.nan_to_num(price_gap_ctx[:9], nan=0.0, posinf=1.0, neginf=0.0)
+    price_gap_ctx = np.clip(price_gap_ctx, 0.0, 1.0)
     recent_ctx = np.asarray(
         recent_context_vec if recent_context_vec is not None else np.zeros(8),
         dtype=np.float32,
@@ -189,7 +189,7 @@ def build_state_vector(
     return np.array(
         fixed
         + demand_ctx.tolist()
-        + wtp_ctx.tolist()
+        + price_gap_ctx.tolist()
         + recent_ctx.tolist()
         + supply.tolist()
         + coef_feats
