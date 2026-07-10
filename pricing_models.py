@@ -140,18 +140,27 @@ class FirmHeuristicPricer:
     def _ema(x: float, ema: float, a: float) -> float:
         return (1 - a) * ema + a * x
 
-    def act(self, city_base: float, city_pmin: float, hour: int, weather: str):
+    def act(
+        self,
+        city_base: float,
+        city_pmin: float,
+        hour: int,
+        weather: str,
+        city_pmile: Optional[float] = None,
+        city_booking: Optional[float] = None,
+        city_airport: Optional[float] = None,
+    ):
         # initialize once
         if "base_fare" in self.managed_keys and self.overrides.base_fare is None:
             self.overrides.base_fare = float(city_base)
         if "per_minute" in self.managed_keys and self.overrides.per_minute is None:
             self.overrides.per_minute = float(city_pmin)
         if "per_mile" in self.managed_keys and self.overrides.per_mile is None:
-            self.overrides.per_mile = 1.50
+            self.overrides.per_mile = float(city_pmile if city_pmile is not None else 1.50)
         if "booking_fee" in self.managed_keys and self.overrides.booking_fee is None:
-            self.overrides.booking_fee = 2.00
+            self.overrides.booking_fee = float(city_booking if city_booking is not None else 2.00)
         if "airport_fee" in self.managed_keys and self.overrides.airport_fee is None:
-            self.overrides.airport_fee = 5.00
+            self.overrides.airport_fee = float(city_airport if city_airport is not None else 5.00)
 
         if self.cooldown > 0:
             self.cooldown -= 1
@@ -163,9 +172,12 @@ class FirmHeuristicPricer:
         # baseline targets (schedule)
         base_target = city_base + (0.20 if peak else 0.0) + (0.10 if bad_weather else 0.0)
         pmin_target = city_pmin + (0.01 if peak else 0.0) + (0.005 if bad_weather else 0.0)
-        pmile_target = 1.50 + (0.08 if peak else 0.0) + (0.05 if bad_weather else 0.0)
-        booking_target = 2.00 + (0.08 if peak else 0.0) + (0.04 if bad_weather else 0.0)
-        airport_target = 5.00 + (0.20 if peak else 0.0)
+        pmile_anchor = float(city_pmile if city_pmile is not None else 1.50)
+        booking_anchor = float(city_booking if city_booking is not None else 2.00)
+        airport_anchor = float(city_airport if city_airport is not None else 5.00)
+        pmile_target = pmile_anchor + (0.08 if peak else 0.0) + (0.05 if bad_weather else 0.0)
+        booking_target = booking_anchor + (0.08 if peak else 0.0) + (0.04 if bad_weather else 0.0)
+        airport_target = airport_anchor + (0.20 if peak else 0.0)
 
         losing = self.ema_share < (self.target_share - self.share_band)
         overpriced = self.ema_gap > self.price_gap_threshold
@@ -300,7 +312,200 @@ class FirmMarginGuardrailPricer(FirmHeuristicPricer):
                 *self.pmin_bounds,
             ))
             self.cooldown = self.guardrail_cooldown_H
+            
+class FirmAdaptiveBestResponsePricer:
+    """Bounded lagged adaptive best-response competitor for Firm 2.
 
+    The controller observes smoothed market share, revenue per request, and the
+    realized Firm2-Firm1 price gap.  It then applies a myopic threshold rule to
+    one bounded coefficient at a time.  This is stronger than a static baseline
+    but remains interpretable and weaker than Firm1's PPO policy because it has
+    no learned value function or delayed-credit optimization.
+    """
+
+    def __init__(
+        self,
+        seed: Optional[int] = None,
+        managed_keys: Optional[List[str]] = None,
+        *,
+        target_share: float = 0.50,
+        alpha_share: float = 0.20,
+        alpha_revenue: float = 0.20,
+        alpha_gap: float = 0.20,
+        k_share: float = 1.00,
+        k_gap: float = 0.60,
+        k_revenue: float = 0.40,
+        response_threshold: float = 0.05,
+        cooldown_batches: int = 3,
+        step_scale: float = 1.00,
+        revenue_target: Optional[float] = None,
+    ):
+        self.rng = np.random.default_rng(seed)
+        self.overrides = CoefficientOverrides()
+        editable = {"base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"}
+        keys = list(managed_keys) if managed_keys is not None else ["base_fare", "per_minute", "per_mile"]
+        self.managed_keys = tuple(k for k in keys if k in editable)
+        if not self.managed_keys:
+            self.managed_keys = ("base_fare", "per_minute", "per_mile")
+        self.config = default_specs_for(list(self.managed_keys))
+
+        self.target_share = float(np.clip(target_share, 0.0, 1.0))
+        self.alpha_share = float(np.clip(alpha_share, 0.0, 1.0))
+        self.alpha_revenue = float(np.clip(alpha_revenue, 0.0, 1.0))
+        self.alpha_gap = float(np.clip(alpha_gap, 0.0, 1.0))
+        self.k_share = float(max(0.0, k_share))
+        self.k_gap = float(max(0.0, k_gap))
+        self.k_revenue = float(max(0.0, k_revenue))
+        self.response_threshold = float(max(0.0, response_threshold))
+        self.cooldown_H = int(max(0, cooldown_batches))
+        self.cooldown = 0
+        self.step_scale = float(max(0.0, step_scale))
+        self.revenue_target = None if revenue_target is None else float(max(1e-6, revenue_target))
+
+        self.ema_share = self.target_share
+        self.ema_revenue = 0.0 if self.revenue_target is None else self.revenue_target
+        self.ema_gap = 0.0
+        self.last_response_score = 0.0
+        self.last_selected_key = "hold"
+        self.last_direction = 0
+        self.last_reason = "init"
+
+    @staticmethod
+    def _ema(x: float, ema: float, a: float) -> float:
+        return (1 - a) * float(ema) + a * float(x)
+
+    def _anchor_map(
+        self,
+        city_base: float,
+        city_pmin: float,
+        city_pmile: Optional[float],
+        city_booking: Optional[float],
+        city_airport: Optional[float],
+    ) -> Dict[str, float]:
+        return {
+            "base_fare": float(city_base),
+            "per_minute": float(city_pmin),
+            "per_mile": float(city_pmile if city_pmile is not None else 1.50),
+            "booking_fee": float(city_booking if city_booking is not None else 2.00),
+            "airport_fee": float(city_airport if city_airport is not None else 5.00),
+        }
+
+    def _ensure_initialized(self, anchors: Dict[str, float]) -> None:
+        for key in self.managed_keys:
+            if getattr(self.overrides, key, None) is None:
+                setattr(self.overrides, key, float(anchors[key]))
+
+    def _response_score(self) -> float:
+        share_error = float(self.target_share - self.ema_share)
+        gap_pressure = float(np.clip(self.ema_gap / 2.0, -1.0, 1.0))
+        if self.revenue_target is None:
+            revenue_surplus = 0.0
+        else:
+            revenue_surplus = float(
+                np.clip((self.ema_revenue - self.revenue_target) / self.revenue_target, -1.0, 1.0)
+            )
+        return float(
+            self.k_share * share_error
+            + self.k_gap * gap_pressure
+            - self.k_revenue * revenue_surplus
+        )
+
+    def _select_coefficient(self, direction: int) -> Optional[str]:
+        if direction < 0:
+            priority = ("base_fare", "booking_fee", "per_mile", "per_minute", "airport_fee")
+        else:
+            priority = ("per_mile", "per_minute", "booking_fee", "base_fare", "airport_fee")
+        candidates: List[Tuple[float, int, str]] = []
+        for rank, key in enumerate(priority):
+            if key not in self.managed_keys:
+                continue
+            curr = getattr(self.overrides, key, None)
+            if curr is None:
+                continue
+            lb, ub = self.config.bounds[key]
+            width = max(1e-6, float(ub - lb))
+            room = (float(curr) - float(lb)) if direction < 0 else (float(ub) - float(curr))
+            room_frac = float(np.clip(room / width, 0.0, 1.0))
+            if room_frac > 1e-6:
+                candidates.append((room_frac, -rank, key))
+        if not candidates:
+            return None
+        return max(candidates)[2]
+
+    def _apply_step(self, key: str, direction: int) -> bool:
+        curr = getattr(self.overrides, key, None)
+        if curr is None:
+            return False
+        step = float(self.config.step[key]) * self.step_scale
+        lb, ub = self.config.bounds[key]
+        new_value = float(np.clip(float(curr) + float(np.sign(direction)) * step, lb, ub))
+        if abs(new_value - float(curr)) <= 1e-12:
+            return False
+        setattr(self.overrides, key, new_value)
+        return True
+
+    def act(
+        self,
+        city_base: float,
+        city_pmin: float,
+        hour: int,
+        weather: str,
+        city_pmile: Optional[float] = None,
+        city_booking: Optional[float] = None,
+        city_airport: Optional[float] = None,
+    ) -> None:
+        del hour, weather
+        anchors = self._anchor_map(city_base, city_pmin, city_pmile, city_booking, city_airport)
+        self._ensure_initialized(anchors)
+        self.last_selected_key = "hold"
+        self.last_direction = 0
+        if self.cooldown > 0:
+            self.cooldown -= 1
+            self.last_reason = "cooldown"
+            return
+
+        score = self._response_score()
+        self.last_response_score = score
+        if abs(score) <= self.response_threshold:
+            self.last_reason = "threshold_hold"
+            return
+
+        direction = -1 if score > 0.0 else 1
+        key = self._select_coefficient(direction)
+        if key is None:
+            self.last_reason = "no_room"
+            return
+
+        moved = self._apply_step(key, direction)
+        self.last_selected_key = key if moved else "hold"
+        self.last_direction = int(direction) if moved else 0
+        self.last_reason = "adaptive_response" if moved else "bounded"
+        if moved:
+            self.cooldown = self.cooldown_H
+
+    def update(self, metrics: FirmMetrics, price_gap_mean: float) -> None:
+        if self.revenue_target is None:
+            self.revenue_target = float(max(1e-6, metrics.rev_per_request))
+            self.ema_revenue = self.revenue_target
+        self.ema_share = self._ema(metrics.share, self.ema_share, self.alpha_share)
+        self.ema_revenue = self._ema(metrics.rev_per_request, self.ema_revenue, self.alpha_revenue)
+        self.ema_gap = self._ema(price_gap_mean, self.ema_gap, self.alpha_gap)
+
+
+class FirmAggressiveAdaptiveBestResponsePricer(FirmAdaptiveBestResponsePricer):
+    """Stress-test variant with faster signal updates and shorter cooldown."""
+
+    def __init__(self, seed: Optional[int] = None, managed_keys: Optional[List[str]] = None):
+        super().__init__(
+            seed=seed,
+            managed_keys=managed_keys,
+            alpha_share=0.35,
+            alpha_revenue=0.35,
+            alpha_gap=0.35,
+            cooldown_batches=1,
+            step_scale=1.50,
+            response_threshold=0.04,
+        )
 
 class FirmRandomWalkPricer(FirmHeuristicPricer):
     """Heuristic pricer with occasional bounded random exploration."""
@@ -309,8 +514,25 @@ class FirmRandomWalkPricer(FirmHeuristicPricer):
         super().__init__(seed=seed, managed_keys=managed_keys)
         self.exploration_prob = 0.20
 
-    def act(self, city_base: float, city_pmin: float, hour: int, weather: str):
-        super().act(city_base=city_base, city_pmin=city_pmin, hour=hour, weather=weather)
+    def act(
+        self,
+        city_base: float,
+        city_pmin: float,
+        hour: int,
+        weather: str,
+        city_pmile: Optional[float] = None,
+        city_booking: Optional[float] = None,
+        city_airport: Optional[float] = None,
+    ):
+        super().act(
+            city_base=city_base,
+            city_pmin=city_pmin,
+            hour=hour,
+            weather=weather,
+            city_pmile=city_pmile,
+            city_booking=city_booking,
+            city_airport=city_airport,
+        )
 
         if self.cooldown > 0 or float(self.rng.random()) >= self.exploration_prob:
             return

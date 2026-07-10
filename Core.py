@@ -49,6 +49,8 @@ from pricing_models import (
     FirmMetrics,
     FirmStaticPricer,
     FirmHeuristicPricer,
+    FirmAdaptiveBestResponsePricer,
+    FirmAggressiveAdaptiveBestResponsePricer,
     FirmMarginGuardrailPricer,
     FirmRandomWalkPricer,
     FirmRLPricer,
@@ -475,11 +477,23 @@ class Core:
         self.firm1_mode = firm1_mode
         self.firm2_mode = firm2_mode
 
-        dynamic_pricer_modes = {"heuristic", "heuristic_margin", "heuristic_random"}
+        dynamic_pricer_modes = {
+            "heuristic",
+            "heuristic_margin",
+            "heuristic_random",
+            "adaptive_best_response",
+            "adaptive_best_response_aggressive",
+        }
         if self.firm1_mode not in {"RL", "static", *dynamic_pricer_modes}:
-            raise ValueError("firm1_mode must be one of: RL, heuristic, heuristic_margin, heuristic_random, static")
+            raise ValueError(
+                "firm1_mode must be one of: RL, heuristic, heuristic_margin, heuristic_random, "
+                "adaptive_best_response, adaptive_best_response_aggressive, static"
+            )
         if self.firm2_mode not in {"static", *dynamic_pricer_modes}:
-            raise ValueError("firm2_mode must be one of: heuristic, heuristic_margin, heuristic_random, static")
+            raise ValueError(
+                "firm2_mode must be one of: heuristic, heuristic_margin, heuristic_random, "
+                "adaptive_best_response, adaptive_best_response_aggressive, static"
+            )
 
         self.opt_keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
         self.shared_edit_keys = list(self.opt_keys)
@@ -488,6 +502,8 @@ class Core:
             "heuristic": FirmHeuristicPricer,
             "heuristic_margin": FirmMarginGuardrailPricer,
             "heuristic_random": FirmRandomWalkPricer,
+            "adaptive_best_response": FirmAdaptiveBestResponsePricer,
+            "adaptive_best_response_aggressive": FirmAggressiveAdaptiveBestResponsePricer,
         }
 
         if self.firm1_mode == "RL":
@@ -2128,10 +2144,26 @@ class Core:
                     else:
                         rl_step = None
                 elif self.firm1_mode != "static":
-                    self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+                    self.firm1.act(
+                        city_base=base.base_fare,
+                        city_pmin=base.per_minute,
+                        city_pmile=base.per_mile,
+                        city_booking=base.booking_fee,
+                        city_airport=base.airport_fee,
+                        hour=hour,
+                        weather=day_ctx.weather,
+                    )
 
                 if self.firm2_mode != "static" and (d % firm2_interval_days == 0 and t == 0):
-                    self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+                    self.firm2.act(
+                        city_base=base.base_fare,
+                        city_pmin=base.per_minute,
+                        city_pmile=base.per_mile,
+                        city_booking=base.booking_fee,
+                        city_airport=base.airport_fee,
+                        hour=hour,
+                        weather=day_ctx.weather,
+                    )
 
                 sampled_profiles = self._sample_profiles_from_pool(train_profile_sample_size)
                 if profiles_out and not profile_limit_reached:
@@ -2547,11 +2579,27 @@ class Core:
                 else:
                     action = -1
             elif self.firm1_mode != "static":
-                self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+                self.firm1.act(
+                    city_base=base.base_fare,
+                    city_pmin=base.per_minute,
+                    city_pmile=base.per_mile,
+                    city_booking=base.booking_fee,
+                    city_airport=base.airport_fee,
+                    hour=hour,
+                    weather=day_ctx.weather,
+                )
 
             firm2_eval_interval_steps = max(1, firm2_interval_days * max(1, int(train_steps_per_day)))
             if self.firm2_mode != "static" and (t % firm2_eval_interval_steps) == 0:
-                self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+                self.firm2.act(
+                    city_base=base.base_fare,
+                    city_pmin=base.per_minute,
+                    city_pmile=base.per_mile,
+                    city_booking=base.booking_fee,
+                    city_airport=base.airport_fee,
+                    hour=hour,
+                    weather=day_ctx.weather,
+                )
 
             _, m1, m2, mean_gap, _, _ = self.simulate_batch(
                 day_of_week=day_ctx.day_of_week,
@@ -3124,10 +3172,26 @@ class Core:
             self._project_rl_action_before_batch(self.market.curr_market)
             rl_step = (action, s_ts, logits, val, af_ts)
         elif self.firm1_mode != "static":
-            self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+            self.firm1.act(
+                city_base=base.base_fare,
+                city_pmin=base.per_minute,
+                city_pmile=base.per_mile,
+                city_booking=base.booking_fee,
+                city_airport=base.airport_fee,
+                hour=hour,
+                weather=day_ctx.weather,
+            )
 
         if self.firm2_mode != "static":
-            self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+            self.firm2.act(
+                city_base=base.base_fare,
+                city_pmin=base.per_minute,
+                city_pmile=base.per_mile,
+                city_booking=base.booking_fee,
+                city_airport=base.airport_fee,
+                hour=hour,
+                weather=day_ctx.weather,
+            )
 
         results, m1, m2, gap, air, dist = self.simulate_batch(day_ctx.day_of_week, day_ctx.weather, hour, rides)
         
@@ -3270,6 +3334,7 @@ class Core:
             base=self.market.curr_market,
             ov_firm1=self.firm1.overrides,
             opt_keys=self.opt_keys,
+            ov_firm2=self.firm2.overrides,
             ride_ctx_vec=ride_ctx_vec,
             airport_rate_last=self.airport_rate_last,
             mean_distance_last=self.mean_distance_last,
@@ -3677,11 +3742,27 @@ class Core:
                     last_action = int(action)
                     rl_step = (action, s_ts, logits, val, af_ts)
                 elif self.firm1_mode != "static":
-                    self.firm1.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+                    self.firm1.act(
+                        city_base=base.base_fare,
+                        city_pmin=base.per_minute,
+                        city_pmile=base.per_mile,
+                        city_booking=base.booking_fee,
+                        city_airport=base.airport_fee,
+                        hour=hour,
+                        weather=day_ctx.weather,
+                    )
 
                 # Firm 2 action
                 if self.firm2_mode != "static":
-                    self.firm2.act(city_base=base.base_fare, city_pmin=base.per_minute, hour=hour, weather=day_ctx.weather)
+                    self.firm2.act(
+                        city_base=base.base_fare,
+                        city_pmin=base.per_minute,
+                        city_pmile=base.per_mile,
+                        city_booking=base.booking_fee,
+                        city_airport=base.airport_fee,
+                        hour=hour,
+                        weather=day_ctx.weather,
+                    )
                 
                 sampled_profiles = self._sample_profiles_from_pool(customers_per_step)
                 if profiles_out and not profile_limit_reached:
@@ -4583,7 +4664,13 @@ def main():
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed. If omitted, a new seed is generated each run.")
     parser.add_argument("--out", type=str, default="market_runs.csv")
 
-    dynamic_mode_choices = ["heuristic", "heuristic_margin", "heuristic_random"]
+    dynamic_mode_choices = [
+        "heuristic",
+        "heuristic_margin",
+        "heuristic_random",
+        "adaptive_best_response",
+        "adaptive_best_response_aggressive",
+    ]
     parser.add_argument("--firm1_mode", type=str, default="heuristic", choices=["RL", *dynamic_mode_choices, "static"])
     parser.add_argument("--firm2_mode", type=str, default="static", choices=[*dynamic_mode_choices, "static"])
 
