@@ -608,6 +608,8 @@ class FirmRLPricer:
         self.supply_max_multiplier = 1.15
         self.action_feature_dim = 19
         self.last_action_descriptor = ActionDescriptor()
+        self.last_action_was_saturated = False
+        self.last_action_was_zero_effect = False
         self._last_action_target = "hold"
         self._last_action_direction = 0
         self._reversal_count = 0
@@ -701,6 +703,8 @@ class FirmRLPricer:
         self._reversal_count = 0
         self.last_action_normalized_gap = {}
         self.last_action_descriptor = ActionDescriptor()
+        self.last_action_was_saturated = False
+        self.last_action_was_zero_effect = False
         
     def update_response_context(self, share: float, gap: float, fulfillment: float) -> None:
         """Cache latest market response signals for state/action features."""
@@ -940,6 +944,8 @@ class FirmRLPricer:
     def apply_action(self, action: int, market_interaction) -> None:
         """Map discrete steps back into concrete market coefficient overrides."""
         self.last_action_normalized_gap = {}
+        self.last_action_was_saturated = False
+        self.last_action_was_zero_effect = False
         self.last_action_descriptor = ActionDescriptor(action_id=int(action))
         if action not in self.action_to_steps:
             return
@@ -991,6 +997,54 @@ class FirmRLPricer:
             curr = getattr(self.overrides, k)
             pre_values[k] = float(getattr(market_interaction.curr_market, k) if curr is None else curr)
         bounds = {k: self.config.bounds[k] for k in fare_step_map.keys()}
+        invalid_bound_actions = []
+        for key, direction in fare_step_map.items():
+            lb, ub = bounds[key]
+            width = max(1e-6, float(ub - lb))
+            pre = float(pre_values.get(key, getattr(market_interaction.curr_market, key)))
+            anchor = float(getattr(market_interaction.curr_market, key))
+            effective_floor = max(float(lb), anchor * (1.0 - self.max_relative_dev))
+            effective_ceil = min(float(ub), anchor * (1.0 + self.max_relative_dev))
+            if effective_floor > effective_ceil:
+                effective_floor, effective_ceil = float(lb), float(ub)
+            lower_distance = float((pre - lb) / width)
+            upper_distance = float((ub - pre) / width)
+            if int(direction) < 0 and (lower_distance <= 1e-4 or pre <= effective_floor + 1e-8):
+                invalid_bound_actions.append((key, int(direction), pre, lb, ub))
+            elif int(direction) > 0 and (upper_distance <= 1e-4 or pre >= effective_ceil - 1e-8):
+                invalid_bound_actions.append((key, int(direction), pre, lb, ub))
+        if invalid_bound_actions and len(invalid_bound_actions) == len(fare_step_map):
+            key, direction, pre, lb, ub = invalid_bound_actions[0]
+            width = max(1e-6, float(ub - lb))
+            if int(action) == self._last_applied_action and int(action) != 0:
+                self._repeat_action_count += 1
+            else:
+                self._last_applied_action = int(action)
+                self._repeat_action_count = 1 if int(action) != 0 else 0
+            self._last_action_target = str(key)
+            self._last_action_direction = int(direction)
+            self.last_action_was_saturated = True
+            self.last_action_was_zero_effect = True
+            self.last_action_steps = dict(step_map)
+            self.last_action_descriptor = ActionDescriptor(
+                action_id=int(action),
+                target=str(key),
+                direction=int(direction),
+                intended_step=0.0,
+                realized_delta=0.0,
+                realized_delta_norm=0.0,
+                pre_value=float(pre),
+                post_value=float(pre),
+                lower_distance=float(np.clip((pre - lb) / width, 0.0, 1.0)),
+                upper_distance=float(np.clip((ub - pre) / width, 0.0, 1.0)),
+                magnitude_multiplier=0.0,
+                magnitude_level=0.0,
+                repeat_count=int(self._repeat_action_count),
+                was_clipped=True,
+                is_reversal=False,
+                reversal_count=int(self._reversal_count),
+            )
+            return
         # Detailed normalized one-unit gap per coefficient:
         # one step => config.step[k], normalized by feasible range width.
         self.last_action_normalized_gap = {
@@ -1017,6 +1071,8 @@ class FirmRLPricer:
             pre = float(pre_values.get(key, anchor))
             realized = float(bounded - pre)
             intended = float(np.sign(fare_step_map[key]) * scaled_steps[key])
+            if abs(realized) <= 1e-8 and abs(intended) > 1e-8:
+                self.last_action_was_zero_effect = True
             direction = int(np.sign(fare_step_map[key]))
             is_reversal = bool(
                 str(key) == str(getattr(self, "_last_action_target", "hold"))

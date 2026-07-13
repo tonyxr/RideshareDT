@@ -14,6 +14,7 @@ Defaults aim for stable learning:
 """
 
 import argparse
+import copy
 import csv
 import glob
 import gzip
@@ -507,7 +508,11 @@ class Core:
         }
 
         if self.firm1_mode == "RL":
-            self.firm1 = FirmRLPricer(seed=self.seed, opt_keys=self.shared_edit_keys, state_frame_stack=state_frame_stack)
+            effective_frame_stack = int(max(1, state_frame_stack))
+            if self.firm2_mode != "static" and effective_frame_stack < 8:
+                effective_frame_stack = 8
+                print("[Core] Dynamic opponent detected; using state_frame_stack=8 so PPO sees enough post-decision history.")
+            self.firm1 = FirmRLPricer(seed=self.seed, opt_keys=self.shared_edit_keys, state_frame_stack=effective_frame_stack)
         elif self.firm1_mode in pricer_by_mode:
             self.firm1 = pricer_by_mode[self.firm1_mode](seed=self.seed, managed_keys=self.shared_edit_keys)
         else:
@@ -1065,6 +1070,71 @@ class Core:
             }
         )
         return diag
+    
+    @staticmethod
+    def _format_distance_segment_diagnostics(stats: Dict[str, Any]) -> str:
+        """Compact distance-bin diagnostics for terminal progress logs."""
+        pieces: List[str] = []
+        for label, display in (
+            ("0_2", "0-2"),
+            ("2_5", "2-5"),
+            ("5_10", "5-10"),
+            ("10_plus", "10+"),
+        ):
+            choice = float(stats.get(f"distance_bin_{label}_firm1_choice_share", np.nan))
+            completed = float(stats.get(f"distance_bin_{label}_firm1_completed_share", np.nan))
+            gap = float(stats.get(f"distance_bin_{label}_price_gap_mean", np.nan))
+            if np.isfinite(choice) and np.isfinite(completed) and np.isfinite(gap):
+                pieces.append(f"{display}:ch={choice:.2f}/done={completed:.2f}/gap={gap:.2f}")
+        return " | ".join(pieces)
+
+    @staticmethod
+    def _segment_balance_penalty_from_stats(stats: Dict[str, Any]) -> float:
+        """Penalty for policies that win only one distance segment or create floods."""
+        completed_shares: List[float] = []
+        flood_penalties: List[float] = []
+        gap_penalties: List[float] = []
+        for label in ("0_2", "2_5", "5_10", "10_plus"):
+            choice = float(stats.get(f"distance_bin_{label}_firm1_choice_share", np.nan))
+            completed = float(stats.get(f"distance_bin_{label}_firm1_completed_share", np.nan))
+            gap = float(stats.get(f"distance_bin_{label}_price_gap_mean", np.nan))
+            if np.isfinite(completed):
+                completed_shares.append(float(np.clip(completed, 0.0, 1.0)))
+            if np.isfinite(choice) and np.isfinite(completed):
+                flood_penalties.append(float(np.clip(choice - completed - 0.25, 0.0, 1.0)))
+            if np.isfinite(gap):
+                gap_penalties.append(float(np.clip((abs(gap) - 3.0) / 3.0, 0.0, 1.0)))
+        imbalance = 0.0
+        if len(completed_shares) >= 2:
+            imbalance = float(np.clip(np.std(completed_shares) / 0.30, 0.0, 1.0))
+        flood = float(np.mean(flood_penalties)) if flood_penalties else 0.0
+        gap_extreme = float(np.mean(gap_penalties)) if gap_penalties else 0.0
+        return float(np.clip(0.50 * imbalance + 0.35 * flood + 0.15 * gap_extreme, 0.0, 1.0))
+
+    def _validation_score_from_metrics(
+        self,
+        *,
+        reward: float,
+        share: float,
+        revpr: float,
+        profitpr: float,
+        fulfillment: float,
+        gap: float,
+        segment_stats: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        """Business validation score for checkpoint selection."""
+        stats = segment_stats or {}
+        gap_error = abs(float(gap) - float(self.reward_target_price_gap))
+        segment_penalty = self._segment_balance_penalty_from_stats(stats)
+        return float(
+            reward
+            + 0.25 * np.clip(share, 0.0, 1.0)
+            + 0.08 * np.clip(revpr / max(self.reward_rev_scale, 1e-6), 0.0, 1.0)
+            + 0.08 * np.clip((profitpr + self.reward_profit_scale) / (2.0 * self.reward_profit_scale), 0.0, 1.0)
+            + 0.20 * np.clip((fulfillment - 0.55) / 0.35, 0.0, 1.0)
+            - 0.15 * np.clip(gap_error / max(self.reward_acceptable_discount, 1e-6), 0.0, 1.0)
+            - 0.20 * segment_penalty
+        )
 
     def _reward_components(
         self,
@@ -1092,7 +1162,7 @@ class Core:
         it uses neutral business targets instead of raw output magnitude.
         """
         
-        share_f = float(np.clip(self._finite_float(share), 0.0, 1.0))
+        choice_share_f = float(np.clip(self._finite_float(share), 0.0, 1.0))
         baseline_share_f = float(np.clip(self._finite_float(baseline_share), 0.0, 1.0))
         revpr = max(0.0, self._finite_float(rev_per_request))
         baseline_revpr = max(0.0, self._finite_float(baseline_rev_per_request))
@@ -1102,6 +1172,12 @@ class Core:
         margin = self._finite_float(profit_margin)
         gap = self._finite_float(price_gap_f2_minus_f1)
         fulfillment_term = float(np.clip(self._finite_float(fulfillment_rate, 1.0), 0.0, 1.0))
+        # Reward the share that can actually be fulfilled. FirmMetrics.share is
+        # completed share in the current simulator, but multiplying by
+        # fulfillment still protects against policies that attract demand into a
+        # low-service regime and makes the objective robust if future metrics
+        # distinguish chosen share from completed share.
+        share_f = float(np.clip(choice_share_f * fulfillment_term, 0.0, 1.0))
         
         wait = max(0.0, self._finite_float(avg_wait_minutes))
         driver_accept = float(np.clip(self._finite_float(driver_acceptance_rate, 1.0), 0.0, 1.0))
@@ -1260,6 +1336,7 @@ class Core:
             "reward_revenue_loss_penalty": float(revenue_loss_penalty),
             "reward_profit_loss_penalty": float(profit_loss_penalty),
             "reward_baseline_share": float(baseline_share_f),
+            "reward_choice_share": float(choice_share_f),
             "reward_baseline_rev_per_request": float(baseline_revpr),
             "reward_baseline_profit_per_request": float(baseline_profitpr),
             "reward_revenue_improvement": float(revenue_improvement),
@@ -1404,7 +1481,10 @@ class Core:
         realized_norm = float(np.clip(abs(getattr(action_desc, "realized_delta_norm", 0.0) or 0.0), 0.0, 1.0))
         magnitude_level = float(np.clip(getattr(action_desc, "magnitude_level", 0.0) or 0.0, 0.0, 2.0))
         clipped_action = bool(getattr(action_desc, "was_clipped", False))
+        saturated_action = bool(getattr(getattr(self, "firm1", None), "last_action_was_saturated", False))
+        zero_effect_action = bool(getattr(getattr(self, "firm1", None), "last_action_was_zero_effect", False))
         stats = getattr(self, "last_crowd_response_stats", {}) or {}
+        segment_balance_penalty = self._segment_balance_penalty_from_stats(stats)
         near_threshold = float(np.clip(stats.get("near_threshold_share", 0.0), 0.0, 1.0))
         no_ride_rate = float(np.clip(stats.get("no_ride_rate", 0.0), 0.0, 1.0))
         airport_rate = float(np.clip(stats.get("airport_rate", 0.0), 0.0, 1.0))
@@ -1448,6 +1528,8 @@ class Core:
             0.025 * realized_norm
             + 0.015 * magnitude_excess * max(0.25, realized_norm)
             + (0.04 if clipped_action and action_direction != 0 else 0.0)
+            + (0.10 if zero_effect_action and action_direction != 0 else 0.0)
+            + (0.05 if saturated_action and action_direction != 0 else 0.0)
         )
         action_reversal = float(1.0 if bool(getattr(action_desc, "is_reversal", False)) else 0.0)
         reversal_count = float(np.clip(getattr(action_desc, "reversal_count", 0) or 0, 0, 5))
@@ -1459,6 +1541,7 @@ class Core:
             - action_realization_penalty
             - oscillation_penalty
             - hold_inaction_penalty
+            - 0.06 * segment_balance_penalty
         )
         # The base terms are already smoothly bounded. A second tanh compressed
         # useful differences between good and excellent outcomes and weakened
@@ -1481,7 +1564,10 @@ class Core:
             "reward_response_component": float(response_component),
             "reward_corrective_action_bonus": float(corrective_action_bonus),
             "reward_hold_inaction_penalty": float(hold_inaction_penalty),
+            "reward_segment_balance_penalty": float(segment_balance_penalty),
             "reward_action_realization_penalty": float(action_realization_penalty),
+            "reward_zero_effect_action": float(zero_effect_action),
+            "reward_saturated_action": float(saturated_action),
             "reward_action_reversal": float(action_reversal),
             "reward_oscillation_count": float(reversal_count),
             "reward_oscillation_penalty": float(oscillation_penalty),
@@ -2013,7 +2099,7 @@ class Core:
             update_every = int(max(1, ppo_update_interval_days))
             action_interval_steps = int(firm1_action_interval_steps)
             if action_interval_steps <= 0:
-                action_interval_steps = max(1, int(train_steps_per_day))
+                action_interval_steps = 1 if self.firm2_mode != "static" else max(1, int(train_steps_per_day))
             action_interval_steps = int(max(1, action_interval_steps))
             approx_decisions = int(np.ceil(max(1, int(train_steps_per_day)) / float(action_interval_steps)))
             print(
@@ -2025,7 +2111,11 @@ class Core:
             action_interval_steps = 1
         firm2_interval_days = int(firm2_action_interval_days)
         if firm2_interval_days <= 0:
-            firm2_interval_days = max(1, int(ppo_update_interval_days))
+            firm2_interval_days = (
+                max(1, int(np.ceil(max(1, int(ppo_update_interval_days)) / 2.0)))
+                if self.firm2_mode != "static"
+                else max(1, int(ppo_update_interval_days))
+            )
         firm2_interval_days = int(max(1, firm2_interval_days))
         if self.firm2_mode != "static":
             print(
@@ -2047,6 +2137,9 @@ class Core:
         print(f">>> Competitor mode for both training and evaluation: {opponent_mode}")
         
         update_every = int(max(1, ppo_update_interval_days))
+        best_checkpoint: Optional[Dict[str, Any]] = None
+        best_validation_score = -float("inf")
+        validation_interval = max(1, update_every)
         last_ppo_metrics = {
             "loss": 0.0,
             "policy_loss": 0.0,
@@ -2323,6 +2416,10 @@ class Core:
                     "constraint_violation_gap_band",
                     "constraint_violation_margin_floor",
                     "reward_action_change_penalty",
+                    "reward_action_realization_penalty",
+                    "reward_zero_effect_action",
+                    "reward_saturated_action",
+                    "reward_segment_balance_penalty",
                     "reward_driver_fulfillment_component",
                     "reward_driver_wait_penalty",
                     "reward_driver_rejection_penalty",
@@ -2482,6 +2579,85 @@ class Core:
             for k in self.shared_edit_keys:
                 log_row[f"firm1_{k}"] = float(get_coeff(self.market.curr_market, self.firm1.overrides, k))
                 log_row[f"firm2_{k}"] = float(get_coeff(self.market.curr_market, self.firm2.overrides, k))
+            validation_score = np.nan
+            if self.firm1_mode == "RL" and ((d + 1) % validation_interval == 0 or (d + 1) == train_timesteps):
+                saved_crowd_stats = dict(getattr(self, "last_crowd_response_stats", {}) or {})
+                val_ctx = self.market.sample_day_context()
+                val_hour = self.market.sample_timestep_hour().hour
+                val_profiles = self._sample_profiles_from_pool(eval_profile_sample_size)
+                _, val_m1, val_m2, val_gap, _, _ = self.simulate_batch(
+                    day_of_week=val_ctx.day_of_week,
+                    weather=val_ctx.weather,
+                    hour=val_hour,
+                    customers_per_step=eval_customers_per_step,
+                    sampled_profiles=val_profiles,
+                    collect_rows=False,
+                )
+                val_segment_stats = dict(getattr(self, "last_crowd_response_stats", {}) or {})
+                val_diag = self._reward_diagnostics(
+                    share=float(val_m1.share),
+                    rev_per_request=float(val_m1.rev_per_request),
+                    mean_gap=float(val_gap),
+                    prev_share=float(self.last_share),
+                    prev_rev_per_request=float(self.last_revpr),
+                    prev_profit_per_request=float(self.last_profitpr),
+                    prev_gap=float(self.last_gap),
+                    profit_per_request=float(val_m1.profit_per_request),
+                    profit_margin=self._profit_margin(val_m1),
+                    fulfillment_rate=float(val_m1.fulfillment_rate),
+                    avg_wait_minutes=float(val_m1.avg_wait_minutes),
+                    driver_acceptance_rate=float(val_m1.driver_acceptance_rate),
+                    action_change_magnitude=0.0,
+                    baseline_share=float(val_m2.share),
+                    baseline_rev_per_request=float(val_m2.rev_per_request),
+                    baseline_profit_per_request=float(val_m2.profit_per_request),
+                )
+                validation_score = self._validation_score_from_metrics(
+                    reward=float(val_diag.get("reward", 0.0)),
+                    share=float(val_m1.share),
+                    revpr=float(val_m1.rev_per_request),
+                    profitpr=float(val_m1.profit_per_request),
+                    fulfillment=float(val_m1.fulfillment_rate),
+                    gap=float(val_gap),
+                    segment_stats=val_segment_stats,
+                )
+                log_row["validation_reward"] = float(val_diag.get("reward", 0.0))
+                log_row["validation_score"] = float(validation_score)
+                log_row["validation_share"] = float(val_m1.share)
+                log_row["validation_rev_per_request"] = float(val_m1.rev_per_request)
+                log_row["validation_profit_per_request"] = float(val_m1.profit_per_request)
+                log_row["validation_fulfillment_rate"] = float(val_m1.fulfillment_rate)
+                log_row["validation_price_gap_f2_minus_f1"] = float(val_gap)
+                log_row["validation_segment_balance_penalty"] = float(self._segment_balance_penalty_from_stats(val_segment_stats))
+                self.last_crowd_response_stats = saved_crowd_stats
+                if float(validation_score) > float(best_validation_score):
+                    best_validation_score = float(validation_score)
+                    best_checkpoint = {
+                        "day": int(d + 1),
+                        "score": float(validation_score),
+                        "firm1_overrides": copy.deepcopy(self.firm1.overrides),
+                        "firm2": copy.deepcopy(self.firm2),
+                        "agent_state": {
+                            k: v.detach().cpu().clone()
+                            for k, v in self.firm1.agent.net.state_dict().items()
+                        },
+                        "last_share": float(self.last_share),
+                        "last_revpr": float(self.last_revpr),
+                        "last_profitpr": float(self.last_profitpr),
+                        "last_gap": float(self.last_gap),
+                        "last_fulfillment": float(self.last_fulfillment),
+                        "last_acceptance": float(self.last_acceptance),
+                        "last_wait": float(self.last_wait),
+                        "last_driver_paypr": float(self.last_driver_paypr),
+                    }
+                    print(
+                        f">>> [validation checkpoint] day={d+1} score={validation_score:.3f} "
+                        f"reward={float(val_diag.get('reward', 0.0)):.3f} share={float(val_m1.share):.3f} "
+                        f"revPR={float(val_m1.rev_per_request):.2f} gap={float(val_gap):.2f} "
+                        f"fulfill={float(val_m1.fulfillment_rate):.3f}"
+                    )
+            else:
+                log_row["validation_score"] = np.nan
             self.training_logs.append(log_row)
             
             if self.firm1_mode == "RL":
@@ -2526,6 +2702,29 @@ class Core:
                     f"KL={float(ppo_metrics.get('approx_kl', 0.0)):.4f} "
                     f"clip={float(ppo_metrics.get('clipfrac', 0.0)):.3f}"
                 )
+                
+                segment_line = self._format_distance_segment_diagnostics(getattr(self, "last_crowd_response_stats", {}) or {})
+                if segment_line:
+                    print(f"    [train segments] {segment_line}")
+        if self.firm1_mode == "RL" and best_checkpoint is not None:
+            self.firm1.agent.net.load_state_dict(
+                {k: v.to(self.firm1.agent.device) for k, v in best_checkpoint["agent_state"].items()}
+            )
+            self.firm1.overrides = copy.deepcopy(best_checkpoint["firm1_overrides"])
+            self.firm2 = copy.deepcopy(best_checkpoint["firm2"])
+            self.last_share = float(best_checkpoint.get("last_share", self.last_share))
+            self.last_revpr = float(best_checkpoint.get("last_revpr", self.last_revpr))
+            self.last_profitpr = float(best_checkpoint.get("last_profitpr", self.last_profitpr))
+            self.last_gap = float(best_checkpoint.get("last_gap", self.last_gap))
+            self.last_fulfillment = float(best_checkpoint.get("last_fulfillment", self.last_fulfillment))
+            self.last_acceptance = float(best_checkpoint.get("last_acceptance", self.last_acceptance))
+            self.last_wait = float(best_checkpoint.get("last_wait", self.last_wait))
+            self.last_driver_paypr = float(best_checkpoint.get("last_driver_paypr", self.last_driver_paypr))
+            print(
+                f">>> Restored validation-best checkpoint from train day {best_checkpoint['day']} "
+                f"(score={best_checkpoint['score']:.3f}) for evaluation."
+            )
+
         
         print(f">>> Evaluating RL agent against same-level {opponent_mode} opponent with shared profile pool...")
         if self.firm1_mode == "RL":
@@ -2695,6 +2894,10 @@ class Core:
                 "reward_driver_unfulfilled_component": float(reward_diag.get("reward_driver_unfulfilled_component", 0.0)),
                 "reward_collapse_component": float(reward_diag.get("reward_collapse_component", 0.0)),
                 "reward_adaptive_constraint_penalty": float(reward_diag.get("reward_adaptive_constraint_penalty", 0.0)),
+                "reward_action_realization_penalty": float(reward_diag.get("reward_action_realization_penalty", 0.0)),
+                "reward_zero_effect_action": float(reward_diag.get("reward_zero_effect_action", 0.0)),
+                "reward_saturated_action": float(reward_diag.get("reward_saturated_action", 0.0)),
+                "reward_segment_balance_penalty": float(reward_diag.get("reward_segment_balance_penalty", 0.0)),
                 "constraint_violation_share_floor": float(reward_diag.get("constraint_violation_share_floor", 0.0)),
                 "constraint_violation_fulfillment_floor": float(
                     reward_diag.get("constraint_violation_fulfillment_floor", 0.0)
@@ -2740,6 +2943,8 @@ class Core:
                 "guardrail_deltas": json.dumps(guardrail_diag.get("deltas", {}), sort_keys=True),
                 "coeff_delta_rl_action": json.dumps(self._coeff_delta(coeff_post_action, coeff_pre_action), sort_keys=True),
                 "coeff_delta_projection": json.dumps(self._coeff_delta(coeff_post_projection, coeff_post_action), sort_keys=True),
+                "action_zero_effect": bool(getattr(self.firm1, "last_action_was_zero_effect", False)) if self.firm1_mode == "RL" else False,
+                "action_saturated": bool(getattr(self.firm1, "last_action_was_saturated", False)) if self.firm1_mode == "RL" else False,
                 "action": int(action),
                 "action_label": (
                     self.firm1.action_label(action)
@@ -2777,6 +2982,9 @@ class Core:
                     f"moving_avg20={moving_avg20:.3f} share={float(m1.share):.3f} "
                     f"revPR={float(m1.rev_per_request):.2f} gap(F2-F1)={float(mean_gap):.2f}"
                 )
+                segment_line = self._format_distance_segment_diagnostics(getattr(self, "last_crowd_response_stats", {}) or {})
+                if segment_line:
+                    print(f"    [eval segments] {segment_line}")
 
         if profiles_out:
             _ensure_parent_dir(profiles_out)
@@ -3876,6 +4084,10 @@ class Core:
                     "constraint_violation_gap_band",
                     "constraint_violation_margin_floor",
                     "reward_action_change_penalty",
+                    "reward_action_realization_penalty",
+                    "reward_zero_effect_action",
+                    "reward_saturated_action",
+                    "reward_segment_balance_penalty",
                     "reward_driver_fulfillment_component",
                     "reward_driver_wait_penalty",
                     "reward_driver_rejection_penalty",
@@ -4690,11 +4902,12 @@ def main():
     parser.add_argument("--train_customers", type=int, default=5000)
     parser.add_argument("--train_steps_per_day", type=int, default=10, help="Synthetic training timesteps per day (run_experiment mode).")
     parser.add_argument("--ppo_update_interval_days", type=int, default=20, help="How many synthetic training days to collect before each PPO optimizer update; larger values produce longer, lower-variance PPO rollouts.")
-    parser.add_argument("--firm1_action_interval_steps", type=int, default=-1, help="Training/eval timesteps to hold each Firm1 PPO price action; <=0 means one PPO price decision per synthetic day.")
-    parser.add_argument("--firm2_action_interval_days", type=int, default=-1, help="Synthetic training days between Firm2 heuristic price manipulations/EMA updates; <=0 aligns Firm2 to PPO update interval.")
+    
+    parser.add_argument("--firm1_action_interval_steps", type=int, default=-1, help="Training/eval timesteps to hold each Firm1 PPO price action; <=0 means every step against dynamic opponents and one PPO price decision per synthetic day against static opponents.")
+    parser.add_argument("--firm2_action_interval_days", type=int, default=-1, help="Synthetic training days between Firm2 heuristic price manipulations/EMA updates; <=0 uses half the PPO interval for dynamic opponents and aligns to the PPO interval for static opponents.")
     parser.add_argument("--ppo_batch_size", type=int, default=256, help="PPO minibatch size used when optimizing each rollout buffer.")
     parser.add_argument("--ppo_update_epochs", type=int, default=8, help="Number of optimization epochs per PPO rollout buffer.")
-    parser.add_argument("--state_frame_stack", type=int, default=4, help="Number of recent encoded RL states to concatenate for history-aware PPO observations.")
+    parser.add_argument("--state_frame_stack", type=int, default=8, help="Number of recent encoded RL states to concatenate for history-aware PPO observations.")
     parser.add_argument("--deterministic_experiment_seed", action="store_true", help="If set, keep run_experiment fully deterministic with --seed.")
     parser.add_argument("--experiment_seed", type=int, default=None, help="Optional explicit run_experiment seed. Overrides stochastic child-seed generation and is recorded in run config.")
     parser.add_argument("--eval_policy_mode", type=str, default="argmax", choices=["argmax", "sample_raw", "sample_low_temp", "top2_margin"], help="Evaluation action-selection mode for the learned policy.")
