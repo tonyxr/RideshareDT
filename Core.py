@@ -367,7 +367,7 @@ class Core:
         reward_profit_weight: Optional[float] = None,
         reward_price_gap_weight: Optional[float] = None,
         reward_hold_inaction_weight: float = 0.06,
-        reward_corrective_action_weight: float = 0.05,
+        reward_corrective_action_weight: float = 0.08,
         reward_baseline_loss_weight: float = 0.12,
         reward_overprice_weight: float = 0.20,
         reward_rev_scale: float = 25.0,
@@ -377,7 +377,7 @@ class Core:
         reward_underprice_weight: float = 0.15,
         reward_acceptable_discount: float = 2.00,
         min_profit_margin: float = 0.08,
-        reward_action_change_weight: float = 0.02,
+        reward_action_change_weight: float = 0.008,
         driver_cost_per_mile: float = 0.85,
         driver_cost_per_minute: float = 0.12,
         fixed_trip_cost: float = 1.25,
@@ -1310,6 +1310,7 @@ class Core:
         raw = (
             share_component
             + revenue_component
+            + profit_component
             + dominance_component
             + fulfillment_component
             - demand_loss_component
@@ -1510,7 +1511,7 @@ class Core:
                     min(max(0.0, profit_delta) / max(self.reward_profit_scale, 1e-6), 1.0),
                 )
         else:
-            response_component = 0.03 * pricing_discipline
+            response_component = 0.0
             hold_pressure = (
                 0.45 * float(components.get("constraint_violation_gap_band", 0.0))
                 + 0.25 * float(components.get("constraint_violation_fulfillment_floor", 0.0))
@@ -1525,8 +1526,8 @@ class Core:
             response_component *= max(0.50, float(np.clip(stats.get("long_trip_share", 0.0), 0.0, 1.0)) + 0.50)
         magnitude_excess = max(0.0, magnitude_level - 1.0)
         action_realization_penalty = (
-            0.025 * realized_norm
-            + 0.015 * magnitude_excess * max(0.25, realized_norm)
+            0.010 * realized_norm
+            + 0.008 * magnitude_excess * max(0.25, realized_norm)
             + (0.04 if clipped_action and action_direction != 0 else 0.0)
             + (0.10 if zero_effect_action and action_direction != 0 else 0.0)
             + (0.05 if saturated_action and action_direction != 0 else 0.0)
@@ -4923,7 +4924,7 @@ def main():
     parser.add_argument("--reward_profit_weight", type=float, default=None, help="Optional separate positive reward weight for profit/unit-economics improvement; defaults to 40%% of reward_revenue_weight while revenue keeps 60%%.")
     parser.add_argument("--reward_price_gap_weight", type=float, default=None, help="Direct price-gap penalty weight; defaults to max(overprice, underprice) weight.")
     parser.add_argument("--reward_hold_inaction_weight", type=float, default=0.06, help="Penalty weight for holding when gap/service/margin constraints call for corrective action.")
-    parser.add_argument("--reward_corrective_action_weight", type=float, default=0.05, help="Bonus weight for non-hold actions that move gap/profit pressure in the corrective direction.")
+    parser.add_argument("--reward_corrective_action_weight", type=float, default=0.08, help="Bonus weight for non-hold actions that move gap/profit pressure in the corrective direction.")
     parser.add_argument("--reward_baseline_loss_weight", type=float, default=0.12, help="Penalty weight for revenue/profit losses relative to the same-batch competitor baseline.")
     parser.add_argument("--reward_overprice_weight", type=float, default=0.20, help="Penalty weight when Firm1 is more expensive than Firm2.")
     parser.add_argument("--reward_rev_scale", type=float, default=25.0, help="Revenue/request value that maps to full revenue reward credit.")
@@ -4934,7 +4935,7 @@ def main():
     parser.add_argument("--reward_acceptable_discount", type=float, default=2.0, help="Firm1 may be this many dollars cheaper than Firm2 before underpricing penalty starts.")
     parser.add_argument("--min_profit_margin", type=float, default=0.08, help="Minimum contribution margin target used by the margin discipline penalty.")
     parser.add_argument("--driver_cost_per_mile", type=float, default=0.85, help="Approximate per-mile contribution cost for completed rides.")
-    parser.add_argument("--reward_action_change_weight", type=float, default=0.02, help="Penalty weight for repeated/incremental coefficient movement by the RL pricing action.")
+    parser.add_argument("--reward_action_change_weight", type=float, default=0.008, help="Penalty weight for repeated/incremental coefficient movement by the RL pricing action.")
     parser.add_argument("--driver_cost_per_minute", type=float, default=0.12, help="Approximate per-minute contribution cost for completed rides.")
     parser.add_argument("--fixed_trip_cost", type=float, default=1.25, help="Approximate fixed platform/driver cost for completed rides.")
     parser.add_argument("--airport_cost", type=float, default=2.0, help="Approximate extra cost for airport rides.")
