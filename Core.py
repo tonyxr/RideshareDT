@@ -523,7 +523,8 @@ class Core:
             self.firm2 = pricer_by_mode[self.firm2_mode](seed=self.seed + 1, managed_keys=self.shared_edit_keys)
         else:
             self.firm2 = FirmStaticPricer()
-            
+        self._assert_competitor_parity()
+        
         print(f"Using random seed: {self.seed}")
 
         # initialize both firms with arbitrary starting coefficients on optimized dimensions
@@ -695,7 +696,44 @@ class Core:
             f"gap_band_fraction={self.gap_band_fraction:.2f}, "
             f"gap_penalty_scale_fraction={self.gap_penalty_scale_fraction:.2f}"
         )
-        
+    
+    def _assert_competitor_parity(self) -> None:
+        """Validate that non-static competitors share Firm1's observable action/state interface."""
+        if self.firm2_mode == "static" or not hasattr(self.firm1, "action_to_steps"):
+            return
+        mismatches: List[str] = []
+        if getattr(self.firm1, "action_keys", None) != getattr(self.firm2, "action_keys", None):
+            mismatches.append(
+                f"action_keys Firm1={getattr(self.firm1, 'action_keys', None)} "
+                f"Firm2={getattr(self.firm2, 'action_keys', None)}"
+            )
+        if getattr(self.firm1, "action_to_steps", None) != getattr(self.firm2, "action_to_steps", None):
+            mismatches.append("action_to_steps")
+        f1_cfg = getattr(self.firm1, "config", None)
+        f2_cfg = getattr(self.firm2, "config", None)
+        if f1_cfg is not None and f2_cfg is not None:
+            if dict(f1_cfg.step) != dict(f2_cfg.step):
+                mismatches.append(f"step Firm1={dict(f1_cfg.step)} Firm2={dict(f2_cfg.step)}")
+            if dict(f1_cfg.bounds) != dict(f2_cfg.bounds):
+                mismatches.append(f"bounds Firm1={dict(f1_cfg.bounds)} Firm2={dict(f2_cfg.bounds)}")
+        if getattr(self.firm1, "single_state_dim", None) != getattr(self.firm2, "single_state_dim", None):
+            mismatches.append(
+                f"single_state_dim Firm1={getattr(self.firm1, 'single_state_dim', None)} "
+                f"Firm2={getattr(self.firm2, 'single_state_dim', None)}"
+            )
+        if getattr(self.firm1, "action_feature_dim", None) != getattr(self.firm2, "action_feature_dim", None):
+            mismatches.append(
+                f"action_feature_dim Firm1={getattr(self.firm1, 'action_feature_dim', None)} "
+                f"Firm2={getattr(self.firm2, 'action_feature_dim', None)}"
+            )
+        if mismatches:
+            raise ValueError("Firm1/Firm2 parity violation; only decision policy may differ: " + "; ".join(mismatches))
+        print(
+            f"[PricingParity] Firm1 and Firm2 share state_dim={getattr(self.firm1, 'single_state_dim', 'n/a')}, "
+            f"action_feature_dim={getattr(self.firm1, 'action_feature_dim', 'n/a')}, "
+            f"actions={len(getattr(self.firm1, 'action_to_steps', {}))}, "
+            f"keys={list(getattr(self.firm1, 'action_keys', []))}."
+        )
     
     def apply_calibration(self, calibration: Dict[str, Any]) -> None:
         """Apply calibration outputs to market priors, agent priors, and choice sensitivity scales."""
@@ -4096,9 +4134,9 @@ class Core:
                 rl_step = None
                 if self.firm1_mode == "RL":
                     s_vec = self._build_rl_state(day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather)
-                    s_vec = self.firm1.stack_state(s_vec)
-                    # Evaluation/deployment runs should reflect the learned policy,
-                    # not PPO's training-time uniform exploration mixture.
+                    s_vec = self.firm1.stack_state(s_vec)# Evaluation/deployment runs reflect the learned policy, not
+                    # PPO's training-time uniform exploration mixture. Use
+                    # --run_experiment for optimizer updates and rollout training.
                     action_features = self.firm1.build_action_feature_matrix(self.market, getattr(self, "last_crowd_response_stats", {}))
                     action, s_ts, logits, val, af_ts = self.firm1.agent.act(s_vec, deterministic=True, action_features=action_features)
                     self.firm1.apply_action(action, self.market)
@@ -4308,7 +4346,15 @@ class Core:
             }
             if self.firm1_mode == "RL":
                 self._sync_agent_optimization_context()
-                ppo_metrics = self.firm1.agent.update(epochs=self.ppo_update_epochs, batch_size=self.ppo_batch_size)
+                ppo_metrics.update({
+                    "ent_coeff": float(self.firm1.agent.ent_coeff),
+                    "clip_eps": float(self.firm1.agent.clip_eps),
+                    "lr": float(self.firm1.agent.curr_lr),
+                    "exploration_rate": 0.0,
+                    "action_coverage": float(self.firm1.agent._action_coverage()),
+                    "optimizer_steps": 0,
+                    "run_mode": "evaluation_no_update",
+                })
                 
             #print("firm 1 revenue per request sum", str(revpr_sum))
             #print("firm 1 market share sum", str(share_sum))
@@ -4414,6 +4460,8 @@ class Core:
                 "ppo_lagrangian_adv_std": float(ppo_metrics.get("lagrangian_adv_std", 0.0)),
                 "ppo_constraint_lambda_mean": float(ppo_metrics.get("constraint_lambda_mean", 0.0)),
                 "ppo_risk_coeff": float(ppo_metrics.get("risk_coeff", 0.0)),
+                "ppo_optimizer_steps": int(ppo_metrics.get("optimizer_steps", 0)),
+                "ppo_run_mode": str(ppo_metrics.get("run_mode", "training_update")),
             })
             for k in self.shared_edit_keys:
                 self.run_logs[-1][f"firm1_{k}"] = float(get_coeff(base, self.firm1.overrides, k))
@@ -4466,7 +4514,7 @@ class Core:
                 )
                 if self.firm1_mode == "RL":
                     print(
-                        f"  [PPO] KL={float(ppo_metrics.get('approx_kl', 0.0)):.4f} "
+                        f"  [PPO eval/no-update] KL={float(ppo_metrics.get('approx_kl', 0.0)):.4f} "
                         f"clipfrac={float(ppo_metrics.get('clipfrac', 0.0)):.3f} "
                         f"ent={float(ppo_metrics.get('entropy', 0.0)):.3f} "
                         f"policy_ent={float(ppo_metrics.get('policy_entropy_fraction', 1.0)):.3f} "

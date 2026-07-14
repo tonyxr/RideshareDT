@@ -93,6 +93,24 @@ class FirmMetrics:
     @property
     def driver_acceptance_rate(self) -> float:
         return ((self.dispatch_offers - self.driver_rejections) / self.dispatch_offers) if self.dispatch_offers > 0 else 1.0
+    
+def build_discrete_action_space(opt_keys: List[str], max_coeffs: int = 5) -> Tuple[Dict[int, Dict[str, int]], List[str]]:
+    """Shared one-coefficient action space for RL and heuristic pricers.
+
+    Index 0 is hold/status quo. Every other option changes exactly one shared
+    rider-facing coefficient by one signed step. RL and heuristic competitors
+    should differ in how they choose among these options, not in which options
+    are feasible.
+    """
+    all_keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
+    active_keys = [k for k in all_keys if k in list(opt_keys)[:max_coeffs]]
+    action_to_steps: Dict[int, Dict[str, int]] = {0: {key: 0 for key in active_keys}}
+    action_idx = 1
+    for key in active_keys:
+        for step in (-1, 1):
+            action_to_steps[action_idx] = {k: (int(step) if k == key else 0) for k in active_keys}
+            action_idx += 1
+    return action_to_steps, active_keys
 
 class FirmStaticPricer:
     def __init__(self):
@@ -122,16 +140,22 @@ class FirmHeuristicPricer:
         if not self.managed_keys:
             self.managed_keys = ("base_fare", "per_minute")
 
-        self.step_base_fare = 0.10
-        self.step_per_minute = 0.01
-        self.step_per_mile = 0.05
-        self.step_booking_fee = 0.10
-        self.step_airport_fee = 0.10
-        self.base_bounds = (1.50, 6.00)
-        self.pmin_bounds = (0.10, 1.00)
-        self.pmile_bounds = (0.50, 4.00)
-        self.booking_bounds = (0.00, 6.00)
-        self.airport_bounds = (0.00, 12.00)
+        self.config = default_specs_for(list(self.managed_keys))
+        self.action_to_steps, self.action_keys = build_discrete_action_space(list(self.managed_keys))
+        self.step_base_fare = self.config.step.get("base_fare", 0.10)
+        self.step_per_minute = self.config.step.get("per_minute", 0.01)
+        self.step_per_mile = self.config.step.get("per_mile", 0.05)
+        self.step_booking_fee = self.config.step.get("booking_fee", 0.10)
+        self.step_airport_fee = self.config.step.get("airport_fee", 0.25)
+        self.base_bounds = self.config.bounds.get("base_fare", (1.50, 6.00))
+        self.pmin_bounds = self.config.bounds.get("per_minute", (0.10, 1.00))
+        self.pmile_bounds = self.config.bounds.get("per_mile", (0.50, 4.00))
+        self.booking_bounds = self.config.bounds.get("booking_fee", (0.00, 6.00))
+        self.airport_bounds = self.config.bounds.get("airport_fee", (0.00, 15.00))
+        self.single_state_dim = 89
+        self.action_feature_dim = 19
+        self.last_state_features = None
+        self.last_action_features = None
 
         self.target_share = 0.50
         self.share_band = 0.03
@@ -143,6 +167,16 @@ class FirmHeuristicPricer:
 
         self.cooldown = 0
         self.cooldown_H = 8
+        
+    def observe_state(self, state_features: np.ndarray, action_features: Optional[np.ndarray] = None) -> None:
+        """Cache the latest observation/action features for parity diagnostics."""
+        self.last_state_features = np.asarray(state_features, dtype=np.float32).copy()
+        self.last_action_features = (
+            None if action_features is None else np.asarray(action_features, dtype=np.float32).copy()
+        )
+
+    def action_steps(self, action: int) -> Dict[str, int]:
+        return dict(self.action_to_steps.get(int(action), {}))
 
     @staticmethod
     def _ema(x: float, ema: float, a: float) -> float:
@@ -357,6 +391,12 @@ class FirmAdaptiveBestResponsePricer:
         if not self.managed_keys:
             self.managed_keys = ("base_fare", "per_minute", "per_mile")
         self.config = default_specs_for(list(self.managed_keys))
+        
+        self.action_to_steps, self.action_keys = build_discrete_action_space(list(self.managed_keys))
+        self.single_state_dim = 89
+        self.action_feature_dim = 19
+        self.last_state_features = None
+        self.last_action_features = None
 
         self.target_share = float(np.clip(target_share, 0.0, 1.0))
         self.alpha_share = float(np.clip(alpha_share, 0.0, 1.0))
@@ -391,7 +431,17 @@ class FirmAdaptiveBestResponsePricer:
         self.last_selected_key = "hold"
         self.last_direction = 0
         self.last_reason = "init"
+    
+    def observe_state(self, state_features: np.ndarray, action_features: Optional[np.ndarray] = None) -> None:
+        """Cache the same observation/action-feature tensors exposed to the RL policy."""
+        self.last_state_features = np.asarray(state_features, dtype=np.float32).copy()
+        self.last_action_features = (
+            None if action_features is None else np.asarray(action_features, dtype=np.float32).copy()
+        )
 
+    def action_steps(self, action: int) -> Dict[str, int]:
+        return dict(self.action_to_steps.get(int(action), {}))
+    
     @staticmethod
     def _ema(x: float, ema: float, a: float) -> float:
         return (1 - a) * float(ema) + a * float(x)
@@ -694,6 +744,8 @@ class FirmRLPricer:
         self.supply_min_multiplier = 0.90
         self.supply_max_multiplier = 1.15
         self.action_feature_dim = 19
+        self.last_state_features = None
+        self.last_action_features = None
         self.last_action_descriptor = ActionDescriptor()
         self.last_action_was_saturated = False
         self.last_action_was_zero_effect = False
@@ -708,21 +760,8 @@ class FirmRLPricer:
         # Hybrid manipulation actions.  Index 0 is hold/status quo; every
         # other discrete action chooses exactly one coefficient and direction.
         # PPO's continuous magnitude head supplies the step multiplier.
-        all_keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
-        active_keys = [k for k in all_keys if k in self.opt_keys]
-        
-
-        self.action_to_steps: Dict[int, Dict[str, int]] = {}
-        self.action_to_steps[0] = {key: 0 for key in active_keys}
-        action_idx = 1
-        for key in active_keys:
-            for step in (-1, 1):
-                self.action_to_steps[action_idx] = {
-                    k: (int(step) if k == key else 0) for k in active_keys
-                }
-                action_idx += 1
+        self.action_to_steps, self.action_keys = build_discrete_action_space(self.opt_keys, self.MAX_MANIPULATED_COEFFS)
         action_dim = len(self.action_to_steps)
-        self.action_keys = list(active_keys)
         
         # State includes cyclical/flag time context, richer demand/WTP context,
         # recent EMA/delta features, direct supply state, own and opponent fare-
@@ -757,6 +796,13 @@ class FirmRLPricer:
             exploration_warmup_fraction=0.35,
             min_action_visits=1,
             exploration_rescue_rate=0.25,
+        )
+        
+    def observe_state(self, state_features: np.ndarray, action_features: Optional[np.ndarray] = None) -> None:
+        """Cache the latest observation/action features for parity diagnostics."""
+        self.last_state_features = np.asarray(state_features, dtype=np.float32).copy()
+        self.last_action_features = (
+            None if action_features is None else np.asarray(action_features, dtype=np.float32).copy()
         )
     
     def action_steps(self, action: int) -> Dict[str, int]:
