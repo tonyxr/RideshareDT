@@ -1,0 +1,79 @@
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+[ChoiceModel] GPT price-threshold mode enabled (thresholds consumed from profile).
+[PricingParity] Firm1 and Firm2 share state_dim=89, action_feature_dim=19, actions=11, keys=['base_fare', 'per_minute', 'per_mile', 'booking_fee', 'airport_fee'].
+Using random seed: 42
+[RewardConfig] revenue=0.28, profit=0.22, share=0.45, price_gap_penalty=0.22, target_gap(F2-F1)=$1.00, profit_scale=12.00, dominance=0.15, trend=0.03, momentum=0.03, driver_fulfillment=0.30, driver_wait=0.00, driver_reject=0.00, driver_unfulfilled=0.12, action_change=0.01, driver_warmup=0.60, constrained=1, constraint_lr=0.100, constraint_scale=0.45, constraint_curriculum=(0.25,0.60,1.10), gap_band_fraction=0.75, gap_penalty_scale_fraction=0.75
+[ThresholdCache] Loaded 20000 cached threshold profiles from artifacts/nyc_full/threshold_cache.jsonl.
+>>> Synthetic setup: profile_pool=20000, train days=120 x 1 steps/day x 5000 rides, eval timesteps=60 x 5000 rides, mc_samples(train/eval)=2000/2000
+>>> PPO rollout/update cadence: 10 day(s) per optimizer step (~10 price decisions/update; Firm1 holds each price action for 1 step(s)).
+>>> Firm2 heuristic cadence: manipulate/update at most once every 1 training day(s), slower than Firm1/PPO rollouts.
+>>> Training RL agent on synthetic New York City sampling (day/timestep cadence)...
+>>> Competitor mode for both training and evaluation: adaptive_best_response_aggressive
+>>> [validation checkpoint] day=10 score=1.360 reward=0.982 share=0.651 revPR=11.00 gap=1.26 fulfill=0.975
+  [train 12/120] reward=0.979 moving_avg20=0.931 share=0.756 revPR=18.81 profitPR=3.90 gap(F2-F1)=2.34 fulfill=1.000 accept=1.000 KL=0.0049 clip=0.000
+    [train segments] 0-2:ch=0.90/done=0.90/gap=2.64 | 2-5:ch=0.82/done=0.82/gap=2.32 | 5-10:ch=0.60/done=0.60/gap=2.11 | 10+:ch=0.27/done=0.27/gap=1.65
+  [train 24/120] reward=0.984 moving_avg20=0.936 share=0.637 revPR=10.56 profitPR=1.87 gap(F2-F1)=1.04 fulfill=0.970 accept=0.970 KL=0.0059 clip=0.000
+    [train segments] 0-2:ch=0.77/done=0.72/gap=1.74 | 2-5:ch=0.69/done=0.69/gap=1.14 | 5-10:ch=0.54/done=0.54/gap=0.44 | 10+:ch=0.29/done=0.29/gap=-1.03
+  [train 36/120] reward=0.973 moving_avg20=0.956 share=0.703 revPR=16.16 profitPR=3.37 gap(F2-F1)=1.95 fulfill=1.000 accept=1.000 KL=0.0033 clip=0.000
+    [train segments] 0-2:ch=0.89/done=0.89/gap=2.66 | 2-5:ch=0.74/done=0.74/gap=2.07 | 5-10:ch=0.47/done=0.47/gap=1.20 | 10+:ch=0.13/done=0.13/gap=-0.38
+  [train 48/120] reward=0.938 moving_avg20=0.936 share=0.724 revPR=14.65 profitPR=2.89 gap(F2-F1)=2.11 fulfill=0.956 accept=0.956 KL=0.0008 clip=0.000
+    [train segments] 0-2:ch=0.92/done=0.83/gap=3.10 | 2-5:ch=0.81/done=0.81/gap=2.31 | 5-10:ch=0.57/done=0.57/gap=1.15 | 10+:ch=0.24/done=0.24/gap=-1.10
+  [train 60/120] reward=0.883 moving_avg20=0.860 share=0.580 revPR=9.86 profitPR=1.84 gap(F2-F1)=0.38 fulfill=0.986 accept=0.986 KL=0.0021 clip=0.000
+    [train segments] 0-2:ch=0.87/done=0.85/gap=2.35 | 2-5:ch=0.65/done=0.65/gap=0.86 | 5-10:ch=0.19/done=0.19/gap=-1.66 | 10+:ch=0.01/done=0.01/gap=-5.99
+  [train 72/120] reward=0.491 moving_avg20=0.760 share=0.480 revPR=6.91 profitPR=1.14 gap(F2-F1)=0.28 fulfill=0.836 accept=0.836 KL=0.0091 clip=0.013
+    [train segments] 0-2:ch=0.78/done=0.53/gap=1.64 | 2-5:ch=0.61/done=0.61/gap=0.63 | 5-10:ch=0.35/done=0.35/gap=-0.95 | 10+:ch=0.07/done=0.07/gap=-4.21
+  [train 84/120] reward=0.184 moving_avg20=0.548 share=0.335 revPR=4.64 profitPR=0.70 gap(F2-F1)=0.69 fulfill=0.551 accept=0.551 KL=0.0039 clip=0.000
+    [train segments] 0-2:ch=0.76/done=0.24/gap=1.55 | 2-5:ch=0.62/done=0.42/gap=0.75 | 5-10:ch=0.44/done=0.44/gap=-0.16 | 10+:ch=0.20/done=0.20/gap=-1.74
+  [train 96/120] reward=0.591 moving_avg20=0.490 share=0.499 revPR=6.96 profitPR=1.11 gap(F2-F1)=0.51 fulfill=0.874 accept=0.874 KL=0.0114 clip=0.000
+    [train segments] 0-2:ch=0.76/done=0.57/gap=1.50 | 2-5:ch=0.56/done=0.56/gap=0.55 | 5-10:ch=0.40/done=0.40/gap=-0.32 | 10+:ch=0.19/done=0.19/gap=-1.87
+  [train 108/120] reward=0.335 moving_avg20=0.602 share=0.478 revPR=6.91 profitPR=1.10 gap(F2-F1)=0.69 fulfill=0.773 accept=0.773 KL=0.0088 clip=0.025
+    [train segments] 0-2:ch=0.74/done=0.40/gap=1.31 | 2-5:ch=0.60/done=0.60/gap=0.59 | 5-10:ch=0.49/done=0.49/gap=0.10 | 10+:ch=0.37/done=0.37/gap=-0.73
+  [train 120/120] reward=0.252 moving_avg20=0.388 share=0.404 revPR=5.65 profitPR=0.90 gap(F2-F1)=0.05 fulfill=0.805 accept=0.805 KL=0.0003 clip=0.000
+    [train segments] 0-2:ch=0.66/done=0.41/gap=1.00 | 2-5:ch=0.50/done=0.50/gap=0.08 | 5-10:ch=0.35/done=0.35/gap=-0.78 | 10+:ch=0.13/done=0.13/gap=-2.52
+>>> Restored validation-best checkpoint from train day 10 (score=1.360) for evaluation.
+>>> Evaluating RL agent against same-level adaptive_best_response_aggressive opponent with shared profile pool...
+  [eval 6/60] reward=0.794 moving_avg20=0.897 share=0.569 revPR=8.18 gap(F2-F1)=0.51
+    [eval segments] 0-2:ch=0.76/done=0.74/gap=1.58 | 2-5:ch=0.60/done=0.60/gap=0.64 | 5-10:ch=0.36/done=0.36/gap=-0.61 | 10+:ch=0.08/done=0.08/gap=-2.93
+  [eval 12/60] reward=0.775 moving_avg20=0.787 share=0.599 revPR=12.04 gap(F2-F1)=0.85
+    [eval segments] 0-2:ch=0.88/done=0.88/gap=2.72 | 2-5:ch=0.63/done=0.63/gap=1.15 | 5-10:ch=0.23/done=0.23/gap=-0.97 | 10+:ch=0.01/done=0.01/gap=-5.00
+  [eval 18/60] reward=0.742 moving_avg20=0.769 share=0.615 revPR=10.26 gap(F2-F1)=0.86
+    [eval segments] 0-2:ch=0.91/done=0.89/gap=2.77 | 2-5:ch=0.64/done=0.64/gap=1.13 | 5-10:ch=0.25/done=0.25/gap=-1.07 | 10+:ch=0.03/done=0.03/gap=-5.14
+  [eval 24/60] reward=0.745 moving_avg20=0.703 share=0.630 revPR=10.69 gap(F2-F1)=0.90
+    [eval segments] 0-2:ch=0.92/done=0.90/gap=2.90 | 2-5:ch=0.67/done=0.67/gap=1.26 | 5-10:ch=0.31/done=0.31/gap=-0.94 | 10+:ch=0.01/done=0.01/gap=-5.18
+  [eval 30/60] reward=0.770 moving_avg20=0.676 share=0.613 revPR=12.00 gap(F2-F1)=0.71
+    [eval segments] 0-2:ch=0.97/done=0.97/gap=4.24 | 2-5:ch=0.66/done=0.66/gap=1.33 | 5-10:ch=0.10/done=0.10/gap=-2.68 | 10+:ch=0.00/done=0.00/gap=-10.17
+  [eval 36/60] reward=0.756 moving_avg20=0.681 share=0.562 revPR=11.75 gap(F2-F1)=0.45
+    [eval segments] 0-2:ch=0.95/done=0.95/gap=4.31 | 2-5:ch=0.55/done=0.55/gap=0.98 | 5-10:ch=0.07/done=0.07/gap=-3.33 | 10+:ch=0.01/done=0.01/gap=-11.56
+  [eval 42/60] reward=0.565 moving_avg20=0.660 share=0.534 revPR=8.14 gap(F2-F1)=-0.07
+    [eval segments] 0-2:ch=0.89/done=0.85/gap=2.80 | 2-5:ch=0.54/done=0.54/gap=0.27 | 5-10:ch=0.10/done=0.10/gap=-2.99 | 10+:ch=0.00/done=0.00/gap=-8.92
+  [eval 48/60] reward=0.278 moving_avg20=0.617 share=0.466 revPR=5.74 gap(F2-F1)=-0.23
+    [eval segments] 0-2:ch=0.85/done=0.70/gap=1.98 | 2-5:ch=0.50/done=0.50/gap=0.03 | 5-10:ch=0.14/done=0.14/gap=-2.36 | 10+:ch=0.01/done=0.01/gap=-6.47
+  [eval 54/60] reward=0.771 moving_avg20=0.550 share=0.608 revPR=10.56 gap(F2-F1)=1.03
+    [eval segments] 0-2:ch=0.89/done=0.83/gap=2.75 | 2-5:ch=0.65/done=0.65/gap=1.13 | 5-10:ch=0.35/done=0.35/gap=-0.40 | 10+:ch=0.07/done=0.07/gap=-3.60
+  [eval 60/60] reward=0.165 moving_avg20=0.381 share=0.424 revPR=5.19 gap(F2-F1)=-0.47
+    [eval segments] 0-2:ch=0.83/done=0.65/gap=2.04 | 2-5:ch=0.45/done=0.45/gap=-0.26 | 5-10:ch=0.13/done=0.13/gap=-2.71 | 10+:ch=0.01/done=0.01/gap=-7.45
+>>> Saved sampled profiles -> artifacts/parity_tests/seq2_aggressive_profiles.csv (rows=200000)
+>>> Profile export capped at profiles_log_limit=200000 rows.
+>>> Training reward trajectory summary: min=-0.171, max=1.000, final=0.252
+>>> Testing reward trajectory summary: min=-0.185, max=0.979, final=0.165
+Experiment Complete.
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_training_diagnostics.csv
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_evaluation_diagnostics.csv
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_price_gap_threshold_distribution.csv
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_dist_PriceGapThreshold.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_reward_training.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_reward_evaluation.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_training_business_diagnostics.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_training_ppo_diagnostics.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_training_coeff_airport_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_training_coeff_base_fare_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_training_coeff_booking_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_training_coeff_per_mile_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_training_coeff_per_minute_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_evaluation_business_diagnostics.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_evaluation_coeff_airport_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_evaluation_coeff_base_fare_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_evaluation_coeff_booking_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_evaluation_coeff_per_mile_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_evaluation_coeff_per_minute_trajectory.png
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/parity_tests/seq2_aggressive_run_config.json

@@ -194,7 +194,7 @@ class PPOAgent:
         response_coeff: float = 0.05,
         risk_coeff: float = 0.10,
         delayed_reward_horizon: int = 6,
-        delayed_reward_blend: float = 0.35,
+        delayed_reward_blend: float = 0.0,
         device: Optional[str] = None,
     ):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
