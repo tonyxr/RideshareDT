@@ -390,17 +390,20 @@ class DriverSupplyLayer:
             )
         return self.last_states
 
-    def state_features_for_firm1(self) -> np.ndarray:
-        f1 = self.smoothed_states.get("Firm1", self.last_states.get("Firm1", FirmDriverBatchState()))
-        f2 = self.smoothed_states.get("Firm2", self.last_states.get("Firm2", FirmDriverBatchState()))
+    def state_features_for_firm(self, firm: str, opponent: str = "Firm2") -> np.ndarray:
+        own = self.smoothed_states.get(firm, self.last_states.get(firm, FirmDriverBatchState()))
+        other = self.smoothed_states.get(opponent, self.last_states.get(opponent, FirmDriverBatchState()))
         features = [
-            np.clip(f1.active_drivers / 800.0, 0.0, 1.0),
-            np.clip(f1.idle_driver_share, 0.0, 1.0),
-            np.clip(f1.utilization, 0.0, 1.0),
-            np.clip(f1.acceptance_rate, 0.0, 1.0),
-            np.clip(f1.fulfillment_rate, 0.0, 1.0),
-            np.clip(f1.avg_wait_minutes / 20.0, 0.0, 1.0),
-            np.clip(f1.driver_earnings_per_hour / 60.0, 0.0, 1.0),
-            np.clip((f2.avg_wait_minutes - f1.avg_wait_minutes + 10.0) / 20.0, 0.0, 1.0),
+            np.clip(own.active_drivers / 800.0, 0.0, 1.0),
+            np.clip(own.idle_driver_share, 0.0, 1.0),
+            np.clip(own.utilization, 0.0, 1.0),
+            np.clip(own.acceptance_rate, 0.0, 1.0),
+            np.clip(own.fulfillment_rate, 0.0, 1.0),
+            np.clip(own.avg_wait_minutes / 20.0, 0.0, 1.0),
+            np.clip(own.driver_earnings_per_hour / 60.0, 0.0, 1.0),
+            np.clip((other.avg_wait_minutes - own.avg_wait_minutes + 10.0) / 20.0, 0.0, 1.0),
         ]
         return np.asarray(features, dtype=np.float32)
+
+    def state_features_for_firm1(self) -> np.ndarray:
+        return self.state_features_for_firm("Firm1", opponent="Firm2")

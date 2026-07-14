@@ -67,10 +67,10 @@
     "pool": 20000,
     "ppo_batch_size": 256,
     "ppo_update_epochs": 8,
-    "ppo_update_interval_days": 20,
+    "ppo_update_interval_days": 10,
     "profiles_log_limit": 200000,
-    "profiles_out": "artifacts/test_profiles_full_6.csv",
-    "report_prefix": "/Users/huali/Desktop/RideResponse/artifacts/test_full_6",
+    "profiles_out": "artifacts/test_profiles_full_fix_7.csv",
+    "report_prefix": "/Users/huali/Desktop/RideResponse/artifacts/test_full_fix_7",
     "reuse_threshold_cache": false,
     "reward_acceptable_discount": 2.0,
     "reward_action_change_weight": 0.008,
@@ -122,7 +122,7 @@
     "--eval_customers",
     "1000",
     "--ppo_update_interval_days",
-    "20",
+    "10",
     "--firm1_action_interval_steps",
     "-1",
     "--firm2_action_interval_days",
@@ -201,11 +201,11 @@
     "--gpt_threshold_failure_pause",
     "1.0",
     "--profiles_out",
-    "artifacts/test_profiles_full_6.csv",
+    "artifacts/test_profiles_full_fix_7.csv",
     "--profiles_log_limit",
     "200000",
     "--report_prefix",
-    "artifacts/test_full_6"
+    "artifacts/test_full_fix_7"
   ],
   "core_reward_weights": {
     "baseline_loss": 0.22,
@@ -216,12 +216,12 @@
     "revenue": 0.2,
     "share": 0.6
   },
-  "created_utc": "2026-07-13T19:29:59Z",
+  "created_utc": "2026-07-13T19:30:48Z",
   "deterministic_experiment_seed": false,
   "effective_seed": 42,
   "eval_guardrail_mode": "deployed",
   "eval_policy_mode": "top2_margin",
   "experiment_seed": null,
-  "report_prefix": "/Users/huali/Desktop/RideResponse/artifacts/test_full_6",
+  "report_prefix": "/Users/huali/Desktop/RideResponse/artifacts/test_full_fix_7",
   "user_seed": 42
 }

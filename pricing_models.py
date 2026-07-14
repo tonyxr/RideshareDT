@@ -65,6 +65,14 @@ class FirmMetrics:
     @property
     def share(self) -> float:
         return (self.wins / self.total) if self.total > 0 else 0.0
+    
+    @property
+    def chosen_share(self) -> float:
+        return (self.chosen / self.total) if self.total > 0 else 0.0
+
+    @property
+    def completed_share(self) -> float:
+        return (self.completed / self.total) if self.total > 0 else 0.0
 
     @property
     def rev_per_request(self) -> float:
@@ -335,6 +343,7 @@ class FirmAdaptiveBestResponsePricer:
         k_share: float = 1.00,
         k_gap: float = 0.60,
         k_revenue: float = 0.40,
+        k_supply: float = 0.85,
         response_threshold: float = 0.05,
         cooldown_batches: int = 3,
         step_scale: float = 1.00,
@@ -356,6 +365,7 @@ class FirmAdaptiveBestResponsePricer:
         self.k_share = float(max(0.0, k_share))
         self.k_gap = float(max(0.0, k_gap))
         self.k_revenue = float(max(0.0, k_revenue))
+        self.k_supply = float(max(0.0, k_supply))
         self.response_threshold = float(max(0.0, response_threshold))
         self.cooldown_H = int(max(0, cooldown_batches))
         self.cooldown = 0
@@ -363,8 +373,20 @@ class FirmAdaptiveBestResponsePricer:
         self.revenue_target = None if revenue_target is None else float(max(1e-6, revenue_target))
 
         self.ema_share = self.target_share
+        self.ema_choice_share = self.target_share
+        self.ema_completed_share = self.target_share
         self.ema_revenue = 0.0 if self.revenue_target is None else self.revenue_target
         self.ema_gap = 0.0
+        self.ema_fulfillment = 1.0
+        self.ema_acceptance = 1.0
+        self.ema_wait = 0.0
+        self.ema_pickup = 0.0
+        self.ema_driver_earnings = 0.0
+        self.ema_idle_share = 1.0
+        self.ema_utilization = 0.0
+        self.last_supply_state_vector = np.zeros(8, dtype=np.float32)
+        self.last_supply_stress = 0.0
+        self.last_demand_shortfall = 0.0
         self.last_response_score = 0.0
         self.last_selected_key = "hold"
         self.last_direction = 0
@@ -396,7 +418,14 @@ class FirmAdaptiveBestResponsePricer:
                 setattr(self.overrides, key, float(anchors[key]))
 
     def _response_score(self) -> float:
-        share_error = float(self.target_share - self.ema_share)
+        # Use chosen-share for demand pressure and completed-share/fulfillment
+        # for service realization. Ride-hailing pricing literature treats
+        # dynamic prices as a two-sided balancing instrument, so fulfillment,
+        # waiting time, driver acceptance, and driver earnings should dampen
+        # demand-chasing cuts when the real bottleneck is supply.
+        choice_share = float(np.clip(self.ema_choice_share, 0.0, 1.0))
+        completed_share = float(np.clip(self.ema_completed_share, 0.0, 1.0))
+        demand_shortfall = float(np.clip(self.target_share - choice_share, -1.0, 1.0))
         gap_pressure = float(np.clip(self.ema_gap / 2.0, -1.0, 1.0))
         if self.revenue_target is None:
             revenue_surplus = 0.0
@@ -404,10 +433,33 @@ class FirmAdaptiveBestResponsePricer:
             revenue_surplus = float(
                 np.clip((self.ema_revenue - self.revenue_target) / self.revenue_target, -1.0, 1.0)
             )
+        fulfillment_stress = float(np.clip((0.78 - self.ema_fulfillment) / 0.38, 0.0, 1.0))
+        acceptance_stress = float(np.clip((0.70 - self.ema_acceptance) / 0.35, 0.0, 1.0))
+        wait_stress = float(np.clip((self.ema_wait - 8.0) / 10.0, 0.0, 1.0))
+        pickup_stress = float(np.clip((self.ema_pickup - 8.0) / 10.0, 0.0, 1.0))
+        earnings_stress = float(np.clip((24.0 - self.ema_driver_earnings) / 24.0, 0.0, 1.0))
+        idle_stress = float(np.clip((0.22 - self.ema_idle_share) / 0.22, 0.0, 1.0))
+        utilization_stress = float(np.clip((self.ema_utilization - 0.78) / 0.22, 0.0, 1.0))
+        completion_gap = float(np.clip(choice_share - completed_share, 0.0, 1.0))
+        supply_stress = float(np.clip(
+            0.22 * fulfillment_stress
+            + 0.18 * acceptance_stress
+            + 0.14 * wait_stress
+            + 0.12 * pickup_stress
+            + 0.18 * earnings_stress
+            + 0.08 * idle_stress
+            + 0.08 * utilization_stress
+            + 0.18 * completion_gap,
+            0.0,
+            1.0,
+        ))
+        self.last_supply_stress = supply_stress
+        self.last_demand_shortfall = demand_shortfall
         return float(
-            self.k_share * share_error
+            self.k_share * demand_shortfall
             + self.k_gap * gap_pressure
             - self.k_revenue * revenue_surplus
+            - self.k_supply * supply_stress
         )
 
     def _select_coefficient(self, direction: int) -> Optional[str]:
@@ -483,13 +535,48 @@ class FirmAdaptiveBestResponsePricer:
         if moved:
             self.cooldown = self.cooldown_H
 
-    def update(self, metrics: FirmMetrics, price_gap_mean: float) -> None:
+    def update(
+        self,
+        metrics: FirmMetrics,
+        price_gap_mean: float,
+        supply_state: Optional[Dict[str, float]] = None,
+        supply_state_vector: Optional[np.ndarray] = None,
+    ) -> None:
         if self.revenue_target is None:
             self.revenue_target = float(max(1e-6, metrics.rev_per_request))
             self.ema_revenue = self.revenue_target
         self.ema_share = self._ema(metrics.share, self.ema_share, self.alpha_share)
+        self.ema_choice_share = self._ema(metrics.chosen_share, self.ema_choice_share, self.alpha_share)
+        self.ema_completed_share = self._ema(metrics.completed_share, self.ema_completed_share, self.alpha_share)
         self.ema_revenue = self._ema(metrics.rev_per_request, self.ema_revenue, self.alpha_revenue)
         self.ema_gap = self._ema(price_gap_mean, self.ema_gap, self.alpha_gap)
+        supply = supply_state or {}
+        self.ema_fulfillment = self._ema(
+            supply.get("fulfillment_rate", metrics.fulfillment_rate),
+            self.ema_fulfillment,
+            self.alpha_share,
+        )
+        self.ema_acceptance = self._ema(
+            supply.get("acceptance_rate", metrics.driver_acceptance_rate),
+            self.ema_acceptance,
+            self.alpha_share,
+        )
+        self.ema_wait = self._ema(supply.get("avg_wait_minutes", metrics.avg_wait_minutes), self.ema_wait, self.alpha_share)
+        self.ema_pickup = self._ema(
+            supply.get("avg_pickup_minutes", metrics.avg_wait_minutes),
+            self.ema_pickup,
+            self.alpha_share,
+        )
+        self.ema_driver_earnings = self._ema(
+            supply.get("driver_earnings_per_hour", self.ema_driver_earnings),
+            self.ema_driver_earnings,
+            self.alpha_share,
+        )
+        self.ema_idle_share = self._ema(supply.get("idle_driver_share", self.ema_idle_share), self.ema_idle_share, self.alpha_share)
+        self.ema_utilization = self._ema(supply.get("utilization", self.ema_utilization), self.ema_utilization, self.alpha_share)
+        if supply_state_vector is not None:
+            vec = np.asarray(supply_state_vector, dtype=np.float32).reshape(-1)
+            self.last_supply_state_vector = np.nan_to_num(vec[:8], nan=0.0, posinf=1.0, neginf=0.0)
 
 
 class FirmAggressiveAdaptiveBestResponsePricer(FirmAdaptiveBestResponsePricer):
