@@ -1,4 +1,13 @@
+<<<<<<< ours
 model/rideshare_data.parquet
 *.csv
 **/*.csv
 .env
+=======
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+config/local.yaml
+>>>>>>> theirs

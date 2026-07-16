@@ -298,7 +298,14 @@ class FirmHeuristicPricer:
 
         self.cooldown = self.cooldown_H
 
-    def update(self, metrics: FirmMetrics, price_gap_mean: float):
+    def update(
+        self,
+        metrics: FirmMetrics,
+        price_gap_mean: float,
+        supply_state: Optional[Dict[str, float]] = None,
+        supply_state_vector: Optional[np.ndarray] = None,
+    ):
+        del supply_state, supply_state_vector
         self.ema_share = self._ema(metrics.share, self.ema_share, self.alpha)
         self.ema_gap = self._ema(price_gap_mean, self.ema_gap, self.alpha)
         
@@ -318,7 +325,19 @@ class FirmMarginGuardrailPricer(FirmHeuristicPricer):
         self.low_share_threshold = 0.38
         self.guardrail_cooldown_H = 6
 
-    def update(self, metrics: FirmMetrics, price_gap_mean: float):
+    def update(
+        self,
+        metrics: FirmMetrics,
+        price_gap_mean: float,
+        supply_state: Optional[Dict[str, float]] = None,
+        supply_state_vector: Optional[np.ndarray] = None,
+    ):
+        super().update(
+            metrics=metrics,
+            price_gap_mean=price_gap_mean,
+            supply_state=supply_state,
+            supply_state_vector=supply_state_vector,
+        )
         super().update(metrics=metrics, price_gap_mean=price_gap_mean)
 
         if self.cooldown > 0:
@@ -627,6 +646,421 @@ class FirmAdaptiveBestResponsePricer:
         if supply_state_vector is not None:
             vec = np.asarray(supply_state_vector, dtype=np.float32).reshape(-1)
             self.last_supply_state_vector = np.nan_to_num(vec[:8], nan=0.0, posinf=1.0, neginf=0.0)
+
+class FirmPIPriceGapPricer(FirmAdaptiveBestResponsePricer):
+    """PI feedback benchmark for price-gap control.
+
+    Literature basis: Fayed, Nilsson, and Geroliminis (Transportation Research
+    Part C, 2024) use PI control to regulate a ride-hailing price gap.  This
+    benchmark applies the same controlled-variable idea to the Firm2-Firm1
+    average price gap available in this simulator.
+    """
+
+    def __init__(self, seed: Optional[int] = None, managed_keys: Optional[List[str]] = None):
+        super().__init__(
+            seed=seed,
+            managed_keys=managed_keys,
+            alpha_share=0.18,
+            alpha_revenue=0.18,
+            alpha_gap=0.25,
+            cooldown_batches=2,
+            step_scale=1.00,
+            response_threshold=0.06,
+        )
+        self.target_gap = 0.0
+        self.kp_gap = 0.85
+        self.ki_gap = 0.18
+        self.integral_gap_error = 0.0
+        self.integral_clip = 2.0
+
+    def act(
+        self,
+        city_base: float,
+        city_pmin: float,
+        hour: int,
+        weather: str,
+        city_pmile: Optional[float] = None,
+        city_booking: Optional[float] = None,
+        city_airport: Optional[float] = None,
+    ) -> None:
+        del hour, weather
+        anchors = self._anchor_map(city_base, city_pmin, city_pmile, city_booking, city_airport)
+        self._ensure_initialized(anchors)
+        self.last_selected_key = "hold"
+        self.last_direction = 0
+        if self.cooldown > 0:
+            self.cooldown -= 1
+            self.last_reason = "cooldown"
+            return
+
+        gap_error = float(self.target_gap - self.ema_gap)
+        self.integral_gap_error = float(np.clip(
+            self.integral_gap_error + gap_error,
+            -self.integral_clip,
+            self.integral_clip,
+        ))
+        control = self.kp_gap * gap_error + self.ki_gap * self.integral_gap_error
+        self.last_response_score = control
+        if abs(control) <= self.response_threshold:
+            self.last_reason = "pi_gap_hold"
+            return
+
+        direction = 1 if control > 0.0 else -1
+        key = self._select_coefficient(direction)
+        if key is None:
+            self.last_reason = "no_room"
+            return
+        moved = self._apply_step(key, direction)
+        self.last_selected_key = key if moved else "hold"
+        self.last_direction = int(direction) if moved else 0
+        self.last_reason = "pi_price_gap" if moved else "bounded"
+        if moved:
+            self.cooldown = self.cooldown_H
+
+
+class FirmRegionSupplyDemandPricer(FirmAdaptiveBestResponsePricer):
+    """Regional supply-demand benchmark using context buckets as pseudo-regions.
+
+    Literature basis: Shi, Lu, and Cao (Applied Intelligence, 2024) segment the
+    ride-hailing market and set regional prices from local demand-supply
+    imbalance.  This simulator lacks explicit spatial cells, so peak/weather
+    contexts and smoothed choice/completion shares serve as coarse operational
+    regions and local imbalance proxies.
+    """
+
+    def __init__(self, seed: Optional[int] = None, managed_keys: Optional[List[str]] = None):
+        super().__init__(
+            seed=seed,
+            managed_keys=managed_keys,
+            alpha_share=0.22,
+            alpha_revenue=0.18,
+            alpha_gap=0.18,
+            k_share=1.10,
+            k_gap=0.20,
+            k_revenue=0.15,
+            k_supply=0.95,
+            cooldown_batches=2,
+            step_scale=1.15,
+            response_threshold=0.08,
+        )
+
+    def act(
+        self,
+        city_base: float,
+        city_pmin: float,
+        hour: int,
+        weather: str,
+        city_pmile: Optional[float] = None,
+        city_booking: Optional[float] = None,
+        city_airport: Optional[float] = None,
+    ) -> None:
+        anchors = self._anchor_map(city_base, city_pmin, city_pmile, city_booking, city_airport)
+        self._ensure_initialized(anchors)
+        self.last_selected_key = "hold"
+        self.last_direction = 0
+        if self.cooldown > 0:
+            self.cooldown -= 1
+            self.last_reason = "cooldown"
+            return
+
+        peak = (7 <= int(hour) < 10) or (16 <= int(hour) < 19)
+        bad_weather = str(weather).lower() in ("rain", "snow", "storm")
+        context_pressure = 0.08 * float(peak) + 0.06 * float(bad_weather)
+        demand_index = float(np.clip(self.ema_choice_share / max(self.target_share, 1e-6), 0.25, 2.0))
+        realized_supply_index = float(np.clip(
+            self.ema_completed_share / max(self.target_share, 1e-6)
+            + 0.50 * max(0.0, self.ema_idle_share - 0.20),
+            0.25,
+            2.0,
+        ))
+        imbalance = float(np.clip((demand_index / max(realized_supply_index, 1e-6)) - 1.0, -1.0, 1.0))
+        score = imbalance + context_pressure
+        self.last_response_score = score
+        if abs(score) <= self.response_threshold:
+            self.last_reason = "regional_hold"
+            return
+
+        direction = 1 if score > 0.0 else -1
+        key_priority = ("per_mile", "base_fare", "per_minute", "booking_fee", "airport_fee")
+        key = next((k for k in key_priority if k in self.managed_keys and getattr(self.overrides, k, None) is not None), None)
+        if key is None:
+            key = self._select_coefficient(direction)
+        if key is None:
+            self.last_reason = "no_room"
+            return
+        moved = self._apply_step(key, direction)
+        self.last_selected_key = key if moved else "hold"
+        self.last_direction = int(direction) if moved else 0
+        self.last_reason = "regional_supply_demand" if moved else "bounded"
+        if moved:
+            self.cooldown = self.cooldown_H
+
+
+class FirmQueueServiceThresholdPricer(FirmAdaptiveBestResponsePricer):
+    """Queue/service-quality threshold benchmark for dynamic service pricing.
+
+    Literature basis: recent queueing models of ride-hailing dynamic service
+    pricing choose prices from system state, including congestion, service
+    completion, and retrial/blocked demand.  This benchmark implements the same
+    state-threshold structure with the simulator's wait, fulfillment,
+    acceptance, utilization, and idle-driver signals.
+    """
+
+    def __init__(self, seed: Optional[int] = None, managed_keys: Optional[List[str]] = None):
+        super().__init__(
+            seed=seed,
+            managed_keys=managed_keys,
+            alpha_share=0.25,
+            alpha_revenue=0.15,
+            alpha_gap=0.15,
+            cooldown_batches=2,
+            step_scale=1.00,
+            response_threshold=0.07,
+        )
+        self.target_fulfillment = 0.86
+        self.target_acceptance = 0.72
+        self.target_wait = 7.0
+
+    def act(
+        self,
+        city_base: float,
+        city_pmin: float,
+        hour: int,
+        weather: str,
+        city_pmile: Optional[float] = None,
+        city_booking: Optional[float] = None,
+        city_airport: Optional[float] = None,
+    ) -> None:
+        del hour, weather
+        anchors = self._anchor_map(city_base, city_pmin, city_pmile, city_booking, city_airport)
+        self._ensure_initialized(anchors)
+        self.last_selected_key = "hold"
+        self.last_direction = 0
+        if self.cooldown > 0:
+            self.cooldown -= 1
+            self.last_reason = "cooldown"
+            return
+
+        service_pressure = float(np.clip(
+            0.40 * max(0.0, self.target_fulfillment - self.ema_fulfillment) / max(self.target_fulfillment, 1e-6)
+            + 0.25 * max(0.0, self.target_acceptance - self.ema_acceptance) / max(self.target_acceptance, 1e-6)
+            + 0.25 * max(0.0, self.ema_wait - self.target_wait) / max(self.target_wait, 1e-6)
+            + 0.20 * max(0.0, self.ema_utilization - 0.78) / 0.22,
+            0.0,
+            1.0,
+        ))
+        idle_supply = float(np.clip(self.ema_idle_share - 0.28, 0.0, 1.0))
+        demand_shortfall = float(np.clip(self.target_share - self.ema_choice_share, 0.0, 1.0))
+        score = service_pressure - 0.45 * idle_supply - 0.55 * demand_shortfall
+        self.last_response_score = score
+        if abs(score) <= self.response_threshold:
+            self.last_reason = "queue_service_hold"
+            return
+
+        direction = 1 if score > 0.0 else -1
+        key = self._select_coefficient(direction)
+        if key is None:
+            self.last_reason = "no_room"
+            return
+        moved = self._apply_step(key, direction)
+        self.last_selected_key = key if moved else "hold"
+        self.last_direction = int(direction) if moved else 0
+        self.last_reason = "queue_service_threshold" if moved else "bounded"
+        if moved:
+            self.cooldown = self.cooldown_H
+
+
+class FirmSurgeDriverIncentivePricer(FirmAdaptiveBestResponsePricer):
+    """Two-sided surge/incentive benchmark.
+
+    Literature basis: Chen, Zheng, Ke, and Yang (Transportation Research Part B,
+    2020) jointly study surge pricing, commission, and incentives for on-demand
+    ride services.  The benchmark exposes a driver incentive multiplier consumed
+    by the driver supply layer and uses rider-facing surge steps when demand is
+    high or when supply needs to be rationed.
+    """
+
+    def __init__(self, seed: Optional[int] = None, managed_keys: Optional[List[str]] = None):
+        super().__init__(
+            seed=seed,
+            managed_keys=managed_keys,
+            alpha_share=0.22,
+            alpha_revenue=0.20,
+            alpha_gap=0.18,
+            cooldown_batches=2,
+            step_scale=1.10,
+            response_threshold=0.08,
+        )
+        self.supply_incentive_multiplier = 1.0
+        self.supply_incentive_step = 0.025
+        self.supply_incentive_bounds = (0.90, 1.15)
+
+    def act(
+        self,
+        city_base: float,
+        city_pmin: float,
+        hour: int,
+        weather: str,
+        city_pmile: Optional[float] = None,
+        city_booking: Optional[float] = None,
+        city_airport: Optional[float] = None,
+    ) -> None:
+        del hour, weather
+        anchors = self._anchor_map(city_base, city_pmin, city_pmile, city_booking, city_airport)
+        self._ensure_initialized(anchors)
+        self.last_selected_key = "hold"
+        self.last_direction = 0
+        if self.cooldown > 0:
+            self.cooldown -= 1
+            self.last_reason = "cooldown"
+            return
+
+        demand_pressure = float(np.clip(self.ema_choice_share - self.target_share, -1.0, 1.0))
+        supply_stress = float(np.clip(self.last_supply_stress, 0.0, 1.0))
+        revenue_gap = 0.0 if self.revenue_target is None else float(np.clip(
+            (self.revenue_target - self.ema_revenue) / self.revenue_target,
+            -1.0,
+            1.0,
+        ))
+        if supply_stress > 0.22:
+            self.supply_incentive_multiplier = float(np.clip(
+                self.supply_incentive_multiplier + self.supply_incentive_step,
+                *self.supply_incentive_bounds,
+            ))
+        elif self.ema_idle_share > 0.32:
+            self.supply_incentive_multiplier = float(np.clip(
+                self.supply_incentive_multiplier - self.supply_incentive_step,
+                *self.supply_incentive_bounds,
+            ))
+
+        incentive_pressure = float(self.supply_incentive_multiplier - 1.0)
+        score = (
+            0.65 * demand_pressure
+            + 0.40 * supply_stress
+            + 0.30 * revenue_gap
+            + 0.20 * self.ema_gap
+            + 0.40 * incentive_pressure
+        )
+        self.last_response_score = score
+        if abs(score) <= self.response_threshold:
+            self.last_reason = "surge_incentive_hold"
+            return
+
+        direction = 1 if score > 0.0 else -1
+        key = self._select_coefficient(direction)
+        if key is None:
+            self.last_reason = "no_room"
+            return
+        moved = self._apply_step(key, direction)
+        self.last_selected_key = key if moved else "hold"
+        self.last_direction = int(direction) if moved else 0
+        self.last_reason = "surge_driver_incentive" if moved else "bounded"
+        if moved:
+            self.cooldown = self.cooldown_H
+
+
+class FirmMPCGridPricer(FirmAdaptiveBestResponsePricer):
+    """Short-horizon grid-search control benchmark.
+
+    Literature basis: Nourinejad and Ramezani (Transportation Research Part B,
+    2020) use model-predictive control for ride-sourcing fare/wage decisions.
+    This benchmark is the simulator-compatible receding-horizon analogue: score
+    all feasible one-step rider-fare moves against a local profit/service
+    objective and apply the best move.
+    """
+
+    def __init__(self, seed: Optional[int] = None, managed_keys: Optional[List[str]] = None):
+        super().__init__(
+            seed=seed,
+            managed_keys=managed_keys,
+            alpha_share=0.20,
+            alpha_revenue=0.20,
+            alpha_gap=0.20,
+            cooldown_batches=1,
+            step_scale=1.00,
+            response_threshold=0.03,
+        )
+
+    def _candidate_score(self, key: str, direction: int) -> float:
+        step = float(self.config.step[key])
+        price_effect = float(direction) * step
+        relative_step = float(np.clip(price_effect / max(1.0, self.ema_revenue), -0.25, 0.25))
+        own_demand = float(np.clip(self.ema_choice_share, 0.0, 1.0))
+        predicted_choice_share = float(np.clip(own_demand - 0.80 * relative_step, 0.0, 1.0))
+        predicted_completed_share = float(np.clip(
+            self.ema_completed_share - 0.50 * max(0.0, relative_step) + 0.20 * max(0.0, -relative_step),
+            0.0,
+            1.0,
+        ))
+        supply_stress = float(np.clip(self.last_supply_stress, 0.0, 1.0))
+        revenue_gap = 0.0 if self.revenue_target is None else float(np.clip(
+            (self.revenue_target - self.ema_revenue) / self.revenue_target,
+            -1.0,
+            1.0,
+        ))
+        gap_after = self.ema_gap + price_effect
+        revenue_bonus = (self.ema_revenue + price_effect) * predicted_choice_share / max(self.revenue_target or 1.0, 1.0)
+        unmet_demand_penalty = max(0.0, self.target_share - predicted_choice_share)
+        service_penalty = (
+            0.55 * supply_stress
+            + 0.25 * max(0.0, self.ema_wait - 7.0) / 7.0
+            + 0.35 * max(0.0, self.target_share - predicted_completed_share)
+        )
+        recovery_bonus = 0.20 * revenue_gap * float(direction)
+        gap_penalty = 0.20 * abs(gap_after)
+        volatility_penalty = 0.05 * abs(relative_step)
+        return float(revenue_bonus + recovery_bonus - unmet_demand_penalty - service_penalty - gap_penalty - volatility_penalty)
+
+    def act(
+        self,
+        city_base: float,
+        city_pmin: float,
+        hour: int,
+        weather: str,
+        city_pmile: Optional[float] = None,
+        city_booking: Optional[float] = None,
+        city_airport: Optional[float] = None,
+    ) -> None:
+        del hour, weather
+        anchors = self._anchor_map(city_base, city_pmin, city_pmile, city_booking, city_airport)
+        self._ensure_initialized(anchors)
+        self.last_selected_key = "hold"
+        self.last_direction = 0
+        if self.cooldown > 0:
+            self.cooldown -= 1
+            self.last_reason = "cooldown"
+            return
+
+        best_score = 0.0
+        best_key: Optional[str] = None
+        best_direction = 0
+        for key in self.managed_keys:
+            if getattr(self.overrides, key, None) is None:
+                continue
+            for direction in (-1, 1):
+                curr = float(getattr(self.overrides, key))
+                lb, ub = self.config.bounds[key]
+                if direction < 0 and curr <= lb:
+                    continue
+                if direction > 0 and curr >= ub:
+                    continue
+                score = self._candidate_score(key, direction)
+                if score > best_score:
+                    best_score = score
+                    best_key = key
+                    best_direction = direction
+
+        self.last_response_score = best_score
+        if best_key is None or best_score <= self.response_threshold:
+            self.last_reason = "mpc_grid_hold"
+            return
+        moved = self._apply_step(best_key, best_direction)
+        self.last_selected_key = best_key if moved else "hold"
+        self.last_direction = int(best_direction) if moved else 0
+        self.last_reason = "mpc_grid" if moved else "bounded"
+        if moved:
+            self.cooldown = self.cooldown_H
+
 
 
 class FirmAggressiveAdaptiveBestResponsePricer(FirmAdaptiveBestResponsePricer):
