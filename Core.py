@@ -3570,76 +3570,23 @@ class Core:
                 log_row[f"firm2_{k}"] = float(get_coeff(self.market.curr_market, self.firm2.overrides, k))
             validation_score = np.nan
             if self.firm1_mode == "RL" and ((d + 1) % validation_interval == 0 or (d + 1) == train_timesteps):
-                saved_crowd_stats = dict(getattr(self, "last_crowd_response_stats", {}) or {})
-                saved_observers = {
-                    name: observer.snapshot() for name, observer in self.platform_observers.items()
-                }
-                saved_stability = self.action_stability.snapshot()
-                val_ctx = self.market.sample_day_context()
-                val_hour = self.market.sample_timestep_hour().hour
-                val_profiles = self._sample_profiles_from_pool(eval_profile_sample_size)
-                _, val_m1, val_m2, val_gap, _, _ = self.simulate_batch(
-                    day_of_week=val_ctx.day_of_week,
-                    weather=val_ctx.weather,
-                    hour=val_hour,
+                validation = self._adaptive_policy_validation(
                     customers_per_step=eval_customers_per_step,
-                    sampled_profiles=val_profiles,
-                    collect_rows=False,
+                    profile_sample_size=eval_profile_sample_size,
+                    horizon=6,
                 )
-                self._ingest_platform_observations(val_m1, val_m2)
-                val_segment_stats = dict(getattr(self, "last_crowd_response_stats", {}) or {})
-                val_diag = self._reward_diagnostics(
-                    share=float(val_m1.chosen_share),
-                    completed_share=float(val_m1.completed_share),
-                    rev_per_request=float(val_m1.rev_per_request),
-                    mean_gap=float(val_gap),
-                    prev_share=float(self.last_share),
-                    prev_rev_per_request=float(self.last_revpr),
-                    prev_profit_per_request=float(self.last_profitpr),
-                    prev_gap=float(self.last_gap),
-                    profit_per_request=float(val_m1.profit_per_request),
-                    profit_margin=self._profit_margin(val_m1),
-                    fulfillment_rate=float(val_m1.fulfillment_rate),
-                    avg_wait_minutes=float(val_m1.avg_wait_minutes),
-                    driver_acceptance_rate=float(val_m1.driver_acceptance_rate),
-                    action_change_magnitude=0.0,
-                    baseline_share=float(val_m2.chosen_share),
-                    baseline_completed_share=float(val_m2.completed_share),
-                    baseline_rev_per_request=float(val_m2.rev_per_request),
-                    baseline_profit_per_request=float(val_m2.profit_per_request),
-                    action_event=False,
-                )
-                validation_score = self._validation_score_from_metrics(
-                    reward=float(val_diag.get("reward", 0.0)),
-                    share=float(val_m1.share),
-                    revpr=float(val_m1.rev_per_request),
-                    profitpr=float(val_m1.profit_per_request),
-                    fulfillment=float(val_m1.fulfillment_rate),
-                    gap=float(val_gap),
-                    segment_stats=val_segment_stats,
-                    rival_profitpr=float(val_m2.profit_per_request),
-                    rival_share=float(val_m2.share),
-                    constraint_costs={
-                        name: float(val_diag.get(f"constraint_cost_{name}", 0.0))
-                        for name in self.soft_constraints.names
-                    },
-                )
-                log_row["validation_reward"] = float(val_diag.get("reward", 0.0))
+                validation_score = float(validation["score"])
+                log_row["validation_reward"] = float(validation["reward"])
                 log_row["validation_score"] = float(validation_score)
-                log_row["validation_share"] = float(val_m1.share)
-                log_row["validation_choice_share"] = float(val_m1.chosen_share)
-                log_row["validation_completed_share"] = float(val_m1.completed_share)
-                log_row["validation_firm2_choice_share"] = float(val_m2.chosen_share)
-                log_row["validation_firm2_completed_share"] = float(val_m2.completed_share)
-                log_row["validation_rev_per_request"] = float(val_m1.rev_per_request)
-                log_row["validation_profit_per_request"] = float(val_m1.profit_per_request)
-                log_row["validation_fulfillment_rate"] = float(val_m1.fulfillment_rate)
-                log_row["validation_price_gap_f2_minus_f1"] = float(val_gap)
-                log_row["validation_segment_balance_penalty"] = float(self._segment_balance_penalty_from_stats(val_segment_stats))
-                self.last_crowd_response_stats = saved_crowd_stats
-                for name, snapshot in saved_observers.items():
-                    self.platform_observers[name].restore(snapshot)
-                self.action_stability.restore(saved_stability)
+                log_row["validation_share"] = float(validation["share"])
+                log_row["validation_completed_share"] = float(validation["share"])
+                log_row["validation_firm2_completed_share"] = float(validation["rival_share"])
+                log_row["validation_profit_per_request"] = float(validation["profit_per_request"])
+                log_row["validation_firm2_profit_per_request"] = float(validation["rival_profit_per_request"])
+                log_row["validation_fulfillment_rate"] = float(validation["fulfillment_rate"])
+                log_row["validation_price_gap_f2_minus_f1"] = float(validation["price_gap"])
+                log_row["validation_action_diversity"] = float(validation["action_diversity"])
+                log_row["validation_action_switch_rate"] = float(validation["action_switch_rate"])
                 if float(validation_score) > float(best_validation_score):
                     best_validation_score = float(validation_score)
                     best_checkpoint = {
