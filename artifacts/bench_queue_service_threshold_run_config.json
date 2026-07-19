@@ -227,7 +227,7 @@
     "revenue": 0.2,
     "share": 0.46
   },
-  "created_utc": "2026-07-16T08:04:35Z",
+  "created_utc": "2026-07-16T11:31:19Z",
   "deterministic_experiment_seed": true,
   "effective_seed": 4303,
   "eval_guardrail_mode": "deployed",

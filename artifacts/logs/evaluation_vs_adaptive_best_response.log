@@ -1,0 +1,83 @@
+[ChoiceModel] GPT price-threshold mode enabled (thresholds consumed from profile).
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+[PricingParity] Firm1 and Firm2 share actions=11, keys=['base_fare', 'per_minute', 'per_mile', 'booking_fee', 'airport_fee'].
+Using random seed: 9303
+[PositiveRewardConfig] profit=0.380, revenue=0.220, completed_demand=0.200, service=0.200, revenue_scale=25.00, profit_scale=12.00, completed_share_target=0.42, wait_target_minutes=7.00; price gap and action stability are separate soft constraints.
+[ConstraintConfig] target_gap(F2-F1)=$0.80, constrained=1, constraint_lr=0.030, overall_gap_tolerance=$0.45, segment_gap_tolerances=(0.65, 0.6, 0.55, 0.55), margin_floor=0.110
+[Calibration] Applied preset=nyc_public for market=New York City.
+[Calibration] {
+  "sample_size": 12000000,
+  "market": {
+    "weather_probs": {
+      "clear": 0.58,
+      "rain": 0.29,
+      "snow": 0.13
+    },
+    "service_probs": {
+      "economy": 0.88,
+      "premium": 0.12
+    },
+    "airport_prob": 0.19
+  },
+  "agent": {
+    "age_mean": 36.8,
+    "age_std": 12.4,
+    "income_probs": {
+      "<50k": 0.21,
+      "50k-100k": 0.34,
+      "100k-200k": 0.29,
+      "200k+": 0.16
+    },
+    "household_lambda": 1.95,
+    "p_new": 0.34
+  },
+  "choice": {
+    "price_sensitivity_scale": 1.12,
+    "loyalty_scale": 0.97,
+    "reliability_scale": 1.08
+  }
+}
+>>> Loaded trained policy <- /Users/huali/Desktop/RideResponse/artifacts/models/platform_policy_staged_seed4303.pt; benchmark opponent remains adaptive_best_response.
+[ThresholdCache] Loaded 30000 cached threshold profiles from artifacts/threshold_profiles_30k.jsonl.
+>>> Synthetic setup: profile_pool=30000, train days=0 x 10 steps/day x 5000 rides, eval timesteps=500 x 1200 rides, mc_samples(train/eval)=2000/1200
+>>> PPO rollout/update cadence: 20 day(s) per optimizer step (~200 price decisions/update; Firm1 holds each price action for 1 step(s)).
+>>> Firm2 heuristic cadence: manipulate/update at most once every 4 training day(s), slower than Firm1/PPO rollouts.
+>>> Evaluation-only mode: using loaded Firm1 policy without optimizer updates.
+>>> Competitor mode for both training and evaluation: adaptive_best_response
+>>> Evaluating RL agent against same-level adaptive_best_response opponent with shared profile pool...
+  [eval 50/500] reward=0.451 moving_avg20=0.421 share=0.447 revPR=10.90 gap(F2-F1)=9.62
+    [eval segments] 0-2:ch=0.94/done=0.40/gap=4.43 | 2-5:ch=0.96/done=0.47/gap=8.32 | 5-10:ch=0.90/done=0.44/gap=14.34 | 10+:ch=0.79/done=0.55/gap=24.68
+  [eval 100/500] reward=0.412 moving_avg20=0.423 share=0.411 revPR=8.26 gap(F2-F1)=7.48
+    [eval segments] 0-2:ch=0.92/done=0.35/gap=3.70 | 2-5:ch=0.94/done=0.44/gap=6.49 | 5-10:ch=0.90/done=0.45/gap=11.30 | 10+:ch=0.83/done=0.47/gap=21.01
+  [eval 150/500] reward=0.375 moving_avg20=0.419 share=0.366 revPR=7.64 gap(F2-F1)=6.44
+    [eval segments] 0-2:ch=0.90/done=0.29/gap=3.30 | 2-5:ch=0.98/done=0.40/gap=5.63 | 5-10:ch=0.95/done=0.40/gap=9.86 | 10+:ch=0.86/done=0.60/gap=18.05
+  [eval 200/500] reward=0.440 moving_avg20=0.435 share=0.444 revPR=9.81 gap(F2-F1)=7.21
+    [eval segments] 0-2:ch=0.85/done=0.41/gap=3.29 | 2-5:ch=0.98/done=0.47/gap=6.06 | 5-10:ch=0.92/done=0.50/gap=11.01 | 10+:ch=0.71/done=0.36/gap=21.17
+  [eval 250/500] reward=0.442 moving_avg20=0.416 share=0.392 revPR=11.09 gap(F2-F1)=10.00
+    [eval segments] 0-2:ch=0.88/done=0.43/gap=4.27 | 2-5:ch=0.93/done=0.43/gap=7.89 | 5-10:ch=0.77/done=0.32/gap=14.99 | 10+:ch=0.55/done=0.25/gap=30.12
+  [eval 300/500] reward=0.395 moving_avg20=0.413 share=0.401 revPR=7.16 gap(F2-F1)=4.10
+    [eval segments] 0-2:ch=0.76/done=0.34/gap=2.05 | 2-5:ch=0.92/done=0.41/gap=3.66 | 5-10:ch=0.93/done=0.47/gap=6.58 | 10+:ch=0.93/done=0.56/gap=12.12
+  [eval 350/500] reward=0.460 moving_avg20=0.411 share=0.395 revPR=12.08 gap(F2-F1)=8.77
+    [eval segments] 0-2:ch=0.85/done=0.41/gap=3.73 | 2-5:ch=0.90/done=0.43/gap=7.27 | 5-10:ch=0.76/done=0.39/gap=13.53 | 10+:ch=0.29/done=0.16/gap=27.57
+  [eval 400/500] reward=0.388 moving_avg20=0.427 share=0.365 revPR=8.06 gap(F2-F1)=4.30
+    [eval segments] 0-2:ch=0.69/done=0.27/gap=1.93 | 2-5:ch=0.88/done=0.39/gap=3.71 | 5-10:ch=0.97/done=0.47/gap=6.75 | 10+:ch=0.90/done=0.45/gap=12.13
+  [eval 450/500] reward=0.426 moving_avg20=0.418 share=0.413 revPR=8.45 gap(F2-F1)=3.44
+    [eval segments] 0-2:ch=0.67/done=0.35/gap=1.49 | 2-5:ch=0.85/done=0.39/gap=2.82 | 5-10:ch=0.92/done=0.50/gap=5.43 | 10+:ch=0.84/done=0.58/gap=9.95
+  [eval 500/500] reward=0.393 moving_avg20=0.448 share=0.383 revPR=7.14 gap(F2-F1)=2.48
+    [eval segments] 0-2:ch=0.64/done=0.29/gap=1.11 | 2-5:ch=0.78/done=0.41/gap=2.08 | 5-10:ch=0.93/done=0.46/gap=3.80 | 10+:ch=0.95/done=0.53/gap=7.09
+No rows to write.
+>>> Saved sampled profiles -> artifacts/evaluations/trained_policy_vs_adaptive_best_response_profiles.csv (rows=0)
+>>> Profile export capped at profiles_log_limit=0 rows.
+>>> Testing reward trajectory summary: min=0.343, max=0.497, final=0.393
+Experiment Complete.
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/evaluations/trained_policy_vs_adaptive_best_response_evaluation_diagnostics.csv
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/evaluations/trained_policy_vs_adaptive_best_response_price_gap_threshold_distribution.csv
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/evaluations/trained_policy_vs_adaptive_best_response_dist_PriceGapThreshold.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/evaluations/trained_policy_vs_adaptive_best_response_reward_evaluation.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/evaluations/trained_policy_vs_adaptive_best_response_evaluation_business_diagnostics.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/evaluations/trained_policy_vs_adaptive_best_response_evaluation_coeff_airport_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/evaluations/trained_policy_vs_adaptive_best_response_evaluation_coeff_base_fare_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/evaluations/trained_policy_vs_adaptive_best_response_evaluation_coeff_booking_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/evaluations/trained_policy_vs_adaptive_best_response_evaluation_coeff_per_mile_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/evaluations/trained_policy_vs_adaptive_best_response_evaluation_coeff_per_minute_trajectory.png
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/evaluations/trained_policy_vs_adaptive_best_response_run_config.json
