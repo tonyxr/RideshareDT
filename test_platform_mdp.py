@@ -3,17 +3,35 @@ import unittest
 import numpy as np
 
 from platform_mdp import (
+    ActionStabilityTracker,
     ConstraintConfig,
+    LongTermProfitReward,
+    LongTermProfitRewardConfig,
     ObservationConfig,
     PlatformObservationModel,
     PositiveBusinessReward,
     PositiveRewardConfig,
     SoftConstraintController,
+    OperationalClock,
     TrainingStageScheduler,
 )
 
 
 class PlatformMDPTests(unittest.TestCase):
+    def test_operational_clock_has_identical_cadence_across_workflows(self):
+        train_clock = OperationalClock()
+        eval_clock = OperationalClock()
+        train_due = []
+        eval_due = []
+        for _ in range(13):
+            train_due.append(train_clock.due(3))
+            eval_due.append(eval_clock.due(3))
+            train_clock.advance()
+            eval_clock.advance()
+
+        self.assertEqual(train_due, eval_due)
+        self.assertEqual([i for i, due in enumerate(train_due) if due], [0, 3, 6, 9, 12])
+
     @staticmethod
     def _metrics():
         return {
@@ -114,7 +132,56 @@ class PlatformMDPTests(unittest.TestCase):
             oscillation_cost=0.0,
         )
         self.assertGreater(costs["gap_overprice"], 0.0)
-        self.assertEqual(len(controller.vector(costs)), 10)
+        self.assertEqual(len(controller.vector(costs)), 4)
+        diagnostics = controller.diagnostics(costs)
+        self.assertEqual(diagnostics["constraint_active_gap_overprice"], 0.0)
+        self.assertEqual(diagnostics["constraint_active_margin"], 1.0)
+
+    def test_long_term_profit_reward_has_exact_economic_decomposition(self):
+        model = LongTermProfitReward(LongTermProfitRewardConfig())
+        result = model.compute(
+            own_profit_per_request=4.0,
+            rival_profit_per_request=2.0,
+            intervention_magnitude=0.4,
+            reversal=1.0,
+        )
+        expected = (
+            0.90 * np.arcsinh(1.0)
+            + 0.10 * np.arcsinh(1.0)
+            - 0.01 * 0.4
+            - 0.005
+        )
+        self.assertAlmostEqual(result["reward_raw"], expected)
+        self.assertAlmostEqual(result["reward"], expected)
+        self.assertGreater(result["reward_profit_advantage_component"], 0.0)
+
+    def test_long_term_profit_reward_does_not_depend_on_share_or_revenue(self):
+        model = LongTermProfitReward()
+        first = model.compute(
+            own_profit_per_request=2.5,
+            rival_profit_per_request=2.0,
+        )
+        second = model.compute(
+            own_profit_per_request=2.5,
+            rival_profit_per_request=2.0,
+        )
+        self.assertEqual(first["reward"], second["reward"])
+
+    def test_reversal_tracker_detects_coefficient_reversal_across_bundles(self):
+        tracker = ActionStabilityTracker(ConstraintConfig(reversal_horizon=4))
+        tracker.record(
+            action_event=True,
+            target="base_fare+booking_fee",
+            direction=1,
+            directions={"base_fare": 1, "booking_fee": 1},
+        )
+        tracker.record(
+            action_event=True,
+            target="base_fare+per_mile",
+            direction=-1,
+            directions={"base_fare": -1, "per_mile": 1},
+        )
+        self.assertEqual(tracker.last_reversal, 1.0)
 
     def test_positive_reward_weights_are_configurable_and_normalized(self):
         metrics = {

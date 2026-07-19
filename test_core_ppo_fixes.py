@@ -11,6 +11,8 @@ from pricing_models import ActionDescriptor, FirmRLPricer, build_discrete_action
 from platform_mdp import (
     ActionStabilityTracker,
     ConstraintConfig,
+    LongTermProfitReward,
+    LongTermProfitRewardConfig,
     ObservationConfig,
     PlatformObservationModel,
     PositiveBusinessReward,
@@ -20,6 +22,67 @@ from platform_mdp import (
 
 
 class CorePPOFixRegressionTests(unittest.TestCase):
+    def test_action_space_contains_coordinated_and_rebalancing_moves(self):
+        keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
+        action_map, _ = build_discrete_action_space(keys)
+        bundles = [mapping for mapping in action_map.values() if len(mapping) > 1]
+
+        self.assertGreaterEqual(len(bundles), 8)
+        self.assertTrue(any(
+            mapping.get("base_fare") == -1
+            and mapping.get("booking_fee") == -1
+            and mapping.get("per_mile") == 1
+            for mapping in bundles
+        ))
+        self.assertTrue(any(
+            {key for key, direction in mapping.items() if direction}
+            == {"base_fare", "per_minute", "per_mile", "booking_fee"}
+            for mapping in bundles
+        ))
+
+    def test_response_supervision_uses_causal_delta(self):
+        baseline = np.array([0.2, -0.1, 0.5], dtype=np.float32)
+        future = np.array([0.7, -0.4, 4.5], dtype=np.float32)
+
+        target = Core._response_delta(baseline, future)
+
+        self.assertTrue(np.allclose(target, np.array([0.5, -0.3, 2.0], dtype=np.float32)))
+
+    def test_standalone_action_features_preserve_bundle_identity(self):
+        keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
+        pricer = FirmRLPricer(seed=3, opt_keys=keys)
+        market = SimpleNamespace(curr_market=SimpleNamespace(
+            base_fare=3.0,
+            per_minute=0.30,
+            per_mile=1.30,
+            booking_fee=1.50,
+            airport_fee=4.0,
+        ))
+
+        features = pricer.build_action_feature_matrix(market, {})
+
+        self.assertEqual(pricer.action_feature_dim, 20)
+        self.assertEqual(features.shape, (len(pricer.action_to_steps), 20))
+        self.assertTrue(np.any(np.count_nonzero(features[:, 2:7], axis=1) > 1))
+
+    def test_pricer_execution_snapshot_is_transactional(self):
+        keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
+        pricer = FirmRLPricer(seed=4, opt_keys=keys)
+        pricer._last_applied_action = 7
+        pricer._repeat_action_count = 3
+        pricer._last_action_target = "base_fare+booking_fee"
+        pricer.agent.action_ever_feasible[:] = True
+        snapshot = pricer.snapshot_execution_state()
+
+        pricer.reset_state_history()
+        pricer.agent.action_ever_feasible[:] = False
+        pricer.restore_execution_state(snapshot)
+
+        self.assertEqual(pricer._last_applied_action, 7)
+        self.assertEqual(pricer._repeat_action_count, 3)
+        self.assertEqual(pricer._last_action_target, "base_fare+booking_fee")
+        self.assertTrue(np.all(pricer.agent.action_ever_feasible))
+
     @staticmethod
     def _diagnostic_core(action_direction=0, zero_effect=False, saturated=False):
         core = Core.__new__(Core)
@@ -35,6 +98,10 @@ class CorePPOFixRegressionTests(unittest.TestCase):
         )
         core.constraint_config = ConstraintConfig(target_gap=1.0, overall_tolerance=0.4)
         core.positive_reward_model = PositiveBusinessReward(PositiveRewardConfig())
+        core.long_term_profit_reward_config = LongTermProfitRewardConfig()
+        core.long_term_profit_reward_model = LongTermProfitReward(
+            core.long_term_profit_reward_config
+        )
         core.soft_constraints = SoftConstraintController(core.constraint_config)
         core.action_stability = ActionStabilityTracker(core.constraint_config)
         observer = PlatformObservationModel(1, core.observation_config)
@@ -90,6 +157,46 @@ class CorePPOFixRegressionTests(unittest.TestCase):
             **{**common, "rev_per_request": 16.0, "profit_per_request": 5.0, "completed_share": 0.40}
         )
         self.assertGreater(stronger["reward"], hold["reward"])
+
+    def test_checkpoint_score_selects_profit_not_proxy_kpis(self):
+        core = self._diagnostic_core()
+        feasible = {name: 0.0 for name in core.soft_constraints.names}
+        first = core._validation_score_from_metrics(
+            reward=-1.0,
+            share=0.05,
+            revpr=100.0,
+            profitpr=3.0,
+            fulfillment=0.2,
+            gap=-20.0,
+            rival_profitpr=2.0,
+            constraint_costs=feasible,
+        )
+        second = core._validation_score_from_metrics(
+            reward=1.0,
+            share=0.95,
+            revpr=1.0,
+            profitpr=3.0,
+            fulfillment=1.0,
+            gap=20.0,
+            rival_profitpr=2.0,
+            constraint_costs=feasible,
+        )
+
+        self.assertAlmostEqual(first, 3.1)
+        self.assertAlmostEqual(second, first)
+
+    def test_convergence_statistics_filter_stationary_market_noise(self):
+        rewards = [0.5 + (0.10 if index % 2 else -0.10) for index in range(100)]
+
+        count, reward_std, reward_delta = Core._smoothed_convergence_statistics(
+            rewards,
+            window=60,
+            smoothing=20,
+        )
+
+        self.assertEqual(count, 60)
+        self.assertLess(reward_std, 1e-12)
+        self.assertLess(reward_delta, 1e-12)
 
     def test_bound_saturated_actions_are_marked_infeasible(self):
         pricer = FirmRLPricer.__new__(FirmRLPricer)

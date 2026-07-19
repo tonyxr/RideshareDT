@@ -206,6 +206,9 @@ class Transition:
     a: torch.Tensor
     r: float
     done: bool
+    truncated: bool
+    discount: float
+    duration: int
     old_logp: torch.Tensor
     old_value: torch.Tensor
     magnitude: torch.Tensor
@@ -217,6 +220,9 @@ class Transition:
     action_mask: torch.Tensor
     old_constraint_values: torch.Tensor
     old_risk_value: torch.Tensor
+    next_value_override: torch.Tensor
+    next_constraint_values_override: torch.Tensor
+    next_risk_value_override: torch.Tensor
 
 class PPOAgent:
     def __init__(
@@ -567,24 +573,57 @@ class PPOAgent:
         return dist.log_prob(raw) - log_abs_det
     
     def adapt_entropy(self, progress: float, reward_converged: bool) -> None:
-        """Keep exploration high early, then tighten as training converges."""
+        """Keep policy entropy alive until external validation has converged.
+
+        Elapsed training time is not evidence that a pricing policy is good.  In
+        particular, a fixed tariff can produce a low-variance reward trace while
+        being exploitable by an adaptive rival.  The caller's
+        ``reward_converged`` flag therefore remains the only signal allowed to
+        release the non-converged entropy floor.
+        """
         p = float(np.clip(progress, 0.0, 1.0))
         if p <= 0.35 and not reward_converged:
             self.ent_coeff = float(max(self.ent_coeff, 0.65 * self.max_ent_coeff))
+            curriculum_floor = 0.65 * self.max_ent_coeff
+            self.adaptive_entropy_floor = (
+                max(self.adaptive_entropy_floor, curriculum_floor)
+                if self.rescue_active
+                else curriculum_floor
+            )
+            self._apply_control_floors()
             return
 
         if p <= 0.55 and not reward_converged:
             self.ent_coeff = float(max(self.ent_coeff, 0.40 * self.max_ent_coeff))
+            curriculum_floor = 0.40 * self.max_ent_coeff
+            self.adaptive_entropy_floor = (
+                max(self.adaptive_entropy_floor, curriculum_floor)
+                if self.rescue_active
+                else curriculum_floor
+            )
+            self._apply_control_floors()
             return
 
-        # The driver-supply environment is non-stationary and high variance, so
-        # keep enough exploration early but decay more decisively after the
-        # policy has seen a representative warmup window.  Persistently high
-        # entropy was preventing convergence in longer driver-enabled runs.
         target = self.min_ent_coeff + (self.max_ent_coeff - self.min_ent_coeff) * max(0.0, 1.0 - p) ** 1.5
         if reward_converged:
             target = max(self.min_ent_coeff, 0.75 * target)
-        self.ent_coeff = float(np.clip(min(self.ent_coeff, target), self.min_ent_coeff, self.max_ent_coeff))
+            if not self.rescue_active:
+                self.adaptive_entropy_floor = self.min_ent_coeff
+        else:
+            # Non-stationary competition needs a persistent capacity to switch
+            # strategy.  This is deliberately below the early curriculum floor
+            # but well above the near-deterministic consolidation setting.
+            target = max(target, 0.35 * self.max_ent_coeff)
+            curriculum_floor = 0.35 * self.max_ent_coeff
+            self.adaptive_entropy_floor = (
+                max(self.adaptive_entropy_floor, curriculum_floor)
+                if self.rescue_active
+                else curriculum_floor
+            )
+        self.ent_coeff = float(
+            np.clip(min(self.ent_coeff, target), self.min_ent_coeff, self.max_ent_coeff)
+        )
+        self._apply_control_floors()
     
     def adapt_optimization(self, progress: float, reward_converged: bool) -> None:
         """Apply an exploration-first schedule for PPO updates.
@@ -679,7 +718,7 @@ class PPOAgent:
     ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         s = torch.tensor(s_np, dtype=torch.float32, device=self.device).unsqueeze(0)
         s = torch.nan_to_num(s, nan=0.0, posinf=1e3, neginf=-1e3)
-        expected_dim = self.net.trunk[0].in_features
+        expected_dim = self.net.single_state_dim * self.net.frame_stack
         if s.shape[-1] != expected_dim:
             raise ValueError(f"State dim mismatch: got {s.shape[-1]}, expected {expected_dim}")
         
@@ -785,6 +824,12 @@ class PPOAgent:
         response_target: Optional[np.ndarray | List[float] | Tuple[float, ...] | torch.Tensor] = None,
         action_features: Optional[np.ndarray | List[List[float]] | torch.Tensor] = None,
         action_mask: Optional[np.ndarray | List[bool] | torch.Tensor] = None,
+        discount: Optional[float] = None,
+        duration: int = 1,
+        truncated: bool = False,
+        next_value: Optional[torch.Tensor | float] = None,
+        next_constraint_values: Optional[torch.Tensor | np.ndarray] = None,
+        next_risk_value: Optional[torch.Tensor | float] = None,
     ) -> None:
         del s_next
         if constraint_costs is None:
@@ -825,6 +870,35 @@ class PPOAgent:
         
         action_feature_tensor = torch.nan_to_num(action_feature_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
         action_mask_tensor = self._coerce_action_mask(action_mask, torch.zeros(self.action_dim, device=self.device)).reshape(-1)
+        transition_duration = int(max(1, duration))
+        transition_discount = float(
+            self.gamma ** transition_duration if discount is None else discount
+        )
+        if not np.isfinite(transition_discount) or transition_discount < 0.0 or transition_discount > 1.0:
+            raise ValueError(f"transition discount must be finite and in [0, 1], got {transition_discount}")
+        next_value_tensor = torch.as_tensor(
+            float("nan") if next_value is None else next_value,
+            dtype=torch.float32,
+            device=self.device,
+        ).reshape(())
+        if next_constraint_values is None:
+            next_constraint_tensor = torch.full(
+                (self.constraint_dim,), float("nan"), dtype=torch.float32, device=self.device
+            )
+        else:
+            next_constraint_tensor = torch.as_tensor(
+                next_constraint_values, dtype=torch.float32, device=self.device
+            ).reshape(-1)
+            if next_constraint_tensor.numel() != self.constraint_dim:
+                raise ValueError(
+                    "next constraint value override width "
+                    f"{next_constraint_tensor.numel()} != {self.constraint_dim}"
+                )
+        next_risk_tensor = torch.as_tensor(
+            float("nan") if next_risk_value is None else next_risk_value,
+            dtype=torch.float32,
+            device=self.device,
+        ).reshape(())
         
         self.buf.append(
             Transition(
@@ -832,6 +906,9 @@ class PPOAgent:
                 a=torch.tensor(a, dtype=torch.long, device=self.device),
                 r=float(r),
                 done=bool(done),
+                truncated=bool(truncated),
+                discount=transition_discount,
+                duration=transition_duration,
                 old_logp=old_logp.detach(),
                 old_value=old_value.detach(),
                 magnitude=torch.tensor(float(getattr(self, "last_continuous_magnitude", 0.0)), dtype=torch.float32, device=self.device),
@@ -845,6 +922,9 @@ class PPOAgent:
                 action_mask=action_mask_tensor.detach(),
                 old_constraint_values=self.last_constraint_values.detach().clone(),
                 old_risk_value=self.last_risk_value.detach().clone(),
+                next_value_override=next_value_tensor.detach(),
+                next_constraint_values_override=next_constraint_tensor.detach(),
+                next_risk_value_override=next_risk_tensor.detach(),
             )
         )
     
@@ -890,25 +970,75 @@ class PPOAgent:
         dones: torch.Tensor,
         bootstrap_value: Optional[torch.Tensor | float] = None,
         normalize_advantage: bool = True,
+        discounts: Optional[torch.Tensor] = None,
+        truncations: Optional[torch.Tensor] = None,
+        next_value_overrides: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generalized advantage estimation for reward, constraint, or risk streams."""
+        """Semi-MDP generalized advantage estimation.
+
+        A stored transition may represent several operational timesteps under
+        one held tariff. ``discounts[t]`` is therefore :math:`gamma^tau`, not
+        necessarily one-step gamma. Time-limit truncations bootstrap from the
+        final observation but stop the GAE trace so it cannot leak into the
+        next curriculum episode.
+        """
         t_size = rewards.numel()
         adv = torch.zeros(t_size, dtype=torch.float32, device=self.device)
         ret = torch.zeros(t_size, dtype=torch.float32, device=self.device)
 
         gae = torch.zeros((), dtype=torch.float32, device=self.device)
-        next_v = torch.as_tensor(
+        rollout_bootstrap = torch.as_tensor(
             0.0 if bootstrap_value is None else bootstrap_value,
             dtype=torch.float32,
             device=self.device,
         ).reshape(())
+        if discounts is None:
+            discounts = torch.full(
+                (t_size,), float(self.gamma), dtype=torch.float32, device=self.device
+            )
+        else:
+            discounts = torch.as_tensor(discounts, dtype=torch.float32, device=self.device).reshape(-1)
+        if truncations is None:
+            truncations = torch.zeros(t_size, dtype=torch.float32, device=self.device)
+        else:
+            truncations = torch.as_tensor(
+                truncations, dtype=torch.float32, device=self.device
+            ).reshape(-1)
+        if next_value_overrides is None:
+            next_value_overrides = torch.full(
+                (t_size,), float("nan"), dtype=torch.float32, device=self.device
+            )
+        else:
+            next_value_overrides = torch.as_tensor(
+                next_value_overrides, dtype=torch.float32, device=self.device
+            ).reshape(-1)
+        if not (
+            discounts.numel() == truncations.numel() == next_value_overrides.numel() == t_size
+        ):
+            raise ValueError("semi-MDP GAE metadata must match reward length")
         for t in reversed(range(t_size)):
-            continuation = 1.0 - float(dones[t].item())
-            delta = rewards[t] + self.gamma * next_v * continuation - old_values[t]
-            gae = delta + self.gamma * self.lam * continuation * gae
+            terminal = float(dones[t].item())
+            truncated = float(truncations[t].item())
+            if torch.isfinite(next_value_overrides[t]):
+                next_v = next_value_overrides[t]
+            elif t == t_size - 1:
+                next_v = rollout_bootstrap
+            else:
+                next_v = old_values[t + 1]
+            step_discount = discounts[t]
+            bootstrap_continuation = 1.0 - terminal
+            trace_continuation = max(0.0, 1.0 - terminal - truncated)
+            delta = (
+                rewards[t]
+                + step_discount * next_v * bootstrap_continuation
+                - old_values[t]
+            )
+            gae = (
+                delta
+                + step_discount * self.lam * trace_continuation * gae
+            )
             adv[t] = gae
             ret[t] = adv[t] + old_values[t]
-            next_v = old_values[t]
 
         if normalize_advantage:
             adv_mean = adv.mean()
@@ -958,6 +1088,15 @@ class PPOAgent:
 
         reward_all = torch.tensor([tr.r for tr in self.buf], dtype=torch.float32, device=self.device)
         done_all = torch.tensor([float(tr.done) for tr in self.buf], dtype=torch.float32, device=self.device)
+        truncated_all = torch.tensor(
+            [float(tr.truncated) for tr in self.buf], dtype=torch.float32, device=self.device
+        )
+        discount_all = torch.tensor(
+            [tr.discount for tr in self.buf], dtype=torch.float32, device=self.device
+        )
+        next_reward_values_all = torch.stack(
+            [tr.next_value_override for tr in self.buf], dim=0
+        ).detach()
         credited_reward_all = self._delayed_reward_credit(reward_all, done_all)
         old_reward_values_all = torch.stack([tr.old_value for tr in self.buf], dim=0).detach()
         old_reward_values_all = torch.nan_to_num(old_reward_values_all, nan=0.0, posinf=0.0, neginf=0.0)
@@ -967,9 +1106,15 @@ class PPOAgent:
             done_all,
             bootstrap_value=bootstrap_value,
             normalize_advantage=False,
+            discounts=discount_all,
+            truncations=truncated_all,
+            next_value_overrides=next_reward_values_all,
         )
         constraint_costs_all = torch.stack([tr.constraint_costs for tr in self.buf], dim=0).detach()
         old_constraint_values_all = torch.stack([tr.old_constraint_values for tr in self.buf], dim=0).detach()
+        next_constraint_values_all = torch.stack(
+            [tr.next_constraint_values_override for tr in self.buf], dim=0
+        ).detach()
         constraint_adv_cols = []
         constraint_ret_cols = []
         for k in range(self.constraint_dim):
@@ -984,6 +1129,9 @@ class PPOAgent:
                 done_all,
                 bootstrap_value=constraint_bootstrap_k,
                 normalize_advantage=False,
+                discounts=discount_all,
+                truncations=truncated_all,
+                next_value_overrides=next_constraint_values_all[:, k],
             )
             constraint_adv_cols.append(adv_k)
             constraint_ret_cols.append(ret_k)
@@ -991,12 +1139,18 @@ class PPOAgent:
         constraint_ret_all = torch.stack(constraint_ret_cols, dim=1)
         risk_cost_all = torch.tensor([tr.risk_cost for tr in self.buf], dtype=torch.float32, device=self.device)
         old_risk_value_all = torch.stack([tr.old_risk_value for tr in self.buf], dim=0).detach()
+        next_risk_values_all = torch.stack(
+            [tr.next_risk_value_override for tr in self.buf], dim=0
+        ).detach()
         risk_adv_all, risk_ret_all = self._gae_scalar(
             risk_cost_all,
             old_risk_value_all,
             done_all,
             bootstrap_value=bootstrap_risk_value,
             normalize_advantage=False,
+            discounts=discount_all,
+            truncations=truncated_all,
+            next_value_overrides=next_risk_values_all,
         )
         response_target_all = torch.stack([tr.response_target for tr in self.buf], dim=0).detach()
         action_feature_items = [tr.action_features for tr in self.buf]
@@ -1074,9 +1228,15 @@ class PPOAgent:
         raw_policy_fixed = bool(
             n >= 8
             and (
-                (raw_argmax_concentration >= 0.85 and state_action_sensitivity <= 0.020)
-                or raw_hold_probability >= 0.82
-                or raw_entropy_fraction <= 0.10
+                (
+                    raw_argmax_concentration >= 0.95
+                    and state_action_sensitivity <= 0.005
+                    and state_action_mi <= 0.002
+                )
+                or (
+                    raw_entropy_fraction <= 0.03
+                    and state_action_sensitivity <= 0.005
+                )
             )
         )
         if raw_policy_fixed:
@@ -1304,6 +1464,11 @@ class PPOAgent:
         last["rollout_reward_std"] = float(torch.std(reward_all, unbiased=False).item()) if reward_all.numel() > 1 else 0.0
         last["credited_reward_std"] = float(torch.std(credited_reward_all, unbiased=False).item()) if credited_reward_all.numel() > 1 else 0.0
         last["delayed_reward_blend"] = float(self.delayed_reward_blend)
+        last["transition_duration_mean"] = float(
+            np.mean([tr.duration for tr in self.buf])
+        )
+        last["transition_discount_mean"] = float(discount_all.mean().item())
+        last["truncation_count"] = int(truncated_all.sum().item())
         last["continuous_magnitude_mean"] = float(torch.mean(magnitude_all).item()) if magnitude_all.numel() > 0 else 0.0
         last["continuous_magnitude_std"] = float(torch.std(magnitude_all, unbiased=False).item()) if magnitude_all.numel() > 1 else 0.0
         # Preserve exploration when a rollout contains too little action contrast
@@ -1352,9 +1517,9 @@ class PPOAgent:
 
         recovered_from_fixation = bool(
             not raw_policy_fixed
-            and raw_argmax_concentration < 0.72
-            and state_action_sensitivity > 0.015
-            and raw_entropy_fraction > 0.20
+            and raw_argmax_concentration < 0.90
+            and state_action_sensitivity > 0.005
+            and raw_entropy_fraction > 0.08
         )
         self._advance_collapse_rescue(recovered_from_fixation)
         self._apply_control_floors()

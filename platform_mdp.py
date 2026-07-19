@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-"""Platform-facing MDP and constrained-control primitives.
+"""Platform-facing POMDP and constrained-control primitives.
 
-This module deliberately sits *outside* the market simulator.  The simulator may
-retain complete ground truth, while a firm receives only operational telemetry
-and noisy/delayed competitor quote probes that a real ride-hailing platform
-could plausibly collect.  Reward is non-negative business utility.  Gap,
-service, margin, and intervention stability are separate soft costs used by a
-constrained optimizer; no action identity is rewarded or penalized directly.
+The simulator may retain complete ground truth, while a firm receives only
+operational telemetry and noisy/delayed competitor quote probes.  The active
+objective is discounted long-run contribution profit with a small competitive
+profit term.  Service feasibility, waiting time, margin, and intervention
+stability remain genuine CMDP constraints.  Public fare gaps are observations
+and diagnostics, not targets the policy is paid or constrained to reproduce.
 """
 
 from collections import deque
@@ -89,6 +89,99 @@ class PositiveRewardConfig:
 
 
 @dataclass(frozen=True)
+class LongTermProfitRewardConfig:
+    """Stationary per-period utility used by the long-run pricing policy.
+
+    ``profit_per_request`` is contribution profit divided by *all incoming
+    requests*, so it already incorporates price, conversion, fulfillment,
+    variable cost, and demand volume.  ``asinh`` preserves the sign and remains
+    approximately linear around zero while preventing rare market shocks from
+    dominating a PPO rollout.
+    """
+
+    own_profit_scale: float = 4.0
+    profit_advantage_scale: float = 2.0
+    own_profit_weight: float = 0.90
+    profit_advantage_weight: float = 0.10
+    intervention_cost_weight: float = 0.01
+    reversal_cost_weight: float = 0.005
+    minimum_reward: float = -2.0
+    maximum_reward: float = 2.0
+
+    def __post_init__(self) -> None:
+        values = np.asarray(
+            [
+                self.own_profit_scale,
+                self.profit_advantage_scale,
+                self.own_profit_weight,
+                self.profit_advantage_weight,
+                self.intervention_cost_weight,
+                self.reversal_cost_weight,
+                self.minimum_reward,
+                self.maximum_reward,
+            ],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(values)):
+            raise ValueError("long-term profit reward configuration must be finite")
+        if self.own_profit_scale <= 0.0 or self.profit_advantage_scale <= 0.0:
+            raise ValueError("long-term profit reward scales must be positive")
+        if self.own_profit_weight < 0.0 or self.profit_advantage_weight < 0.0:
+            raise ValueError("long-term profit reward weights must be non-negative")
+        if self.intervention_cost_weight < 0.0 or self.reversal_cost_weight < 0.0:
+            raise ValueError("long-term profit action costs must be non-negative")
+        if self.minimum_reward >= self.maximum_reward:
+            raise ValueError("minimum_reward must be smaller than maximum_reward")
+
+
+class LongTermProfitReward:
+    """Compute the action-neutral economic reward used by PPO."""
+
+    def __init__(self, config: Optional[LongTermProfitRewardConfig] = None) -> None:
+        self.config = config or LongTermProfitRewardConfig()
+
+    def compute(
+        self,
+        *,
+        own_profit_per_request: float,
+        rival_profit_per_request: float,
+        intervention_magnitude: float = 0.0,
+        reversal: float = 0.0,
+    ) -> Dict[str, float]:
+        c = self.config
+        own_profit = float(np.nan_to_num(own_profit_per_request, nan=0.0))
+        rival_profit = float(np.nan_to_num(rival_profit_per_request, nan=0.0))
+        intervention = float(np.clip(intervention_magnitude, 0.0, 1.0))
+        reversal_flag = float(np.clip(reversal, 0.0, 1.0))
+        own_utility = float(np.arcsinh(own_profit / c.own_profit_scale))
+        advantage_utility = float(
+            np.arcsinh((own_profit - rival_profit) / c.profit_advantage_scale)
+        )
+        own_component = float(c.own_profit_weight * own_utility)
+        advantage_component = float(c.profit_advantage_weight * advantage_utility)
+        intervention_cost = float(c.intervention_cost_weight * intervention)
+        reversal_cost = float(c.reversal_cost_weight * reversal_flag)
+        raw_reward = own_component + advantage_component - intervention_cost - reversal_cost
+        reward = float(np.clip(raw_reward, c.minimum_reward, c.maximum_reward))
+        return {
+            "reward": reward,
+            "reward_raw": raw_reward,
+            "reward_base": own_component,
+            "reward_own_profit_utility": own_utility,
+            "reward_profit_advantage_utility": advantage_utility,
+            "reward_own_profit_component": own_component,
+            "reward_profit_advantage_component": advantage_component,
+            "reward_intervention_cost": intervention_cost,
+            "reward_reversal_cost": reversal_cost,
+            "reward_intervention_magnitude": intervention,
+            "reward_reversal_indicator": reversal_flag,
+            "reward_profit_per_request": own_profit,
+            "reward_rival_profit_per_request": rival_profit,
+            "reward_profit_advantage_per_request": own_profit - rival_profit,
+        }
+
+
+@dataclass(frozen=True)
 class ConstraintConfig:
     target_gap: float = 0.75
     overall_tolerance: float = 0.45
@@ -106,11 +199,9 @@ class ConstraintConfig:
     multiplier_lr: float = 0.035
     multiplier_max: float = 1.5
     cost_ema_alpha: float = 0.10
-    cost_budgets: Tuple[float, ...] = (
-        0.01, 0.01,  # aggregate overprice / underprice
-        0.02, 0.02, 0.025, 0.03,  # distance segments
-        0.01, 0.01, 0.01, 0.03,  # fulfillment, wait, margin, oscillation
-    )
+    # Only operational feasibility is optimized as a constraint.  Fare-gap
+    # channels remain available in diagnostics and the observation model.
+    cost_budgets: Tuple[float, ...] = (0.01, 0.01, 0.01, 0.03)
 
 
 @dataclass(frozen=True)
@@ -581,6 +672,9 @@ class ActionStabilityTracker:
         self.last_target = "hold"
         self.last_direction = 0
         self.steps_since_intervention = self.config.reversal_horizon + 1
+        self.decision_index = 0
+        self.last_direction_by_target: Dict[str, int] = {}
+        self.last_decision_by_target: Dict[str, int] = {}
         self.last_reversal = 0.0
         self.last_cost = 0.0
 
@@ -590,6 +684,9 @@ class ActionStabilityTracker:
             "last_target": self.last_target,
             "last_direction": self.last_direction,
             "steps_since_intervention": self.steps_since_intervention,
+            "decision_index": self.decision_index,
+            "last_direction_by_target": dict(self.last_direction_by_target),
+            "last_decision_by_target": dict(self.last_decision_by_target),
             "last_reversal": self.last_reversal,
             "last_cost": self.last_cost,
         }
@@ -602,6 +699,15 @@ class ActionStabilityTracker:
         self.last_target = str(snapshot.get("last_target", "hold"))
         self.last_direction = int(snapshot.get("last_direction", 0))
         self.steps_since_intervention = int(snapshot.get("steps_since_intervention", self.config.reversal_horizon + 1))
+        self.decision_index = int(snapshot.get("decision_index", 0))
+        self.last_direction_by_target = {
+            str(k): int(v)
+            for k, v in dict(snapshot.get("last_direction_by_target", {})).items()
+        }
+        self.last_decision_by_target = {
+            str(k): int(v)
+            for k, v in dict(snapshot.get("last_decision_by_target", {})).items()
+        }
         self.last_reversal = float(snapshot.get("last_reversal", 0.0))
         self.last_cost = float(snapshot.get("last_cost", 0.0))
 
@@ -610,7 +716,14 @@ class ActionStabilityTracker:
         x = max(0.0, float(excess))
         return float(1.0 - np.exp(-x / max(1e-6, softness)))
 
-    def record(self, *, action_event: bool, target: str, direction: int) -> float:
+    def record(
+        self,
+        *,
+        action_event: bool,
+        target: str,
+        direction: int,
+        directions: Optional[Mapping[str, int]] = None,
+    ) -> float:
         self.steps_since_intervention += 1
         if not action_event:
             self.last_reversal = 0.0
@@ -623,14 +736,31 @@ class ActionStabilityTracker:
                 )
             )
             return self.last_cost
-        non_hold = int(direction != 0 and str(target) != "hold")
+        self.decision_index += 1
+        coefficient_directions = {
+            str(key): int(np.sign(value))
+            for key, value in dict(directions or {}).items()
+            if int(np.sign(value)) != 0
+        }
+        if not coefficient_directions and direction != 0 and str(target) != "hold":
+            coefficient_directions = {str(target): int(np.sign(direction))}
+        non_hold = int(bool(coefficient_directions))
         self.recent_interventions.append(non_hold)
-        reversal = float(
-            non_hold
-            and self.last_target == str(target)
-            and self.last_direction == -int(direction)
-            and self.steps_since_intervention <= self.config.reversal_horizon
-        )
+        reversal = 0.0
+        for coefficient, current_direction in coefficient_directions.items():
+            previous_direction = int(self.last_direction_by_target.get(coefficient, 0))
+            previous_decision = int(
+                self.last_decision_by_target.get(
+                    coefficient, -self.config.reversal_horizon - 1
+                )
+            )
+            if (
+                previous_direction == -current_direction
+                and self.decision_index - previous_decision <= self.config.reversal_horizon
+            ):
+                reversal = 1.0
+            self.last_direction_by_target[coefficient] = current_direction
+            self.last_decision_by_target[coefficient] = self.decision_index
         if non_hold:
             self.last_target = str(target)
             self.last_direction = int(direction)
@@ -662,7 +792,7 @@ class ActionStabilityTracker:
 
 
 class SoftConstraintController:
-    names: Tuple[str, ...] = (
+    diagnostic_names: Tuple[str, ...] = (
         "gap_overprice",
         "gap_underprice",
         "gap_0_2",
@@ -674,6 +804,7 @@ class SoftConstraintController:
         "margin",
         "oscillation",
     )
+    names: Tuple[str, ...] = ("fulfillment", "wait", "margin", "oscillation")
 
     def __init__(self, config: Optional[ConstraintConfig] = None) -> None:
         self.config = config or ConstraintConfig()
@@ -749,11 +880,20 @@ class SoftConstraintController:
 
     def diagnostics(self, costs: Mapping[str, float]) -> Dict[str, float]:
         result: Dict[str, float] = {}
-        for index, name in enumerate(self.names):
+        active_index = {name: index for index, name in enumerate(self.names)}
+        for name in self.diagnostic_names:
             result[f"constraint_cost_{name}"] = float(costs.get(name, 0.0))
-            result[f"constraint_lambda_{name}"] = float(self.lambdas[index])
-            result[f"constraint_cost_ema_{name}"] = float(self.cost_ema[index])
-            result[f"constraint_budget_{name}"] = float(self.config.cost_budgets[index])
+            if name in active_index:
+                index = active_index[name]
+                result[f"constraint_lambda_{name}"] = float(self.lambdas[index])
+                result[f"constraint_cost_ema_{name}"] = float(self.cost_ema[index])
+                result[f"constraint_budget_{name}"] = float(self.config.cost_budgets[index])
+                result[f"constraint_active_{name}"] = 1.0
+            else:
+                result[f"constraint_lambda_{name}"] = 0.0
+                result[f"constraint_cost_ema_{name}"] = 0.0
+                result[f"constraint_budget_{name}"] = 0.0
+                result[f"constraint_active_{name}"] = 0.0
         return result
 
 
@@ -762,10 +902,17 @@ def config_payload(
     reward: PositiveRewardConfig,
     constraints: ConstraintConfig,
     stages: TrainingStageScheduler,
+    long_term_reward: Optional[LongTermProfitRewardConfig] = None,
 ) -> Dict[str, Any]:
     return {
         "observation": asdict(observation),
+        "active_reward": {
+            "type": "discounted_long_term_contribution_profit",
+            **asdict(long_term_reward or LongTermProfitRewardConfig()),
+        },
         "positive_reward": asdict(reward),
         "constraints": asdict(constraints),
+        "active_constraint_names": list(SoftConstraintController.names),
+        "diagnostic_constraint_names": list(SoftConstraintController.diagnostic_names),
         "training_curriculum": stages.as_dict(),
     }
