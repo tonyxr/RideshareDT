@@ -11,7 +11,7 @@ Firm2: Heuristic dynamic pricing (schedule + competitive response + guardrails)
 """
 
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 import copy
 import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
 import numpy as np
@@ -1179,6 +1179,7 @@ class FirmRLPricer:
         action_feature_dim: int = 20,
         constraint_dim: int = 5,
         response_dim: int = 12,
+        feature_groups: Optional[Dict[str, Sequence[int]]] = None,
         gamma: float = 0.995,
         gae_lambda: float = 0.97,
     ):
@@ -1263,7 +1264,7 @@ class FirmRLPricer:
             ent_coeff=0.010,
             min_ent_coeff=0.0005,
             ent_decay=0.992,
-            target_kl=0.030,
+            target_kl=0.020,
             max_lr=6.0e-4,
             value_clip_eps=0.30,
             initial_exploration_rate=0.20,
@@ -1271,8 +1272,14 @@ class FirmRLPricer:
             action_feature_dim=self.action_feature_dim,
             constraint_dim=int(max(1, constraint_dim)),
             response_dim=int(max(1, response_dim)),
-            action_q_coeff=0.10,
-            response_coeff=0.12,
+            # PPO's GAE requires a state-value critic.  A second chosen-action
+            # Monte-Carlo Q regressor shared the critic trunk and supplied a
+            # conflicting target under changing opponents.
+            action_q_coeff=0.0,
+            # Response prediction is trained by an isolated auxiliary
+            # optimizer.  It validates the inferred opponent latent but cannot
+            # directly reshape the PPO policy gradient.
+            response_coeff=0.10,
             # The Core training loop now records the exact discounted return for
             # each held pricing decision.  A second future-reward redistribution
             # would double count the same delayed outcomes.
@@ -1280,12 +1287,11 @@ class FirmRLPricer:
             delayed_reward_blend=0.0,
             single_state_dim=self.single_state_dim,
             frame_stack=self.state_frame_stack,
-            state_action_mi_coeff=0.025,
-            collapse_rescue_updates=8,
+            state_action_mi_coeff=0.0,
+            feature_groups=feature_groups,
             exploration_fraction=0.65,
             exploration_warmup_fraction=0.10,
             min_action_visits=1,
-            exploration_rescue_rate=0.08,
         )
         
     def observe_state(self, state_features: np.ndarray, action_features: Optional[np.ndarray] = None) -> None:
@@ -1565,20 +1571,6 @@ class FirmRLPricer:
             reward_converged=stable,
             reward_std=reward_std,
         )
-        if not stable:
-            # Time-based curriculum progress must never be sufficient to turn a
-            # still-undominated policy deterministic.  These health floors are
-            # lower than the collapse-rescue settings, so a detected fixation
-            # continues to receive the stronger intervention.
-            self.agent.adaptive_exploration_floor = max(
-                self.agent.adaptive_exploration_floor,
-                0.04,
-            )
-            self.agent.adaptive_entropy_floor = max(
-                self.agent.adaptive_entropy_floor,
-                0.35 * self.agent.max_ent_coeff,
-            )
-            self.agent._apply_control_floors()
     
     @staticmethod
     def _bounded_relative_move(value: float, anchor: float, max_relative_dev: float, lb: float, ub: float) -> float:

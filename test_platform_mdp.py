@@ -132,10 +132,11 @@ class PlatformMDPTests(unittest.TestCase):
             oscillation_cost=0.0,
         )
         self.assertGreater(costs["gap_overprice"], 0.0)
-        self.assertEqual(len(controller.vector(costs)), 4)
+        self.assertEqual(len(controller.vector(costs)), 3)
         diagnostics = controller.diagnostics(costs)
         self.assertEqual(diagnostics["constraint_active_gap_overprice"], 0.0)
         self.assertEqual(diagnostics["constraint_active_margin"], 1.0)
+        self.assertEqual(diagnostics["constraint_active_oscillation"], 0.0)
 
     def test_long_term_profit_reward_has_exact_economic_decomposition(self):
         model = LongTermProfitReward(LongTermProfitRewardConfig())
@@ -146,14 +147,94 @@ class PlatformMDPTests(unittest.TestCase):
             reversal=1.0,
         )
         expected = (
-            0.90 * np.arcsinh(1.0)
-            + 0.10 * np.arcsinh(1.0)
-            - 0.01 * 0.4
-            - 0.005
+            np.arcsinh(1.0)
+            + 0.10
+            * (1.0 - np.exp(-1.0))
+            * np.tanh(2.0 / 2.5)
         )
         self.assertAlmostEqual(result["reward_raw"], expected)
         self.assertAlmostEqual(result["reward"], expected)
+        self.assertAlmostEqual(
+            result["reward_base"],
+            result["reward_own_profit_component"]
+            + result["reward_profit_advantage_component"],
+        )
         self.assertGreater(result["reward_profit_advantage_component"], 0.0)
+        self.assertAlmostEqual(
+            result["reward_profit_quality_gate"],
+            1.0 - np.exp(-1.0),
+        )
+
+    def test_profitability_gate_prevents_destructive_dominance(self):
+        model = LongTermProfitReward()
+        destructive_win = model.compute(
+            own_profit_per_request=0.05,
+            rival_profit_per_request=-2.0,
+        )
+        profitable_parity = model.compute(
+            own_profit_per_request=4.0,
+            rival_profit_per_request=4.0,
+        )
+
+        self.assertGreater(
+            profitable_parity["reward"],
+            destructive_win["reward"],
+        )
+
+    def test_observation_exposes_public_opponent_quote_trends(self):
+        observer = PlatformObservationModel(
+            3,
+            ObservationConfig(
+                telemetry_delay_steps=0,
+                quote_probe_interval_steps=1,
+                quote_probe_delay_steps=0,
+                quote_noise_dollars=0.0,
+                quote_missing_probability=0.0,
+            ),
+        )
+        first_stats = {
+            f"distance_bin_{segment}_price_gap_mean": 0.5
+            for segment in ("0_2", "2_5", "5_10", "10_plus")
+        }
+        second_stats = {
+            f"distance_bin_{segment}_price_gap_mean": 1.5
+            for segment in ("0_2", "2_5", "5_10", "10_plus")
+        }
+        observer.ingest(
+            own_metrics=self._metrics(),
+            supply_metrics={},
+            crowd_stats=first_stats,
+        )
+        observer.ingest(
+            own_metrics=self._metrics(),
+            supply_metrics={},
+            crowd_stats=second_stats,
+        )
+        observation = observer.build_observation(
+            hour=8,
+            day_of_week=2,
+            weather="clear",
+            own_coefficients={
+                "base_fare": 3.0,
+                "per_minute": 0.3,
+                "per_mile": 1.8,
+                "booking_fee": 2.0,
+                "airport_fee": 5.0,
+            },
+            anchor_coefficients={
+                "base_fare": 3.0,
+                "per_minute": 0.3,
+                "per_mile": 1.8,
+                "booking_fee": 2.0,
+                "airport_fee": 5.0,
+            },
+        )
+
+        self.assertEqual(observation.shape, (81,))
+        np.testing.assert_allclose(
+            observation[[51, 55, 59, 63]],
+            np.full(4, 1.5 / observer.config.gap_scale_dollars),
+        )
 
     def test_long_term_profit_reward_does_not_depend_on_share_or_revenue(self):
         model = LongTermProfitReward()

@@ -182,8 +182,44 @@ class CorePPOFixRegressionTests(unittest.TestCase):
             constraint_costs=feasible,
         )
 
-        self.assertAlmostEqual(first, 3.1)
+        config = core.long_term_profit_reward_config
+        expected = (
+            config.own_profit_weight * 3.0
+            + config.profit_advantage_weight
+            * (1.0 - np.exp(-3.0 / config.dominance_quality_scale))
+            * config.profit_advantage_scale
+            * np.tanh(1.0 / config.profit_advantage_scale)
+        )
+        self.assertAlmostEqual(first, expected)
         self.assertAlmostEqual(second, first)
+
+    def test_checkpoint_score_ignores_non_objective_diagnostics(self):
+        core = self._diagnostic_core()
+        costs = {name: 0.0 for name in core.soft_constraints.names}
+        clean = core._validation_score_from_metrics(
+            reward=0.0,
+            share=0.0,
+            revpr=0.0,
+            profitpr=3.0,
+            fulfillment=1.0,
+            gap=0.0,
+            rival_profitpr=2.0,
+            constraint_costs=costs,
+        )
+        for name in costs:
+            costs[name] = 1.0
+        diagnosed = core._validation_score_from_metrics(
+            reward=0.0,
+            share=0.0,
+            revpr=0.0,
+            profitpr=3.0,
+            fulfillment=1.0,
+            gap=0.0,
+            rival_profitpr=2.0,
+            constraint_costs=costs,
+        )
+
+        self.assertAlmostEqual(diagnosed, clean)
 
     def test_convergence_statistics_filter_stationary_market_noise(self):
         rewards = [0.5 + (0.10 if index % 2 else -0.10) for index in range(100)]

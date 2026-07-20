@@ -391,11 +391,12 @@ class Core:
         positive_reward_completed_demand_weight: float = 0.20,
         positive_reward_service_weight: float = 0.20,
         long_term_profit_scale: float = 4.0,
-        long_term_profit_advantage_scale: float = 2.0,
-        long_term_profit_weight: float = 0.90,
+        long_term_profit_advantage_scale: float = 2.5,
+        long_term_profit_weight: float = 1.0,
         profit_dominance_weight: float = 0.10,
-        intervention_cost_weight: float = 0.01,
-        reversal_cost_weight: float = 0.005,
+        dominance_quality_scale: float = 4.0,
+        intervention_cost_weight: float = 0.0,
+        reversal_cost_weight: float = 0.0,
         ppo_gamma: float = 0.995,
         ppo_gae_lambda: float = 0.97,
         reward_share_weight: float = 0.40,
@@ -413,7 +414,7 @@ class Core:
         reward_underprice_weight: float = 0.15,
         reward_acceptable_discount: float = 2.00,
         min_profit_margin: float = 0.08,
-        reward_action_change_weight: float = 0.008,
+        reward_action_change_weight: float = 0.0,
         driver_cost_per_mile: float = 0.85,
         driver_cost_per_minute: float = 0.12,
         fixed_trip_cost: float = 1.25,
@@ -431,9 +432,9 @@ class Core:
         driver_reward_reject_weight: float = 0.0,
         driver_reward_unfulfilled_weight: float = 0.05,
         driver_reward_warmup_fraction: float = 0.60,
-        constrained_reward: bool = True,
+        constrained_reward: bool = False,
         constraint_lr: float = 0.03,
-        constraint_penalty_scale: float = 0.35,
+        constraint_penalty_scale: float = 0.10,
         constraint_curriculum_start_scale: float = 0.25,
         constraint_curriculum_mid_scale: float = 0.60,
         constraint_curriculum_end_scale: float = 1.00,
@@ -585,6 +586,7 @@ class Core:
             profit_advantage_scale=float(long_term_profit_advantage_scale),
             own_profit_weight=float(long_term_profit_weight),
             profit_advantage_weight=float(profit_dominance_weight),
+            dominance_quality_scale=float(dominance_quality_scale),
             intervention_cost_weight=float(intervention_cost_weight),
             reversal_cost_weight=float(reversal_cost_weight),
         )
@@ -632,6 +634,7 @@ class Core:
                 action_feature_dim=PlatformObservationModel.action_feature_dim,
                 constraint_dim=len(self.soft_constraints.names),
                 response_dim=12,
+                feature_groups=PlatformObservationModel.feature_groups(),
                 gamma=float(ppo_gamma),
                 gae_lambda=float(ppo_gae_lambda),
             )
@@ -807,8 +810,10 @@ class Core:
             f"own={self.long_term_profit_reward_config.own_profit_weight:.3f}"
             f"*asinh(profit/{self.long_term_profit_reward_config.own_profit_scale:.2f}) + "
             f"dominance={self.long_term_profit_reward_config.profit_advantage_weight:.3f}"
-            f"*asinh((profit-rival_profit)/"
-            f"{self.long_term_profit_reward_config.profit_advantage_scale:.2f}); "
+            f"*profit_quality*tanh((profit-rival_profit)/"
+            f"{self.long_term_profit_reward_config.profit_advantage_scale:.2f}), "
+            f"profit_quality=1-exp(-max(profit,0)/"
+            f"{self.long_term_profit_reward_config.dominance_quality_scale:.2f}); "
             f"intervention_cost={self.long_term_profit_reward_config.intervention_cost_weight:.4f}, "
             f"reversal_cost={self.long_term_profit_reward_config.reversal_cost_weight:.4f}, "
             f"gamma={self.firm1.agent.gamma if self.firm1_mode == 'RL' else float('nan'):.4f}, "
@@ -1192,7 +1197,6 @@ class Core:
                 float(reward_diag.get("constraint_cost_fulfillment", 0.0)),
                 float(reward_diag.get("constraint_cost_wait", 0.0)),
                 float(reward_diag.get("constraint_cost_margin", 0.0)),
-                float(reward_diag.get("constraint_cost_oscillation", 0.0)),
             ],
             dtype=float,
         )
@@ -1240,16 +1244,30 @@ class Core:
         """Push current Lagrange multipliers and risk weight into the PPO agent."""
         if self.firm1_mode != "RL" or not hasattr(getattr(self.firm1, "agent", None), "set_optimization_context"):
             return
+        if not self.constrained_reward:
+            self.firm1.agent.set_optimization_context(
+                np.zeros(len(self.soft_constraints.names), dtype=np.float32),
+                risk_coeff=0.0,
+                constraints_active=False,
+                risk_active=False,
+            )
+            return
         scale = float(getattr(self.current_training_stage, "constraint_scale", 1.0))
         lambdas = np.asarray(self.soft_constraints.lambdas, dtype=np.float32).copy()
-        # The four active channels are genuine operational feasibility
-        # constraints.  Cap their combined actor pressure so the CMDP cannot
-        # silently replace the stated profit objective.
-        operational_total = float(np.sum(lambdas))
-        if operational_total > 0.80:
-            lambdas *= 0.80 / operational_total
+        # Fulfillment, wait, and contribution margin are economic feasibility
+        # constraints. Tariff oscillation is an outcome diagnostic rather than
+        # a feasibility condition: charging it through the Lagrangian made
+        # "hold forever" the easiest way to reduce the actor loss.
+        for index, name in enumerate(self.soft_constraints.names):
+            if name == "oscillation":
+                lambdas[index] = 0.0
         lambdas *= scale
-        self.firm1.agent.set_optimization_context(lambdas, risk_coeff=0.12)
+        self.firm1.agent.set_optimization_context(
+            lambdas,
+            risk_coeff=float(self.constraint_penalty_scale * scale),
+            constraints_active=True,
+            risk_active=bool(self.constraint_penalty_scale * scale > 0.0),
+        )
 
     def _ppo_bootstrap_estimates(
         self,
@@ -1531,23 +1549,32 @@ class Core:
         rival_share: float = 0.0,
         constraint_costs: Optional[Dict[str, float]] = None,
     ) -> float:
-        """Profit-only checkpoint score with operational feasibility gates.
+        """Profit and profit-dominance checkpoint score.
 
         The score intentionally has no share, revenue, price-gap, or action
-        diversity term. Those quantities may explain profit but cannot change
-        which policy is selected.
+        diversity or feasibility penalty. Those quantities remain diagnostics
+        but cannot change which policy is selected.
         """
-        costs = constraint_costs or {}
-        values = np.asarray(
-            [float(np.clip(costs.get(name, 0.0), 0.0, 1.0)) for name in self.soft_constraints.names],
-            dtype=float,
+        config = self.long_term_profit_reward_config
+        profit_quality = float(
+            1.0
+            - np.exp(
+                -max(0.0, float(profitpr))
+                / config.dominance_quality_scale
+            )
         )
-        worst = float(np.max(values)) if values.size else 0.0
+        dominance_tie_breaker = float(
+            config.profit_advantage_scale
+            * np.tanh(
+                (float(profitpr) - float(rival_profitpr))
+                / config.profit_advantage_scale
+            )
+        )
         return float(
-            float(profitpr)
-            + 0.10 * (float(profitpr) - float(rival_profitpr))
-            - 5.0 * worst
-            - float(np.sum(values))
+            config.own_profit_weight * float(profitpr)
+            + config.profit_advantage_weight
+            * profit_quality
+            * dominance_tie_breaker
         )
 
     @staticmethod
@@ -2019,8 +2046,9 @@ class Core:
         Share, revenue, fare gaps, and one-step KPI improvements are deliberately
         excluded from the optimized scalar. They remain logged because they are
         useful explanations of *why* profit changed. Service feasibility,
-        waiting, margin, and oscillation are learned through separate constraint
-        critics rather than being mixed into the business objective.
+        waiting, and margin are learned through separate constraint critics
+        rather than being mixed into the business objective. Tariff oscillation
+        is logged but not optimized, so legitimate reactions are not suppressed.
         """
         profitpr = float(rev_per_request if profit_per_request is None else profit_per_request)
         margin = float(0.0 if profit_margin is None else profit_margin)
@@ -2623,7 +2651,7 @@ class Core:
         os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
         artifact = {
             "format": "ride-response-platform-policy",
-            "version": 4,
+            "version": 7,
             "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             "market_name": self.market_name,
             "opt_keys": list(self.shared_edit_keys),
@@ -2633,12 +2661,19 @@ class Core:
             "action_feature_dim": int(self.firm1.action_feature_dim),
             "constraint_names": list(self.soft_constraints.names),
             "response_dim": int(self.firm1.agent.response_dim),
+            "observation_feature_groups": {
+                name: [int(index) for index in indices]
+                for name, indices in PlatformObservationModel.feature_groups().items()
+            },
+            "city_context_keys": list(PlatformObservationModel.CITY_CONTEXT_KEYS),
+            "architecture": "hierarchical-public-history-city-context-ppo",
             "gamma": float(self.firm1.agent.gamma),
             "gae_lambda": float(self.firm1.agent.lam),
             "network_state": {
                 key: value.detach().cpu() for key, value in self.firm1.agent.net.state_dict().items()
             },
-            "optimizer_state": self.firm1.agent.opt.state_dict(),
+            "optimizer_state": self.firm1.agent.optimizer_state_dict(),
+            "normalizer_state": self.firm1.agent.normalizer_state_dict(),
             # Tariffs, opponent controller state, observation queues, and dual
             # variables are deliberately excluded.  The artifact is a policy,
             # not a terminal training-world snapshot.
@@ -2672,6 +2707,12 @@ class Core:
             artifact = torch.load(source, map_location=self.firm1.agent.device)
         if artifact.get("format") != "ride-response-platform-policy":
             raise ValueError(f"unsupported trained model artifact: {source}")
+        if int(artifact.get("version", 0)) < 7:
+            raise ValueError(
+                "trained model predates the version-7 public-history opponent encoder, "
+                "continuous city context, and isolated actor/critic/response design; "
+                "retrain the policy"
+            )
         expected = {
             "single_state_dim": int(self.firm1.single_state_dim),
             "state_frame_stack": int(self.firm1.state_frame_stack),
@@ -2686,14 +2727,38 @@ class Core:
             raise ValueError("trained model pricing keys do not match runtime pricing keys")
         if artifact.get("action_to_steps") != self.firm1.action_to_steps:
             raise ValueError("trained model action mapping does not match runtime action mapping")
+        expected_groups = {
+            name: [int(index) for index in indices]
+            for name, indices in PlatformObservationModel.feature_groups().items()
+        }
+        if artifact.get("observation_feature_groups") != expected_groups:
+            raise ValueError(
+                "trained model observation feature groups do not match the runtime "
+                "immediate/opponent/city hierarchy"
+            )
+        if list(artifact.get("city_context_keys", [])) != list(
+            PlatformObservationModel.CITY_CONTEXT_KEYS
+        ):
+            raise ValueError("trained model city-context schema does not match runtime")
         if list(artifact.get("constraint_names", [])) != list(self.soft_constraints.names):
             raise ValueError(
                 "trained model constraint critics do not match runtime active constraints; "
                 f"artifact={artifact.get('constraint_names')} runtime={list(self.soft_constraints.names)}"
             )
-        self.firm1.agent.net.load_state_dict(artifact["network_state"])
+        try:
+            self.firm1.agent.net.load_state_dict(artifact["network_state"])
+        except RuntimeError as exc:
+            raise ValueError(
+                "trained model network is incompatible with the hierarchical "
+                "actor/critic architecture; retrain and save a version-7 artifact"
+            ) from exc
+        self.firm1.agent.load_normalizer_state_dict(
+            artifact.get("normalizer_state")
+        )
         if load_optimizer and artifact.get("optimizer_state"):
-            self.firm1.agent.opt.load_state_dict(artifact["optimizer_state"])
+            self.firm1.agent.load_optimizer_state_dict(
+                artifact["optimizer_state"]
+            )
         if restore_tariff:
             for key, value in artifact.get("firm1_coefficients", {}).items():
                 if key in self.shared_edit_keys:
@@ -2719,8 +2784,8 @@ class Core:
         *,
         customers_per_step: int,
         profile_sample_size: int,
-        horizon: int = 6,
-    ) -> Dict[str, float]:
+        horizon: int = 192,
+    ) -> Dict[str, Any]:
         """Evaluate the policy in closed loop against unseen adaptive rivals.
 
         Validation must call ``agent.act`` repeatedly.  Scoring a single market
@@ -2748,16 +2813,24 @@ class Core:
         rewards: List[float] = []
         own_shares: List[float] = []
         rival_shares: List[float] = []
+        own_revenues: List[float] = []
+        rival_revenues: List[float] = []
         own_profits: List[float] = []
         rival_profits: List[float] = []
         gaps: List[float] = []
         fulfillment: List[float] = []
         actions: List[int] = []
+        validation_mode_names: List[str] = []
+        mode_profit_advantages: List[float] = []
+        mode_own_profit_means: List[float] = []
+        mode_rival_profit_means: List[float] = []
         try:
             validation_modes = (
+                "static",
                 "adaptive_best_response_aggressive",
                 "pi_price_gap",
                 "queue_service_threshold",
+                "region_supply_demand",
             )
             for rollout_index, mode in enumerate(validation_modes):
                 self._reset_adaptive_episode(
@@ -2770,6 +2843,7 @@ class Core:
                 prev_rev = 0.0
                 prev_profit = 0.0
                 prev_gap = 0.0
+                mode_rewards: List[float] = []
                 mode_own_profits: List[float] = []
                 mode_rival_profits: List[float] = []
                 mode_constraint_costs: Dict[str, List[float]] = {
@@ -2848,9 +2922,12 @@ class Core:
                         mode_constraint_costs[name].append(
                             float(diag.get(f"constraint_cost_{name}", 0.0))
                         )
+                    mode_rewards.append(float(diag["reward"]))
                     rewards.append(float(diag["reward"]))
                     own_shares.append(float(m1.completed_share))
                     rival_shares.append(float(m2.completed_share))
+                    own_revenues.append(float(m1.rev_per_request))
+                    rival_revenues.append(float(m2.rev_per_request))
                     own_profits.append(float(m1.profit_per_request))
                     rival_profits.append(float(m2.profit_per_request))
                     gaps.append(float(gap))
@@ -2860,16 +2937,30 @@ class Core:
                     prev_profit = float(m1.profit_per_request)
                     prev_gap = float(gap)
                     clock.advance()
+                # Score the long-run half of each closed-loop rollout. This
+                # rejects policies that win only during their initial tariff
+                # transient and then collapse into an unprofitable price war.
+                # while still retaining the full trace in returned diagnostics.
+                tail_start = min(
+                    len(mode_own_profits) - 1,
+                    max(0, len(mode_own_profits) // 2),
+                )
+                tail_own_profit = float(np.mean(mode_own_profits[tail_start:]))
+                tail_rival_profit = float(np.mean(mode_rival_profits[tail_start:]))
+                validation_mode_names.append(str(mode))
+                mode_own_profit_means.append(tail_own_profit)
+                mode_rival_profit_means.append(tail_rival_profit)
+                mode_profit_advantages.append(tail_own_profit - tail_rival_profit)
                 mode_scores.append(self._validation_score_from_metrics(
-                    reward=float(np.mean(rewards[-max(2, int(horizon)):])),
+                    reward=float(np.mean(mode_rewards[tail_start:])),
                     share=0.0,
                     revpr=0.0,
-                    profitpr=float(np.mean(mode_own_profits)),
+                    profitpr=tail_own_profit,
                     fulfillment=0.0,
                     gap=0.0,
-                    rival_profitpr=float(np.mean(mode_rival_profits)),
+                    rival_profitpr=tail_rival_profit,
                     constraint_costs={
-                        name: float(np.mean(values))
+                        name: float(np.mean(values[tail_start:]))
                         for name, values in mode_constraint_costs.items()
                     },
                 ))
@@ -2888,13 +2979,54 @@ class Core:
                 setattr(self, name, value)
         mean_mode_score = float(np.mean(mode_scores)) if mode_scores else -float("inf")
         mode_score_std = float(np.std(mode_scores)) if mode_scores else float("inf")
+        worst_mode_score = float(np.min(mode_scores)) if mode_scores else -float("inf")
+        mean_profit_advantage = (
+            float(np.mean(mode_profit_advantages))
+            if mode_profit_advantages else -float("inf")
+        )
+        worst_profit_advantage = (
+            float(np.min(mode_profit_advantages))
+            if mode_profit_advantages else -float("inf")
+        )
+        profit_win_rate = (
+            float(np.mean(np.asarray(mode_profit_advantages) > 0.0))
+            if mode_profit_advantages else 0.0
+        )
         return {
-            "score": mean_mode_score - 0.50 * mode_score_std,
+            "score": (
+                0.35 * mean_mode_score
+                + 0.65 * worst_mode_score
+                - 0.15 * mode_score_std
+            ),
             "mode_score_mean": mean_mode_score,
             "mode_score_std": mode_score_std,
+            "mode_score_worst": worst_mode_score,
+            "mean_profit_advantage": mean_profit_advantage,
+            "worst_profit_advantage": worst_profit_advantage,
+            "profit_win_rate": profit_win_rate,
+            "mode_profit_advantages": {
+                name: float(advantage)
+                for name, advantage in zip(
+                    validation_mode_names, mode_profit_advantages
+                )
+            },
+            "mode_own_profit_per_request": {
+                name: float(profit)
+                for name, profit in zip(
+                    validation_mode_names, mode_own_profit_means
+                )
+            },
+            "mode_rival_profit_per_request": {
+                name: float(profit)
+                for name, profit in zip(
+                    validation_mode_names, mode_rival_profit_means
+                )
+            },
             "reward": float(np.mean(rewards)) if rewards else 0.0,
             "share": float(np.mean(own_shares)) if own_shares else 0.0,
             "rival_share": float(np.mean(rival_shares)) if rival_shares else 0.0,
+            "rev_per_request": float(np.mean(own_revenues)) if own_revenues else 0.0,
+            "rival_rev_per_request": float(np.mean(rival_revenues)) if rival_revenues else 0.0,
             "profit_per_request": float(np.mean(own_profits)) if own_profits else 0.0,
             "rival_profit_per_request": float(np.mean(rival_profits)) if rival_profits else 0.0,
             "fulfillment_rate": float(np.mean(fulfillment)) if fulfillment else 0.0,
@@ -2913,6 +3045,7 @@ class Core:
         profiles_log_limit: int = 200000,
         train_steps_per_day: int = 10,
         ppo_update_interval_days: int = 20,
+        ppo_min_rollout_transitions: int = 256,
         stochastic_training: bool = True,
         firm1_action_interval_steps: int = -1,
         firm2_action_interval_days: int = -1,
@@ -2973,6 +3106,7 @@ class Core:
             print(
                 f">>> PPO rollout/update cadence: {update_every} day(s) per optimizer step "
                 f"(~{update_every * approx_decisions} price decisions/update; "
+                f"minimum rollout={max(32, int(ppo_min_rollout_transitions))} transitions; "
                 f"Firm1 holds each price action for {action_interval_steps} step(s))."
             )
         else:
@@ -3012,6 +3146,10 @@ class Core:
         benchmark_opponent = copy.deepcopy(self.firm2)
         opponent_population = [
             opponent_mode,
+            # Robust stages must contain both non-reactive and reactive rivals.
+            # Static episodes teach monopoly-like margin discovery; adaptive
+            # episodes teach anticipation and selective competitive response.
+            "static",
             "adaptive_best_response",
             "adaptive_best_response_aggressive",
             "pi_price_gap",
@@ -3028,14 +3166,18 @@ class Core:
         update_every = int(max(1, ppo_update_interval_days))
         best_checkpoint: Optional[Dict[str, Any]] = None
         best_validation_score = -float("inf")
-        validation_interval = max(25, 4 * update_every)
+        minimum_rollout = int(max(32, ppo_min_rollout_transitions))
+        validation_interval = max(150, 8 * update_every)
         latest_validation: Dict[str, float] = {}
         last_ppo_metrics = {
             "loss": np.nan,
             "policy_loss": np.nan,
             "value_loss": np.nan,
+            "critic_loss": np.nan,
+            "critic_grad_norm": np.nan,
             "constraint_value_loss": np.nan,
             "risk_value_loss": np.nan,
+            "action_q_loss": np.nan,
             "response_loss": np.nan,
             "lagrangian_adv_mean": np.nan,
             "lagrangian_adv_std": np.nan,
@@ -3054,17 +3196,30 @@ class Core:
             "action_coverage": float(self.firm1.agent._action_coverage()) if self.firm1_mode == "RL" else np.nan,
             "explained_variance": np.nan,
             "optimizer_steps": 0,
+            "actor_optimizer_steps": 0,
+            "critic_optimizer_steps": 0,
             "lr": float(self.firm1.agent.curr_lr) if self.firm1_mode == "RL" else np.nan,
+            "critic_lr": float(self.firm1.agent.critic_opt.param_groups[0]["lr"]) if self.firm1_mode == "RL" else np.nan,
             "update_performed": False,
             "learning_signal_ok": False,
             "run_mode": "rollout_collection",
         }
 
+        active_stage_name: Optional[str] = None
+        # Once the policy has demonstrated stable reward and robust validation
+        # profit dominance, do not re-open the high-exploration schedule because
+        # of one noisy later rollout.  This latch controls optimization only; it
+        # never changes simulator outcomes or evaluation actions.
+        training_convergence_latched = False
+        latched_convergence_std = float("inf")
+        episode_end_day = 0
         for d in range(train_timesteps):
             train_progress = float(d + 1) / max(1.0, float(train_timesteps))
             self.current_training_stage = self.training_stage_scheduler.stage_at(train_progress)
             episode_days = int(max(1, self.current_training_stage.episode_days))
-            if d % episode_days == 0:
+            stage_changed = active_stage_name != self.current_training_stage.name
+            episode_reset = bool(d == 0 or stage_changed or d >= episode_end_day)
+            if episode_reset:
                 pool = opponent_population[: max(1, self.current_training_stage.opponent_pool_size)]
                 selected_mode = str(self.rng.choice(pool))
                 self._reset_adaptive_episode(
@@ -3073,11 +3228,24 @@ class Core:
                     episode_seed=self.seed + 50_000 + d,
                 )
                 training_clock.reset()
+                active_stage_name = self.current_training_stage.name
+                episode_end_day = min(train_timesteps, d + episode_days)
                 print(
                     f">>> [curriculum episode] day={d + 1} stage={self.current_training_stage.name} "
                     f"opponent={selected_mode} horizon={episode_days}d "
                     f"tariff_reset=±{100.0 * self.current_training_stage.tariff_reset_fraction:.0f}%"
                 )
+            next_stage_name = self.current_training_stage.name
+            if (d + 1) < train_timesteps:
+                next_progress = float(d + 2) / max(1.0, float(train_timesteps))
+                next_stage_name = self.training_stage_scheduler.stage_at(
+                    next_progress
+                ).name
+            day_regime_boundary = bool(
+                (d + 1) >= episode_end_day
+                or next_stage_name != self.current_training_stage.name
+                or (d + 1) == train_timesteps
+            )
             stage_action_interval_steps = int(max(
                 base_action_interval_steps,
                 self.current_training_stage.action_hold_steps,
@@ -3092,6 +3260,16 @@ class Core:
                     entropy_scale=self.current_training_stage.entropy_scale,
                     learning_rate_scale=self.current_training_stage.learning_rate_scale,
                 )
+                # Stage controls are reapplied at the start of every simulated
+                # day.  Preserve a validated convergence decision across that
+                # reset so late training cannot reopen exploration and destroy
+                # a robustly profitable policy.
+                if training_convergence_latched:
+                    self.firm1.configure_training_controls(
+                        progress=train_progress,
+                        reward_converged=True,
+                        reward_std=latched_convergence_std,
+                    )
             self._configure_constraint_curriculum(train_progress)
             warmup_days = max(1.0, float(train_timesteps) * self.driver_reward_warmup_fraction)
             self.driver_reward_scale_current = float(np.clip((d + 1) / warmup_days, 0.0, 1.0)) if self.enable_driver_supply else 0.0
@@ -3113,6 +3291,8 @@ class Core:
             completed_share_sum = 0.0
             firm2_choice_share_sum = 0.0
             firm2_completed_share_sum = 0.0
+            firm2_revpr_sum = 0.0
+            firm2_profitpr_sum = 0.0
             revpr_sum = 0.0
             profitpr_sum = 0.0
             gap_sum = 0.0
@@ -3271,11 +3451,7 @@ class Core:
                     pending_count += 1
                     pending_discount *= float(self.firm1.agent.gamma)
                     end_of_day = (t == len(hours) - 1)
-                    episode_truncated = bool(
-                        end_of_day
-                        and ((d + 1) % episode_days) == 0
-                        and (d + 1) < train_timesteps
-                    )
+                    episode_truncated = bool(end_of_day and day_regime_boundary)
                     interval_closed = ((t + 1) % stage_action_interval_steps == 0) or end_of_day
                     if interval_closed and pending_count > 0:
                         action, s_ts, old_logp, val, af_ts, mask_ts = pending_rl_step
@@ -3414,6 +3590,8 @@ class Core:
                 completed_share_sum += float(m1.completed_share)
                 firm2_choice_share_sum += float(m2.chosen_share)
                 firm2_completed_share_sum += float(m2.completed_share)
+                firm2_revpr_sum += float(m2.rev_per_request)
+                firm2_profitpr_sum += float(m2.profit_per_request)
                 revpr_sum += float(m1.rev_per_request)
                 profitpr_sum += float(m1.profit_per_request)
                 gap_sum += float(mean_gap)
@@ -3444,7 +3622,7 @@ class Core:
                     key: np.nan
                     for key in (
                         "loss", "policy_loss", "value_loss", "constraint_value_loss",
-                        "risk_value_loss", "response_loss", "lagrangian_adv_mean",
+                        "risk_value_loss", "action_q_loss", "response_loss", "lagrangian_adv_mean",
                         "lagrangian_adv_std", "constraint_lambda_mean", "risk_coeff",
                         "approx_kl", "clipfrac", "entropy", "policy_entropy",
                         "discrete_policy_entropy", "magnitude_entropy", "explained_variance",
@@ -3452,7 +3630,6 @@ class Core:
                         "continuous_magnitude_mean", "continuous_magnitude_std",
                         "raw_policy_argmax_concentration", "raw_policy_hold_probability",
                         "state_action_sensitivity", "state_action_mi",
-                        "action_balance_loss",
                     )
                 },
                 "policy_entropy_fraction": float(self.firm1.agent.last_policy_entropy_fraction) if self.firm1_mode == "RL" else np.nan,
@@ -3467,7 +3644,13 @@ class Core:
                 "run_mode": "rollout_collection",
             }
             if self.firm1_mode == "RL":
-                should_update = ((d + 1) % update_every == 0) or ((d + 1) == train_timesteps)
+                should_update = bool(
+                    (
+                        (d + 1) % update_every == 0
+                        or (d + 1) == train_timesteps
+                    )
+                    and self.firm1.agent.buffer_size >= minimum_rollout
+                )
                 if should_update:
                     self._sync_agent_optimization_context()
                     bootstrap_v, bootstrap_constraint_v, bootstrap_risk_v = self._ppo_bootstrap_estimates(
@@ -3496,6 +3679,8 @@ class Core:
             avg_completed_share = float(completed_share_sum / n_steps)
             avg_firm2_choice_share = float(firm2_choice_share_sum / n_steps)
             avg_firm2_completed_share = float(firm2_completed_share_sum / n_steps)
+            avg_firm2_revpr = float(firm2_revpr_sum / n_steps)
+            avg_firm2_profitpr = float(firm2_profitpr_sum / n_steps)
             avg_revpr = float(revpr_sum / n_steps)
             avg_profitpr = float(profitpr_sum / n_steps)
             avg_gap = float(gap_sum / n_steps)
@@ -3554,6 +3739,11 @@ class Core:
                 "avg_firm2_completed_share": avg_firm2_completed_share,
                 "avg_rev_per_request": avg_revpr,
                 "avg_profit_per_request": avg_profitpr,
+                "avg_firm2_rev_per_request": avg_firm2_revpr,
+                "avg_firm2_profit_per_request": avg_firm2_profitpr,
+                "avg_profit_advantage_per_request": (
+                    avg_profitpr - avg_firm2_profitpr
+                ),
                 "avg_price_gap_f2_minus_f1": avg_gap,
                 "avg_price_gap_abs_error": float(abs(avg_gap - self.reward_target_price_gap)),
                 "avg_gap_violation_025": float(abs(avg_gap - self.reward_target_price_gap) > 0.25),
@@ -3595,14 +3785,20 @@ class Core:
                 "loss": float(ppo_metrics.get("loss", 0.0)),
                 "ppo_policy_loss": float(ppo_metrics.get("policy_loss", 0.0)),
                 "ppo_value_loss": float(ppo_metrics.get("value_loss", 0.0)),
+                "ppo_critic_loss": float(ppo_metrics.get("critic_loss", 0.0)),
+                "ppo_critic_grad_norm": float(ppo_metrics.get("critic_grad_norm", 0.0)),
                 "ppo_constraint_value_loss": float(ppo_metrics.get("constraint_value_loss", 0.0)),
                 "ppo_risk_value_loss": float(ppo_metrics.get("risk_value_loss", 0.0)),
+                "ppo_action_q_loss": float(ppo_metrics.get("action_q_loss", 0.0)),
                 "ppo_response_loss": float(ppo_metrics.get("response_loss", 0.0)),
                 "ppo_lagrangian_adv_mean": float(ppo_metrics.get("lagrangian_adv_mean", 0.0)),
                 "ppo_lagrangian_adv_std": float(ppo_metrics.get("lagrangian_adv_std", 0.0)),
                 "ppo_constraint_lambda_mean": float(ppo_metrics.get("constraint_lambda_mean", 0.0)),
                 "ppo_risk_coeff": float(ppo_metrics.get("risk_coeff", 0.0)),
                 "ppo_approx_kl": float(ppo_metrics.get("approx_kl", 0.0)),
+                "ppo_target_kl": float(
+                    ppo_metrics.get("target_kl", self.firm1.agent.target_kl)
+                ),
                 "ppo_clipfrac": float(ppo_metrics.get("clipfrac", 0.0)),
                 "ppo_entropy": float(ppo_metrics.get("entropy", 0.0)),
                 "ppo_policy_entropy": float(ppo_metrics.get("policy_entropy", 0.0)),
@@ -3615,7 +3811,12 @@ class Core:
                 "ppo_action_coverage": float(ppo_metrics.get("action_coverage", 0.0)),
                 "ppo_explained_variance": float(ppo_metrics.get("explained_variance", 0.0)),
                 "ppo_optimizer_steps": int(ppo_metrics.get("optimizer_steps", 0)),
+                "ppo_actor_optimizer_steps": int(ppo_metrics.get("actor_optimizer_steps", 0)),
+                "ppo_critic_optimizer_steps": int(ppo_metrics.get("critic_optimizer_steps", 0)),
                 "ppo_lr": float(ppo_metrics.get("lr", 0.0)),
+                "ppo_critic_lr": float(ppo_metrics.get("critic_lr", 0.0)),
+                "ppo_critic_target_mean": float(ppo_metrics.get("critic_target_mean", np.nan)),
+                "ppo_critic_target_std": float(ppo_metrics.get("critic_target_std", np.nan)),
                 "ppo_update_performed": bool(ppo_metrics.get("update_performed", False)),
                 "ppo_run_mode": str(ppo_metrics.get("run_mode", "rollout_collection")),
                 "ppo_learning_signal_ok": bool(ppo_metrics.get("learning_signal_ok", False)),
@@ -3628,7 +3829,6 @@ class Core:
                 "ppo_raw_hold_probability": float(ppo_metrics.get("raw_policy_hold_probability", np.nan)),
                 "ppo_state_action_sensitivity": float(ppo_metrics.get("state_action_sensitivity", np.nan)),
                 "ppo_state_action_mi": float(ppo_metrics.get("state_action_mi", np.nan)),
-                "ppo_collapse_rescue_active": bool(ppo_metrics.get("collapse_rescue_active", False)),
                 "ppo_rollout_size": int(ppo_metrics.get("rollout_size", 0)),
                 "ppo_effective_batch_size": int(ppo_metrics.get("effective_batch_size", 0)),
                 "ppo_stopped_early_kl": bool(ppo_metrics.get("stopped_early_kl", False)),
@@ -3646,7 +3846,7 @@ class Core:
                 validation = self._adaptive_policy_validation(
                     customers_per_step=eval_customers_per_step,
                     profile_sample_size=eval_profile_sample_size,
-                    horizon=6,
+                    horizon=192,
                 )
                 latest_validation = dict(validation)
                 validation_score = float(validation["score"])
@@ -3655,12 +3855,46 @@ class Core:
                 log_row["validation_share"] = float(validation["share"])
                 log_row["validation_completed_share"] = float(validation["share"])
                 log_row["validation_firm2_completed_share"] = float(validation["rival_share"])
+                log_row["validation_rev_per_request"] = float(validation["rev_per_request"])
+                log_row["validation_firm2_rev_per_request"] = float(validation["rival_rev_per_request"])
                 log_row["validation_profit_per_request"] = float(validation["profit_per_request"])
                 log_row["validation_firm2_profit_per_request"] = float(validation["rival_profit_per_request"])
                 log_row["validation_fulfillment_rate"] = float(validation["fulfillment_rate"])
                 log_row["validation_price_gap_f2_minus_f1"] = float(validation["price_gap"])
                 log_row["validation_action_diversity"] = float(validation["action_diversity"])
                 log_row["validation_action_switch_rate"] = float(validation["action_switch_rate"])
+                log_row["validation_mean_profit_advantage"] = float(
+                    validation["mean_profit_advantage"]
+                )
+                log_row["validation_worst_profit_advantage"] = float(
+                    validation["worst_profit_advantage"]
+                )
+                log_row["validation_profit_win_rate"] = float(
+                    validation["profit_win_rate"]
+                )
+                for mode, advantage in validation["mode_profit_advantages"].items():
+                    log_row[f"validation_profit_advantage_{mode}"] = float(advantage)
+                print(
+                    f">>> [validation snapshot] day={d+1} score={validation_score:.3f} "
+                    f"reward={validation['reward']:.3f} "
+                    f"share={validation['share']:.3f} "
+                    f"rivalShare={validation['rival_share']:.3f} "
+                    f"revPR={validation['rev_per_request']:.2f} "
+                    f"rivalRevPR={validation['rival_rev_per_request']:.2f} "
+                    f"profitPR={validation['profit_per_request']:.2f} "
+                    f"rivalProfitPR={validation['rival_profit_per_request']:.2f} "
+                    f"profitAdv={validation['mean_profit_advantage']:+.2f} "
+                    f"worstProfitAdv={validation['worst_profit_advantage']:+.2f} "
+                    f"wins={validation['profit_win_rate']:.0%} "
+                    f"actions={validation['action_diversity']:.2f} "
+                    f"switch={validation['action_switch_rate']:.2f}"
+                )
+                mode_advantages = " | ".join(
+                    f"{mode}:{advantage:+.2f}"
+                    for mode, advantage in validation["mode_profit_advantages"].items()
+                )
+                if mode_advantages:
+                    print(f"    [validation opponents profitAdv] {mode_advantages}")
                 if float(validation_score) > float(best_validation_score):
                     best_validation_score = float(validation_score)
                     best_checkpoint = {
@@ -3670,15 +3904,14 @@ class Core:
                             k: v.detach().cpu().clone()
                             for k, v in self.firm1.agent.net.state_dict().items()
                         },
+                        "normalizer_state": copy.deepcopy(
+                            self.firm1.agent.normalizer_state_dict()
+                        ),
                         "validation": dict(validation),
                     }
                     print(
-                        f">>> [validation checkpoint] day={d+1} score={validation_score:.3f} "
-                        f"reward={validation['reward']:.3f} "
-                        f"profitPR={validation['profit_per_request']:.2f} "
-                        f"rivalProfitPR={validation['rival_profit_per_request']:.2f} "
-                        f"actions={validation['action_diversity']:.2f} "
-                        f"switch={validation['action_switch_rate']:.2f}"
+                        f">>> [validation checkpoint] new_best day={d+1} "
+                        f"score={validation_score:.3f}"
                     )
             else:
                 log_row["validation_score"] = np.nan
@@ -3699,17 +3932,28 @@ class Core:
                     smoothing=20,
                 )
                 control_ppo_metrics = last_ppo_metrics
-                reward_converged = bool(
+                convergence_now = bool(
                     convergence_count >= 40
                     and convergence_std <= self.reward_convergence_tol
                     and convergence_delta <= self.reward_trend_tol
                     and bool(control_ppo_metrics.get("learning_signal_ok", False))
                     and float(control_ppo_metrics.get("state_action_sensitivity", 0.0)) >= 0.005
-                    and float(control_ppo_metrics.get("state_action_mi", 0.0)) >= 0.002
                     and bool(latest_validation)
-                    and float(latest_validation.get("profit_per_request", -float("inf")))
-                        > float(latest_validation.get("rival_profit_per_request", float("inf")))
+                    and float(latest_validation.get("profit_win_rate", 0.0)) >= 1.0
+                    and float(
+                        latest_validation.get(
+                            "worst_profit_advantage", -float("inf")
+                        )
+                    ) > 0.0
                 )
+                training_convergence_latched = bool(
+                    training_convergence_latched or convergence_now
+                )
+                if convergence_now:
+                    latched_convergence_std = float(convergence_std)
+                reward_converged = training_convergence_latched
+                log_row["reward_converged"] = bool(reward_converged)
+                log_row["reward_convergence_now"] = bool(convergence_now)
                 self.firm1.configure_training_controls(
                     progress=float((d + 1) / max(1, train_timesteps)),
                     reward_converged=reward_converged,
@@ -3721,6 +3965,8 @@ class Core:
                     f"  [train {d+1}/{train_timesteps}] reward={float(avg_reward):.3f} "
                     f"moving_avg20={moving_avg20:.3f} share={avg_share:.3f} "
                     f"revPR={avg_revpr:.2f} profitPR={avg_profitpr:.2f} "
+                    f"rivalProfitPR={avg_firm2_profitpr:.2f} "
+                    f"profitAdv={avg_profitpr - avg_firm2_profitpr:+.2f} "
                     f"gap(F2-F1)={avg_gap:.2f} fulfill={avg_fulfillment:.3f} "
                     f"accept={avg_driver_accept:.3f}"
                 )
@@ -3733,6 +3979,15 @@ class Core:
                 else:
                     progress_line += f" PPO=collecting ({len(self.firm1.agent.buf)} transitions buffered)"
                 print(progress_line)
+                print(
+                    f"    [train action summary] decisions={sum(action_counts.values())} "
+                    f"dominant={dominant_action_label or 'none'} "
+                    f"rate={dominant_action_rate:.1%} "
+                    f"steps={json.dumps(dominant_action_steps, sort_keys=True)} "
+                    f"last={last_action} "
+                    f"lastSteps={json.dumps(last_action_steps, sort_keys=True)} "
+                    f"sampledOffTop={sampled_not_top_count}"
+                )
                 
                 segment_line = self._format_distance_segment_diagnostics(getattr(self, "last_crowd_response_stats", {}) or {})
                 if segment_line:
@@ -3740,6 +3995,9 @@ class Core:
         if self.firm1_mode == "RL" and best_checkpoint is not None:
             self.firm1.agent.net.load_state_dict(
                 {k: v.to(self.firm1.agent.device) for k, v in best_checkpoint["agent_state"].items()}
+            )
+            self.firm1.agent.load_normalizer_state_dict(
+                best_checkpoint["normalizer_state"]
             )
             print(
                 f">>> Restored validation-best policy from train day {best_checkpoint['day']} "
@@ -3776,10 +4034,7 @@ class Core:
         eval_last_revpr = float(self.last_revpr)
         eval_last_profitpr = float(self.last_profitpr)
         eval_last_gap = float(self.last_gap)
-        eval_action_interval_steps = int(max(
-            base_action_interval_steps,
-            self.training_stage_scheduler.stages[-1].action_hold_steps,
-        ))
+        eval_action_interval_steps = int(base_action_interval_steps)
         eval_clock = OperationalClock()
         for t in range(eval_timesteps):
             day_ctx = self.market.sample_day_context()
@@ -4088,8 +4343,16 @@ class Core:
             if (t + 1) % max(1, eval_timesteps // 10) == 0:
                 print(
                     f"  [eval {t+1}/{eval_timesteps}] reward={float(eval_reward):.3f} "
-                    f"moving_avg20={moving_avg20:.3f} share={float(m1.share):.3f} "
-                    f"revPR={float(m1.rev_per_request):.2f} gap(F2-F1)={float(mean_gap):.2f}"
+                    f"moving_avg20={moving_avg20:.3f} "
+                    f"share={float(m1.completed_share):.3f} "
+                    f"rivalShare={float(m2.completed_share):.3f} "
+                    f"revPR={float(m1.rev_per_request):.2f} "
+                    f"rivalRevPR={float(m2.rev_per_request):.2f} "
+                    f"profitPR={float(m1.profit_per_request):.2f} "
+                    f"rivalProfitPR={float(m2.profit_per_request):.2f} "
+                    f"profitAdv={float(m1.profit_per_request - m2.profit_per_request):+.2f} "
+                    f"gap(F2-F1)={float(mean_gap):.2f} "
+                    f"action={log_row['action_label'] or 'none'}"
                 )
                 segment_line = self._format_distance_segment_diagnostics(getattr(self, "last_crowd_response_stats", {}) or {})
                 if segment_line:
@@ -4106,6 +4369,29 @@ class Core:
             print(f">>> Training reward trajectory summary: min={float(np.min(reward_history)):.3f}, max={float(np.max(reward_history)):.3f}, final={float(reward_history[-1]):.3f}")
         if eval_rewards:
             print(f">>> Testing reward trajectory summary: min={float(np.min(eval_rewards)):.3f}, max={float(np.max(eval_rewards)):.3f}, final={float(eval_rewards[-1]):.3f}")
+        if self.training_logs:
+            training_tail = self.training_logs[-min(100, len(self.training_logs)):]
+            print(
+                f">>> Training competitive summary (last {len(training_tail)} days): "
+                f"share={float(np.mean([row['avg_completed_share'] for row in training_tail])):.3f} "
+                f"rivalShare={float(np.mean([row['avg_firm2_completed_share'] for row in training_tail])):.3f} "
+                f"revPR={float(np.mean([row['avg_rev_per_request'] for row in training_tail])):.2f} "
+                f"rivalRevPR={float(np.mean([row['avg_firm2_rev_per_request'] for row in training_tail])):.2f} "
+                f"profitPR={float(np.mean([row['avg_profit_per_request'] for row in training_tail])):.2f} "
+                f"rivalProfitPR={float(np.mean([row['avg_firm2_profit_per_request'] for row in training_tail])):.2f} "
+                f"profitAdv={float(np.mean([row['avg_profit_advantage_per_request'] for row in training_tail])):+.2f}"
+            )
+        if self.evaluation_logs:
+            print(
+                f">>> Evaluation competitive summary ({len(self.evaluation_logs)} days): "
+                f"share={float(np.mean([row['rl_completed_share'] for row in self.evaluation_logs])):.3f} "
+                f"rivalShare={float(np.mean([row['heuristic_completed_share'] for row in self.evaluation_logs])):.3f} "
+                f"revPR={float(np.mean([row['rl_revenue'] for row in self.evaluation_logs])):.2f} "
+                f"rivalRevPR={float(np.mean([row['heuristic_revenue'] for row in self.evaluation_logs])):.2f} "
+                f"profitPR={float(np.mean([row['rl_profit'] for row in self.evaluation_logs])):.2f} "
+                f"rivalProfitPR={float(np.mean([row['heuristic_profit'] for row in self.evaluation_logs])):.2f} "
+                f"profitAdv={float(np.mean([row['rl_profit'] - row['heuristic_profit'] for row in self.evaluation_logs])):+.2f}"
+            )
             
         print("Experiment Complete.")
         return self.training_logs, self.evaluation_logs
@@ -4589,6 +4875,80 @@ class Core:
             self.ema_firm2_profitpr = self._ema(float(m2.profit_per_request), float(getattr(self, "ema_firm2_profitpr", 0.0)), alpha)
             self.ema_firm2_gap = self._ema(float(-mean_gap), float(getattr(self, "ema_firm2_gap", 0.0)), alpha)
             self.ema_firm2_fulfillment = self._ema(float(m2.fulfillment_rate), float(getattr(self, "ema_firm2_fulfillment", 1.0)), alpha)
+
+    @staticmethod
+    def _bounded_context(value: float, center: float, scale: float) -> float:
+        """Normalize a public/calibrated market descriptor without city identity."""
+        return float(np.clip((float(value) - float(center)) / max(1e-6, float(scale)), -1.5, 1.5))
+
+    def _build_city_context(self, *, hour: int, day_of_week: int, weather: str) -> Dict[str, float]:
+        """Build continuous market context shared across city twins.
+
+        These descriptors are either supplied by digital-twin calibration or
+        estimated from previously realized aggregate demand.  No city name,
+        opponent label, controller parameters, or future simulator state is
+        exposed to the policy.
+        """
+        base = self.market.curr_market
+        demand = dict(getattr(self, "last_crowd_response_stats", {}) or {})
+
+        time_multiplier = float(self.market._time_multiplier(int(hour)))
+        day_multiplier = float(base.day_multiplier.get(int(day_of_week), 1.0))
+        weather_multiplier = float(base.weather_multiplier.get(str(weather), 1.0))
+        demand_multiplier = time_multiplier * day_multiplier * weather_multiplier
+
+        distance_mean = float(demand.get("distance_mean", 6.0) or 6.0)
+        duration_mean = float(demand.get("duration_mean", 24.0) or 24.0)
+        airport_intensity = float(getattr(self.market, "airport_prob", 0.12))
+
+        income_probs = np.asarray(
+            getattr(self.agent_gen, "income_probs", [0.25, 0.25, 0.25, 0.25]),
+            dtype=np.float64,
+        ).reshape(-1)
+        income_scores = np.linspace(0.0, 1.0, max(1, income_probs.size))
+        income_total = float(income_probs.sum())
+        income_index = float(
+            np.dot(income_probs / income_total, income_scores)
+            if income_total > 0.0
+            else 0.5
+        )
+
+        choice_price_scale = float(getattr(self.choice_model, "price_sensitivity_scale", 1.0))
+        choice_loyalty_scale = float(getattr(self.choice_model, "loyalty_scale", 1.0))
+        loyalty_mean = 0.5 * (
+            float(getattr(self.agent_gen, "loy_lo", 0.4))
+            + float(getattr(self.agent_gen, "loy_hi", 1.0))
+        )
+        new_rider_share = float(getattr(self.agent_gen, "p_new", 0.30))
+
+        supply_config = getattr(self.driver_supply, "config", None)
+        base_active_drivers = float(getattr(supply_config, "base_active_drivers", 260.0))
+        weather_probs = dict(getattr(self.market, "weather_probs", {}) or {})
+        expected_weather_multiplier = sum(
+            float(probability) * float(base.weather_multiplier.get(name, 1.0))
+            for name, probability in weather_probs.items()
+        )
+        if not weather_probs:
+            expected_weather_multiplier = 1.0
+
+        return {
+            "demand_intensity": self._bounded_context(demand_multiplier, 1.15, 0.45),
+            "trip_distance_scale": self._bounded_context(distance_mean, 6.0, 4.0),
+            "trip_duration_scale": self._bounded_context(duration_mean, 24.0, 16.0),
+            "airport_intensity": self._bounded_context(airport_intensity, 0.12, 0.10),
+            "income_index": self._bounded_context(income_index, 0.50, 0.30),
+            "price_elasticity": self._bounded_context(choice_price_scale, 1.0, 0.60),
+            "loyalty_intensity": self._bounded_context(
+                loyalty_mean * choice_loyalty_scale, 0.70, 0.40
+            ),
+            "new_rider_share": self._bounded_context(new_rider_share, 0.30, 0.20),
+            "driver_cost_mile": self._bounded_context(self.driver_cost_per_mile, 0.85, 0.40),
+            "driver_cost_minute": self._bounded_context(self.driver_cost_per_minute, 0.12, 0.08),
+            "supply_intensity": self._bounded_context(base_active_drivers, 260.0, 120.0),
+            "weather_sensitivity": self._bounded_context(
+                expected_weather_multiplier, 1.08, 0.16
+            ),
+        }
     
     def _build_rl_state(self, day_of_week: int, hour: int, weather: str, perspective: str = "Firm1") -> np.ndarray:
         """Build the platform's operational observation, not simulator truth.
@@ -4622,6 +4982,11 @@ class Core:
             own_coefficients=coefficients,
             anchor_coefficients=anchors,
             last_action=last_action,
+            city_context=self._build_city_context(
+                hour=hour,
+                day_of_week=day_of_week,
+                weather=weather,
+            ),
         )
 
     def simulate_batch(
@@ -5778,6 +6143,65 @@ def _plot_reports(
             return
         xs = [int(r[x_key]) + (1 if x_key == "batch" else 0) for r in logs]
 
+        # Directly comparable two-firm business outcomes.  The original
+        # dashboard showed only Firm 1 share/revenue plus a fare gap, which
+        # could make a low-price, low-profit policy look successful.  Preserve
+        # that diagnostic below and add the actual competitive objective.
+        if x_key == "batch":
+            competitive_keys = (
+                ("avg_completed_share", "avg_firm2_completed_share"),
+                ("avg_rev_per_request", "avg_firm2_rev_per_request"),
+                ("avg_profit_per_request", "avg_firm2_profit_per_request"),
+            )
+        else:
+            competitive_keys = (
+                ("rl_completed_share", "heuristic_completed_share"),
+                ("rl_revenue", "heuristic_revenue"),
+                ("rl_profit", "heuristic_profit"),
+            )
+        if all(
+            own_key in logs[0] and rival_key in logs[0]
+            for own_key, rival_key in competitive_keys
+        ):
+            fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+            ylabels = ("Completed market share", "Revenue / request", "Profit / request")
+            for ax, (own_key, rival_key), ylabel in zip(
+                axes, competitive_keys, ylabels
+            ):
+                own = [float(r.get(own_key, np.nan)) for r in logs]
+                rival = [float(r.get(rival_key, np.nan)) for r in logs]
+                _plot_timeseries(
+                    ax, xs, own, label="Firm 1 raw", color="tab:blue",
+                    alpha=0.20, linewidth=0.8,
+                )
+                _plot_timeseries(
+                    ax, xs, rival, label="Firm 2 raw", color="tab:orange",
+                    alpha=0.20, linewidth=0.8,
+                )
+                _plot_timeseries(
+                    ax, xs, _moving_average(own, 20),
+                    label="Firm 1 MA20", color="tab:blue",
+                    marker="", linewidth=2.0,
+                )
+                _plot_timeseries(
+                    ax, xs, _moving_average(rival, 20),
+                    label="Firm 2 MA20", color="tab:orange",
+                    marker="", linewidth=2.0,
+                )
+                ax.set_ylabel(ylabel)
+                ax.grid(axis="y", linestyle="--", alpha=0.25)
+                ax.legend(loc="best", ncol=2, fontsize=8)
+            axes[0].set_ylim(-0.02, 1.02)
+            axes[2].axhline(0.0, color="black", linewidth=0.8, alpha=0.35)
+            axes[2].set_xlabel("Training day" if x_key == "batch" else "Evaluation day")
+            fig.suptitle(f"{label.title()} Two-Firm Competitive Performance")
+            fig.tight_layout()
+            out = f"{prefix}_{label}_competitive_performance.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+
         share_key = "avg_share" if "avg_share" in logs[0] else "rl_share"
         revenue_key = "avg_rev_per_request" if "avg_rev_per_request" in logs[0] else "rl_revenue"
         gap_key = "avg_price_gap_f2_minus_f1" if "avg_price_gap_f2_minus_f1" in logs[0] else "price_gap_f2_minus_f1"
@@ -5802,26 +6226,167 @@ def _plot_reports(
             print(f"Saved graph -> {out}")
             plt.close(fig)
 
-        ppo_keys = [
-            "ppo_approx_kl",
-            "ppo_clipfrac",
-            "ppo_entropy",
-            "ppo_policy_entropy_fraction",
-            "ppo_ent_coeff",
-            "ppo_exploration_rate",
-            "ppo_action_coverage",
-            "ppo_explained_variance",
+        # PPO metrics exist only when an optimizer update is performed. Plotting
+        # them on every simulator day used to join sparse update values through
+        # zero/NaN placeholders and mixed quantities with incompatible scales.
+        # That produced the misleading vertical spikes in the old dashboard.
+        ppo_logs = [
+            r for r in logs
+            if bool(r.get("ppo_update_performed", False))
+            and np.isfinite(float(r.get("ppo_approx_kl", np.nan)))
         ]
-        present_ppo = [k for k in ppo_keys if any(k in r for r in logs)]
-        if present_ppo:
-            fig, ax = plt.subplots(figsize=(9, 4))
-            for k in present_ppo:
-                _plot_timeseries(ax, xs, [float(r.get(k, np.nan)) for r in logs], label=k.replace("ppo_", ""), marker="")
-            ax.set_title(f"{label.title()} PPO Diagnostics")
-            ax.set_xlabel("Batch" if x_key == "batch" else "Day")
-            ax.set_ylabel("Value")
-            ax.legend(loc="best")
-            ax.grid(axis="y", linestyle="--", alpha=0.25)
+        if ppo_logs:
+            ppo_xs = [
+                int(r[x_key]) + (1 if x_key == "batch" else 0)
+                for r in ppo_logs
+            ]
+            fig, axes = plt.subplots(4, 1, figsize=(10, 11), sharex=True)
+
+            trust_ax = axes[0]
+            trust_twin = trust_ax.twinx()
+            _plot_timeseries(
+                trust_ax,
+                ppo_xs,
+                [float(r.get("ppo_approx_kl", np.nan)) for r in ppo_logs],
+                label="approx KL",
+                color="tab:blue",
+            )
+            target_kl = np.asarray(
+                [float(r.get("ppo_target_kl", np.nan)) for r in ppo_logs],
+                dtype=float,
+            )
+            if np.isfinite(target_kl).any():
+                _plot_timeseries(
+                    trust_ax,
+                    ppo_xs,
+                    target_kl,
+                    label="target KL",
+                    color="tab:blue",
+                    marker="",
+                    linestyle="--",
+                    alpha=0.65,
+                )
+            _plot_timeseries(
+                trust_twin,
+                ppo_xs,
+                [float(r.get("ppo_clipfrac", np.nan)) for r in ppo_logs],
+                label="clip fraction",
+                color="tab:orange",
+            )
+            trust_ax.set_ylabel("KL divergence")
+            trust_twin.set_ylabel("Clip fraction")
+            trust_twin.set_ylim(bottom=0.0)
+            trust_ax.set_title("Trust-region behavior")
+
+            exploration_ax = axes[1]
+            exploration_twin = exploration_ax.twinx()
+            for key, display, color in (
+                ("ppo_policy_entropy_fraction", "policy entropy fraction", "tab:red"),
+                ("ppo_exploration_rate", "exploration rate", "tab:brown"),
+                ("ppo_action_coverage", "action coverage", "tab:pink"),
+            ):
+                _plot_timeseries(
+                    exploration_ax,
+                    ppo_xs,
+                    [float(r.get(key, np.nan)) for r in ppo_logs],
+                    label=display,
+                    color=color,
+                )
+            _plot_timeseries(
+                exploration_twin,
+                ppo_xs,
+                [float(r.get("ppo_ent_coeff", np.nan)) for r in ppo_logs],
+                label="entropy coefficient",
+                color="tab:purple",
+            )
+            exploration_ax.set_ylabel("Fraction / rate")
+            exploration_ax.set_ylim(-0.02, 1.02)
+            exploration_twin.set_ylabel("Entropy coefficient")
+            exploration_ax.set_title("Exploration and policy concentration")
+
+            critic_ax = axes[2]
+            critic_twin = critic_ax.twinx()
+            _plot_timeseries(
+                critic_ax,
+                ppo_xs,
+                [float(r.get("ppo_explained_variance", np.nan)) for r in ppo_logs],
+                label="explained variance",
+                color="tab:gray",
+            )
+            for key, display, color in (
+                ("ppo_critic_loss", "critic loss", "tab:green"),
+                ("ppo_value_loss", "value loss", "tab:olive"),
+            ):
+                _plot_timeseries(
+                    critic_twin,
+                    ppo_xs,
+                    [float(r.get(key, np.nan)) for r in ppo_logs],
+                    label=display,
+                    color=color,
+                )
+            critic_ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.35)
+            critic_ax.set_ylim(-1.05, 1.05)
+            critic_ax.set_ylabel("Explained variance")
+            critic_twin.set_ylabel("Loss")
+            critic_twin.set_yscale("symlog", linthresh=1e-3)
+            critic_ax.set_title("Critic fit")
+
+            credit_ax = axes[3]
+            credit_twin = credit_ax.twinx()
+            _plot_timeseries(
+                credit_ax,
+                ppo_xs,
+                [float(r.get("ppo_rollout_action_diversity", np.nan)) for r in ppo_logs],
+                label="rollout action diversity",
+                color="tab:cyan",
+            )
+            _plot_timeseries(
+                credit_ax,
+                ppo_xs,
+                [
+                    1.0 - float(r.get("ppo_raw_argmax_concentration", np.nan))
+                    for r in ppo_logs
+                ],
+                label="policy adaptive mass",
+                color="tab:blue",
+            )
+            for key, display, color in (
+                ("ppo_state_action_sensitivity", "state-action sensitivity", "tab:orange"),
+                ("ppo_state_action_mi", "state-action mutual information", "tab:green"),
+            ):
+                _plot_timeseries(
+                    credit_twin,
+                    ppo_xs,
+                    [float(r.get(key, np.nan)) for r in ppo_logs],
+                    label=display,
+                    color=color,
+                )
+            credit_ax.set_ylim(-0.02, 1.02)
+            credit_ax.set_ylabel("Diversity / adaptive mass")
+            credit_twin.set_ylabel("State dependence")
+            credit_ax.set_title("Action credit and state dependence")
+            credit_ax.set_xlabel("Training day" if x_key == "batch" else "Day")
+
+            twins = {
+                trust_ax: trust_twin,
+                exploration_ax: exploration_twin,
+                critic_ax: critic_twin,
+                credit_ax: credit_twin,
+            }
+            for ax in axes:
+                ax.grid(axis="y", linestyle="--", alpha=0.25)
+                twin = twins[ax]
+                handles, labels_left = ax.get_legend_handles_labels()
+                twin_handles, labels_right = twin.get_legend_handles_labels()
+                handles += twin_handles
+                labels_left += labels_right
+                if handles:
+                    ax.legend(handles, labels_left, loc="best", fontsize=8)
+
+            fig.suptitle(
+                f"{label.title()} PPO Update Diagnostics "
+                f"({len(ppo_logs)} optimizer updates)"
+            )
             fig.tight_layout()
             out = f"{prefix}_{label}_ppo_diagnostics.png"
             _ensure_parent_dir(out)
@@ -5977,6 +6542,7 @@ def main():
     parser.add_argument("--train_customers", type=int, default=5000)
     parser.add_argument("--train_steps_per_day", type=int, default=10, help="Synthetic training timesteps per day (run_experiment mode).")
     parser.add_argument("--ppo_update_interval_days", type=int, default=20, help="How many synthetic training days to collect before each PPO optimizer update; larger values produce longer, lower-variance PPO rollouts.")
+    parser.add_argument("--ppo_min_rollout_transitions", type=int, default=256, help="Minimum complete on-policy pricing decisions required before PPO may update; stage boundaries truncate GAE but do not trigger undersized optimizer steps.")
     
     parser.add_argument("--firm1_action_interval_steps", type=int, default=-1, help="Training/eval timesteps to hold each Firm1 PPO price action; <=0 means one pricing decision every market timestep for both static and dynamic opponents.")
     parser.add_argument("--firm2_action_interval_days", type=int, default=-1, help="Legacy option name: operational decision periods between Firm2 manipulations/updates; <=0 derives cadence from the PPO update interval.")
@@ -5999,11 +6565,12 @@ def main():
     parser.add_argument("--positive_reward_completed_demand_weight", type=float, default=0.20, help="Active positive-reward weight for completed demand share.")
     parser.add_argument("--positive_reward_service_weight", type=float, default=0.20, help="Active positive-reward weight for fulfillment, driver acceptance, and wait quality.")
     parser.add_argument("--long_term_profit_scale", type=float, default=4.0, help="Scale inside asinh(own contribution profit per incoming request / scale).")
-    parser.add_argument("--long_term_profit_advantage_scale", type=float, default=2.0, help="Scale inside asinh((own-rival contribution profit per incoming request) / scale).")
-    parser.add_argument("--long_term_profit_weight", type=float, default=0.90, help="Weight on own long-run contribution-profit utility.")
-    parser.add_argument("--profit_dominance_weight", type=float, default=0.10, help="Weight on contribution-profit advantage over the rival.")
-    parser.add_argument("--intervention_cost_weight", type=float, default=0.01, help="Small cost on realized tariff movement in standard step units.")
-    parser.add_argument("--reversal_cost_weight", type=float, default=0.005, help="Small cost on reversing the same tariff target within four decisions.")
+    parser.add_argument("--long_term_profit_advantage_scale", type=float, default=2.5, help="Scale inside tanh((own-rival contribution profit per incoming request) / scale).")
+    parser.add_argument("--long_term_profit_weight", type=float, default=1.0, help="Primary weight on own long-run contribution-profit utility.")
+    parser.add_argument("--profit_dominance_weight", type=float, default=0.10, help="Small profitability-gated tie-breaker for outperforming the rival.")
+    parser.add_argument("--dominance_quality_scale", type=float, default=4.0, help="Own-profit scale controlling when the rival-relative tie-breaker becomes economically meaningful.")
+    parser.add_argument("--intervention_cost_weight", type=float, default=0.0, help="Optional cost on realized tariff movement in standard step units; zero leaves economically useful reactions unpenalized.")
+    parser.add_argument("--reversal_cost_weight", type=float, default=0.0, help="Optional cost on reversing the same tariff target within four decisions; zero avoids inducing a fixed tariff.")
     parser.add_argument("--ppo_gamma", type=float, default=0.995, help="Operational-timestep discount used by semi-MDP decision returns.")
     parser.add_argument("--ppo_gae_lambda", type=float, default=0.97, help="GAE lambda applied once per pricing decision with gamma^duration discount.")
     parser.add_argument("--reward_share_weight", type=float, default=0.40, help="Deprecated legacy diagnostic weight; does not enter the active scalar reward.")
@@ -6030,7 +6597,7 @@ def main():
     parser.add_argument("--quote_noise_dollars", type=float, default=0.18, help="Standard deviation of public competitor quote measurement noise.")
     parser.add_argument("--quote_missing_probability", type=float, default=0.03, help="Probability that a scheduled competitor quote probe is unavailable.")
     parser.add_argument("--driver_cost_per_mile", type=float, default=0.85, help="Approximate per-mile contribution cost for completed rides.")
-    parser.add_argument("--reward_action_change_weight", type=float, default=0.008, help="Deprecated compatibility option; action stability is handled by the oscillation soft constraint.")
+    parser.add_argument("--reward_action_change_weight", type=float, default=0.0, help="Deprecated legacy-diagnostic option; it does not enter the active long-term-profit reward.")
     parser.add_argument("--driver_cost_per_minute", type=float, default=0.12, help="Approximate per-minute contribution cost for completed rides.")
     parser.add_argument("--fixed_trip_cost", type=float, default=1.25, help="Approximate fixed platform/driver cost for completed rides.")
     parser.add_argument("--airport_cost", type=float, default=2.0, help="Approximate extra cost for airport rides.")
@@ -6047,10 +6614,10 @@ def main():
     parser.add_argument("--driver_reward_reject_weight", type=float, default=0.0, help="Legacy option retained for compatibility; scalar reward uses positive driver-acceptance satisfaction instead.")
     parser.add_argument("--driver_reward_unfulfilled_weight", type=float, default=0.05, help="Legacy option retained for compatibility; scalar reward uses positive fulfillment/service quality instead.")
     parser.add_argument("--driver_reward_warmup_fraction", type=float, default=0.60, help="Fraction of training over which driver reward terms ramp from zero to full strength.")
-    parser.add_argument("--enable_constrained_reward", action="store_true", help="Deprecated compatibility flag; operational constraint critics are enabled by default.")
-    parser.add_argument("--disable_constrained_reward", action="store_true", help="Disable operational constraint multiplier updates (diagnostics are still logged).")
+    parser.add_argument("--enable_constrained_reward", action="store_true", help="Opt in to operational constraint multipliers; default training optimizes profit and profit dominance only.")
+    parser.add_argument("--disable_constrained_reward", action="store_true", help="Deprecated compatibility flag; unconstrained profit optimization is already the default.")
     parser.add_argument("--constraint_lr", type=float, default=0.03, help="Learning rate for constraint multipliers used by diagnostics/constraint critics.")
-    parser.add_argument("--constraint_penalty_scale", type=float, default=0.35, help="Risk-advantage coefficient at full constraint curriculum scale.")
+    parser.add_argument("--constraint_penalty_scale", type=float, default=0.10, help="Risk-advantage coefficient at full constraint curriculum scale.")
     parser.add_argument("--constraint_curriculum_start_scale", type=float, default=0.25, help="Legacy constraint-diagnostic curriculum scale used during early exploration.")
     parser.add_argument("--constraint_curriculum_mid_scale", type=float, default=0.60, help="Legacy constraint-diagnostic curriculum scale reached by mid-training.")
     parser.add_argument("--constraint_curriculum_end_scale", type=float, default=1.00, help="Legacy constraint-diagnostic curriculum scale at the end of training.")
@@ -6141,6 +6708,11 @@ def main():
                 "profit_advantage_weight", args.profit_dominance_weight
             )
         )
+        args.dominance_quality_scale = float(
+            saved_active_reward.get(
+                "dominance_quality_scale", args.dominance_quality_scale
+            )
+        )
         args.intervention_cost_weight = float(
             saved_active_reward.get(
                 "intervention_cost_weight", args.intervention_cost_weight
@@ -6200,6 +6772,7 @@ def main():
         long_term_profit_advantage_scale=args.long_term_profit_advantage_scale,
         long_term_profit_weight=args.long_term_profit_weight,
         profit_dominance_weight=args.profit_dominance_weight,
+        dominance_quality_scale=args.dominance_quality_scale,
         intervention_cost_weight=args.intervention_cost_weight,
         reversal_cost_weight=args.reversal_cost_weight,
         ppo_gamma=args.ppo_gamma,
@@ -6237,7 +6810,9 @@ def main():
         driver_reward_reject_weight=args.driver_reward_reject_weight,
         driver_reward_unfulfilled_weight=args.driver_reward_unfulfilled_weight,
         driver_reward_warmup_fraction=args.driver_reward_warmup_fraction,
-        constrained_reward=bool(not args.disable_constrained_reward),
+        constrained_reward=bool(
+            args.enable_constrained_reward and not args.disable_constrained_reward
+        ),
         constraint_lr=args.constraint_lr,
         constraint_penalty_scale=args.constraint_penalty_scale,
         constraint_curriculum_start_scale=args.constraint_curriculum_start_scale,
@@ -6300,6 +6875,7 @@ def main():
             profiles_log_limit=args.profiles_log_limit,
             train_steps_per_day=args.train_steps_per_day,
             ppo_update_interval_days=args.ppo_update_interval_days,
+            ppo_min_rollout_transitions=args.ppo_min_rollout_transitions,
             stochastic_training=(not args.deterministic_experiment_seed and args.experiment_seed is None),
             firm1_action_interval_steps=args.firm1_action_interval_steps,
             firm2_action_interval_days=args.firm2_action_interval_days,

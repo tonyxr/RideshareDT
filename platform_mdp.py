@@ -100,11 +100,15 @@ class LongTermProfitRewardConfig:
     """
 
     own_profit_scale: float = 4.0
-    profit_advantage_scale: float = 2.0
-    own_profit_weight: float = 0.90
+    profit_advantage_scale: float = 2.5
+    # Absolute contribution profit is the objective. Rival-relative profit is
+    # deliberately only a small tie-breaker and is gated by own profitability,
+    # so PPO cannot earn a high return merely by winning a destructive price war.
+    own_profit_weight: float = 1.0
     profit_advantage_weight: float = 0.10
-    intervention_cost_weight: float = 0.01
-    reversal_cost_weight: float = 0.005
+    dominance_quality_scale: float = 4.0
+    intervention_cost_weight: float = 0.0
+    reversal_cost_weight: float = 0.0
     minimum_reward: float = -2.0
     maximum_reward: float = 2.0
 
@@ -115,6 +119,7 @@ class LongTermProfitRewardConfig:
                 self.profit_advantage_scale,
                 self.own_profit_weight,
                 self.profit_advantage_weight,
+                self.dominance_quality_scale,
                 self.intervention_cost_weight,
                 self.reversal_cost_weight,
                 self.minimum_reward,
@@ -124,14 +129,27 @@ class LongTermProfitRewardConfig:
         )
         if not np.all(np.isfinite(values)):
             raise ValueError("long-term profit reward configuration must be finite")
-        if self.own_profit_scale <= 0.0 or self.profit_advantage_scale <= 0.0:
+        if (
+            self.own_profit_scale <= 0.0
+            or self.profit_advantage_scale <= 0.0
+            or self.dominance_quality_scale <= 0.0
+        ):
             raise ValueError("long-term profit reward scales must be positive")
         if self.own_profit_weight < 0.0 or self.profit_advantage_weight < 0.0:
             raise ValueError("long-term profit reward weights must be non-negative")
+        if self.own_profit_weight + self.profit_advantage_weight <= 0.0:
+            raise ValueError("at least one long-term profit reward weight must be positive")
         if self.intervention_cost_weight < 0.0 or self.reversal_cost_weight < 0.0:
             raise ValueError("long-term profit action costs must be non-negative")
         if self.minimum_reward >= self.maximum_reward:
             raise ValueError("minimum_reward must be smaller than maximum_reward")
+
+    def normalized_weights(self) -> Tuple[float, float]:
+        total = float(self.own_profit_weight + self.profit_advantage_weight)
+        return (
+            float(self.own_profit_weight / total),
+            float(self.profit_advantage_weight / total),
+        )
 
 
 class LongTermProfitReward:
@@ -155,10 +173,15 @@ class LongTermProfitReward:
         reversal_flag = float(np.clip(reversal, 0.0, 1.0))
         own_utility = float(np.arcsinh(own_profit / c.own_profit_scale))
         advantage_utility = float(
-            np.arcsinh((own_profit - rival_profit) / c.profit_advantage_scale)
+            np.tanh((own_profit - rival_profit) / c.profit_advantage_scale)
+        )
+        profit_quality = float(
+            1.0 - np.exp(-max(0.0, own_profit) / c.dominance_quality_scale)
         )
         own_component = float(c.own_profit_weight * own_utility)
-        advantage_component = float(c.profit_advantage_weight * advantage_utility)
+        advantage_component = float(
+            c.profit_advantage_weight * profit_quality * advantage_utility
+        )
         intervention_cost = float(c.intervention_cost_weight * intervention)
         reversal_cost = float(c.reversal_cost_weight * reversal_flag)
         raw_reward = own_component + advantage_component - intervention_cost - reversal_cost
@@ -166,9 +189,10 @@ class LongTermProfitReward:
         return {
             "reward": reward,
             "reward_raw": raw_reward,
-            "reward_base": own_component,
+            "reward_base": own_component + advantage_component,
             "reward_own_profit_utility": own_utility,
             "reward_profit_advantage_utility": advantage_utility,
+            "reward_profit_quality_gate": profit_quality,
             "reward_own_profit_component": own_component,
             "reward_profit_advantage_component": advantage_component,
             "reward_intervention_cost": intervention_cost,
@@ -201,7 +225,7 @@ class ConstraintConfig:
     cost_ema_alpha: float = 0.10
     # Only operational feasibility is optimized as a constraint.  Fare-gap
     # channels remain available in diagnostics and the observation model.
-    cost_budgets: Tuple[float, ...] = (0.01, 0.01, 0.01, 0.03)
+    cost_budgets: Tuple[float, ...] = (0.01, 0.01, 0.01)
 
 
 @dataclass(frozen=True)
@@ -255,20 +279,20 @@ class TrainingStageScheduler:
         else:
             self.stages = (
                 TrainingStage(
-                    "foundation", 0.0, 0.18, 1, True, 2, 0.35, 0.18, 1.00, 1.00,
+                    "foundation", 0.0, 0.18, 1, True, 1, 0.35, 0.18, 1.00, 1.00,
                     48, 1, 0.12,
                 ),
                 TrainingStage(
-                    "robustness", 0.18, 0.48, 2, False, 2, 0.70, 0.13, 0.95, 1.00,
+                    "robustness", 0.18, 0.48, 2, False, 1, 0.70, 0.12, 0.75, 0.90,
                     64, 4, 0.18,
                 ),
                 TrainingStage(
-                    "competition", 0.48, 0.85, 1, False, 1, 1.00, 0.08, 0.80, 0.90,
-                    72, 8, 0.22,
+                    "competition", 0.48, 0.80, 1, False, 1, 1.00, 0.06, 0.45, 0.70,
+                    96, 8, 0.18,
                 ),
                 TrainingStage(
-                    "consolidation", 0.85, 1.000001, 1, False, 2, 1.10, 0.04, 0.65, 0.70,
-                    64, 6, 0.16,
+                    "consolidation", 0.80, 1.000001, 1, False, 1, 1.00, 0.03, 0.35, 0.40,
+                    128, 8, 0.08,
                 ),
             )
 
@@ -316,8 +340,51 @@ class PlatformObservationModel:
         "airport_rate",
         "long_trip_share",
     )
-    observation_dim: int = 61
+    CITY_CONTEXT_KEYS: Tuple[str, ...] = (
+        "demand_intensity",
+        "trip_distance_scale",
+        "trip_duration_scale",
+        "airport_intensity",
+        "income_index",
+        "price_elasticity",
+        "loyalty_intensity",
+        "new_rider_share",
+        "driver_cost_mile",
+        "driver_cost_minute",
+        "supply_intensity",
+        "weather_sensitivity",
+    )
+    # Layout (single frame):
+    #   0:25   immediate time/tariff/operational measurements
+    #   25:31  observable outcome changes caused by market/opponent dynamics
+    #   31:43  numeric city/digital-twin context (never a city identity)
+    #   43:51  current demand-mix measurements
+    #   51:75  public competitor quote history and its changes
+    #   75:81  the agent's own previous intervention
+    observation_dim: int = 81
     action_feature_dim: int = 20
+
+    @classmethod
+    def feature_groups(cls) -> Dict[str, Tuple[int, ...]]:
+        """Return semantic observation partitions for hierarchical encoders.
+
+        Opponent features contain only observable consequences and public quote
+        history.  The simulator-side opponent mode or controller parameters are
+        deliberately absent.  City features are continuous calibrated market
+        descriptors, so a policy cannot memorize an integer city identifier.
+        """
+        return {
+            "immediate": tuple(
+                list(range(0, 25))
+                + list(range(43, 51))
+                + list(range(75, 81))
+            ),
+            "opponent": tuple(
+                list(range(25, 31))
+                + list(range(51, 75))
+            ),
+            "city": tuple(range(31, 43)),
+        }
 
     def __init__(self, seed: int, config: Optional[ObservationConfig] = None) -> None:
         self.config = config or ObservationConfig()
@@ -338,6 +405,9 @@ class PlatformObservationModel:
             segment: {"gap": 0.0, "uncertainty": 1.0, "age": float(self.config.max_quote_age_steps), "available": 0.0}
             for segment in SEGMENTS
         }
+        self.previous_quote_probes = {
+            segment: dict(values) for segment, values in self.quote_probes.items()
+        }
         self._latest_true_gaps = {segment: 0.0 for segment in SEGMENTS}
 
     def snapshot(self) -> Dict[str, Any]:
@@ -350,6 +420,9 @@ class PlatformObservationModel:
             "previous_telemetry": dict(self.previous_telemetry),
             "demand_mix": dict(self.demand_mix),
             "quote_probes": {k: dict(v) for k, v in self.quote_probes.items()},
+            "previous_quote_probes": {
+                k: dict(v) for k, v in self.previous_quote_probes.items()
+            },
             "latest_true_gaps": dict(self._latest_true_gaps),
         }
 
@@ -366,6 +439,12 @@ class PlatformObservationModel:
         self.previous_telemetry = dict(snapshot.get("previous_telemetry", self.previous_telemetry))
         self.demand_mix = dict(snapshot.get("demand_mix", self.demand_mix))
         self.quote_probes = {k: dict(v) for k, v in snapshot.get("quote_probes", self.quote_probes).items()}
+        self.previous_quote_probes = {
+            k: dict(v)
+            for k, v in snapshot.get(
+                "previous_quote_probes", self.previous_quote_probes
+            ).items()
+        }
         self._latest_true_gaps = dict(snapshot.get("latest_true_gaps", self._latest_true_gaps))
 
     @staticmethod
@@ -440,6 +519,9 @@ class PlatformObservationModel:
         if len(self._probe_queue) > probe_delay:
             released = self._probe_queue.popleft()
             for segment, probe in released.items():
+                self.previous_quote_probes[segment] = dict(
+                    self.quote_probes[segment]
+                )
                 if probe.get("available", 0.0) > 0.0:
                     self.quote_probes[segment] = dict(probe)
                 else:
@@ -457,6 +539,7 @@ class PlatformObservationModel:
         own_coefficients: Mapping[str, float],
         anchor_coefficients: Mapping[str, float],
         last_action: Optional[Mapping[str, float]] = None,
+        city_context: Optional[Mapping[str, float]] = None,
     ) -> np.ndarray:
         hour_f = float(int(hour) % 24)
         day_f = float(int(day_of_week) % 7)
@@ -501,6 +584,11 @@ class PlatformObservationModel:
             float(np.clip((t.get("fulfillment_rate", 1.0) - p.get("fulfillment_rate", 1.0)) / 0.25, -1.0, 1.0)),
             float(np.clip((t.get("wait_minutes", 0.0) - p.get("wait_minutes", 0.0)) / c.wait_scale_minutes, -1.0, 1.0)),
         ]
+        numeric_city_context = city_context or {}
+        city_features = [
+            float(np.clip(numeric_city_context.get(key, 0.0), -1.5, 1.5))
+            for key in self.CITY_CONTEXT_KEYS
+        ]
         d = self.demand_mix
         demand_features = [
             float(np.clip(d.get("distance_mean", 0.0) / 12.0, 0.0, 1.5)),
@@ -513,13 +601,41 @@ class PlatformObservationModel:
             float(np.clip(d.get("long_trip_share", 0.0), 0.0, 1.0)),
         ]
         probe_features = []
+        probe_trend_features = []
         for segment in SEGMENTS:
             probe = self.quote_probes[segment]
+            previous_probe = self.previous_quote_probes[segment]
             probe_features.extend([
                 float(np.clip((probe.get("gap", 0.0)) / c.gap_scale_dollars, -1.5, 1.5)),
                 float(np.clip(probe.get("uncertainty", 1.0) / c.gap_scale_dollars, 0.0, 1.0)),
                 float(np.clip(probe.get("age", c.max_quote_age_steps) / max(1, c.max_quote_age_steps), 0.0, 1.0)),
                 float(np.clip(probe.get("available", 0.0), 0.0, 1.0)),
+            ])
+            both_available = float(
+                probe.get("available", 0.0) > 0.0
+                and previous_probe.get("available", 0.0) > 0.0
+            )
+            probe_trend_features.extend([
+                float(
+                    np.clip(
+                        (
+                            probe.get("gap", 0.0)
+                            - previous_probe.get("gap", 0.0)
+                        )
+                        / c.gap_scale_dollars,
+                        -1.5,
+                        1.5,
+                    )
+                    * both_available
+                ),
+                float(
+                    np.clip(
+                        probe.get("available", 0.0)
+                        - previous_probe.get("available", 0.0),
+                        -1.0,
+                        1.0,
+                    )
+                ),
             ])
         action = last_action or {}
         action_features = [
@@ -535,8 +651,10 @@ class PlatformObservationModel:
             + coefficient_features
             + telemetry_features
             + trend_features
+            + city_features
             + demand_features
             + probe_features
+            + probe_trend_features
             + action_features,
             dtype=np.float32,
         )
@@ -804,7 +922,10 @@ class SoftConstraintController:
         "margin",
         "oscillation",
     )
-    names: Tuple[str, ...] = ("fulfillment", "wait", "margin", "oscillation")
+    # These are true operating-feasibility constraints. Oscillation remains a
+    # diagnostic, but is intentionally not a Lagrangian target: reacting to an
+    # evolving opponent is part of the desired policy, not a violation.
+    names: Tuple[str, ...] = ("fulfillment", "wait", "margin")
 
     def __init__(self, config: Optional[ConstraintConfig] = None) -> None:
         self.config = config or ConstraintConfig()

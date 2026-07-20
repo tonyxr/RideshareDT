@@ -16,6 +16,7 @@ class PPOAgentRegressionTests(unittest.TestCase):
             action_dim=3,
             action_feature_dim=4,
             response_dim=2,
+            action_q_coeff=0.1,
             device="cpu",
         )
         state = torch.tensor([[0.1, 0.2, 0.3, 0.8, -0.4, 0.6]])
@@ -34,27 +35,67 @@ class PPOAgentRegressionTests(unittest.TestCase):
         self.assertFalse(torch.allclose(response[:, 0], response[:, 1]))
         self.assertFalse(torch.allclose(logits, reversed_logits))
 
-    def test_collapse_rescue_survives_later_stage_controls(self):
+    def test_actor_and_critic_optimizers_have_disjoint_parameters(self):
         agent = PPOAgent(
             state_dim=3,
             action_dim=3,
             initial_exploration_rate=0.20,
             final_exploration_rate=0.01,
-            exploration_rescue_rate=0.09,
             ent_coeff=0.02,
             min_ent_coeff=0.001,
             device="cpu",
         )
-        agent.trigger_collapse_rescue(updates=3)
+        actor_ids = {
+            id(parameter)
+            for group in agent.actor_opt.param_groups
+            for parameter in group["params"]
+        }
+        critic_ids = {
+            id(parameter)
+            for group in agent.critic_opt.param_groups
+            for parameter in group["params"]
+        }
+
+        self.assertTrue(actor_ids)
+        self.assertTrue(critic_ids)
+        self.assertFalse(actor_ids & critic_ids)
+
+    def test_stage_controls_follow_declared_schedule_without_reactive_floors(self):
+        agent = PPOAgent(
+            state_dim=3,
+            action_dim=3,
+            initial_exploration_rate=0.20,
+            final_exploration_rate=0.01,
+            ent_coeff=0.02,
+            min_ent_coeff=0.001,
+            device="cpu",
+        )
         agent.set_stage_controls(
             exploration_rate=0.01,
             entropy_scale=0.05,
             learning_rate_scale=0.5,
         )
 
-        self.assertTrue(agent.rescue_active)
-        self.assertGreaterEqual(agent.exploration_rate, 0.09)
-        self.assertGreaterEqual(agent.ent_coeff, 0.01)
+        self.assertAlmostEqual(agent.exploration_rate, 0.01)
+        self.assertAlmostEqual(agent.ent_coeff, 0.001)
+
+    def test_critic_normalizer_round_trip_preserves_raw_value(self):
+        torch.manual_seed(12)
+        source = PPOAgent(state_dim=3, action_dim=2, device="cpu")
+        source.reward_normalizer.update(torch.tensor([10.0, 12.0, 14.0]))
+        state = torch.tensor([[0.1, -0.2, 0.3]])
+        with torch.no_grad():
+            _, _, _, normalized, *_ = source.net(state)
+            expected = source.reward_normalizer.denormalize(normalized)
+
+        target = PPOAgent(state_dim=3, action_dim=2, device="cpu")
+        target.net.load_state_dict(source.net.state_dict())
+        target.load_normalizer_state_dict(source.normalizer_state_dict())
+        with torch.no_grad():
+            _, _, _, normalized, *_ = target.net(state)
+            actual = target.reward_normalizer.denormalize(normalized)
+
+        self.assertTrue(torch.allclose(actual, expected))
 
     def test_structured_update_trains_causal_response_and_action_heads(self):
         rng = np.random.default_rng(5)
@@ -95,6 +136,8 @@ class PPOAgentRegressionTests(unittest.TestCase):
         metrics = agent.update(epochs=1, batch_size=8, bootstrap_value=0.0)
 
         self.assertTrue(metrics["update_performed"])
+        self.assertEqual(agent.buffer_size, 0)
+        self.assertAlmostEqual(metrics["target_kl"], agent.target_kl)
         self.assertTrue(np.isfinite(metrics["response_loss"]))
         self.assertTrue(np.isfinite(metrics["state_action_mi"]))
         self.assertIn("raw_policy_argmax_concentration", metrics)
