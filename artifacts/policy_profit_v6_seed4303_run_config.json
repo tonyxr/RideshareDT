@@ -218,7 +218,7 @@
     "--report_prefix",
     "artifacts/policy_profit_v6_seed4303"
   ],
-  "created_utc": "2026-07-20T15:29:47Z",
+  "created_utc": "2026-07-20T23:21:58Z",
   "deterministic_experiment_seed": true,
   "effective_seed": 4303,
   "eval_guardrail_mode": "off",

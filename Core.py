@@ -89,6 +89,14 @@ from platform_mdp import (
     TrainingStageScheduler,
     config_payload as platform_mdp_config_payload,
 )
+from model_registry import (
+    allocate_archive_path,
+    append_manifest,
+    default_model_id,
+    list_registered_models,
+    resolve_model_reference,
+    safe_model_id,
+)
 
 try:
     import kagglehub
@@ -292,11 +300,24 @@ def _iter_tabular_rows(fpath: str):
             return
         parquet_file = pq.ParquetFile(fpath)
         fieldnames = parquet_file.schema.names
-        for batch in parquet_file.iter_batches(batch_size=10000):
-            records = batch.to_pylist()
-            if not records:
-                continue
-            yield fieldnames, records
+        # Round-robin row groups so a bounded comparison does not consist only
+        # of the first hours/days of a chronologically sorted 365M-row file.
+        iterators = [
+            iter(parquet_file.iter_batches(batch_size=1000, row_groups=[group]))
+            for group in range(parquet_file.num_row_groups)
+        ]
+        while iterators:
+            active = []
+            for iterator in iterators:
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    continue
+                active.append(iterator)
+                records = batch.to_pylist()
+                if records:
+                    yield fieldnames, records
+            iterators = active
         return
 
 def _infer_service_level(row: Dict[str, Any]) -> str:
@@ -315,16 +336,24 @@ def _infer_weather(row: Dict[str, Any]) -> str:
 
 
 def _infer_airport_trip(row: Dict[str, Any]) -> bool:
-    text = " ".join(
-        str(_pick_value(row, ["source", "destination", "pickup", "dropoff", "pickup_zone", "dropoff_zone"]) or "").lower().split()
-    )
+    location_fields = [
+        "source", "destination", "pickup", "dropoff", "pickup_zone", "dropoff_zone",
+        "pickup_location", "dropoff_location",
+    ]
+    values = [row.get(name) for name in location_fields if row.get(name) is not None]
+    text = " ".join(str(value).lower() for value in values)
     airport_tokens = ["airport", "jfk", "lga", "ewr", "laguardia", "newark"]
-    return any(tok in text for tok in airport_tokens)
+    if any(tok in text for tok in airport_tokens):
+        return True
+    # NYC TLC taxi-zone ids: Newark Airport=1, JFK=132, LaGuardia=138.
+    airport_zone_ids = {1, 132, 138}
+    return any((_to_int(value) in airport_zone_ids) for value in values)
 
 
 def _infer_hour_day(row: Dict[str, Any]) -> Tuple[int, int]:
-    hour = _to_int(_pick_value(row, ["hour", "pickup_hour"]))
+    hour = _to_int(_pick_value(row, ["hour", "pickup_hour", "hour_of_day"]))
     day = _to_int(_pick_value(row, ["day_of_week", "weekday", "day"]))
+    day_was_explicit = day is not None
 
     dt_raw = _pick_value(row, ["datetime", "pickup_datetime", "time_stamp", "timestamp", "date"])
     dt: Optional[datetime] = None
@@ -350,7 +379,7 @@ def _infer_hour_day(row: Dict[str, Any]) -> Tuple[int, int]:
         if day is None:
             day = int(dt.weekday())
 
-    if day is not None and day >= 1 and day <= 7:
+    if day_was_explicit and day is not None and day >= 1 and day <= 7:
         day = (day - 1) % 7
 
     return int(hour if hour is not None else 12), int(day if day is not None else 2)
@@ -2643,16 +2672,37 @@ class Core:
             return requested_i
         return int(min(requested_i, self.simulation_sample_cap))
 
-    def save_trained_model(self, path: str, metadata: Optional[Dict[str, Any]] = None) -> str:
-        """Save a portable Firm1 policy artifact independent of the opponent."""
+    def save_trained_model(
+        self,
+        path: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        *,
+        registry_dir: Optional[str] = None,
+        model_id: Optional[str] = None,
+    ) -> str:
+        """Save a portable policy and, when configured, an immutable archive copy.
+
+        ``path`` remains a convenient mutable alias for older scripts.  The
+        registry copy is never overwritten and can later be addressed by its
+        model id or archive filename.
+        """
         if self.firm1_mode != "RL":
             raise ValueError("trained model artifacts require firm1_mode='RL'")
-        output = os.path.abspath(os.path.expanduser(path))
-        os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+        if not path and not registry_dir:
+            raise ValueError("save_trained_model requires a path or registry_dir")
+        resolved_model_id = safe_model_id(model_id or (os.path.splitext(os.path.basename(path or ""))[0] or "trained-policy"))
+        archive_output = (
+            allocate_archive_path(registry_dir, resolved_model_id)
+            if registry_dir
+            else os.path.abspath(os.path.expanduser(str(path)))
+        )
+        alias_output = os.path.abspath(os.path.expanduser(str(path))) if path else None
+        created_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
         artifact = {
             "format": "ride-response-platform-policy",
             "version": 7,
-            "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "created_at": created_at,
+            "model_id": resolved_model_id,
             "market_name": self.market_name,
             "opt_keys": list(self.shared_edit_keys),
             "action_to_steps": copy.deepcopy(self.firm1.action_to_steps),
@@ -2686,9 +2736,32 @@ class Core:
             ),
             "metadata": dict(metadata or {}),
         }
-        torch.save(artifact, output)
-        print(f">>> Saved portable trained policy -> {output}")
-        return output
+        os.makedirs(os.path.dirname(archive_output) or ".", exist_ok=True)
+        torch.save(artifact, archive_output)
+        if alias_output and os.path.realpath(alias_output) != os.path.realpath(archive_output):
+            os.makedirs(os.path.dirname(alias_output) or ".", exist_ok=True)
+            torch.save(artifact, alias_output)
+            print(f">>> Updated trained-policy alias -> {alias_output}")
+        if registry_dir:
+            manifest = append_manifest(
+                registry_dir,
+                {
+                    "model_id": resolved_model_id,
+                    "archive_id": os.path.basename(archive_output),
+                    "archive_path": archive_output,
+                    "alias_path": alias_output,
+                    "created_at": created_at,
+                    "market_name": self.market_name,
+                    "metadata": dict(metadata or {}),
+                },
+            )
+            print(f">>> Registered immutable trained policy -> {archive_output}")
+            print(f">>> Model registry manifest -> {manifest}")
+        else:
+            print(f">>> Saved portable trained policy -> {archive_output}")
+        self.last_saved_model_path = archive_output
+        self.last_saved_model_id = resolved_model_id
+        return archive_output
 
     def load_trained_model(
         self,
@@ -2774,6 +2847,8 @@ class Core:
             observer.reset()
         self.action_stability.reset()
         self._sync_agent_optimization_context()
+        self.loaded_trained_model_path = source
+        self.loaded_trained_model_id = artifact.get("model_id")
         print(
             f">>> Loaded trained policy <- {source}; benchmark opponent remains {self.firm2_mode}."
         )
@@ -3049,12 +3124,15 @@ class Core:
         stochastic_training: bool = True,
         firm1_action_interval_steps: int = -1,
         firm2_action_interval_days: int = -1,
-        eval_policy_mode: str = "argmax",
+        eval_policy_mode: str = "top2_margin",
         eval_policy_temperature: float = 0.50,
         eval_top2_margin: float = 0.05,
+        eval_policy_seed: Optional[int] = None,
         eval_guardrail_mode: str = "log_only",
         training_enabled: bool = True,
         trained_model_out: Optional[str] = None,
+        model_registry_dir: Optional[str] = "artifacts/trained_models",
+        trained_model_id: Optional[str] = None,
     ):
         """Run workflow: synthetic-data RL training (day/timestep cadence), then held-out evaluation."""
         training_enabled = bool(training_enabled)
@@ -4008,8 +4086,8 @@ class Core:
         self.firm2 = copy.deepcopy(benchmark_opponent)
         self._reset_adaptive_episode(tariff_reset_fraction=0.18)
 
-        if training_enabled and trained_model_out and self.firm1_mode == "RL":
-            self.save_trained_model(
+        if training_enabled and self.firm1_mode == "RL" and (trained_model_out or model_registry_dir):
+            saved_policy_path = self.save_trained_model(
                 trained_model_out,
                 metadata={
                     "best_validation_day": None if best_checkpoint is None else int(best_checkpoint["day"]),
@@ -4017,7 +4095,13 @@ class Core:
                     "training_opponent": str(opponent_mode),
                     "training_days": int(train_timesteps),
                 },
+                registry_dir=model_registry_dir,
+                model_id=trained_model_id,
             )
+            # Evaluate the serialized artifact, not a merely equivalent
+            # in-memory object. This continuously verifies that every archived
+            # checkpoint is independently loadable for future benchmark runs.
+            self.load_trained_model(saved_policy_path, load_optimizer=False)
 
         
         print(f">>> Evaluating RL agent against same-level {opponent_mode} opponent with shared profile pool...")
@@ -4027,6 +4111,15 @@ class Core:
             observer.reset()
         self.action_stability.reset()
         self.driver_reward_scale_current = 1.0 if self.enable_driver_supply else 0.0
+        resolved_eval_policy_seed = int(self.seed + 700_001 if eval_policy_seed is None else eval_policy_seed)
+        if str(eval_policy_mode) != "argmax":
+            torch.manual_seed(resolved_eval_policy_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(resolved_eval_policy_seed)
+            print(
+                f">>> Evaluation policy mode={eval_policy_mode} seed={resolved_eval_policy_seed} "
+                f"temperature={float(eval_policy_temperature):.3f} top2_margin={float(eval_top2_margin):.4f}"
+            )
         eval_rewards: List[float] = []
         # Reset reward-trend baselines so evaluation reward reflects evaluation dynamics,
         # not trailing deltas from the end of training.
@@ -4277,6 +4370,7 @@ class Core:
                 "gap_violation_050": float(abs(float(mean_gap) - self.reward_target_price_gap) > 0.50),
                 "constraint_curriculum_scale": float(self.constraint_curriculum_scale),
                 "eval_policy_mode": str(eval_policy_mode),
+                "eval_policy_seed": int(resolved_eval_policy_seed),
                 "eval_guardrail_mode": str(eval_guardrail_mode),
                 "policy_top_action": int(eval_policy_diag.get("policy_top_action", -1)),
                 "policy_top_action_label": (
@@ -4396,20 +4490,121 @@ class Core:
         print("Experiment Complete.")
         return self.training_logs, self.evaluation_logs
     
+    def _predict_dataset_ride_with_policy(
+        self,
+        *,
+        distance: float,
+        duration: float,
+        ctx: RideContext,
+        policy_mode: str,
+        policy_temperature: float,
+    ) -> Dict[str, Any]:
+        """Make one independent, row-conditioned counterfactual policy quote.
+
+        The PPO policy controls an aggregate tariff rather than directly
+        regressing a fare.  For offline validation, each ride therefore starts
+        from the city anchor tariff, supplies its observed time and demand mix
+        as the current platform context, takes one learned tariff action, and
+        prices the ride with the resulting coefficients.  Rows never mutate the
+        next row's tariff or state history.
+        """
+        if self.firm1_mode != "RL":
+            raise ValueError("dataset policy validation requires firm1_mode='RL'")
+
+        observer = self.platform_observers["Firm1"]
+        observer.reset()
+        long_trip = float(distance >= 10.0)
+        observer.demand_mix.update({
+            "distance_mean": float(distance),
+            "distance_std": 0.0,
+            "distance_q25": float(distance),
+            "distance_q75": float(distance),
+            "duration_mean": float(duration),
+            "duration_std": 0.0,
+            "airport_rate": float(bool(ctx.airport)),
+            "long_trip_share": long_trip,
+        })
+        self.last_crowd_response_stats = {
+            "distance_mean": float(distance),
+            "duration_mean": float(duration),
+            "airport_rate": float(bool(ctx.airport)),
+            "long_trip_share": long_trip,
+            "peak_context": float((7 <= ctx.hour < 10) or (16 <= ctx.hour < 19)),
+        }
+        self.firm1.overrides = CoefficientOverrides()
+        self.firm1.reset_state_history()
+        self.action_stability.reset()
+
+        raw_state = self._build_rl_state(
+            day_of_week=ctx.day_of_week,
+            hour=ctx.hour,
+            weather=ctx.weather,
+        )
+        action_features = self._action_feature_matrix_for_pricer(
+            self.firm1, self.last_crowd_response_stats
+        )
+        state = self.firm1.stack_state(raw_state, commit=False)
+        action_mask = self.firm1.feasible_action_mask(self.market)
+        policy_diag = self.firm1.agent.policy_diagnostics(
+            state,
+            action_features=action_features,
+            action_mask=action_mask,
+            temperature=1.0,
+        )
+        baseline_price = float(self.market.quote_price(
+            distance_miles=float(max(0.0, distance)),
+            duration_minutes=float(max(0.0, duration)),
+            ctx=ctx,
+            overrides=self.firm1.overrides,
+        ))
+        action, *_ = self.firm1.agent.act(
+            state,
+            deterministic=True,
+            action_features=action_features,
+            action_mask=action_mask,
+            policy_mode=policy_mode,
+            policy_temperature=policy_temperature,
+            top2_margin=0.05,
+        )
+        self.firm1.apply_action(int(action), self.market)
+        predicted_price = float(self.market.quote_price(
+            distance_miles=float(max(0.0, distance)),
+            duration_minutes=float(max(0.0, duration)),
+            ctx=ctx,
+            overrides=self.firm1.overrides,
+        ))
+        coefficients = self._coeff_snapshot()
+        return {
+            "predicted_price": predicted_price,
+            "anchor_price": baseline_price,
+            "action": int(action),
+            "action_label": self.firm1.action_label(int(action)),
+            "action_magnitude": float(self.firm1.agent.last_continuous_magnitude),
+            "policy_top_action": int(policy_diag.get("policy_top_action", -1)),
+            "policy_top_prob": float(policy_diag.get("policy_top_prob", 0.0)),
+            "policy_second_prob": float(policy_diag.get("policy_second_prob", 0.0)),
+            "policy_action_margin": float(policy_diag.get("policy_action_margin", 0.0)),
+            "policy_entropy": float(policy_diag.get("policy_entropy", 0.0)),
+            "coefficients": coefficients,
+        }
+
     def compare_trained_rl_to_dataset(
        self,
        dataset_root: str,
        dataset_glob: str = "*.parquet",
        out_csv: Optional[str] = None,
        out_plot_prefix: Optional[str] = None,
-       max_rows: int = 50000,
+       max_rows: int = 5000,
        preview_rows: int = 5,
+       policy_mode: str = "argmax",
+       policy_temperature: float = 0.50,
+       policy_seed: int = 99173,
    ) -> Dict[str, Any]:
        files = _discover_dataset_files(dataset_root=dataset_root, dataset_glob=dataset_glob)
 
        if not files:
            raise FileNotFoundError(
-               f"No parquet dataset files found under dataset_root={dataset_root!r} with glob={dataset_glob!r}"
+               f"No dataset files found under dataset_root={dataset_root!r} with glob={dataset_glob!r}"
            )
 
        rows_out: List[Dict[str, Any]] = []
@@ -4417,6 +4612,7 @@ class Core:
        sq_err: List[float] = []
        signed_err: List[float] = []
        abs_pct: List[float] = []
+       anchor_abs_err: List[float] = []
        dur_abs_err: List[float] = []
        dur_sq_err: List[float] = []
        dur_abs_pct: List[float] = []
@@ -4446,10 +4642,24 @@ class Core:
        
        skipped_missing_price = 0
        skipped_missing_distance = 0
+       skipped_invalid_price = 0
+       skipped_invalid_distance = 0
        files_with_rows = 0
        preview_printed = False
 
-       for fpath in files:
+       saved_policy_state = {
+           "firm1_overrides": copy.deepcopy(self.firm1.overrides),
+           "firm1_execution": self.firm1.snapshot_execution_state(),
+           "observer": self.platform_observers["Firm1"].snapshot(),
+           "stability": self.action_stability.snapshot(),
+           "crowd": dict(getattr(self, "last_crowd_response_stats", {}) or {}),
+       }
+       torch.manual_seed(int(policy_seed))
+       if torch.cuda.is_available():
+           torch.cuda.manual_seed_all(int(policy_seed))
+
+       try:
+        for fpath in files:
            file_kept = 0
            try:
                for fieldnames, reader in _iter_tabular_rows(fpath):
@@ -4491,6 +4701,12 @@ class Core:
                        if distance is None:
                            skipped_missing_distance += 1
                            continue
+                       if not np.isfinite(actual_paid) or float(actual_paid) <= 0.0:
+                           skipped_invalid_price += 1
+                           continue
+                       if not np.isfinite(distance) or float(distance) <= 0.0:
+                           skipped_invalid_distance += 1
+                           continue
 
                        hour, day_of_week = _infer_hour_day(raw)
                        actual_duration, duration_key = _pick_first_minutes_with_key(raw, duration_cols)
@@ -4517,6 +4733,11 @@ class Core:
                                except Exception:
                                    pass
 
+                       if actual_duration is not None and (
+                           not np.isfinite(actual_duration) or float(actual_duration) <= 0.0
+                       ):
+                           actual_duration = None
+
                        predicted_duration = float(self.estimate_duration(float(distance), hour))
                        duration = float(actual_duration) if actual_duration is not None else predicted_duration
 
@@ -4539,15 +4760,15 @@ class Core:
                            airport=bool(airport),
                            service=service,
                        )
-                       # Keep coefficient overrides fixed during dataset comparison.
-                       # Applying sequential RL actions row-by-row introduces policy drift
-                       # unrelated to each observed ride and creates strong directional bias.
-                       rl_price = self.market.quote_price(
-                           distance_miles=float(max(0.0, distance)),
-                           duration_minutes=float(max(0.0, duration)),
+                       policy_prediction = self._predict_dataset_ride_with_policy(
+                           distance=float(max(0.0, distance)),
+                           duration=float(max(0.0, duration)),
                            ctx=ctx,
-                           overrides=self.firm1.overrides,
+                           policy_mode=policy_mode,
+                           policy_temperature=policy_temperature,
                        )
+                       rl_price = float(policy_prediction["predicted_price"])
+                       anchor_abs_err.append(abs(float(policy_prediction["anchor_price"]) - actual_paid))
 
                        err = float(rl_price - actual_paid)
                        ae = float(abs(err))
@@ -4561,6 +4782,7 @@ class Core:
                            "source_file": os.path.basename(fpath),
                            "actual_paid": float(actual_paid),
                            "rl_predicted_price": float(rl_price),
+                           "anchor_tariff_price": float(policy_prediction["anchor_price"]),
                            "price_error": err,
                            "abs_error": ae,
                            "distance_miles": float(distance),
@@ -4572,6 +4794,19 @@ class Core:
                            "weather": str(ctx.weather),
                            "airport": bool(ctx.airport),
                            "service": str(ctx.service),
+                           "policy_mode": str(policy_mode),
+                           "policy_action": int(policy_prediction["action"]),
+                           "policy_action_label": str(policy_prediction["action_label"]),
+                           "policy_action_magnitude": float(policy_prediction["action_magnitude"]),
+                           "policy_top_action": int(policy_prediction["policy_top_action"]),
+                           "policy_top_prob": float(policy_prediction["policy_top_prob"]),
+                           "policy_second_prob": float(policy_prediction["policy_second_prob"]),
+                           "policy_action_margin": float(policy_prediction["policy_action_margin"]),
+                           "policy_entropy": float(policy_prediction["policy_entropy"]),
+                           **{
+                               f"predicted_{key}": float(value)
+                               for key, value in policy_prediction["coefficients"].items()
+                           },
                        })
                        kept += 1
                        file_kept += 1
@@ -4587,6 +4822,12 @@ class Core:
                files_with_rows += 1
            if kept >= max_rows:
                break
+       finally:
+           self.firm1.overrides = saved_policy_state["firm1_overrides"]
+           self.firm1.restore_execution_state(saved_policy_state["firm1_execution"])
+           self.platform_observers["Firm1"].restore(saved_policy_state["observer"])
+           self.action_stability.restore(saved_policy_state["stability"])
+           self.last_crowd_response_stats = saved_policy_state["crowd"]
 
        if out_csv:
            _ensure_parent_dir(out_csv)
@@ -4606,16 +4847,37 @@ class Core:
            "rows_compared": int(kept),
            "rows_skipped_missing_price": int(skipped_missing_price),
            "rows_skipped_missing_distance": int(skipped_missing_distance),
+           "rows_skipped_invalid_price": int(skipped_invalid_price),
+           "rows_skipped_invalid_distance": int(skipped_invalid_distance),
            "files_with_comparable_rows": int(files_with_rows),
            "mae": float(np.mean(abs_err)) if abs_err else None,
+           "anchor_tariff_mae": float(np.mean(anchor_abs_err)) if anchor_abs_err else None,
+           "policy_mae_improvement_vs_anchor": (
+               float(np.mean(anchor_abs_err) - np.mean(abs_err))
+               if anchor_abs_err and abs_err else None
+           ),
            "rmse": float(np.sqrt(np.mean(sq_err))) if sq_err else None,
            "mape": float(np.mean(abs_pct)) if abs_pct else None,
            "bias": float(np.mean(signed_err)) if signed_err else None,
+           "median_absolute_error": float(np.median(abs_err)) if abs_err else None,
+           "within_2_dollars": float(np.mean(np.asarray(abs_err) <= 2.0)) if abs_err else None,
+           "within_5_dollars": float(np.mean(np.asarray(abs_err) <= 5.0)) if abs_err else None,
+           "actual_price_mean": float(np.mean([row["actual_paid"] for row in rows_out])) if rows_out else None,
+           "predicted_price_mean": float(np.mean([row["rl_predicted_price"] for row in rows_out])) if rows_out else None,
+           "price_correlation": (
+               float(np.corrcoef(
+                   [row["actual_paid"] for row in rows_out],
+                   [row["rl_predicted_price"] for row in rows_out],
+               )[0, 1]) if len(rows_out) > 1 else None
+           ),
            "duration_mae_minutes": float(np.mean(dur_abs_err)) if dur_abs_err else None,
            "duration_rmse_minutes": float(np.sqrt(np.mean(dur_sq_err))) if dur_sq_err else None,
            "duration_mape": float(np.mean(dur_abs_pct)) if dur_abs_pct else None,
            "out_csv": out_csv,
            "out_plot_prefix": out_plot_prefix,
+           "policy_mode": str(policy_mode),
+           "policy_temperature": float(policy_temperature),
+           "policy_seed": int(policy_seed),
        }
        self._print_reality_gap_check(summary)
        self._print_sensitivity_analysis()
@@ -4625,13 +4887,17 @@ class Core:
         mae = summary.get("mae")
         mape = summary.get("mape")
         bias = summary.get("bias")
+        anchor_mae = summary.get("anchor_tariff_mae")
+        improvement = summary.get("policy_mae_improvement_vs_anchor")
         if mae is None:
             print(">>> Reality gap check: insufficient comparable Kaggle rows.")
             return
         bias_dir = "overpricing" if (bias or 0.0) > 0 else "underpricing"
         print(
             ">>> Reality gap check: "
-            f"mae={float(mae):.3f}, mape={float(mape or 0.0):.3f}, bias={float(bias or 0.0):.3f} ({bias_dir})."
+            f"policy_mae={float(mae):.3f}, anchor_mae={float(anchor_mae or 0.0):.3f}, "
+            f"policy_improvement={float(improvement or 0.0):+.3f}, "
+            f"mape={float(mape or 0.0):.3f}, bias={float(bias or 0.0):.3f} ({bias_dir})."
         )
 
     def _print_sensitivity_analysis(self) -> None:
@@ -4652,7 +4918,7 @@ class Core:
         premium = _quote(base_distance, base_duration, base_ctx.hour, base_ctx.weather, base_ctx.airport, "premium")
 
         print(
-            ">>> Sensitivity analysis (trained RL pricing, baseline ride=3mi clear weekday 14:00): "
+            ">>> Sensitivity analysis (active tariff after restoring the simulation state; baseline ride=3mi clear weekday 14:00): "
             f"base={base_price:.2f}, +20%dist={dist_up:.2f}, +20%duration={dur_up:.2f}, rush18={rush:.2f}, rain={rain:.2f}, airport={airport:.2f}, premium={premium:.2f}"
         )
         
@@ -4682,6 +4948,12 @@ class Core:
             f"price_rmse={float(np.sqrt(np.mean(np.square(price_errors)))):.3f}, "
             f"price_bias={float(np.mean(price_errors)):.3f}, "
             f"price_mape={float(np.nanmean(ape)):.3f}"
+        )
+
+        action_counts = Counter(str(r.get("policy_action_label", "unknown")) for r in rows_out)
+        print(
+            ">>> Kaggle learned-policy actions: "
+            + ", ".join(f"{label}={count}" for label, count in action_counts.most_common(8))
         )
 
         if duration_errors:
@@ -6471,7 +6743,12 @@ def _write_run_config(prefix: str, args: argparse.Namespace, core: Core) -> None
         "effective_seed": core.seed,
         "deterministic_experiment_seed": bool(args.deterministic_experiment_seed),
         "eval_policy_mode": args.eval_policy_mode,
+        "eval_policy_seed": args.eval_policy_seed,
         "eval_guardrail_mode": args.eval_guardrail_mode,
+        "trained_model_archive": getattr(core, "last_saved_model_path", None),
+        "trained_model_id": getattr(core, "last_saved_model_id", None),
+        "loaded_trained_model_path": getattr(core, "loaded_trained_model_path", None),
+        "loaded_trained_model_id": getattr(core, "loaded_trained_model_id", None),
         "report_prefix": args.report_prefix,
         "platform_mdp": platform_mdp_config_payload(
             core.observation_config,
@@ -6535,9 +6812,13 @@ def main():
     
     parser.add_argument("--report_prefix", type=str, default="artifacts/report")
     parser.add_argument("--run_experiment", action="store_true", help="Run workflow-aligned training/eval experiment")
-    parser.add_argument("--trained_model_in", type=str, default="", help="Load a portable Firm1 policy artifact before evaluation or continued training.")
-    parser.add_argument("--trained_model_out", type=str, default="", help="Save the validation-best Firm1 policy artifact before evaluation.")
+    parser.add_argument("--trained_model_in", type=str, default="", help="Load a policy by explicit path, immutable registry model id/archive filename, or 'latest'.")
+    parser.add_argument("--trained_model_out", type=str, default="", help="Optional mutable alias for the validation-best policy. Every training run is also saved immutably in --model_registry_dir.")
+    parser.add_argument("--trained_model_id", type=str, default="", help="Stable human-readable id recorded for this training run in the model registry.")
+    parser.add_argument("--model_registry_dir", type=str, default="artifacts/trained_models", help="Directory containing immutable trained-policy archives and manifest.jsonl.")
+    parser.add_argument("--list_trained_models", action="store_true", help="List available immutable trained-policy archives and exit.")
     parser.add_argument("--eval_only", action="store_true", help="Skip training and evaluate --trained_model_in directly against --firm2_mode.")
+    parser.add_argument("--dataset_only", action="store_true", help="Load --trained_model_in and run only --compare_with_dataset, without synthetic evaluation/profile bootstrap.")
     parser.add_argument("--train_timesteps", type=int, default=1500)
     parser.add_argument("--train_customers", type=int, default=5000)
     parser.add_argument("--train_steps_per_day", type=int, default=10, help="Synthetic training timesteps per day (run_experiment mode).")
@@ -6552,9 +6833,10 @@ def main():
     parser.add_argument("--training_curriculum", type=str, default="staged", choices=["staged", "direct"], help="Use staged opponent/cadence/optimization training or train directly in full competition.")
     parser.add_argument("--deterministic_experiment_seed", action="store_true", help="If set, keep run_experiment fully deterministic with --seed.")
     parser.add_argument("--experiment_seed", type=int, default=None, help="Optional explicit run_experiment seed. Overrides stochastic child-seed generation and is recorded in run config.")
-    parser.add_argument("--eval_policy_mode", type=str, default="argmax", choices=["argmax", "sample_raw", "sample_low_temp", "top2_margin"], help="Evaluation action-selection mode for the learned policy.")
+    parser.add_argument("--eval_policy_mode", type=str, default="top2_margin", choices=["argmax", "sample_raw", "sample_low_temp", "top2_margin"], help="Evaluation action-selection mode. top2_margin avoids brittle pure argmax when the two leading actions are statistically close.")
     parser.add_argument("--eval_policy_temperature", type=float, default=0.50, help="Temperature for --eval_policy_mode sample_low_temp.")
     parser.add_argument("--eval_top2_margin", type=float, default=0.05, help="Top-probability margin required before deterministic top action is used in --eval_policy_mode top2_margin.")
+    parser.add_argument("--eval_policy_seed", type=int, default=None, help="Torch sampling seed for stochastic evaluation modes; defaults to effective run seed + 700001.")
     parser.add_argument("--eval_guardrail_mode", type=str, default="log_only", choices=["deployed", "off", "log_only"], help="Whether evaluation applies, disables, or only logs the post-batch business guardrail.")
     parser.add_argument("--eval_timesteps", type=int, default=200)
     parser.add_argument("--eval_customers", type=int, default=1000)
@@ -6637,6 +6919,7 @@ def main():
     parser.add_argument("--calibration_city", type=str, default="", help="Optional city filter for --calibration_csv; defaults to --market if omitted.")
     parser.add_argument("--calibration_preset", type=str, default="", choices=["", "nyc_public"], help="Optional built-in calibration preset. Use nyc_public explicitly for NYC TLC + ACS + weather priors.")
     parser.add_argument("--compare_with_dataset", action="store_true", help="After training/run, compare RL-implied prices against actual paid prices in the Kaggle rideshare dataset files.")
+    parser.add_argument("--dataset_root", type=str, default="", help="Optional local dataset root. When omitted, --compare_with_dataset downloads/resolves the configured Kaggle dataset.")
     parser.add_argument("--dataset_glob", type=str, default="*.parquet", help="Glob for dataset file discovery under kagglehub download path.")
     parser.add_argument(
         "--comparison_out", "--comparison-out",
@@ -6654,18 +6937,34 @@ def main():
         default="artifacts/rl_dataset_validation",
         help="Prefix for validation graphs (price/time match) against dataset. If provided without a value, defaults to artifacts/rl_dataset_validation.",
     )
-    parser.add_argument("--comparison_limit", type=int, default=50000, help="Max number of dataset rows to score during RL-vs-actual comparison.")
+    parser.add_argument("--comparison_limit", type=int, default=5000, help="Max number of dataset rows to score during learned-policy validation; parquet row groups are sampled round-robin for temporal coverage.")
     parser.add_argument("--dataset_preview_rows", type=int, default=5, help="How many raw dataset rows to print once as format preview during RL-vs-actual comparison.")
+    parser.add_argument("--comparison_policy_mode", type=str, default="argmax", choices=["argmax", "sample_raw", "sample_low_temp", "top2_margin"], help="One-step learned-policy action mode used independently for each dataset ride row.")
+    parser.add_argument("--comparison_policy_temperature", type=float, default=0.50, help="Temperature for stochastic dataset-row policy scoring.")
+    parser.add_argument("--comparison_policy_seed", type=int, default=99173, help="Sampling seed for reproducible dataset-row policy scoring.")
 
     args, unknown_args = parser.parse_known_args()
     if unknown_args:
         print(f"[WARN] Ignoring unrecognized CLI args: {unknown_args}")
+    if args.list_trained_models:
+        records = list_registered_models(args.model_registry_dir)
+        if not records:
+            print(f"No trained policies registered in {os.path.abspath(os.path.expanduser(args.model_registry_dir))}")
+        for record in records:
+            print(json.dumps(record, sort_keys=True))
+        return
     if args.eval_only and not args.trained_model_in:
         parser.error("--eval_only requires --trained_model_in")
+    if args.dataset_only and (not args.trained_model_in or not args.compare_with_dataset):
+        parser.error("--dataset_only requires --trained_model_in and --compare_with_dataset")
     if args.trained_model_in:
         args.firm1_mode = "RL"
         args.run_experiment = True
-        artifact_path = os.path.abspath(os.path.expanduser(args.trained_model_in))
+        try:
+            artifact_path = resolve_model_reference(args.trained_model_in, args.model_registry_dir)
+        except FileNotFoundError as exc:
+            parser.error(str(exc))
+        args.trained_model_in = artifact_path
         try:
             artifact_header = torch.load(artifact_path, map_location="cpu", weights_only=False)
         except TypeError:
@@ -6865,7 +7164,10 @@ def main():
         )
 
 
-    if args.run_experiment:
+    if args.dataset_only:
+        print(">>> Dataset-only mode: skipping synthetic training/evaluation.")
+        rows = []
+    elif args.run_experiment:
         core.run_experiment(
             train_timesteps=args.train_timesteps,
             train_customers_per_step=args.train_customers,
@@ -6882,9 +7184,12 @@ def main():
             eval_policy_mode=args.eval_policy_mode,
             eval_policy_temperature=args.eval_policy_temperature,
             eval_top2_margin=args.eval_top2_margin,
+            eval_policy_seed=args.eval_policy_seed,
             eval_guardrail_mode=args.eval_guardrail_mode,
             training_enabled=not args.eval_only,
             trained_model_out=args.trained_model_out or None,
+            model_registry_dir=args.model_registry_dir or None,
+            trained_model_id=args.trained_model_id or default_model_id(args.report_prefix),
         )
         rows = []
     else:
@@ -6932,12 +7237,19 @@ def main():
     
     if args.compare_with_dataset:
         summary = core.compare_trained_rl_to_dataset(
-            dataset_root=_resolve_dataset_path(),
+            dataset_root=(
+                os.path.abspath(os.path.expanduser(args.dataset_root))
+                if args.dataset_root
+                else _resolve_dataset_path()
+            ),
             dataset_glob=args.dataset_glob,
             out_csv=args.comparison_out,
             out_plot_prefix=args.comparison_plot_prefix,
             max_rows=args.comparison_limit,
             preview_rows=args.dataset_preview_rows,
+            policy_mode=args.comparison_policy_mode,
+            policy_temperature=args.comparison_policy_temperature,
+            policy_seed=args.comparison_policy_seed,
         )
         print(f"[RL vs Actual] {json.dumps(summary, indent=2)}")
 

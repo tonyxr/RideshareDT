@@ -181,7 +181,7 @@
     "--report_prefix",
     "artifacts/policy_profit_v6_seed4303_vs_region_supply_demand"
   ],
-  "created_utc": "2026-07-20T15:52:04Z",
+  "created_utc": "2026-07-20T23:44:50Z",
   "deterministic_experiment_seed": true,
   "effective_seed": 4303,
   "eval_guardrail_mode": "off",

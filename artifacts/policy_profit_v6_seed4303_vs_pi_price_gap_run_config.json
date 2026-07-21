@@ -181,7 +181,7 @@
     "--report_prefix",
     "artifacts/policy_profit_v6_seed4303_vs_pi_price_gap"
   ],
-  "created_utc": "2026-07-20T15:43:09Z",
+  "created_utc": "2026-07-20T23:35:40Z",
   "deterministic_experiment_seed": true,
   "effective_seed": 4303,
   "eval_guardrail_mode": "off",

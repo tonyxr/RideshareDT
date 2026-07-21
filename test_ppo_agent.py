@@ -7,6 +7,33 @@ from PPOAgent import PPOAgent
 
 
 class PPOAgentRegressionTests(unittest.TestCase):
+    def test_top2_margin_mode_is_seeded_and_never_samples_lower_ranked_actions(self):
+        agent = PPOAgent(state_dim=3, action_dim=3, device="cpu")
+        final_policy_layer = agent.net.pi_head[-1]
+        with torch.no_grad():
+            final_policy_layer.weight.zero_()
+            final_policy_layer.bias.copy_(torch.tensor([2.0, 1.99, -10.0]))
+
+        def draw_sequence():
+            return [
+                agent.act(
+                    [0.0, 0.0, 0.0],
+                    deterministic=True,
+                    action_mask=[True, True, True],
+                    policy_mode="top2_margin",
+                    top2_margin=0.05,
+                )[0]
+                for _ in range(40)
+            ]
+
+        torch.manual_seed(123)
+        first = draw_sequence()
+        torch.manual_seed(123)
+        second = draw_sequence()
+
+        self.assertEqual(first, second)
+        self.assertEqual(set(first), {0, 1})
+
     def test_recurrent_belief_and_action_conditioned_response_are_live(self):
         torch.manual_seed(17)
         agent = PPOAgent(

@@ -76,9 +76,14 @@ python Core.py \
   --report_prefix artifacts/platform_train
 ```
 
-The saved artifact includes the policy, tariff, action mapping, frame-stack
-shape, observation/reward/constraint configuration, dual state, optimizer
-state, and validation metadata. It does not contain the benchmark opponent.
+Every training run writes a timestamped immutable policy under
+`artifacts/trained_models/` and appends its identity to `manifest.jsonl`.
+`--trained_model_out` is an optional mutable convenience alias; overwriting the
+alias never removes older archived models. The artifact includes policy and
+optimizer weights, normalizers, action mapping, frame-stack shape, MDP
+configuration, and validation metadata. It deliberately excludes the terminal
+tariff, opponent, observation queues, and dual state so evaluation starts from
+a fresh market rather than a leaked training world.
 
 ## Evaluate the same policy against benchmarks
 
@@ -86,13 +91,43 @@ state, and validation metadata. It does not contain the benchmark opponent.
 for opponent in pi_price_gap mpc_grid region_supply_demand surge_driver_incentive queue_service_threshold; do
   python Core.py \
     --eval_only \
-    --trained_model_in artifacts/platform_policy.pt \
+    --trained_model_in platform_train \
     --firm2_mode "$opponent" \
     --report_prefix "artifacts/eval_${opponent}"
 done
 ```
 
-Evaluation restores the artifact's exact MDP configuration and Firm1 tariff,
-leaves the selected opponent untouched, performs no optimizer update, and uses
-the learned policy directly. The default evaluation guardrail is `log_only` so
-it cannot silently replace policy actions.
+`--trained_model_in` accepts an explicit `.pt` path, a registry model id/archive
+filename, or `latest`. `--list_trained_models` prints all available archive
+records. Evaluation restores the artifact's exact MDP configuration, leaves the
+selected opponent untouched, performs no optimizer update, and uses the learned
+policy directly. The default action mode is seeded `top2_margin`: it samples
+between the two leaders only when their probability gap is below 0.05, avoiding
+brittle argmax tie-breaking while remaining reproducible. Use
+`--eval_policy_mode argmax` for the deterministic baseline. The default
+evaluation guardrail is `log_only`, so it cannot silently replace policy
+actions.
+
+## Validate prices against NYC ride rows
+
+```bash
+python Core.py \
+  --eval_only \
+  --dataset_only \
+  --trained_model_in platform_train \
+  --firm2_mode static \
+  --compare_with_dataset \
+  --comparison_policy_mode argmax \
+  --comparison_limit 5000 \
+  --comparison_out artifacts/platform_train_nyc_prices.csv
+```
+
+For each valid ride, the validator starts from the NYC anchor tariff, injects
+the observed hour/day, distance, duration, airport, weather, and service
+context, executes one independent learned policy action, and computes a fare.
+It records the selected action, action confidence, magnitude, resulting tariff
+coefficients, predicted price, and paid passenger fare. Rows do not change the
+next row's state. Reports include MAE/RMSE/MAPE/bias, correlation, $2/$5
+coverage, invalid-row counts, and improvement relative to the unmodified NYC
+anchor tariff. Parquet row groups are read round-robin so a bounded sample is
+not confined to the start of a chronologically sorted file.

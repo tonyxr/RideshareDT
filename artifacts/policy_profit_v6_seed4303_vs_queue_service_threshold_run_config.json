@@ -181,7 +181,7 @@
     "--report_prefix",
     "artifacts/policy_profit_v6_seed4303_vs_queue_service_threshold"
   ],
-  "created_utc": "2026-07-20T15:47:35Z",
+  "created_utc": "2026-07-20T23:40:12Z",
   "deterministic_experiment_seed": true,
   "effective_seed": 4303,
   "eval_guardrail_mode": "off",
