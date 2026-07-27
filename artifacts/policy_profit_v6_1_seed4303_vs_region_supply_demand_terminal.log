@@ -1,0 +1,52 @@
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+[ChoiceModel] GPT price-threshold mode enabled (thresholds consumed from profile).
+[PricingParity] Firm1 and Firm2 share actions=21, keys=['base_fare', 'per_minute', 'per_mile', 'booking_fee', 'airport_fee'].
+Using random seed: 4303
+[LongTermProfitReward] own=1.000*asinh(profit/4.00) + dominance=0.100*profit_quality*tanh((profit-rival_profit)/2.50), profit_quality=1-exp(-max(profit,0)/4.00); intervention_cost=0.0000, reversal_cost=0.0000, gamma=0.9950, lambda=0.970.
+[ConstraintConfig] constrained=0, constraint_lr=0.030, active=('fulfillment', 'wait', 'margin'), margin_floor=0.080; fare-gap channels are diagnostics only.
+>>> Loaded trained policy <- /Users/huali/Desktop/RideResponse/policy_profit_v6_seed4303.pt; benchmark opponent remains region_supply_demand.
+[ThresholdCache] Loaded 30000 cached threshold profiles from artifacts/threshold_profiles_30k.jsonl.
+>>> Synthetic setup: profile_pool=30000, train days=0 x 10 steps/day x 5000 rides, eval timesteps=1000 x 5000 rides, mc_samples(train/eval)=2000/2000
+>>> PPO rollout/update cadence: 20 day(s) per optimizer step (~200 price decisions/update; minimum rollout=256 transitions; Firm1 holds each price action for 1 step(s)).
+>>> Firm2 heuristic cadence: manipulate/update every 10 operational decision period(s).
+>>> Evaluation-only mode: using loaded Firm1 policy without optimizer updates.
+>>> Competitor mode for both training and evaluation: region_supply_demand
+>>> Evaluating RL agent against same-level region_supply_demand opponent with shared profile pool...
+  [eval 100/1000] reward=0.493 moving_avg20=0.757 share=0.746 rivalShare=0.076 revPR=11.37 rivalRevPR=0.88 profitPR=1.95 rivalProfitPR=0.15 profitAdv=+1.80 gap(F2-F1)=7.30 action=booking_fee:-1@continuous
+    [eval segments] 0-2:ch=0.79/done=0.79/gap=2.73 | 2-5:ch=0.98/done=0.93/gap=5.91 | 5-10:ch=0.97/done=0.58/gap=12.46 | 10+:ch=0.92/done=0.13/gap=23.05
+  [eval 200/1000] reward=0.829 moving_avg20=0.709 share=0.859 rivalShare=0.093 revPR=18.27 rivalRevPR=1.31 profitPR=3.44 rivalProfitPR=0.25 profitAdv=+3.19 gap(F2-F1)=8.37 action=booking_fee:-1@continuous
+    [eval segments] 0-2:ch=0.76/done=0.76/gap=2.59 | 2-5:ch=0.97/done=0.97/gap=6.85 | 5-10:ch=0.95/done=0.95/gap=14.03 | 10+:ch=0.88/done=0.72/gap=27.83
+  [eval 300/1000] reward=0.892 moving_avg20=0.504 share=0.842 rivalShare=0.085 revPR=19.21 rivalRevPR=1.31 profitPR=3.76 rivalProfitPR=0.27 profitAdv=+3.49 gap(F2-F1)=8.60 action=base_fare:+1@continuous,per_minute:-1@continuous,per_mile:-1@continuous,booking_fee:+1@continuous
+    [eval segments] 0-2:ch=0.78/done=0.78/gap=2.98 | 2-5:ch=0.97/done=0.95/gap=6.59 | 5-10:ch=0.97/done=0.90/gap=13.87 | 10+:ch=0.92/done=0.58/gap=27.53
+  [eval 400/1000] reward=0.893 moving_avg20=0.684 share=0.713 rivalShare=0.250 revPR=18.77 rivalRevPR=4.33 profitPR=3.79 rivalProfitPR=0.91 profitAdv=+2.87 gap(F2-F1)=4.58 action=booking_fee:-1@continuous
+    [eval segments] 0-2:ch=0.49/done=0.49/gap=0.51 | 2-5:ch=0.81/done=0.81/gap=3.19 | 5-10:ch=0.96/done=0.96/gap=8.70 | 10+:ch=0.91/done=0.82/gap=18.36
+  [eval 500/1000] reward=0.411 moving_avg20=0.683 share=0.577 rivalShare=0.193 revPR=9.22 rivalRevPR=2.51 profitPR=1.63 rivalProfitPR=0.45 profitAdv=+1.18 gap(F2-F1)=3.08 action=booking_fee:-1@continuous
+    [eval segments] 0-2:ch=0.70/done=0.70/gap=1.80 | 2-5:ch=0.76/done=0.70/gap=2.30 | 5-10:ch=0.96/done=0.37/gap=4.29 | 10+:ch=0.94/done=0.13/gap=8.03
+  [eval 600/1000] reward=0.403 moving_avg20=0.527 share=0.637 rivalShare=0.189 revPR=9.48 rivalRevPR=2.47 profitPR=1.59 rivalProfitPR=0.44 profitAdv=+1.16 gap(F2-F1)=2.60 action=base_fare:-1@continuous
+    [eval segments] 0-2:ch=0.76/done=0.76/gap=2.15 | 2-5:ch=0.76/done=0.72/gap=2.10 | 5-10:ch=0.88/done=0.45/gap=3.24 | 10+:ch=0.95/done=0.17/gap=5.21
+  [eval 700/1000] reward=0.215 moving_avg20=0.521 share=0.463 rivalShare=0.211 revPR=5.68 rivalRevPR=2.18 profitPR=0.85 rivalProfitPR=0.33 profitAdv=+0.52 gap(F2-F1)=1.85 action=booking_fee:-1@continuous
+    [eval segments] 0-2:ch=0.69/done=0.69/gap=1.63 | 2-5:ch=0.64/done=0.44/gap=1.51 | 5-10:ch=0.78/done=0.15/gap=2.25 | 10+:ch=0.88/done=0.15/gap=3.31
+  [eval 800/1000] reward=0.310 moving_avg20=0.543 share=0.523 rivalShare=0.187 revPR=7.40 rivalRevPR=2.25 profitPR=1.22 rivalProfitPR=0.38 profitAdv=+0.84 gap(F2-F1)=2.48 action=base_fare:-1@continuous
+    [eval segments] 0-2:ch=0.76/done=0.75/gap=2.15 | 2-5:ch=0.76/done=0.54/gap=2.09 | 5-10:ch=0.83/done=0.18/gap=2.81 | 10+:ch=0.96/done=0.19/gap=4.98
+  [eval 900/1000] reward=0.408 moving_avg20=0.501 share=0.584 rivalShare=0.042 revPR=9.11 rivalRevPR=0.62 profitPR=1.60 rivalProfitPR=0.12 profitAdv=+1.48 gap(F2-F1)=4.46 action=base_fare:-1@continuous
+    [eval segments] 0-2:ch=0.94/done=0.80/gap=3.97 | 2-5:ch=0.94/done=0.67/gap=3.87 | 5-10:ch=0.94/done=0.25/gap=5.01 | 10+:ch=0.96/done=0.17/gap=7.31
+  [eval 1000/1000] reward=0.399 moving_avg20=0.541 share=0.636 rivalShare=0.188 revPR=9.41 rivalRevPR=2.58 profitPR=1.58 rivalProfitPR=0.46 profitAdv=+1.12 gap(F2-F1)=2.58 action=base_fare:-1@continuous
+    [eval segments] 0-2:ch=0.79/done=0.79/gap=2.27 | 2-5:ch=0.74/done=0.73/gap=2.05 | 5-10:ch=0.83/done=0.41/gap=3.13 | 10+:ch=0.91/done=0.15/gap=4.68
+No rows to write.
+>>> Saved sampled profiles -> artifacts/sampled_profiles.csv (rows=0)
+>>> Profile export capped at profiles_log_limit=0 rows.
+>>> Testing reward trajectory summary: min=0.150, max=1.290, final=0.399
+>>> Evaluation competitive summary (1000 days): share=0.685 rivalShare=0.163 revPR=13.73 rivalRevPR=2.42 profitPR=2.61 rivalProfitPR=0.47 profitAdv=+2.15
+Experiment Complete.
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_vs_region_supply_demand_evaluation_diagnostics.csv
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_vs_region_supply_demand_price_gap_threshold_distribution.csv
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_vs_region_supply_demand_dist_PriceGapThreshold.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_vs_region_supply_demand_reward_evaluation.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_vs_region_supply_demand_evaluation_competitive_performance.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_vs_region_supply_demand_evaluation_business_diagnostics.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_vs_region_supply_demand_evaluation_coeff_airport_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_vs_region_supply_demand_evaluation_coeff_base_fare_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_vs_region_supply_demand_evaluation_coeff_booking_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_vs_region_supply_demand_evaluation_coeff_per_mile_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_vs_region_supply_demand_evaluation_coeff_per_minute_trajectory.png
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_vs_region_supply_demand_run_config.json

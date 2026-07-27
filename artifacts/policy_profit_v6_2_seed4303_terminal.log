@@ -722,7 +722,10 @@ Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) S
     [train action summary] decisions=4 dominant=per_minute:-1@continuous,per_mile:-1@continuous rate=50.0% steps={"airport_fee": 0, "base_fare": 0, "booking_fee": 0, "per_mile": -1, "per_minute": -1} last=13 lastSteps={"airport_fee": 0, "base_fare": 0, "booking_fee": 0, "per_mile": -1, "per_minute": -1} sampledOffTop=3
     [train segments] 0-2:ch=0.53/done=0.53/gap=0.52 | 2-5:ch=0.82/done=0.82/gap=4.09 | 5-10:ch=0.75/done=0.75/gap=9.57 | 10+:ch=0.41/done=0.41/gap=20.30
 >>> Restored validation-best policy from train day 1920 (score=2.950) for evaluation.
->>> Saved portable trained policy -> /Users/huali/Desktop/RideResponse/policy_profit_v6_1_seed4303.pt
+>>> Updated trained-policy alias -> /Users/huali/Desktop/RideResponse/policy_profit_v6_2_seed4303.pt
+>>> Registered immutable trained policy -> /Users/huali/Desktop/RideResponse/artifacts/trained_models/policy_profit_v6_2_seed4303__20260721T234517.169044Z.pt
+>>> Model registry manifest -> /Users/huali/Desktop/RideResponse/artifacts/trained_models/manifest.jsonl
+>>> Loaded trained policy <- /Users/huali/Desktop/RideResponse/artifacts/trained_models/policy_profit_v6_2_seed4303__20260721T234517.169044Z.pt; benchmark opponent remains adaptive_best_response_aggressive.
 >>> Evaluating RL agent against same-level adaptive_best_response_aggressive opponent with shared profile pool...
   [eval 50/500] reward=1.130 moving_avg20=0.934 share=0.802 rivalShare=0.090 revPR=23.69 rivalRevPR=1.70 profitPR=5.09 rivalProfitPR=0.37 profitAdv=+4.71 gap(F2-F1)=10.96 action=booking_fee:-1@continuous
     [eval segments] 0-2:ch=0.73/done=0.73/gap=2.29 | 2-5:ch=0.89/done=0.89/gap=8.77 | 5-10:ch=0.85/done=0.85/gap=19.80 | 10+:ch=0.68/done=0.68/gap=42.76
@@ -752,25 +755,25 @@ No rows to write.
 >>> Training competitive summary (last 100 days): share=0.735 rivalShare=0.148 revPR=19.11 rivalRevPR=2.57 profitPR=4.02 rivalProfitPR=0.67 profitAdv=+3.35
 >>> Evaluation competitive summary (500 days): share=0.775 rivalShare=0.119 revPR=18.17 rivalRevPR=1.74 profitPR=3.67 rivalProfitPR=0.34 profitAdv=+3.33
 Experiment Complete.
-Saved -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_training_diagnostics.csv
-Saved -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_evaluation_diagnostics.csv
-Saved -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_price_gap_threshold_distribution.csv
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_dist_PriceGapThreshold.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_reward_training.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_reward_evaluation.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_training_competitive_performance.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_training_business_diagnostics.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_training_ppo_diagnostics.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_training_coeff_airport_fee_trajectory.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_training_coeff_base_fare_trajectory.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_training_coeff_booking_fee_trajectory.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_training_coeff_per_mile_trajectory.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_training_coeff_per_minute_trajectory.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_evaluation_competitive_performance.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_evaluation_business_diagnostics.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_evaluation_coeff_airport_fee_trajectory.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_evaluation_coeff_base_fare_trajectory.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_evaluation_coeff_booking_fee_trajectory.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_evaluation_coeff_per_mile_trajectory.png
-Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_evaluation_coeff_per_minute_trajectory.png
-Saved -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_1_seed4303_run_config.json
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_training_diagnostics.csv
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_evaluation_diagnostics.csv
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_price_gap_threshold_distribution.csv
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_dist_PriceGapThreshold.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_reward_training.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_reward_evaluation.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_training_competitive_performance.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_training_business_diagnostics.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_training_ppo_diagnostics.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_training_coeff_airport_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_training_coeff_base_fare_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_training_coeff_booking_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_training_coeff_per_mile_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_training_coeff_per_minute_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_evaluation_competitive_performance.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_evaluation_business_diagnostics.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_evaluation_coeff_airport_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_evaluation_coeff_base_fare_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_evaluation_coeff_booking_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_evaluation_coeff_per_mile_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_evaluation_coeff_per_minute_trajectory.png
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/policy_profit_v6_2_seed4303_run_config.json
