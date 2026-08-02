@@ -184,9 +184,9 @@
     "--report_prefix",
     "artifacts/policy_profit_v7_seed4303_top2_nyc_validation_run"
   ],
-  "created_utc": "2026-07-21T14:37:55Z",
+  "created_utc": "2026-07-28T10:28:08Z",
   "deterministic_experiment_seed": false,
-  "effective_seed": 4253566089,
+  "effective_seed": 1122426517,
   "eval_guardrail_mode": "log_only",
   "eval_policy_mode": "top2_margin",
   "eval_policy_seed": null,

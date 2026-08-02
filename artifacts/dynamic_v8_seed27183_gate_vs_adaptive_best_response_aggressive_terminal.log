@@ -1,0 +1,55 @@
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+[ChoiceModel] GPT price-threshold mode enabled (thresholds consumed from profile).
+[PricingParity] Firm1 and Firm2 share actions=21, keys=['base_fare', 'per_minute', 'per_mile', 'booking_fee', 'airport_fee'].
+Using random seed: 4500
+[LongTermProfitReward] own=1.000*asinh(profit/4.00) + dominance=0.100*profit_quality*tanh((profit-rival_profit)/2.50), profit_quality=1-exp(-max(profit,0)/4.00); intervention_cost=0.0000, reversal_cost=0.0000, gamma=0.9950, lambda=0.970.
+[ConstraintConfig] constrained=0, constraint_lr=0.030, active=('fulfillment', 'wait', 'margin'), margin_floor=0.080; fare-gap channels are diagnostics only.
+>>> Loaded trained policy <- /Users/huali/Desktop/RideResponse/artifacts/trained_models/dynamic_v8_seed27183_gate.pt; model_id=dynamic_v8_seed27183_gate, training_seed=27183 (artifact_metadata); benchmark opponent remains adaptive_best_response_aggressive.
+[ThresholdCache] Loaded 30000 cached threshold profiles from artifacts/threshold_profiles_30k.jsonl.
+>>> Synthetic setup: profile_pool=30000, train days=0 x 10 steps/day x 5000 rides, eval timesteps=1000 x 200 rides, mc_samples(train/eval)=2000/200
+>>> PPO rollout/update cadence: 10 day(s) per optimizer step (~100 price decisions/update; minimum rollout=128 transitions; Firm1 holds each price action for 1 step(s)).
+>>> Firm2 heuristic cadence: manipulate/update every 5 operational decision period(s).
+>>> Evaluation-only mode: using loaded Firm1 policy without optimizer updates.
+>>> Competitor mode for both training and evaluation: adaptive_best_response_aggressive
+>>> Evaluating RL agent against same-level adaptive_best_response_aggressive opponent with shared profile pool...
+  [eval 100/1000] reward=0.319 moving_avg20=0.242 share=0.400 rivalShare=0.000 revPR=6.94 rivalRevPR=0.00 profitPR=1.25 rivalProfitPR=0.00 profitAdv=+1.25 gap(F2-F1)=18.86 action=hold
+    [eval segments] 0-2:ch=1.00/done=0.52/gap=8.72 | 2-5:ch=1.00/done=0.47/gap=16.48 | 5-10:ch=0.98/done=0.18/gap=28.71 | 10+:ch=0.93/done=0.14/gap=52.70
+  [eval 200/1000] reward=0.196 moving_avg20=0.284 share=0.250 rivalShare=0.005 revPR=4.38 rivalRevPR=0.05 profitPR=0.77 rivalProfitPR=0.01 profitAdv=+0.76 gap(F2-F1)=13.17 action=hold
+    [eval segments] 0-2:ch=0.99/done=0.28/gap=5.73 | 2-5:ch=1.00/done=0.30/gap=11.57 | 5-10:ch=0.97/done=0.20/gap=20.92 | 10+:ch=1.00/done=0.11/gap=33.30
+  [eval 300/1000] reward=0.305 moving_avg20=0.258 share=0.375 rivalShare=0.010 revPR=6.59 rivalRevPR=0.15 profitPR=1.19 rivalProfitPR=0.03 profitAdv=+1.16 gap(F2-F1)=11.05 action=hold
+    [eval segments] 0-2:ch=0.98/done=0.45/gap=5.19 | 2-5:ch=0.99/done=0.33/gap=9.91 | 5-10:ch=0.96/done=0.33/gap=15.08 | 10+:ch=0.92/done=0.29/gap=30.53
+  [eval 400/1000] reward=0.299 moving_avg20=0.257 share=0.330 rivalShare=0.075 revPR=6.33 rivalRevPR=0.95 profitPR=1.17 rivalProfitPR=0.17 profitAdv=+1.00 gap(F2-F1)=7.24 action=hold
+    [eval segments] 0-2:ch=0.83/done=0.32/gap=3.33 | 2-5:ch=0.97/done=0.31/gap=6.50 | 5-10:ch=1.00/done=0.29/gap=10.83 | 10+:ch=1.00/done=0.56/gap=22.36
+  [eval 500/1000] reward=0.119 moving_avg20=0.174 share=0.180 rivalShare=0.175 revPR=2.84 rivalRevPR=1.96 profitPR=0.47 rivalProfitPR=0.31 profitAdv=+0.16 gap(F2-F1)=3.25 action=hold
+    [eval segments] 0-2:ch=0.73/done=0.14/gap=1.31 | 2-5:ch=0.78/done=0.20/gap=2.73 | 5-10:ch=0.97/done=0.24/gap=5.49 | 10+:ch=0.92/done=0.15/gap=11.89
+  [eval 600/1000] reward=0.207 moving_avg20=0.197 share=0.240 rivalShare=0.265 revPR=4.61 rivalRevPR=3.47 profitPR=0.83 rivalProfitPR=0.60 profitAdv=+0.23 gap(F2-F1)=2.52 action=hold
+    [eval segments] 0-2:ch=0.53/done=0.23/gap=0.22 | 2-5:ch=0.69/done=0.29/gap=1.96 | 5-10:ch=0.85/done=0.20/gap=4.81 | 10+:ch=0.77/done=0.15/gap=11.42
+  [eval 700/1000] reward=0.090 moving_avg20=0.175 share=0.170 rivalShare=0.200 revPR=2.36 rivalRevPR=3.01 profitPR=0.36 rivalProfitPR=0.54 profitAdv=-0.18 gap(F2-F1)=-0.31 action=hold
+    [eval segments] 0-2:ch=0.33/done=0.26/gap=-1.29 | 2-5:ch=0.42/done=0.18/gap=-0.76 | 5-10:ch=0.52/done=0.07/gap=0.15 | 10+:ch=0.94/done=0.06/gap=3.92
+  [eval 800/1000] reward=0.048 moving_avg20=0.117 share=0.085 rivalShare=0.060 revPR=1.24 rivalRevPR=1.05 profitPR=0.19 rivalProfitPR=0.20 profitAdv=-0.01 gap(F2-F1)=-1.07 action=hold
+    [eval segments] 0-2:ch=0.37/done=0.08/gap=-1.63 | 2-5:ch=0.40/done=0.05/gap=-1.20 | 5-10:ch=0.58/done=0.17/gap=0.25 | 10+:ch=0.31/done=0.06/gap=-0.82
+  [eval 900/1000] reward=0.317 moving_avg20=0.092 share=0.275 rivalShare=0.260 revPR=6.70 rivalRevPR=5.35 profitPR=1.28 rivalProfitPR=1.08 profitAdv=+0.20 gap(F2-F1)=-0.22 action=hold
+    [eval segments] 0-2:ch=0.53/done=0.24/gap=-1.08 | 2-5:ch=0.41/done=0.24/gap=-0.57 | 5-10:ch=0.58/done=0.29/gap=0.61 | 10+:ch=0.80/done=0.50/gap=2.56
+  [eval 1000/1000] reward=0.083 moving_avg20=0.147 share=0.130 rivalShare=0.145 revPR=1.97 rivalRevPR=1.86 profitPR=0.33 rivalProfitPR=0.33 profitAdv=+0.00 gap(F2-F1)=-0.34 action=hold
+    [eval segments] 0-2:ch=0.46/done=0.12/gap=-1.13 | 2-5:ch=0.54/done=0.16/gap=-0.02 | 5-10:ch=0.56/done=0.12/gap=0.13 | 10+:ch=0.71/done=0.07/gap=2.17
+No rows to write.
+>>> Saved sampled profiles -> artifacts/sampled_profiles.csv (rows=0)
+>>> Profile export capped at profiles_log_limit=0 rows.
+>>> Testing reward trajectory summary: min=0.010, max=0.664, final=0.083
+>>> Evaluation competitive summary (1000 days): share=0.239 rivalShare=0.100 revPR=4.48 rivalRevPR=1.40 profitPR=0.81 rivalProfitPR=0.25 profitAdv=+0.56
+>>> Competitive durability backtest: FAIL; lateShareAdv=+nan, lateProfitAdv=+nan, validationTrend=+nan, evalRewardRetention=nan%, lateFareMove=nan%, lateActions=0
+    [backtest failures] training_or_evaluation_logs_missing
+Experiment Complete.
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/dynamic_v8_seed27183_gate_vs_adaptive_best_response_aggressive_evaluation_diagnostics.csv
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/dynamic_v8_seed27183_gate_vs_adaptive_best_response_aggressive_price_gap_threshold_distribution.csv
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/dynamic_v8_seed27183_gate_vs_adaptive_best_response_aggressive_dist_PriceGapThreshold.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/dynamic_v8_seed27183_gate_vs_adaptive_best_response_aggressive_reward_evaluation.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/dynamic_v8_seed27183_gate_vs_adaptive_best_response_aggressive_evaluation_competitive_performance.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/dynamic_v8_seed27183_gate_vs_adaptive_best_response_aggressive_evaluation_business_diagnostics.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/dynamic_v8_seed27183_gate_vs_adaptive_best_response_aggressive_evaluation_coeff_airport_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/dynamic_v8_seed27183_gate_vs_adaptive_best_response_aggressive_evaluation_coeff_base_fare_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/dynamic_v8_seed27183_gate_vs_adaptive_best_response_aggressive_evaluation_coeff_booking_fee_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/dynamic_v8_seed27183_gate_vs_adaptive_best_response_aggressive_evaluation_coeff_per_mile_trajectory.png
+Saved graph -> /Users/huali/Desktop/RideResponse/artifacts/dynamic_v8_seed27183_gate_vs_adaptive_best_response_aggressive_evaluation_coeff_per_minute_trajectory.png
+Saved -> /Users/huali/Desktop/RideResponse/artifacts/dynamic_v8_seed27183_gate_vs_adaptive_best_response_aggressive_run_config.json
+[WARN] Report-prefix seed label does not match the effective run seed: prefix labels=[27183], effective_seed=4500. The run-config and trained-policy identity are authoritative.

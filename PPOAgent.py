@@ -719,7 +719,9 @@ class PPOAgent:
             width = min(self.constraint_dim, arr.size)
             if width > 0:
                 padded[:width] = np.maximum(arr[:width], 0.0)
-            self.constraint_lambdas = torch.tensor(padded, dtype=torch.float32, device=self.device)
+            self.constraint_lambdas = self._tensor_from_value(
+                padded, dtype=torch.float32, device=self.device
+            )
         if risk_coeff is not None:
             self.risk_coeff = float(max(0.0, risk_coeff))
         if constraints_active is not None:
@@ -791,6 +793,28 @@ class PPOAgent:
         self._apply_control_floors()
 
     @staticmethod
+    def _tensor_from_value(
+        value,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Create a tensor without requiring Torch's NumPy C-API bridge.
+
+        Some supported environments pair a Torch wheel compiled against NumPy
+        1.x with NumPy 2.x. Converting ndarray inputs to native containers first
+        keeps inference, Kaggle evaluation, and tests functional in that setup
+        without changing numeric values.
+        """
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+        elif isinstance(value, np.generic):
+            value = value.item()
+        elif torch.is_tensor(value):
+            return value.detach().to(device=device, dtype=dtype).clone()
+        return torch.tensor(value, dtype=dtype, device=device)
+
+    @staticmethod
     def _coerce_action_mask(
         action_mask: Optional[np.ndarray | List[bool] | torch.Tensor],
         logits: torch.Tensor,
@@ -799,7 +823,11 @@ class PPOAgent:
         if action_mask is None:
             mask = torch.ones_like(logits, dtype=torch.bool)
         else:
-            mask = torch.as_tensor(action_mask, dtype=torch.bool, device=logits.device)
+            mask = PPOAgent._tensor_from_value(
+                action_mask,
+                dtype=torch.bool,
+                device=logits.device,
+            )
             while mask.ndim < logits.ndim:
                 mask = mask.unsqueeze(0)
             try:
@@ -822,6 +850,123 @@ class PPOAgent:
     ) -> torch.Tensor:
         mask = cls._coerce_action_mask(action_mask, logits)
         return logits.masked_fill(~mask, -1e9)
+
+    @staticmethod
+    def _economic_group_probabilities(
+        logits: torch.Tensor,
+        action_features: Optional[torch.Tensor],
+        temperature: float = 0.20,
+    ) -> Optional[torch.Tensor]:
+        """Return sharpened lower/neutral/higher fare probabilities.
+
+        Mutual information computed from the ordinary softmax can be increased
+        through tiny changes in low-ranked action tails while deterministic
+        argmax remains identical in every state. Sharpening only the
+        specialization diagnostic/loss makes its gradient reflect economically
+        different deterministic choices; it does not change the PPO sampling
+        or deployment distribution.
+        """
+        if (
+            action_features is None
+            or action_features.ndim != 3
+            or action_features.shape[-1] < 14
+        ):
+            return None
+        specialization_probs = torch.softmax(
+            logits / max(1e-3, float(temperature)),
+            dim=-1,
+        )
+        # Match Core._economic_action_group exactly: the segment weights
+        # represent the broad-market mix and imply about 14.65 minutes,
+        # 3.95 miles, and 7.75% airport exposure. A simple unweighted segment
+        # average classified mixed rebalancing bundles differently during
+        # training and validation, allowing within-group switching to satisfy
+        # the optimizer while deployment still looked economically constant.
+        segment_weights = torch.as_tensor(
+            [0.35, 0.35, 0.20, 0.10],
+            dtype=action_features.dtype,
+            device=action_features.device,
+        )
+        fare_impact = (
+            action_features[:, :, 10:14] * segment_weights
+        ).sum(dim=-1)
+        # Action-feature fare impacts are stored in ``dollars / 20`` by the
+        # observation model. Core's deployment audit uses a five-cent
+        # broad-market threshold in dollars, so the matching threshold here is
+        # 0.05 / 20.0. Applying 0.05 directly made virtually every single-
+        # lever intervention look neutral to the optimizer even though the
+        # exact same action was lower/higher fare in the deployment audit.
+        normalized_fare_threshold = 0.05 / 20.0
+        lower_mask = (
+            fare_impact < -normalized_fare_threshold
+        ).to(specialization_probs.dtype)
+        higher_mask = (
+            fare_impact > normalized_fare_threshold
+        ).to(specialization_probs.dtype)
+        neutral_mask = 1.0 - torch.clamp(
+            lower_mask + higher_mask, 0.0, 1.0
+        )
+        economic_probs = torch.stack(
+            [
+                (specialization_probs * lower_mask).sum(dim=-1),
+                (specialization_probs * neutral_mask).sum(dim=-1),
+                (specialization_probs * higher_mask).sum(dim=-1),
+            ],
+            dim=-1,
+        )
+        return economic_probs / economic_probs.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp(min=1e-8)
+
+    @staticmethod
+    def _mutual_information(
+        probabilities: torch.Tensor,
+        state_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Mutual information between sampled states and policy choices.
+
+        ``state_weights`` is detached economic credit, not another policy
+        target.  With positive-advantage weights, an unprofitable state cannot
+        earn the actor a specialization bonus merely by selecting a different
+        price direction.  If a minibatch has no positive advantages, the
+        auxiliary is disabled for that minibatch and PPO remains the sole
+        actor objective.
+        """
+        if probabilities.ndim != 2 or probabilities.shape[0] == 0:
+            return probabilities.new_zeros(())
+        if state_weights is None:
+            weights = probabilities.new_full(
+                (probabilities.shape[0],),
+                1.0 / float(probabilities.shape[0]),
+            )
+        else:
+            weights = torch.clamp(
+                state_weights.detach().to(
+                    dtype=probabilities.dtype,
+                    device=probabilities.device,
+                ),
+                min=0.0,
+            ).reshape(-1)
+            if weights.shape[0] != probabilities.shape[0]:
+                raise ValueError("state_weights must match probability rows")
+            weight_sum = weights.sum()
+            if float(weight_sum.item()) <= 1e-8:
+                return probabilities.new_zeros(())
+            weights = weights / weight_sum
+        row_entropy = -(
+            probabilities
+            * torch.log(probabilities.clamp(min=1e-8))
+        ).sum(dim=-1)
+        marginal = (probabilities * weights.unsqueeze(-1)).sum(dim=0)
+        marginal_entropy = -(
+            marginal * torch.log(marginal.clamp(min=1e-8))
+        ).sum()
+        conditional_entropy = (row_entropy * weights).sum()
+        return torch.clamp(
+            marginal_entropy - conditional_entropy,
+            min=0.0,
+        )
 
     @classmethod
     def _exploratory_distribution(
@@ -915,11 +1060,15 @@ class PPOAgent:
         temperature: float = 1.0,
     ) -> Dict[str, float]:
         """Return raw-policy action diagnostics without the training exploration mix."""
-        s = torch.tensor(s_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+        s = self._tensor_from_value(
+            s_np, dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
         s = torch.nan_to_num(s, nan=0.0, posinf=1e3, neginf=-1e3)
         af_tensor = None
         if self.action_feature_dim > 0 and action_features is not None:
-            af_tensor = torch.as_tensor(action_features, dtype=torch.float32, device=self.device)
+            af_tensor = self._tensor_from_value(
+                action_features, dtype=torch.float32, device=self.device
+            )
             af_tensor = af_tensor.reshape(1, af_tensor.shape[-2], af_tensor.shape[-1])
         logits, mag_mean, mag_logstd, value, constraint_values, risk_value, response_pred, _ = self.net(s, af_tensor)
         del mag_mean, mag_logstd, value, constraint_values, risk_value, response_pred
@@ -964,9 +1113,10 @@ class PPOAgent:
         action_mask: Optional[np.ndarray] = None,
         policy_mode: str = "argmax",
         policy_temperature: float = 0.50,
-        top2_margin: float = 0.05,
     ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        s = torch.tensor(s_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+        s = self._tensor_from_value(
+            s_np, dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
         s = torch.nan_to_num(s, nan=0.0, posinf=1e3, neginf=-1e3)
         expected_dim = self.net.single_state_dim * self.net.frame_stack
         if s.shape[-1] != expected_dim:
@@ -974,7 +1124,9 @@ class PPOAgent:
         
         af_tensor = None
         if self.action_feature_dim > 0 and action_features is not None:
-            af_tensor = torch.as_tensor(action_features, dtype=torch.float32, device=self.device)
+            af_tensor = self._tensor_from_value(
+                action_features, dtype=torch.float32, device=self.device
+            )
             af_tensor = af_tensor.reshape(1, af_tensor.shape[-2], af_tensor.shape[-1])
         logits, mag_mean, mag_logstd, value, constraint_values, risk_value, response_pred, _ = self.net(s, af_tensor)
         value = self.reward_normalizer.denormalize(value)
@@ -998,17 +1150,12 @@ class PPOAgent:
             elif mode == "sample_low_temp":
                 temp = float(max(1e-6, policy_temperature))
                 a = torch.distributions.Categorical(logits=logits / temp).sample()
-            elif mode == "top2_margin":
-                probs = torch.softmax(logits, dim=-1)
-                top_probs, top_idx = torch.topk(probs, k=min(2, probs.shape[-1]), dim=-1)
-                if top_probs.shape[-1] < 2 or float((top_probs[:, 0] - top_probs[:, 1]).item()) >= float(max(0.0, top2_margin)):
-                    a = top_idx[:, 0]
-                else:
-                    pair_probs = top_probs / torch.clamp(top_probs.sum(dim=-1, keepdim=True), min=1e-12)
-                    pair_choice = torch.distributions.Categorical(probs=pair_probs).sample()
-                    a = top_idx.gather(1, pair_choice.reshape(-1, 1)).squeeze(1)
-            else:
+            elif mode == "argmax":
                 a = torch.argmax(logits, dim=-1)
+            else:
+                raise ValueError(
+                    "policy_mode must be one of: argmax, sample_raw, sample_low_temp"
+                )
         else:
             a = dist.sample()
         chosen_mean = mag_mean.gather(1, a.reshape(-1, 1)).squeeze(1)
@@ -1050,11 +1197,15 @@ class PPOAgent:
         action_features: Optional[np.ndarray] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Evaluate all critics for bootstrapping a truncated rollout."""
-        s = torch.tensor(s_np, dtype=torch.float32, device=self.device).reshape(1, -1)
+        s = self._tensor_from_value(
+            s_np, dtype=torch.float32, device=self.device
+        ).reshape(1, -1)
         s = torch.nan_to_num(s, nan=0.0, posinf=1e3, neginf=-1e3)
         af_tensor = None
         if self.action_feature_dim > 0 and action_features is not None:
-            af_tensor = torch.as_tensor(action_features, dtype=torch.float32, device=self.device)
+            af_tensor = self._tensor_from_value(
+                action_features, dtype=torch.float32, device=self.device
+            )
             af_tensor = af_tensor.reshape(1, af_tensor.shape[-2], af_tensor.shape[-1])
         _, _, _, value, constraint_values, risk_value, _, _ = self.net(s, af_tensor)
         value = self.reward_normalizer.denormalize(value)
@@ -1091,7 +1242,9 @@ class PPOAgent:
         if constraint_costs is None:
             constraint_tensor = torch.zeros(self.constraint_dim, dtype=torch.float32, device=self.device)
         else:
-            constraint_tensor = torch.as_tensor(constraint_costs, dtype=torch.float32, device=self.device).reshape(-1)
+            constraint_tensor = self._tensor_from_value(
+                constraint_costs, dtype=torch.float32, device=self.device
+            ).reshape(-1)
             if constraint_tensor.numel() != self.constraint_dim:
                 padded = torch.zeros(self.constraint_dim, dtype=torch.float32, device=self.device)
                 width = min(self.constraint_dim, constraint_tensor.numel())
@@ -1101,7 +1254,9 @@ class PPOAgent:
         if response_target is None:
             response_tensor = self.last_response_pred.detach().clone()
         else:
-            response_tensor = torch.as_tensor(response_target, dtype=torch.float32, device=self.device).reshape(-1)
+            response_tensor = self._tensor_from_value(
+                response_target, dtype=torch.float32, device=self.device
+            ).reshape(-1)
             if response_tensor.numel() != self.response_dim:
                 padded = torch.zeros(self.response_dim, dtype=torch.float32, device=self.device)
                 width = min(self.response_dim, response_tensor.numel())
@@ -1112,7 +1267,9 @@ class PPOAgent:
         if action_features is None or self.action_feature_dim <= 0:
             action_feature_tensor = torch.empty(0, dtype=torch.float32, device=self.device)
         else:
-            action_feature_tensor = torch.as_tensor(action_features, dtype=torch.float32, device=self.device)
+            action_feature_tensor = self._tensor_from_value(
+                action_features, dtype=torch.float32, device=self.device
+            )
             action_feature_tensor = action_feature_tensor.reshape(-1, action_feature_tensor.shape[-1])
             if action_feature_tensor.shape[-1] != self.action_feature_dim:
                 fixed = torch.zeros((self.action_visits.size, self.action_feature_dim), dtype=torch.float32, device=self.device)
@@ -1142,8 +1299,10 @@ class PPOAgent:
                 (self.constraint_dim,), float("nan"), dtype=torch.float32, device=self.device
             )
         else:
-            next_constraint_tensor = torch.as_tensor(
-                next_constraint_values, dtype=torch.float32, device=self.device
+            next_constraint_tensor = self._tensor_from_value(
+                next_constraint_values,
+                dtype=torch.float32,
+                device=self.device,
             ).reshape(-1)
             if next_constraint_tensor.numel() != self.constraint_dim:
                 raise ValueError(
@@ -1504,9 +1663,18 @@ class PPOAgent:
                 .mean()
                 .item()
             )
-            mean_probs = raw_probs_all.mean(dim=0)
-            mean_entropy = -(mean_probs * torch.log(mean_probs.clamp(min=1e-8))).sum()
-            state_action_mi = float(torch.clamp(mean_entropy - row_entropy.mean(), min=0.0).item())
+            economic_probs = self._economic_group_probabilities(
+                raw_logits_all,
+                action_features_all,
+            )
+            if economic_probs is not None:
+                state_action_mi = float(
+                    self._mutual_information(economic_probs).item()
+                )
+            else:
+                state_action_mi = float(
+                    self._mutual_information(raw_probs_all).item()
+                )
 
         self.last_raw_argmax_concentration = raw_argmax_concentration
         self.last_state_action_sensitivity = state_action_sensitivity
@@ -1749,14 +1917,27 @@ class PPOAgent:
                 exploratory_entropy = dist.entropy().mean()
                 entropy = exploratory_entropy + mag_entropy
                 raw_probs_b = torch.softmax(logits, dim=-1)
-                mean_probs_b = raw_probs_b.mean(dim=0)
-                mean_entropy_b = -(
-                    mean_probs_b
-                    * torch.log(mean_probs_b.clamp(min=1e-8))
-                ).sum()
-                state_action_mi_b = torch.clamp(
-                    mean_entropy_b - discrete_entropy, min=0.0
+                economic_probs_b = self._economic_group_probabilities(
+                    logits,
+                    action_features_b,
                 )
+                if economic_probs_b is not None:
+                    # Specialize economically meaningful direction, not raw
+                    # action identity. Columns 10:14 are representative fare
+                    # impacts for short through long trips. Grouping actions
+                    # into lower / neutral / higher fare prevents a policy
+                    # from earning this bonus through low-ranked probability
+                    # tails, airport-only chatter, or nearly equivalent
+                    # coefficient actions.
+                    state_action_mi_b = self._mutual_information(
+                        economic_probs_b,
+                        torch.relu(adv_b),
+                    )
+                else:
+                    state_action_mi_b = self._mutual_information(
+                        raw_probs_b,
+                        torch.relu(adv_b),
+                    )
                 logratio = logp - old_logp_b
                 approx_kl = ((torch.exp(logratio) - 1.0) - logratio).mean()
                 clipfrac = (
@@ -1765,6 +1946,7 @@ class PPOAgent:
                 actor_loss = (
                     policy_loss
                     - self.ent_coeff * (discrete_entropy + mag_entropy)
+                    - self.state_action_mi_coeff * state_action_mi_b
                 )
                 if not torch.isfinite(actor_loss):
                     continue

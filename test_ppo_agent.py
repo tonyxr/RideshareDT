@@ -7,32 +7,43 @@ from PPOAgent import PPOAgent
 
 
 class PPOAgentRegressionTests(unittest.TestCase):
-    def test_top2_margin_mode_is_seeded_and_never_samples_lower_ranked_actions(self):
+    def test_specialization_credit_ignores_nonpositive_advantage_states(self):
+        probabilities = torch.tensor(
+            [
+                [0.99, 0.005, 0.005],
+                [0.005, 0.005, 0.99],
+            ],
+            dtype=torch.float32,
+        )
+
+        unweighted = PPOAgent._mutual_information(probabilities)
+        positive_only = PPOAgent._mutual_information(
+            probabilities,
+            torch.tensor([1.0, 0.0]),
+        )
+        no_positive = PPOAgent._mutual_information(
+            probabilities,
+            torch.tensor([0.0, 0.0]),
+        )
+
+        self.assertGreater(float(unweighted.item()), 0.5)
+        self.assertAlmostEqual(float(positive_only.item()), 0.0, places=6)
+        self.assertAlmostEqual(float(no_positive.item()), 0.0, places=6)
+
+    def test_removed_top2_mode_is_rejected(self):
         agent = PPOAgent(state_dim=3, action_dim=3, device="cpu")
         final_policy_layer = agent.net.pi_head[-1]
         with torch.no_grad():
             final_policy_layer.weight.zero_()
             final_policy_layer.bias.copy_(torch.tensor([2.0, 1.99, -10.0]))
 
-        def draw_sequence():
-            return [
-                agent.act(
-                    [0.0, 0.0, 0.0],
-                    deterministic=True,
-                    action_mask=[True, True, True],
-                    policy_mode="top2_margin",
-                    top2_margin=0.05,
-                )[0]
-                for _ in range(40)
-            ]
-
-        torch.manual_seed(123)
-        first = draw_sequence()
-        torch.manual_seed(123)
-        second = draw_sequence()
-
-        self.assertEqual(first, second)
-        self.assertEqual(set(first), {0, 1})
+        with self.assertRaisesRegex(ValueError, "policy_mode must be one of"):
+            agent.act(
+                [0.0, 0.0, 0.0],
+                deterministic=True,
+                action_mask=[True, True, True],
+                policy_mode="top2_margin",
+            )
 
     def test_recurrent_belief_and_action_conditioned_response_are_live(self):
         torch.manual_seed(17)

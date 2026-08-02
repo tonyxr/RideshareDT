@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from Core import Core
+from GenerateAgent import GenerateAgent
 from Market_models import CoefficientOverrides
 from optim_config import default_specs_for
 from pricing_models import ActionDescriptor, FirmRLPricer, build_discrete_action_space
@@ -22,6 +23,191 @@ from platform_mdp import (
 
 
 class CorePPOFixRegressionTests(unittest.TestCase):
+    def test_generalization_profiles_bypass_cache_and_cover_all_markets(self):
+        core = Core.__new__(Core)
+        core.seed = 773
+        core.rng = np.random.default_rng(core.seed)
+        core.total_customers_pool = 64
+        core.training_generalization_fraction = 0.25
+        core.evaluation_generalization_fraction = 1.0
+        cached_profile = {
+            "ProfileId": "cached-only",
+            "PriceThreshold": 1.25,
+            "PriceThresholdSource": "cached",
+        }
+        core.synthetic_profile_pool = [cached_profile]
+        core.generalization_profile_pool = []
+        core.generalization_profiles_by_city = {}
+
+        core._build_generalization_profile_pool(pool_size=80)
+
+        self.assertEqual(
+            set(core.generalization_profiles_by_city),
+            set(GenerateAgent.CITY_DEMOGRAPHICS),
+        )
+        self.assertTrue(all(
+            row["PriceThresholdSource"] == "generalization_fallback"
+            for row in core.generalization_profile_pool
+        ))
+        thresholds = np.asarray([
+            row["PriceThreshold"] for row in core.generalization_profile_pool
+        ])
+        self.assertGreater(float(np.std(thresholds)), 0.05)
+
+        holdout = core._sample_profiles_from_pool(
+            16,
+            generalization_fraction=1.0,
+            generalization_city="Chicago",
+        )
+        self.assertTrue(all(row["ProfileMarket"] == "Chicago" for row in holdout))
+        self.assertTrue(all(row is not cached_profile for row in holdout))
+
+        cached_only = core._sample_profiles_from_pool(
+            4, generalization_fraction=0.0
+        )
+        self.assertTrue(all(row is cached_profile for row in cached_only))
+
+    def test_competitive_backtest_requires_dynamic_late_dominance(self):
+        core = Core.__new__(Core)
+        core.firm1_mode = "RL"
+        core.shared_edit_keys = ["base_fare"]
+        core.firm1 = SimpleNamespace(
+            action_steps=lambda action: (
+                {}
+                if int(action) == 0
+                else {"base_fare": -1 if int(action) % 2 else 1}
+            ),
+            config=SimpleNamespace(step={"base_fare": 0.10}),
+        )
+        core.training_logs = [
+            {
+                "avg_reward": 0.20 + 0.005 * day,
+                "validation_score": (
+                    0.5 + 0.2 * (day // 25)
+                    if day in {24, 49, 74, 99}
+                    else np.nan
+                ),
+            }
+            for day in range(100)
+        ]
+        core.evaluation_logs = [
+            {
+                "reward": 0.30 + 0.004 * day,
+                "rl_completed_share": 0.72,
+                "heuristic_completed_share": 0.20,
+                "rl_profit": 3.0,
+                "heuristic_profit": 0.8,
+                "firm1_base_fare": 2.5 + 0.1 * (day % 2),
+                "action": 1 + (day % 2),
+            }
+            for day in range(100)
+        ]
+
+        report = core._competitive_durability_backtest()
+
+        self.assertTrue(report["passed"])
+        self.assertGreater(report["late_completed_share_advantage"], 0.10)
+        self.assertGreater(report["late_profit_advantage_per_request"], 0.0)
+        self.assertGreater(report["held_out_validation_score_fitted_change"], 0.0)
+        self.assertGreaterEqual(report["late_evaluation_reward_retention"], 0.75)
+        self.assertGreater(report["late_coefficient_change_rate"], 0.02)
+
+    def test_stable_dominant_policy_can_converge_without_action_churn(self):
+        core = Core.__new__(Core)
+        core.firm1_mode = "RL"
+        core.shared_edit_keys = ["base_fare"]
+        core.firm1 = SimpleNamespace(
+            action_steps=lambda action: {},
+            config=SimpleNamespace(step={"base_fare": 0.10}),
+        )
+        core.training_logs = [
+            {
+                "avg_reward": 0.60,
+                "validation_score": (
+                    0.80
+                    if day in {24, 49, 74, 99}
+                    else np.nan
+                ),
+            }
+            for day in range(100)
+        ]
+        core.evaluation_logs = [
+            {
+                "reward": 0.60,
+                "rl_completed_share": 0.60,
+                "heuristic_completed_share": 0.30,
+                "rl_profit": 3.0,
+                "heuristic_profit": 2.0,
+                "firm1_base_fare": 2.5,
+                "action": 0,
+            }
+            for _ in range(100)
+        ]
+
+        report = core._competitive_durability_backtest()
+
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["late_fare_equivalent_change_rate"], 0.0)
+        self.assertEqual(report["late_action_diversity"], 1)
+
+    def test_competitiveness_backtest_uses_share_gap_not_profit_or_quote_gap(self):
+        core = Core.__new__(Core)
+        core.firm1_mode = "RL"
+        core.shared_edit_keys = ["base_fare"]
+        core.firm1 = SimpleNamespace(
+            action_steps=lambda action: {"base_fare": -1 if int(action) % 2 else 1},
+            config=SimpleNamespace(step={"base_fare": 0.10}),
+        )
+        core.long_term_profit_reward_config = LongTermProfitRewardConfig(
+            objective_mode="competitiveness",
+            own_profit_weight=0.0,
+            profit_advantage_weight=0.0,
+            market_share_competitiveness_weight=1.0,
+            market_share_target_gap=0.10,
+        )
+        core.constraint_config = ConstraintConfig(
+            target_gap=0.0,
+            overall_tolerance=0.45,
+        )
+        core.training_logs = [
+            {
+                "avg_reward": 0.50,
+                "validation_score": (
+                    0.50 + 0.10 * (day // 25)
+                    if day in {24, 49, 74, 99}
+                    else np.nan
+                ),
+            }
+            for day in range(100)
+        ]
+        core.evaluation_logs = [
+            {
+                "reward": 0.75,
+                # Firm 1 wins customer choice while Firm 2 completes more
+                # requests because of supply. Competitiveness must use the
+                # former; completion coverage is a separate service measure.
+                "rl_market_share": 0.60,
+                "heuristic_market_share": 0.40,
+                "rl_completed_share": 0.20,
+                "heuristic_completed_share": 0.50,
+                "rl_profit": 1.0,
+                "heuristic_profit": 2.0,
+                "rl_fulfillment_rate": 0.90,
+                "price_gap_f2_minus_f1": 8.0,
+                "firm1_base_fare": 2.5 + 0.1 * (day % 2),
+                "action": 1 + (day % 2),
+            }
+            for day in range(100)
+        ]
+
+        report = core._competitive_durability_backtest()
+
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["primary_objective"], "competitiveness")
+        self.assertGreaterEqual(
+            report["late_completed_share_advantage"], 0.10
+        )
+
     def test_action_space_contains_coordinated_and_rebalancing_moves(self):
         keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
         action_map, _ = build_discrete_action_space(keys)
@@ -39,6 +225,116 @@ class CorePPOFixRegressionTests(unittest.TestCase):
             == {"base_fare", "per_minute", "per_mile", "booking_fee"}
             for mapping in bundles
         ))
+
+    def test_economic_action_group_ignores_negligible_airport_chatter(self):
+        core = Core.__new__(Core)
+        core.firm1_mode = "RL"
+        core.shared_edit_keys = [
+            "base_fare",
+            "per_minute",
+            "per_mile",
+            "booking_fee",
+            "airport_fee",
+        ]
+        core.firm1 = SimpleNamespace(
+            action_steps=lambda action: {
+                1: {"airport_fee": 1},
+                2: {"base_fare": -1},
+                3: {"base_fare": 1},
+            }.get(int(action), {}),
+            config=SimpleNamespace(
+                step={
+                    "base_fare": 0.10,
+                    "per_minute": 0.01,
+                    "per_mile": 0.05,
+                    "booking_fee": 0.10,
+                    "airport_fee": 0.10,
+                }
+            ),
+        )
+
+        self.assertEqual(core._economic_action_group(1), 0)
+        self.assertEqual(core._economic_action_group(2), -1)
+        self.assertEqual(core._economic_action_group(3), 1)
+
+    def test_competitiveness_mask_blocks_further_discount_when_service_is_low(self):
+        core = Core.__new__(Core)
+        core.firm1_mode = "RL"
+        core.firm1 = SimpleNamespace(
+            action_steps=lambda action: {
+                1: {"base_fare": -1},
+                2: {"base_fare": 1},
+            }.get(int(action), {}),
+            config=SimpleNamespace(step={"base_fare": 0.10}),
+        )
+        core.long_term_profit_reward_config = LongTermProfitRewardConfig(
+            objective_mode="competitiveness",
+            own_profit_weight=0.0,
+            profit_advantage_weight=0.0,
+            market_share_competitiveness_weight=1.0,
+        )
+        core.constraint_config = ConstraintConfig(fulfillment_floor=0.78)
+
+        masked = core._objective_action_mask(
+            np.asarray([True, True, True]),
+            fulfillment_rate=0.60,
+        )
+
+        np.testing.assert_array_equal(masked, [False, False, True])
+
+    def test_profit_pipeline_keeps_normal_action_mask(self):
+        core = Core.__new__(Core)
+        core.firm1_mode = "RL"
+        core.firm1 = SimpleNamespace(
+            action_steps=lambda action: {
+                1: {"base_fare": -1},
+                2: {"base_fare": 1},
+            }.get(int(action), {}),
+            config=SimpleNamespace(step={"base_fare": 0.10}),
+        )
+        core.long_term_profit_reward_config = LongTermProfitRewardConfig(
+            objective_mode="profit_maximization",
+        )
+        core.constraint_config = ConstraintConfig(fulfillment_floor=0.78)
+        base = np.asarray([True, True, True])
+
+        masked = core._objective_action_mask(
+            base,
+            fulfillment_rate=0.20,
+        )
+
+        np.testing.assert_array_equal(masked, base)
+
+    def test_optimizer_and_backtest_use_identical_economic_groups(self):
+        keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
+        pricer = FirmRLPricer(seed=5, opt_keys=keys)
+        market = SimpleNamespace(curr_market=SimpleNamespace(
+            base_fare=3.0,
+            per_minute=0.30,
+            per_mile=1.30,
+            booking_fee=1.50,
+            airport_fee=4.0,
+        ))
+        features = pricer.build_action_feature_matrix(market, {})
+        weights = np.asarray([0.35, 0.35, 0.20, 0.10], dtype=float)
+        feature_impacts = features[:, 10:14] @ weights
+        normalized_fare_threshold = 0.05 / 20.0
+        feature_groups = np.where(
+            feature_impacts < -normalized_fare_threshold,
+            -1,
+            np.where(feature_impacts > normalized_fare_threshold, 1, 0),
+        )
+        core = Core.__new__(Core)
+        core.firm1_mode = "RL"
+        core.shared_edit_keys = keys
+        core.firm1 = pricer
+
+        audit_groups = np.asarray([
+            core._economic_action_group(action)
+            for action in range(len(pricer.action_to_steps))
+        ])
+
+        np.testing.assert_array_equal(feature_groups, audit_groups)
 
     def test_response_supervision_uses_causal_delta(self):
         baseline = np.array([0.2, -0.1, 0.5], dtype=np.float32)
@@ -64,6 +360,15 @@ class CorePPOFixRegressionTests(unittest.TestCase):
         self.assertEqual(pricer.action_feature_dim, 20)
         self.assertEqual(features.shape, (len(pricer.action_to_steps), 20))
         self.assertTrue(np.any(np.count_nonzero(features[:, 2:7], axis=1) > 1))
+
+    def test_state_action_specialization_weight_is_configurable(self):
+        pricer = FirmRLPricer(
+            seed=31,
+            opt_keys=["base_fare", "per_minute"],
+            state_action_mi_weight=0.23,
+        )
+
+        self.assertAlmostEqual(pricer.agent.state_action_mi_coeff, 0.23)
 
     def test_pricer_execution_snapshot_is_transactional(self):
         keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
@@ -158,66 +463,145 @@ class CorePPOFixRegressionTests(unittest.TestCase):
         )
         self.assertGreater(stronger["reward"], hold["reward"])
 
-    def test_checkpoint_score_selects_profit_not_proxy_kpis(self):
+    def test_competitiveness_diagnostics_separate_market_share_from_coverage(self):
         core = self._diagnostic_core()
-        feasible = {name: 0.0 for name in core.soft_constraints.names}
-        first = core._validation_score_from_metrics(
-            reward=-1.0,
-            share=0.05,
-            revpr=100.0,
-            profitpr=3.0,
-            fulfillment=0.2,
-            gap=-20.0,
-            rival_profitpr=2.0,
-            constraint_costs=feasible,
+        core.long_term_profit_reward_config = LongTermProfitRewardConfig(
+            objective_mode="competitiveness",
+            own_profit_weight=0.0,
+            profit_advantage_weight=0.0,
+            market_share_competitiveness_weight=1.0,
         )
-        second = core._validation_score_from_metrics(
-            reward=1.0,
-            share=0.95,
-            revpr=1.0,
-            profitpr=3.0,
-            fulfillment=1.0,
-            gap=20.0,
-            rival_profitpr=2.0,
-            constraint_costs=feasible,
+        core.long_term_profit_reward_model = LongTermProfitReward(
+            core.long_term_profit_reward_config
         )
 
-        config = core.long_term_profit_reward_config
-        expected = (
-            config.own_profit_weight * 3.0
-            + config.profit_advantage_weight
-            * (1.0 - np.exp(-3.0 / config.dominance_quality_scale))
-            * config.profit_advantage_scale
-            * np.tanh(1.0 / config.profit_advantage_scale)
+        result = core._reward_diagnostics(
+            share=0.47,
+            baseline_share=0.50,
+            completed_share=0.30,
+            baseline_completed_share=0.25,
+            rev_per_request=8.0,
+            baseline_rev_per_request=7.0,
+            profit_per_request=1.5,
+            baseline_profit_per_request=1.0,
+            mean_gap=1.0,
+            prev_share=0.50,
+            prev_rev_per_request=8.0,
+            prev_profit_per_request=1.5,
+            fulfillment_rate=0.80,
         )
-        self.assertAlmostEqual(first, expected)
+
+        self.assertAlmostEqual(result["reward_market_share_sum"], 1.0)
+        self.assertAlmostEqual(result["reward_outside_option_share"], 0.03)
+        self.assertAlmostEqual(result["reward_completion_coverage"], 0.55)
+        self.assertAlmostEqual(result["reward_market_share"], 0.47 / 0.97)
+        self.assertAlmostEqual(result["reward"], (0.47 / 0.97) * 0.80)
+
+    def test_checkpoint_score_selects_profit_not_proxy_kpis(self):
+        core = self._diagnostic_core()
+        objective = core.long_term_profit_reward_model.compute(
+            own_profit_per_request=3.0,
+            rival_profit_per_request=2.0,
+            price_gap_f2_minus_f1=-20.0,
+        )["reward"]
+        first = core._validation_score_from_metrics(reward=objective)
+        second = core._validation_score_from_metrics(reward=objective)
+
+        self.assertAlmostEqual(first, objective)
         self.assertAlmostEqual(second, first)
+
+    def test_checkpoint_score_honors_serviceable_market_share(self):
+        core = self._diagnostic_core()
+        core.long_term_profit_reward_config = LongTermProfitRewardConfig(
+            objective_mode="competitiveness",
+            own_profit_weight=0.0,
+            profit_advantage_weight=0.0,
+            market_share_competitiveness_weight=1.0,
+        )
+        core.long_term_profit_reward_model = LongTermProfitReward(
+            core.long_term_profit_reward_config
+        )
+        matched_reward = core.long_term_profit_reward_model.compute(
+            own_profit_per_request=1.0,
+            rival_profit_per_request=1.0,
+            own_market_share=0.60,
+            rival_market_share=0.40,
+            own_fulfillment_rate=0.90,
+        )["reward"]
+        distant_reward = core.long_term_profit_reward_model.compute(
+            own_profit_per_request=1.0,
+            rival_profit_per_request=1.0,
+            own_market_share=0.45,
+            rival_market_share=0.55,
+            own_fulfillment_rate=0.90,
+        )["reward"]
+        matched = core._validation_score_from_metrics(
+            reward=matched_reward,
+            completed_share_advantage=0.20,
+        )
+        distant = core._validation_score_from_metrics(
+            reward=distant_reward,
+            completed_share_advantage=-0.05,
+        )
+        self.assertGreater(matched, distant)
+
+    def test_competitiveness_checkpoint_score_cannot_be_bought_with_profit(self):
+        core = self._diagnostic_core()
+        core.long_term_profit_reward_config = LongTermProfitRewardConfig(
+            objective_mode="competitiveness",
+            own_profit_weight=0.0,
+            profit_advantage_weight=0.0,
+            market_share_competitiveness_weight=1.0,
+        )
+        core.long_term_profit_reward_model = LongTermProfitReward(
+            core.long_term_profit_reward_config
+        )
+        high_profit_bad_share_reward = (
+            core.long_term_profit_reward_model.compute(
+                own_profit_per_request=100.0,
+                rival_profit_per_request=0.0,
+                own_market_share=0.45,
+                rival_market_share=0.55,
+                own_fulfillment_rate=0.90,
+            )["reward"]
+        )
+        low_profit_good_share_reward = (
+            core.long_term_profit_reward_model.compute(
+                own_profit_per_request=-100.0,
+                rival_profit_per_request=100.0,
+                own_market_share=0.60,
+                rival_market_share=0.40,
+                own_fulfillment_rate=0.90,
+            )["reward"]
+        )
+        high_profit_bad_share_gap = core._validation_score_from_metrics(
+            reward=high_profit_bad_share_reward,
+            completed_share_advantage=-0.10,
+        )
+        low_profit_good_share_gap = core._validation_score_from_metrics(
+            reward=low_profit_good_share_reward,
+            completed_share_advantage=0.20,
+        )
+        self.assertGreater(
+            low_profit_good_share_gap, high_profit_bad_share_gap
+        )
+
+    def test_ineligible_checkpoint_never_replaces_deployable_best(self):
+        self.assertFalse(Core._checkpoint_candidate_is_better(
+            score=100.0,
+            eligible=False,
+            best_eligible_score=0.1,
+        ))
+        self.assertTrue(Core._checkpoint_candidate_is_better(
+            score=0.2,
+            eligible=True,
+            best_eligible_score=0.1,
+        ))
 
     def test_checkpoint_score_ignores_non_objective_diagnostics(self):
         core = self._diagnostic_core()
-        costs = {name: 0.0 for name in core.soft_constraints.names}
-        clean = core._validation_score_from_metrics(
-            reward=0.0,
-            share=0.0,
-            revpr=0.0,
-            profitpr=3.0,
-            fulfillment=1.0,
-            gap=0.0,
-            rival_profitpr=2.0,
-            constraint_costs=costs,
-        )
-        for name in costs:
-            costs[name] = 1.0
-        diagnosed = core._validation_score_from_metrics(
-            reward=0.0,
-            share=0.0,
-            revpr=0.0,
-            profitpr=3.0,
-            fulfillment=1.0,
-            gap=0.0,
-            rival_profitpr=2.0,
-            constraint_costs=costs,
-        )
+        clean = core._validation_score_from_metrics(reward=0.0)
+        diagnosed = core._validation_score_from_metrics(reward=0.0)
 
         self.assertAlmostEqual(diagnosed, clean)
 

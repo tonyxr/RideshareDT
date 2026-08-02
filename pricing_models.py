@@ -1182,6 +1182,7 @@ class FirmRLPricer:
         feature_groups: Optional[Dict[str, Sequence[int]]] = None,
         gamma: float = 0.995,
         gae_lambda: float = 0.97,
+        state_action_mi_weight: float = 0.10,
     ):
         # Structured response-aware action design:
         #   1) the PPO actor selects hold, a single lever, or a coordinated
@@ -1268,7 +1269,7 @@ class FirmRLPricer:
             max_lr=6.0e-4,
             value_clip_eps=0.30,
             initial_exploration_rate=0.20,
-            final_exploration_rate=0.02,
+            final_exploration_rate=0.01,
             action_feature_dim=self.action_feature_dim,
             constraint_dim=int(max(1, constraint_dim)),
             response_dim=int(max(1, response_dim)),
@@ -1287,7 +1288,7 @@ class FirmRLPricer:
             delayed_reward_blend=0.0,
             single_state_dim=self.single_state_dim,
             frame_stack=self.state_frame_stack,
-            state_action_mi_coeff=0.0,
+            state_action_mi_coeff=float(max(0.0, state_action_mi_weight)),
             feature_groups=feature_groups,
             exploration_fraction=0.65,
             exploration_warmup_fraction=0.10,

@@ -5,15 +5,21 @@ import numpy as np
 from platform_mdp import (
     ActionStabilityTracker,
     ConstraintConfig,
+    BalancedPolicyReward,
+    CustomPolicyReward,
     LongTermProfitReward,
     LongTermProfitRewardConfig,
     ObservationConfig,
     PlatformObservationModel,
+    MarketShareCompetitivenessReward,
+    ProfitMaximizationReward,
     PositiveBusinessReward,
     PositiveRewardConfig,
     SoftConstraintController,
     OperationalClock,
     TrainingStageScheduler,
+    conditional_competitive_shares,
+    policy_objective_defaults,
 )
 
 
@@ -108,6 +114,27 @@ class PlatformMDPTests(unittest.TestCase):
         self.assertEqual(features.shape, (3, 20))
         self.assertGreater(abs(features[2, 13]), abs(features[2, 10]))
 
+    def test_action_features_do_not_encode_a_target_price_gap(self):
+        observer = PlatformObservationModel(3, ObservationConfig())
+        kwargs = dict(
+            action_steps={
+                0: {},
+                1: {"base_fare": -1},
+                2: {"base_fare": 1},
+            },
+            action_keys=["base_fare"],
+            own_coefficients={"base_fare": 3.0},
+            anchor_coefficients={"base_fare": 3.0},
+            coefficient_steps={"base_fare": 0.1},
+            coefficient_bounds={"base_fare": (1.5, 5.0)},
+            step_scale=1.0,
+        )
+
+        low_target = observer.build_action_features(target_gap=0.1, **kwargs)
+        high_target = observer.build_action_features(target_gap=9.0, **kwargs)
+
+        np.testing.assert_allclose(low_target, high_target)
+
     def test_reward_and_costs_are_separate(self):
         reward = PositiveBusinessReward().compute({
             "profit_per_request": 2.0,
@@ -139,7 +166,8 @@ class PlatformMDPTests(unittest.TestCase):
         self.assertEqual(diagnostics["constraint_active_oscillation"], 0.0)
 
     def test_long_term_profit_reward_has_exact_economic_decomposition(self):
-        model = LongTermProfitReward(LongTermProfitRewardConfig())
+        config = LongTermProfitRewardConfig()
+        model = LongTermProfitReward(config)
         result = model.compute(
             own_profit_per_request=4.0,
             rival_profit_per_request=2.0,
@@ -148,7 +176,7 @@ class PlatformMDPTests(unittest.TestCase):
         )
         expected = (
             np.arcsinh(1.0)
-            + 0.10
+            + config.profit_advantage_weight
             * (1.0 - np.exp(-1.0))
             * np.tanh(2.0 / 2.5)
         )
@@ -157,12 +185,277 @@ class PlatformMDPTests(unittest.TestCase):
         self.assertAlmostEqual(
             result["reward_base"],
             result["reward_own_profit_component"]
-            + result["reward_profit_advantage_component"],
+            + result["reward_profit_advantage_component"]
+            + result["reward_price_competitiveness_component"],
         )
         self.assertGreater(result["reward_profit_advantage_component"], 0.0)
         self.assertAlmostEqual(
             result["reward_profit_quality_gate"],
             1.0 - np.exp(-1.0),
+        )
+
+    def test_market_share_competitiveness_reward_tracks_target_lead(self):
+        config = LongTermProfitRewardConfig(
+            objective_mode="competitiveness",
+            own_profit_weight=0.0,
+            profit_advantage_weight=0.0,
+            market_share_competitiveness_weight=1.0,
+            market_share_target_gap=0.10,
+            market_share_gap_scale=0.05,
+            market_share_level_weight=0.0,
+        )
+        model = LongTermProfitReward(config)
+        matched = model.compute(
+            own_profit_per_request=1.0,
+            rival_profit_per_request=1.0,
+            own_completed_share=0.55,
+            rival_completed_share=0.45,
+        )
+        distant = model.compute(
+            own_profit_per_request=1.0,
+            rival_profit_per_request=1.0,
+            own_completed_share=0.45,
+            rival_completed_share=0.55,
+        )
+        self.assertAlmostEqual(matched["reward"], 0.55)
+        self.assertGreater(matched["reward"], distant["reward"])
+        self.assertAlmostEqual(
+            matched["reward_market_share_advantage"], 0.10
+        )
+
+    def test_conditional_market_shares_sum_to_one_and_report_outside_option(self):
+        own, rival, outside = conditional_competitive_shares(0.47, 0.50)
+
+        self.assertAlmostEqual(own + rival, 1.0)
+        self.assertAlmostEqual(outside, 0.03)
+        self.assertAlmostEqual(own, 0.47 / 0.97)
+
+    def test_conditional_market_shares_use_even_prior_when_market_is_empty(self):
+        own, rival, outside = conditional_competitive_shares(0.0, 0.0)
+
+        self.assertEqual((own, rival, outside), (0.5, 0.5, 1.0))
+
+    def test_competitiveness_reward_is_dense_above_certification_target(self):
+        model = LongTermProfitReward(LongTermProfitRewardConfig(
+            objective_mode="competitiveness",
+            own_profit_weight=0.0,
+            profit_advantage_weight=0.0,
+            market_share_competitiveness_weight=1.0,
+        ))
+        certified = model.compute(
+            own_profit_per_request=1.0,
+            rival_profit_per_request=1.0,
+            own_market_share=0.56,
+            rival_market_share=0.44,
+            own_fulfillment_rate=0.90,
+        )
+        stronger = model.compute(
+            own_profit_per_request=1.0,
+            rival_profit_per_request=1.0,
+            own_market_share=0.66,
+            rival_market_share=0.34,
+            own_fulfillment_rate=0.90,
+        )
+
+        self.assertGreater(stronger["reward"], certified["reward"])
+        self.assertAlmostEqual(stronger["reward"], 0.66 * 0.90)
+
+    def test_competitiveness_reward_rejects_unserviceable_share_gaming(self):
+        model = LongTermProfitReward(LongTermProfitRewardConfig(
+            objective_mode="competitiveness",
+            own_profit_weight=0.0,
+            profit_advantage_weight=0.0,
+            market_share_competitiveness_weight=1.0,
+        ))
+        extreme_but_unserved = model.compute(
+            own_profit_per_request=1.0,
+            rival_profit_per_request=0.0,
+            own_market_share=0.97,
+            rival_market_share=0.03,
+            own_fulfillment_rate=0.42,
+        )
+        durable_lead = model.compute(
+            own_profit_per_request=1.0,
+            rival_profit_per_request=0.5,
+            own_market_share=0.60,
+            rival_market_share=0.40,
+            own_fulfillment_rate=0.80,
+        )
+
+        self.assertGreater(durable_lead["reward"], extreme_but_unserved["reward"])
+
+    def test_competitiveness_reward_prefers_serviceable_lead_near_floor(self):
+        model = LongTermProfitReward(LongTermProfitRewardConfig(
+            objective_mode="competitiveness",
+            own_profit_weight=0.0,
+            profit_advantage_weight=0.0,
+            market_share_competitiveness_weight=1.0,
+            market_share_service_floor=0.78,
+        ))
+        extreme_but_below_floor = model.compute(
+            own_profit_per_request=2.0,
+            rival_profit_per_request=0.0,
+            own_market_share=0.996,
+            rival_market_share=0.004,
+            own_fulfillment_rate=0.669,
+        )
+        durable_lead = model.compute(
+            own_profit_per_request=1.0,
+            rival_profit_per_request=0.5,
+            own_market_share=0.75,
+            rival_market_share=0.25,
+            own_fulfillment_rate=0.80,
+        )
+
+        self.assertGreater(durable_lead["reward"], extreme_but_below_floor["reward"])
+        self.assertAlmostEqual(
+            extreme_but_below_floor["reward_market_share_service_penalty"],
+            2.0 * (0.78 - 0.669),
+        )
+
+    def test_market_share_competitiveness_ignores_public_quote_gap(self):
+        model = LongTermProfitReward(LongTermProfitRewardConfig(
+            objective_mode="competitiveness",
+            own_profit_weight=0.0,
+            profit_advantage_weight=0.0,
+            market_share_competitiveness_weight=1.0,
+        ))
+        matched_quotes = model.compute(
+            own_profit_per_request=1.0,
+            rival_profit_per_request=1.0,
+            own_completed_share=0.60,
+            rival_completed_share=0.40,
+            price_gap_f2_minus_f1=0.75,
+            price_gap_abs_error=0.0,
+        )
+        distant_quotes = model.compute(
+            own_profit_per_request=1.0,
+            rival_profit_per_request=1.0,
+            own_completed_share=0.60,
+            rival_completed_share=0.40,
+            price_gap_f2_minus_f1=8.0,
+            price_gap_abs_error=7.25,
+        )
+        self.assertAlmostEqual(
+            matched_quotes["reward"], distant_quotes["reward"]
+        )
+        self.assertEqual(
+            matched_quotes["reward_price_competitiveness_component"], 0.0
+        )
+
+    def test_named_objective_profiles_restore_v6_and_competitiveness(self):
+        profit = policy_objective_defaults("profit_maximization")
+        competitive = policy_objective_defaults("competitiveness")
+        self.assertEqual(profit["long_term_profit_weight"], 1.0)
+        self.assertEqual(profit["profit_dominance_weight"], 0.10)
+        self.assertEqual(profit["price_competitiveness_weight"], 0.0)
+        self.assertEqual(competitive["long_term_profit_weight"], 0.0)
+        self.assertEqual(competitive["profit_dominance_weight"], 0.0)
+        self.assertEqual(
+            competitive["market_share_competitiveness_weight"], 1.0
+        )
+        self.assertEqual(competitive["market_share_target_gap"], 0.10)
+        self.assertEqual(competitive["price_competitiveness_weight"], 0.0)
+
+    def test_reward_weights_switch_policy_preference(self):
+        profit_model = LongTermProfitReward(
+            LongTermProfitRewardConfig(
+                own_profit_weight=1.0,
+                profit_advantage_weight=0.5,
+                price_competitiveness_weight=0.0,
+            )
+        )
+        competitive_model = LongTermProfitReward(
+            LongTermProfitRewardConfig(
+                objective_mode="competitiveness",
+                own_profit_weight=0.0,
+                profit_advantage_weight=0.0,
+                market_share_competitiveness_weight=1.0,
+            )
+        )
+        dominant = dict(
+            own_profit_per_request=5.0,
+            rival_profit_per_request=2.0,
+            own_completed_share=0.40,
+            rival_completed_share=0.50,
+        )
+        matched = dict(
+            own_profit_per_request=3.0,
+            rival_profit_per_request=2.0,
+            own_completed_share=0.60,
+            rival_completed_share=0.30,
+        )
+        self.assertGreater(
+            profit_model.compute(**dominant)["reward_raw"],
+            profit_model.compute(**matched)["reward_raw"],
+        )
+        self.assertGreater(
+            competitive_model.compute(**matched)["reward_raw"],
+            competitive_model.compute(**dominant)["reward_raw"],
+        )
+
+    def test_named_objectives_dispatch_to_distinct_reward_mechanisms(self):
+        profit = LongTermProfitReward(LongTermProfitRewardConfig())
+        competitive = LongTermProfitReward(LongTermProfitRewardConfig(
+            objective_mode="competitiveness",
+            own_profit_weight=0.0,
+            profit_advantage_weight=0.0,
+            market_share_competitiveness_weight=1.0,
+        ))
+        balanced = LongTermProfitReward(LongTermProfitRewardConfig(
+            objective_mode="balanced",
+            market_share_competitiveness_weight=1.0,
+        ))
+        custom = LongTermProfitReward(LongTermProfitRewardConfig(
+            objective_mode="custom",
+            market_share_competitiveness_weight=1.0,
+        ))
+
+        self.assertIsInstance(profit.implementation, ProfitMaximizationReward)
+        self.assertIsInstance(
+            competitive.implementation, MarketShareCompetitivenessReward
+        )
+        self.assertIsInstance(balanced.implementation, BalancedPolicyReward)
+        self.assertIsInstance(custom.implementation, CustomPolicyReward)
+
+    def test_profit_reward_is_invariant_to_price_gap_at_fixed_economics(self):
+        model = LongTermProfitReward(LongTermProfitRewardConfig())
+        common = {
+            "own_profit_per_request": 4.0,
+            "rival_profit_per_request": 2.0,
+        }
+        matched = model.compute(
+            **common, price_gap_f2_minus_f1=0.0, price_gap_abs_error=0.0
+        )
+        distant = model.compute(
+            **common, price_gap_f2_minus_f1=8.0, price_gap_abs_error=8.0
+        )
+        self.assertAlmostEqual(matched["reward"], distant["reward"])
+        self.assertEqual(matched["reward_price_competitiveness_component"], 0.0)
+
+    def test_competitiveness_reward_is_invariant_to_profit_at_fixed_share_gap(self):
+        model = LongTermProfitReward(LongTermProfitRewardConfig(
+            objective_mode="competitiveness",
+            own_profit_weight=0.0,
+            profit_advantage_weight=0.0,
+            market_share_competitiveness_weight=1.0,
+        ))
+        profitable = model.compute(
+            own_profit_per_request=8.0,
+            rival_profit_per_request=1.0,
+            own_completed_share=0.60,
+            rival_completed_share=0.40,
+        )
+        unprofitable = model.compute(
+            own_profit_per_request=-8.0,
+            rival_profit_per_request=10.0,
+            own_completed_share=0.60,
+            rival_completed_share=0.40,
+        )
+        self.assertAlmostEqual(profitable["reward"], unprofitable["reward"])
+        self.assertEqual(profitable["reward_own_profit_component"], 0.0)
+        self.assertEqual(
+            profitable["reward_profit_advantage_component"], 0.0
         )
 
     def test_profitability_gate_prevents_destructive_dominance(self):
@@ -241,12 +534,21 @@ class PlatformMDPTests(unittest.TestCase):
         first = model.compute(
             own_profit_per_request=2.5,
             rival_profit_per_request=2.0,
+            own_completed_share=0.80,
+            rival_completed_share=0.10,
+            price_gap_f2_minus_f1=8.0,
         )
         second = model.compute(
             own_profit_per_request=2.5,
             rival_profit_per_request=2.0,
+            own_completed_share=0.10,
+            rival_completed_share=0.80,
+            price_gap_f2_minus_f1=-8.0,
         )
         self.assertEqual(first["reward"], second["reward"])
+        self.assertEqual(
+            first["reward_market_share_competitiveness_component"], 0.0
+        )
 
     def test_reversal_tracker_detects_coefficient_reversal_across_bundles(self):
         tracker = ActionStabilityTracker(ConstraintConfig(reversal_horizon=4))
@@ -318,8 +620,25 @@ class PlatformMDPTests(unittest.TestCase):
         self.assertEqual(scheduler.stage_at(0.30).name, "robustness")
         self.assertEqual(scheduler.stage_at(0.65).name, "competition")
         self.assertEqual(scheduler.stage_at(0.95).name, "consolidation")
+        self.assertGreaterEqual(scheduler.stage_at(0.95).episode_days, 512)
+        self.assertLessEqual(scheduler.stage_at(0.95).exploration_rate, 0.01)
         self.assertTrue(scheduler.stage_at(0.05).freeze_opponent)
         self.assertFalse(scheduler.stage_at(0.95).freeze_opponent)
+
+    def test_stage_optimizer_controls_transition_smoothly(self):
+        scheduler = TrainingStageScheduler("staged")
+        before = scheduler.smooth_controls_at(0.1799)
+        boundary = scheduler.smooth_controls_at(0.1800)
+        after = scheduler.smooth_controls_at(0.1810)
+        self.assertAlmostEqual(
+            before["exploration_rate"],
+            boundary["exploration_rate"],
+            places=3,
+        )
+        self.assertLess(
+            abs(after["exploration_rate"] - boundary["exploration_rate"]),
+            0.01,
+        )
 
 
 if __name__ == "__main__":

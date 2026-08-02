@@ -1,0 +1,50 @@
+Intel MKL WARNING: Support of Intel(R) Streaming SIMD Extensions 4.2 (Intel(R) SSE4.2) enabled only processors has been deprecated. Intel oneAPI Math Kernel Library 2025.0 will require Intel(R) Advanced Vector Extensions (Intel(R) AVX) instructions.
+[WARN] --report_prefix was absolute (/Users/huali/Desktop/RideResponse/artifacts/policy_profit_v7_seed4303_top2_nyc_robustness/actual_if_available_p65537_d32452843_run); rewriting to /Users/huali/Desktop/RideResponse/actual_if_available_p65537_d32452843_run so graphs are generated in code folder.
+[WARN] --comparison_plot_prefix was absolute (/Users/huali/Desktop/RideResponse/artifacts/policy_profit_v7_seed4303_top2_nyc_robustness/actual_if_available_p65537_d32452843); rewriting to /Users/huali/Desktop/RideResponse/actual_if_available_p65537_d32452843 so graphs are generated in code folder.
+[ChoiceModel] GPT price-threshold mode enabled (thresholds consumed from profile).
+Using random seed: 4303
+[LongTermProfitReward] own=1.000*asinh(profit/4.00) + dominance=0.100*profit_quality*tanh((profit-rival_profit)/2.50), profit_quality=1-exp(-max(profit,0)/4.00); intervention_cost=0.0000, reversal_cost=0.0000, gamma=0.9950, lambda=0.970.
+[ConstraintConfig] constrained=0, constraint_lr=0.030, active=('fulfillment', 'wait', 'margin'), margin_floor=0.080; fare-gap channels are diagnostics only.
+>>> Loaded trained policy <- /Users/huali/Desktop/RideResponse/artifacts/trained_models/policy_profit_v7_seed4303_top2__20260721T142417.885977Z.pt; benchmark opponent remains static.
+>>> Dataset-only mode: skipping synthetic training/evaluation.
+Saved -> /Users/huali/Desktop/RideResponse/actual_if_available_p65537_d32452843_run_run_config.json
+Saved graph -> /Users/huali/Desktop/RideResponse/actual_if_available_p65537_d32452843_price_match_scatter.png
+Saved graph -> /Users/huali/Desktop/RideResponse/actual_if_available_p65537_d32452843_duration_match_scatter.png
+>>> Kaggle comparison summary: rows=3000, price_mae=6.038, price_rmse=10.793, price_bias=-1.920, price_mape=0.225
+>>> Kaggle learned-policy actions: base_fare:-1@continuous,per_minute:-1@continuous,per_mile:-1@continuous,booking_fee:-1@continuous=1563, per_minute:-1@continuous,per_mile:-1@continuous=1437
+>>> Kaggle duration summary: duration_mae_minutes=6.131, duration_rmse_minutes=8.510
+>>> Reality gap check: policy_mae=6.038, anchor_mae=6.079, policy_improvement=+0.041, mape=0.225, bias=-1.920 (underpricing).
+>>> Sensitivity analysis (active tariff after restoring the simulation state; baseline ride=3mi clear weekday 14:00): base=13.47, +20%dist=14.53, +20%duration=14.00, rush18=20.52, rain=16.84, airport=18.71, premium=24.24
+[RL vs Actual] {
+  "dataset_root": "/Users/huali/.cache/kagglehub/datasets/aaronweymouth/nyc-rideshare-raw-data/versions/1",
+  "files_scanned": 1,
+  "rows_processed": 3005,
+  "rows_compared": 3000,
+  "rows_skipped_missing_price": 0,
+  "rows_skipped_missing_distance": 0,
+  "rows_skipped_invalid_price": 3,
+  "rows_skipped_invalid_distance": 1,
+  "files_with_comparable_rows": 1,
+  "mae": 6.037889999999999,
+  "anchor_tariff_mae": 6.079246666666666,
+  "policy_mae_improvement_vs_anchor": 0.04135666666666715,
+  "rmse": 10.79309809245396,
+  "mape": 0.22491003956923228,
+  "bias": -1.92027,
+  "median_absolute_error": 3.504999999999999,
+  "within_2_dollars": 0.2986666666666667,
+  "within_5_dollars": 0.6406666666666667,
+  "actual_price_mean": 26.776493333333338,
+  "predicted_price_mean": 24.856223333333336,
+  "price_correlation": 0.8681998954722756,
+  "duration_mae_minutes": 6.1313356444444445,
+  "duration_rmse_minutes": 8.510392681132963,
+  "duration_mape": 0.35808510639547686,
+  "out_csv": "/Users/huali/Desktop/RideResponse/artifacts/policy_profit_v7_seed4303_top2_nyc_robustness/actual_if_available_p65537_d32452843_rows.csv",
+  "out_plot_prefix": "/Users/huali/Desktop/RideResponse/actual_if_available_p65537_d32452843",
+  "policy_mode": "top2_margin",
+  "policy_temperature": 0.5,
+  "policy_seed": 65537,
+  "dataset_sample_seed": 32452843,
+  "duration_mode": "actual_if_available"
+}
