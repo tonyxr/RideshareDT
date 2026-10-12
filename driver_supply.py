@@ -33,6 +33,34 @@ class DriverPayPolicy:
     fare_share: float = 0.72
     minimum_pay: float = 3.50
     incentive_multiplier: float = 1.0
+    # v28 deliberately removes the legacy [0.85, 1.25] economic guardrail.
+    # The marker travels with the policy because both the scalar and
+    # vectorized market implementations consume DriverPayPolicy directly.
+    experimental_unbounded_economics: bool = False
+
+
+def resolve_driver_incentive_multiplier(policy: Any) -> float:
+    """Resolve a pay multiplier under the policy's declared economics mode.
+
+    Legacy simulations retain the historical [0.85, 1.25] clamp exactly.  In
+    v28, every finite positive multiplier is accepted without projection; a
+    non-positive value is outside the multiplicative policy domain and a
+    non-finite value is numerically invalid.
+    """
+    value = float(getattr(policy, "incentive_multiplier", 1.0))
+    if not bool(getattr(policy, "experimental_unbounded_economics", False)):
+        return float(np.clip(value, 0.85, 1.25))
+    if not np.isfinite(value):
+        raise FloatingPointError(
+            "v28 driver incentive multiplier must be finite; "
+            f"received {value!r}"
+        )
+    if value <= 0.0:
+        raise ValueError(
+            "v28 driver incentive multiplier must be positive; "
+            f"received {value!r}"
+        )
+    return value
 
 @dataclass
 class DriverSupplyConfig:
@@ -59,6 +87,11 @@ class DriverSupplyConfig:
     
     acceptance_mode: str = "expected"
     expected_acceptance_cutoff: float = 0.55
+    # v26 environment contract.  Legacy defaults reproduce v25 exactly.
+    firm2_supply_bias: float = 0.96
+    linear_demand_scaling: bool = False
+    reference_customers: float = 500.0
+    legacy_peak_factor: bool = True
 
     def __post_init__(self) -> None:
         self.acceptance_mode = str(self.acceptance_mode).lower().strip()
@@ -209,19 +242,41 @@ class DriverSupplyLayer:
         self.smoothed_states = {"Firm1": FirmDriverBatchState(), "Firm2": FirmDriverBatchState()}
         self._batch_states = {"Firm1": FirmDriverBatchState(), "Firm2": FirmDriverBatchState()}
 
-    def begin_batch(self, customers_per_step: int, hour: int, weather: str) -> None:
+    def begin_batch(
+        self,
+        customers_per_step: int,
+        hour: int,
+        weather: str,
+        supply_multiplier: float = 1.0,
+    ) -> None:
+        """Start one market step.
+
+        ``customers_per_step`` sets fleet capacity.  Legacy mode floors the
+        capacity scale at 0.25, which made the request/driver ratio differ
+        between 100-customer training and 200-customer evaluation; the v26
+        ``linear_demand_scaling`` keeps that ratio invariant.  In v26 callers
+        pass the run's base customers here (capacity) and an hourly
+        ``supply_multiplier`` that tracks only part of the demand cycle, while
+        realized requests vary with the calibrated hour-of-day volume.
+        """
         self._batch_states = {}
-        demand_scale = max(0.25, float(customers_per_step) / 500.0)
-        peak = 1.18 if (7 <= int(hour) < 10 or 16 <= int(hour) < 19) else 1.0
+        if self.config.linear_demand_scaling:
+            demand_scale = max(1e-3, float(customers_per_step) / float(self.config.reference_customers))
+        else:
+            demand_scale = max(0.25, float(customers_per_step) / 500.0)
+        rush = 7 <= int(hour) < 10 or 16 <= int(hour) < 19
+        peak = 1.18 if (rush and self.config.legacy_peak_factor) else 1.0
+        busy_peak = rush
         weather_supply = 0.88 if str(weather).lower() in {"rain", "snow", "storm"} else 1.0
-        for firm, bias in (("Firm1", 1.0), ("Firm2", 0.96)):
+        hourly = float(max(0.05, supply_multiplier))
+        for firm, bias in (("Firm1", 1.0), ("Firm2", float(self.config.firm2_supply_bias))):
             previous = self.smoothed_states.get(firm, self.last_states[firm])
             previous_earnings = previous.driver_earnings_per_hour or self.config.reservation_wage_per_hour
             online_response = 1.0 + self.config.supply_elasticity * np.tanh(
                 (previous_earnings - self.config.reservation_wage_per_hour) / max(1e-6, self.config.online_temperature)
             )
-            active = int(max(1, round(self.config.base_active_drivers * demand_scale * peak * weather_supply * bias * online_response)))
-            busy = int(np.clip(round(active * (0.18 if peak > 1.0 else 0.12)), 0, max(0, active - 1)))
+            active = int(max(1, round(self.config.base_active_drivers * demand_scale * peak * hourly * weather_supply * bias * online_response)))
+            busy = int(np.clip(round(active * (0.18 if busy_peak else 0.12)), 0, max(0, active - 1)))
             idle = max(1, active - busy)
             state = FirmDriverBatchState(active_drivers=active, idle_drivers=idle, busy_drivers=busy)
             state.total_online_minutes = float(active * 60.0)
@@ -254,7 +309,15 @@ class DriverSupplyLayer:
         del distance_miles, duration_minutes, pickup_minutes, airport
         policy = self.pay_policies[firm]
         base_pay = max(policy.minimum_pay, policy.fare_share * max(0.0, float(rider_fare)))
-        return float(max(policy.minimum_pay, base_pay * float(np.clip(policy.incentive_multiplier, 0.85, 1.25))))
+        incentive = resolve_driver_incentive_multiplier(policy)
+        with np.errstate(over="ignore", invalid="ignore"):
+            driver_pay = float(base_pay * incentive)
+        if bool(getattr(policy, "experimental_unbounded_economics", False)) and not np.isfinite(driver_pay):
+            raise OverflowError(
+                "v28 driver pay overflowed while applying incentive multiplier "
+                f"{incentive!r} to base pay {base_pay!r}"
+            )
+        return float(max(policy.minimum_pay, driver_pay))
 
     def driver_acceptance_ratio(
         self,
@@ -313,12 +376,21 @@ class DriverSupplyLayer:
         duration_minutes: float,
         airport: bool = False,
         weather: str = "clear",
+        pay_reference_fare: Optional[float] = None,
     ) -> DispatchResult:
+        """Offer one ride to the firm's drivers.
+
+        ``pay_reference_fare`` (v26 ``driver_pay_basis='anchor'``) is the
+        city-anchor fare for the same trip and context; driver pay is a share of
+        it, so rider discounts/premiums are absorbed by the platform instead of
+        moving driver pay one-for-one (upfront pay / regulated pay floors).
+        """
         state = self._batch_states.setdefault(firm, FirmDriverBatchState(active_drivers=1, idle_drivers=1))
         state.offered_dispatches += 1
         pickup_minutes = self.estimate_pickup_minutes(firm, airport=airport)
         pickup_miles = max(0.1, pickup_minutes * 0.28)
-        driver_pay = self.quote_driver_pay(firm, rider_fare, distance_miles, duration_minutes, pickup_minutes, airport)
+        pay_fare = float(rider_fare if pay_reference_fare is None else pay_reference_fare)
+        driver_pay = self.quote_driver_pay(firm, pay_fare, distance_miles, duration_minutes, pickup_minutes, airport)
         accept_prob = self.driver_acceptance_probability(
             driver_pay=driver_pay,
             distance_miles=distance_miles,
@@ -393,8 +465,11 @@ class DriverSupplyLayer:
     def state_features_for_firm(self, firm: str, opponent: str = "Firm2") -> np.ndarray:
         own = self.smoothed_states.get(firm, self.last_states.get(firm, FirmDriverBatchState()))
         other = self.smoothed_states.get(opponent, self.last_states.get(opponent, FirmDriverBatchState()))
+        # v27 sets ``active_driver_feature_scale`` from its calibrated fleet;
+        # the legacy constant is 800 drivers.
+        scale = float(getattr(self, "active_driver_feature_scale", 800.0) or 800.0)
         features = [
-            np.clip(own.active_drivers / 800.0, 0.0, 1.0),
+            np.clip(own.active_drivers / scale, 0.0, 1.0),
             np.clip(own.idle_driver_share, 0.0, 1.0),
             np.clip(own.utilization, 0.0, 1.0),
             np.clip(own.acceptance_rate, 0.0, 1.0),

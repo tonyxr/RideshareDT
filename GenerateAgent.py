@@ -56,6 +56,17 @@ class GenerateAgent:
             "household_lambda": float(NYC_AGENT_CAL.get("household_lambda", 1.9)),
             "p_new": float(NYC_AGENT_CAL.get("p_new", 0.34)),
         },
+        "Boston": {
+            # Neutral startup values are replaced by --calibration_json when
+            # the downloaded ACS pipeline is used.
+            "age_mean": 37.0,
+            "age_std": 12.0,
+            "income_probs": [0.20, 0.31, 0.30, 0.19],
+            "marital_probs": [0.55, 0.31, 0.09, 0.05],
+            "gender_probs": [0.48, 0.52],
+            "household_lambda": 2.1,
+            "p_new": 0.30,
+        },
         "Chicago": {
             "age_mean": 38.0,
             "age_std": 12.0,
@@ -95,6 +106,7 @@ class GenerateAgent:
         self.gender_probs = np.array(self.demographics["gender_probs"], dtype=float)
         self.household_lambda = float(self.demographics["household_lambda"])
         self.p_new = float(self.demographics["p_new"])
+        self.freeze_current_priors_as_base()
 
         # Create a compact static “population” pool so loyalty is fixed per rider across timesteps
         self._build_population()
@@ -107,10 +119,23 @@ class GenerateAgent:
             return np.ones_like(clipped, dtype=float) / float(len(clipped))
         return clipped / total
 
+    def freeze_current_priors_as_base(self) -> None:
+        """Make current priors the center of future run-level perturbations."""
+
+        self._base_demographics = {
+            "age_mean": float(self.age_mean),
+            "age_std": float(self.age_std),
+            "income_probs": np.array(self.income_probs, dtype=float).copy(),
+            "marital_probs": np.array(self.marital_probs, dtype=float).copy(),
+            "gender_probs": np.array(self.gender_probs, dtype=float).copy(),
+            "household_lambda": float(self.household_lambda),
+            "p_new": float(self.p_new),
+        }
+
     def apply_probability_variation(self, jitter_scale: float = 0.05) -> None:
         """Apply slight run-level variation to demographic priors, then rebuild pool."""
         j = float(max(0.0, jitter_scale))
-        base = self.CITY_DEMOGRAPHICS[self.city_name]
+        base = self._base_demographics
 
         self.age_mean = float(base["age_mean"] + self.rng.normal(0.0, 1.0 * j))
         self.age_std = float(max(5.0, base["age_std"] * (1.0 + self.rng.normal(0.0, 0.15 * j))))
@@ -184,4 +209,3 @@ class GenerateAgent:
             }
             for i in idxs
         ]
-        

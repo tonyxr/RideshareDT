@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "cities": {
+    "nyc": {
+      "market_name": "New York City",
+      "aliases": ["nyc", "new york", "new york city"],
+      "timezone": "America/New_York",
+      "ride_semantics": "realized_trip",
+      "price_semantics": "realized_passenger_fare",
+      "kaggle_slug": "aaronweymouth/nyc-rideshare-raw-data",
+      "ride_root": "rides/nyc_kaggle",
+      "ride_glob": "*.parquet",
+      "weather_glob": "nyc_laguardia_*.csv",
+      "weather_station": "72503014732",
+      "pums_person": "csv_pny.zip",
+      "pums_household": "csv_hny.zip",
+      "puma_geography": "tl_2024_36_puma20.zip",
+      "puma_name_pattern": "^NYC-",
+      "state_fips": "36",
+      "place_fips": "51000",
+      "sources": {
+        "rides": "https://www.kaggle.com/datasets/aaronweymouth/nyc-rideshare-raw-data",
+        "weather": "https://www.ncei.noaa.gov/data/global-hourly/access/",
+        "demographics": "https://www2.census.gov/programs-surveys/acs/data/pums/2024/5-Year/"
+      }
+    },
+    "boston": {
+      "market_name": "Boston",
+      "aliases": ["boston", "boston ma", "boston massachusetts"],
+      "timezone": "America/New_York",
+      "ride_semantics": "price_quote",
+      "price_semantics": "posted_quote_excluding_tip",
+      "kaggle_slug": "brllrb/uber-and-lyft-dataset-boston-ma",
+      "ride_root": "rides/boston_kaggle",
+      "ride_glob": "*.csv",
+      "weather_glob": "boston_logan_*.csv",
+      "weather_station": "72509014739",
+      "pums_person": "csv_pma.zip",
+      "pums_household": "csv_hma.zip",
+      "puma_geography": "tl_2024_25_puma20.zip",
+      "puma_name_pattern": "Boston City",
+      "state_fips": "25",
+      "place_fips": "07000",
+      "sources": {
+        "rides": "https://www.kaggle.com/datasets/brllrb/uber-and-lyft-dataset-boston-ma",
+        "weather": "https://www.ncei.noaa.gov/data/global-hourly/access/",
+        "demographics": "https://www2.census.gov/programs-surveys/acs/data/pums/2024/5-Year/"
+      }
+    },
+    "chicago": {
+      "market_name": "Chicago",
+      "aliases": ["chicago", "chicago il", "chicago illinois"],
+      "timezone": "America/Chicago",
+      "ride_semantics": "realized_trip",
+      "price_semantics": "realized_fare_plus_mandatory_charges_excluding_tip",
+      "kaggle_slug": "esaihuamanmeza/transportation-network-providers-trips-18-2022",
+      "ride_root": "rides/chicago_kaggle",
+      "ride_glob": "*.csv",
+      "weather_glob": "chicago_ohare_*.csv",
+      "weather_station": "72530094846",
+      "pums_person": "csv_pil.zip",
+      "pums_household": "csv_hil.zip",
+      "puma_geography": "tl_2024_17_puma20.zip",
+      "puma_name_pattern": "Chicago City",
+      "state_fips": "17",
+      "place_fips": "14000",
+      "sources": {
+        "rides": "https://www.kaggle.com/datasets/esaihuamanmeza/transportation-network-providers-trips-18-2022",
+        "weather": "https://www.ncei.noaa.gov/data/global-hourly/access/",
+        "demographics": "https://www2.census.gov/programs-surveys/acs/data/pums/2024/5-Year/"
+      }
+    }
+  }
+}

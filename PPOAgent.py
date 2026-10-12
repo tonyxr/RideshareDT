@@ -1,113 +1,24 @@
 from __future__ import annotations
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
-"""
-Created on Sun Feb  8 15:58:46 2026
-
-@author: Xiaoru Shi
-
-PPO actor-critic for hybrid discrete/continuous pricing policies.
-
-This is designed for STABILITY:
-- advantage normalization
-- clipped policy and value objectives
-- adaptive entropy and learning-rate controls
-- gradient clipping
-
-"""
+"""Sequence-aware categorical PPO with fully separate actor and critic."""
 
 from dataclasses import dataclass
+import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
+import mkl_config  # noqa: F401 - configure oneMKL before NumPy/Torch imports
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
 
-class RunningNormalizer:
-    """Numerically stable running moments for critic targets.
-
-    PPO stores values in economic units for GAE, while the critic is trained in
-    normalized units.  This keeps long-horizon profit and constraint returns
-    from producing value losses that overwhelm the actor.
-    """
-
-    def __init__(self, shape: Tuple[int, ...] = (), device: Optional[torch.device] = None):
-        self.device = device or torch.device("cpu")
-        self.shape = tuple(shape)
-        self.mean = torch.zeros(self.shape, dtype=torch.float32, device=self.device)
-        self.var = torch.ones(self.shape, dtype=torch.float32, device=self.device)
-        self.count = torch.tensor(1e-4, dtype=torch.float32, device=self.device)
-
-    @torch.no_grad()
-    def update(self, values: torch.Tensor) -> None:
-        x = torch.as_tensor(values, dtype=torch.float32, device=self.device)
-        if x.numel() == 0:
-            return
-        if self.shape:
-            x = x.reshape(-1, *self.shape)
-        else:
-            x = x.reshape(-1)
-        batch_count = torch.tensor(float(x.shape[0]), dtype=torch.float32, device=self.device)
-        batch_mean = x.mean(dim=0)
-        batch_var = x.var(dim=0, unbiased=False)
-        delta = batch_mean - self.mean
-        total = self.count + batch_count
-        new_mean = self.mean + delta * batch_count / total
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        m2 = m_a + m_b + delta.square() * self.count * batch_count / total
-        self.mean = new_mean
-        self.var = torch.clamp(m2 / total, min=1e-4)
-        self.count = total
-
-    def normalize(self, values: torch.Tensor, clip: float = 10.0) -> torch.Tensor:
-        x = torch.as_tensor(values, dtype=torch.float32, device=self.device)
-        z = (x - self.mean) / torch.sqrt(self.var + 1e-6)
-        return torch.clamp(z, -float(clip), float(clip))
-
-    def denormalize(self, values: torch.Tensor) -> torch.Tensor:
-        x = torch.as_tensor(values, dtype=torch.float32, device=self.device)
-        return x * torch.sqrt(self.var + 1e-6) + self.mean
-
-    def state_dict(self) -> Dict[str, object]:
-        return {
-            "mean": self.mean.detach().cpu(),
-            "var": self.var.detach().cpu(),
-            "count": float(self.count.item()),
-        }
-
-    def load_state_dict(self, state: Dict[str, object]) -> None:
-        if not state:
-            return
-        self.mean = torch.as_tensor(state["mean"], dtype=torch.float32, device=self.device).reshape(self.shape)
-        self.var = torch.clamp(
-            torch.as_tensor(state["var"], dtype=torch.float32, device=self.device).reshape(self.shape),
-            min=1e-4,
-        )
-        self.count = torch.tensor(
-            max(1e-4, float(state.get("count", 1e-4))),
-            dtype=torch.float32,
-            device=self.device,
-        )
-
-
 class ActorCritic(nn.Module):
-    """Hierarchical recurrent actor-critic for a partially observed market game.
+    """Independent recurrent encoders for policy and state value.
 
-    The network deliberately keeps three kinds of information separate:
-
-    * immediate public market/firm observations,
-    * a recurrent belief inferred from *observable* opponent history, and
-    * a continuous city/market context (never a city or opponent identity).
-
-    Actor and critic use independent encoders so critic error cannot rewrite the
-    policy representation.  The supervised response model is independent again:
-    it is useful for diagnostics and representation validation, but its target
-    cannot leak into PPO's policy gradient.
+    The v23 default keeps two public-state recurrent paths. Optional v24 modules
+    add critic-only privileged-state fusion and discrete action values; actor
+    parameters and inputs remain isolated.
     """
 
     def __init__(
@@ -115,425 +26,427 @@ class ActorCritic(nn.Module):
         state_dim: int,
         action_dim: int,
         hidden: int = 192,
-        constraint_dim: int = 5,
-        response_dim: int = 4,
+        constraint_dim: int = 0,
+        response_dim: int = 0,
+        opponent_forecast_dim: int = 0,
         action_feature_dim: int = 0,
-        enable_action_q: bool = True,
+        enable_action_q: bool = False,
+        critic_state_dim: Optional[int] = None,
+        privileged_critic: bool = False,
+        privileged_value_only: bool = False,
+        persistent_recurrence: bool = False,
         single_state_dim: Optional[int] = None,
         frame_stack: int = 1,
         feature_groups: Optional[Dict[str, Sequence[int]]] = None,
-    ):
+        normalize_values: bool = False,
+    ) -> None:
         super().__init__()
-        self.constraint_dim = int(max(1, constraint_dim))
-        self.response_dim = int(max(1, response_dim))
+        del feature_groups
+
+        self.state_dim = int(max(1, state_dim))
         self.action_dim = int(max(1, action_dim))
+        self.constraint_dim = int(max(0, constraint_dim))
+        self.response_dim = int(max(0, response_dim))
+        self.opponent_forecast_dim = int(
+            np.clip(opponent_forecast_dim, 0, self.response_dim)
+        )
         self.action_feature_dim = int(max(0, action_feature_dim))
-        self.enable_action_q = bool(enable_action_q and self.action_feature_dim > 0)
+        self.enable_action_q = bool(enable_action_q)
+        self.privileged_critic = bool(privileged_critic)
+        self.privileged_value_only = bool(
+            privileged_value_only and privileged_critic
+        )
+        self.persistent_recurrence = bool(persistent_recurrence)
+        self.critic_state_dim = int(
+            max(
+                1,
+                self.state_dim
+                if critic_state_dim is None
+                else critic_state_dim,
+            )
+        )
         self.frame_stack = int(max(1, frame_stack))
         self.single_state_dim = int(
-            max(1, state_dim if single_state_dim is None else single_state_dim)
+            max(1, self.state_dim if single_state_dim is None else single_state_dim)
         )
-        if self.single_state_dim * self.frame_stack != int(state_dim):
+        if self.single_state_dim * self.frame_stack != self.state_dim:
             raise ValueError(
                 "state_dim must equal single_state_dim * frame_stack: "
-                f"{state_dim} != {self.single_state_dim} * {self.frame_stack}"
+                f"{self.state_dim} != {self.single_state_dim} * {self.frame_stack}"
             )
-        groups = dict(feature_groups or {})
 
-        def _group(name: str) -> Tuple[int, ...]:
-            raw = groups.get(name, tuple(range(self.single_state_dim)))
-            clean = tuple(dict.fromkeys(int(i) for i in raw))
-            if not clean:
-                raise ValueError(f"feature group {name!r} cannot be empty")
-            if min(clean) < 0 or max(clean) >= self.single_state_dim:
-                raise ValueError(
-                    f"feature group {name!r} is outside [0, {self.single_state_dim})"
-                )
-            return clean
-
-        immediate_idx = _group("immediate")
-        opponent_idx = _group("opponent")
-        city_idx = _group("city")
-        self.register_buffer(
-            "immediate_indices", torch.tensor(immediate_idx, dtype=torch.long)
+        self.actor_frame_encoder = nn.Sequential(
+            nn.Linear(self.single_state_dim, hidden),
+            nn.Tanh(),
         )
-        self.register_buffer(
-            "opponent_indices", torch.tensor(opponent_idx, dtype=torch.long)
-        )
-        self.register_buffer(
-            "city_indices", torch.tensor(city_idx, dtype=torch.long)
-        )
-
-        immediate_hidden = max(64, hidden // 2)
-        opponent_hidden = max(48, hidden // 3)
-        city_hidden = max(32, hidden // 4)
-
-        # Actor encoders.  The opponent GRU sees only public behavioral
-        # consequences, not a strategy label or simulator-private parameters.
-        self.immediate_frame_encoder = nn.Sequential(
-            nn.Linear(len(immediate_idx), immediate_hidden),
-            nn.LayerNorm(immediate_hidden),
-            nn.SiLU(),
-        )
-        self.immediate_temporal_encoder = nn.GRU(
-            input_size=immediate_hidden,
-            hidden_size=immediate_hidden,
-            num_layers=1,
-            batch_first=True,
-        )
-        self.opponent_frame_encoder = nn.Sequential(
-            nn.Linear(len(opponent_idx), opponent_hidden),
-            nn.LayerNorm(opponent_hidden),
-            nn.SiLU(),
-        )
-        self.opponent_temporal_encoder = nn.GRU(
-            input_size=opponent_hidden,
-            hidden_size=opponent_hidden,
-            num_layers=1,
-            batch_first=True,
-        )
-        self.city_encoder = nn.Sequential(
-            nn.Linear(len(city_idx), city_hidden),
-            nn.LayerNorm(city_hidden),
-            nn.SiLU(),
-            nn.Linear(city_hidden, city_hidden),
-            nn.SiLU(),
-        )
-        fusion_dim = immediate_hidden + opponent_hidden + city_hidden
-        self.actor_fusion = nn.Sequential(
-            nn.Linear(fusion_dim, hidden),
-            nn.LayerNorm(hidden),
-            nn.SiLU(),
+        self.actor_recurrent = nn.GRU(hidden, hidden, batch_first=True)
+        self.actor_encoder = nn.Sequential(
             nn.Linear(hidden, hidden),
-            nn.LayerNorm(hidden),
-            nn.SiLU(),
+            nn.Tanh(),
         )
-
-        # Fully separate critic encoders and fusion trunk.
-        self.critic_immediate_frame_encoder = nn.Sequential(
-            nn.Linear(len(immediate_idx), immediate_hidden),
-            nn.LayerNorm(immediate_hidden),
-            nn.SiLU(),
+        self.critic_frame_encoder = nn.Sequential(
+            nn.Linear(self.single_state_dim, hidden),
+            nn.Tanh(),
         )
-        self.critic_immediate_temporal_encoder = nn.GRU(
-            input_size=immediate_hidden,
-            hidden_size=immediate_hidden,
-            num_layers=1,
-            batch_first=True,
-        )
-        self.critic_opponent_frame_encoder = nn.Sequential(
-            nn.Linear(len(opponent_idx), opponent_hidden),
-            nn.LayerNorm(opponent_hidden),
-            nn.SiLU(),
-        )
-        self.critic_opponent_temporal_encoder = nn.GRU(
-            input_size=opponent_hidden,
-            hidden_size=opponent_hidden,
-            num_layers=1,
-            batch_first=True,
-        )
-        self.critic_city_encoder = nn.Sequential(
-            nn.Linear(len(city_idx), city_hidden),
-            nn.LayerNorm(city_hidden),
-            nn.SiLU(),
-            nn.Linear(city_hidden, city_hidden),
-            nn.SiLU(),
-        )
-        self.critic_fusion = nn.Sequential(
-            nn.Linear(fusion_dim, hidden),
-            nn.LayerNorm(hidden),
-            nn.SiLU(),
+        self.critic_recurrent = nn.GRU(hidden, hidden, batch_first=True)
+        self.critic_encoder = nn.Sequential(
             nn.Linear(hidden, hidden),
-            nn.LayerNorm(hidden),
-            nn.SiLU(),
+            nn.Tanh(),
         )
-
-        # The response predictor has its own recurrent encoder and optimizer.
-        # It can test whether public history is predictive without allowing a
-        # supervised target to steer the actor toward reward-hacking actions.
-        response_hidden = max(64, hidden // 2)
-        self.response_frame_encoder = nn.Sequential(
-            nn.Linear(self.single_state_dim, response_hidden),
-            nn.LayerNorm(response_hidden),
-            nn.SiLU(),
-        )
-        self.response_temporal_encoder = nn.GRU(
-            input_size=response_hidden,
-            hidden_size=response_hidden,
-            num_layers=1,
-            batch_first=True,
-        )
-        self.response_state_encoder = nn.Sequential(
-            nn.Linear(response_hidden, response_hidden),
-            nn.LayerNorm(response_hidden),
-            nn.SiLU(),
-        )
-
-        self.action_encoder = None
-        self.critic_action_encoder = None
-        self.response_action_encoder = None
-        self.action_score_head = None
-        self.action_q_head = None
-        if self.action_feature_dim > 0:
-            self.action_encoder = nn.Sequential(
-                nn.Linear(self.action_feature_dim, hidden // 2),
-                nn.SiLU(),
-                nn.Linear(hidden // 2, hidden // 2),
-                nn.SiLU(),
+        if self.privileged_critic:
+            self.critic_privileged_encoder: Optional[nn.Module] = nn.Sequential(
+                nn.Linear(self.critic_state_dim, hidden),
+                nn.Tanh(),
+                *(
+                    (nn.Linear(hidden, hidden), nn.Tanh())
+                    if self.privileged_value_only
+                    else ()
+                ),
             )
-            joint_dim = hidden + hidden // 2
-            self.action_score_head = nn.Sequential(
-                nn.Linear(joint_dim, hidden),
-                nn.SiLU(),
-                nn.Linear(hidden, 1),
-            )
-            if self.enable_action_q:
-                self.critic_action_encoder = nn.Sequential(
-                    nn.Linear(self.action_feature_dim, hidden // 2),
-                    nn.SiLU(),
-                    nn.Linear(hidden // 2, hidden // 2),
-                    nn.SiLU(),
+            self.critic_fusion: Optional[nn.Module] = (
+                None
+                if self.privileged_value_only
+                else nn.Sequential(
+                    nn.Linear(hidden * 2, hidden),
+                    nn.Tanh(),
                 )
-                self.action_q_head = nn.Sequential(
-                    nn.Linear(hidden + hidden // 2, hidden),
-                    nn.SiLU(),
-                    nn.Linear(hidden, 1),
-                )
-            self.response_action_encoder = nn.Sequential(
-                nn.Linear(self.action_feature_dim, response_hidden // 2),
-                nn.SiLU(),
-                nn.Linear(response_hidden // 2, response_hidden // 2),
-                nn.SiLU(),
-            )
-            self.response_head = nn.Sequential(
-                nn.Linear(response_hidden + response_hidden // 2, response_hidden),
-                nn.SiLU(),
-                nn.Linear(response_hidden, self.response_dim),
-            )
-            self.pi_head = nn.Sequential(
-                nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, action_dim)
             )
         else:
-            self.pi_head = nn.Sequential(
-                nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, action_dim)
+            # ``None`` keeps the disabled network schema identical to v23.
+            self.critic_privileged_encoder = None
+            self.critic_fusion = None
+        self.pi_head = nn.Linear(hidden, self.action_dim)
+        self.v_head = nn.Linear(hidden, 1)
+        self.normalize_values = bool(normalize_values)
+        if self.normalize_values:
+            self.register_buffer("value_scale", torch.ones(()))
+            self.register_buffer("value_square_sum", torch.zeros((), dtype=torch.float64))
+            self.register_buffer("value_count", torch.zeros((), dtype=torch.float64))
+
+        # Explicit compatibility markers. These are not modules or parameters.
+        self.mag_mean_head = None
+        if self.enable_action_q:
+            q_state_dim = (
+                self.critic_state_dim
+                if self.privileged_critic
+                else self.state_dim
             )
-            self.response_head = nn.Sequential(
-                nn.Linear(response_hidden, response_hidden),
-                nn.SiLU(),
-                nn.Linear(response_hidden, self.response_dim),
+            self.q_state_encoder: Optional[nn.Module] = nn.Sequential(
+                nn.Linear(q_state_dim, hidden),
+                nn.Tanh(),
+                nn.Linear(hidden, hidden),
+                nn.Tanh(),
             )
-        self.mag_mean_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, action_dim))
-        self.mag_logstd = nn.Parameter(torch.full((action_dim,), -0.35))
-        self.v_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, 1))
-        self.constraint_head = nn.Sequential(
-            nn.Linear(hidden, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, self.constraint_dim),
-        )
-        self.risk_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, 1))
+            self.q_action_encoder: Optional[nn.Module] = nn.Sequential(
+                nn.Linear(
+                    self.action_feature_dim
+                    if self.action_feature_dim > 0
+                    else self.action_dim,
+                    hidden,
+                ),
+                nn.Tanh(),
+            )
+            self.action_q_head: Optional[nn.Module] = nn.Linear(
+                hidden * 2, 1
+            )
+        else:
+            self.q_state_encoder = None
+            self.q_action_encoder = None
+            self.action_q_head = None
+        self.constraint_head = None
+        self.risk_head = None
+        self.response_head = None
         self._init_weights()
 
-    def actor_parameters(self) -> List[nn.Parameter]:
-        modules = [
-            self.immediate_frame_encoder,
-            self.immediate_temporal_encoder,
-            self.opponent_frame_encoder,
-            self.opponent_temporal_encoder,
-            self.city_encoder,
-            self.actor_fusion,
-            self.pi_head,
-            self.mag_mean_head,
-        ]
-        for module in (self.action_encoder, self.action_score_head):
-            if module is not None:
-                modules.append(module)
-        params: List[nn.Parameter] = [self.mag_logstd]
-        for module in modules:
-            params.extend(list(module.parameters()))
-        return params
-
-    def critic_parameters(self) -> List[nn.Parameter]:
-        modules = [
-            self.critic_immediate_frame_encoder,
-            self.critic_immediate_temporal_encoder,
-            self.critic_opponent_frame_encoder,
-            self.critic_opponent_temporal_encoder,
-            self.critic_city_encoder,
-            self.critic_fusion,
-            self.v_head,
-            self.constraint_head,
-            self.risk_head,
-        ]
-        for module in (self.critic_action_encoder, self.action_q_head):
-            if module is not None:
-                modules.append(module)
-        params: List[nn.Parameter] = []
-        for module in modules:
-            params.extend(list(module.parameters()))
-        return params
-
-    def response_parameters(self) -> List[nn.Parameter]:
-        modules = [
-            self.response_frame_encoder,
-            self.response_temporal_encoder,
-            self.response_state_encoder,
-            self.response_head,
-        ]
-        if self.response_action_encoder is not None:
-            modules.append(self.response_action_encoder)
-        params: List[nn.Parameter] = []
-        for module in modules:
-            params.extend(list(module.parameters()))
-        return params
-
     def _init_weights(self) -> None:
-        """Orthogonal init improves PPO stability and early optimization speed."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.orthogonal_(module.weight, gain=np.sqrt(2.0))
                 nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.GRU):
+                for name, parameter in module.named_parameters():
+                    if "weight_ih" in name:
+                        nn.init.xavier_uniform_(parameter)
+                    elif "weight_hh" in name:
+                        nn.init.orthogonal_(parameter)
+                    elif "bias" in name:
+                        nn.init.constant_(parameter, 0.0)
+        # Start the categorical actor from an exactly neutral prior.  A tiny
+        # random policy head makes deterministic checkpoint validation select
+        # an arbitrary tariff before PPO has learned anything; with absolute
+        # tariff targets, that lucky initial argmax can look like successful
+        # learning for the entire run.  Zero logits retain a uniform stochastic
+        # behavior policy (so PPO can break symmetry from reward evidence) and
+        # make the deterministic pre-learning tie resolve to legal action 0
+        # (hold).  No action is removed, masked, or forced after initialization.
+        nn.init.zeros_(self.pi_head.weight)
+        nn.init.zeros_(self.pi_head.bias)
+        nn.init.orthogonal_(self.v_head.weight, gain=1.0)
+        if self.action_q_head is not None:
+            nn.init.orthogonal_(self.action_q_head.weight, gain=0.5)
 
-        if isinstance(self.pi_head[-1], nn.Linear):
-            nn.init.orthogonal_(self.pi_head[-1].weight, gain=0.01)
-            nn.init.constant_(self.pi_head[-1].bias, 0.0)
-        if self.action_score_head is not None and isinstance(self.action_score_head[-1], nn.Linear):
-            nn.init.orthogonal_(self.action_score_head[-1].weight, gain=0.01)
-            nn.init.constant_(self.action_score_head[-1].bias, 0.0)
-        if isinstance(self.mag_mean_head[-1], nn.Linear):
-            nn.init.orthogonal_(self.mag_mean_head[-1].weight, gain=0.01)
-            nn.init.constant_(self.mag_mean_head[-1].bias, 0.0)
-        
-        for head in (self.v_head, self.constraint_head, self.risk_head, self.response_head):
-            if isinstance(head[-1], nn.Linear):
-                nn.init.orthogonal_(head[-1].weight, gain=1.0)
-                nn.init.constant_(head[-1].bias, 0.0)
+    def actor_parameters(self) -> List[nn.Parameter]:
+        return [
+            *self.actor_frame_encoder.parameters(),
+            *self.actor_recurrent.parameters(),
+            *self.actor_encoder.parameters(),
+            *self.pi_head.parameters(),
+        ]
 
-    @staticmethod
-    def _temporal_latent(
-        frames: torch.Tensor,
-        indices: torch.Tensor,
-        frame_encoder: nn.Module,
-        temporal_encoder: nn.GRU,
-    ) -> torch.Tensor:
-        selected = torch.index_select(frames, dim=-1, index=indices)
-        encoded = frame_encoder(selected)
-        temporal, _ = temporal_encoder(encoded)
-        return temporal[:, -1, :]
+    def critic_parameters(self) -> List[nn.Parameter]:
+        if self.privileged_value_only:
+            assert self.critic_privileged_encoder is not None
+            return [
+                *self.critic_privileged_encoder.parameters(),
+                *self.v_head.parameters(),
+            ]
+        parameters = [
+            *self.critic_frame_encoder.parameters(),
+            *self.critic_recurrent.parameters(),
+            *self.critic_encoder.parameters(),
+            *self.v_head.parameters(),
+        ]
+        if self.critic_privileged_encoder is not None:
+            parameters.extend(self.critic_privileged_encoder.parameters())
+        if self.critic_fusion is not None:
+            parameters.extend(self.critic_fusion.parameters())
+        return parameters
 
-    def _actor_latent(self, frames: torch.Tensor) -> torch.Tensor:
-        immediate = self._temporal_latent(
-            frames,
-            self.immediate_indices,
-            self.immediate_frame_encoder,
-            self.immediate_temporal_encoder,
-        )
-        opponent = self._temporal_latent(
-            frames,
-            self.opponent_indices,
-            self.opponent_frame_encoder,
-            self.opponent_temporal_encoder,
-        )
-        city = self.city_encoder(
-            torch.index_select(
-                frames[:, -1, :], dim=-1, index=self.city_indices
+    def q_parameters(self) -> List[nn.Parameter]:
+        if self.action_q_head is None:
+            return []
+        assert self.q_state_encoder is not None
+        assert self.q_action_encoder is not None
+        return [
+            *self.q_state_encoder.parameters(),
+            *self.q_action_encoder.parameters(),
+            *self.action_q_head.parameters(),
+        ]
+
+    def response_parameters(self) -> List[nn.Parameter]:
+        return []
+
+    def _public_sequence(self, state: torch.Tensor) -> torch.Tensor:
+        state = torch.nan_to_num(state, nan=0.0, posinf=1e3, neginf=-1e3)
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+        if state.shape[-1] != self.state_dim:
+            raise ValueError(
+                f"State dim mismatch: got {state.shape[-1]}, expected {self.state_dim}"
             )
+        return state.reshape(
+            state.shape[0], self.frame_stack, self.single_state_dim
         )
-        return self.actor_fusion(torch.cat([immediate, opponent, city], dim=-1))
 
-    def _critic_latent(self, frames: torch.Tensor) -> torch.Tensor:
-        immediate = self._temporal_latent(
-            frames,
-            self.immediate_indices,
-            self.critic_immediate_frame_encoder,
-            self.critic_immediate_temporal_encoder,
-        )
-        opponent = self._temporal_latent(
-            frames,
-            self.opponent_indices,
-            self.critic_opponent_frame_encoder,
-            self.critic_opponent_temporal_encoder,
-        )
-        city = self.critic_city_encoder(
-            torch.index_select(
-                frames[:, -1, :], dim=-1, index=self.city_indices
-            )
-        )
-        return self.critic_fusion(torch.cat([immediate, opponent, city], dim=-1))
+    def actor_forward(
+        self,
+        state: torch.Tensor,
+        hidden: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        sequence = self._public_sequence(state)
+        if self.persistent_recurrence and hidden is not None:
+            # Frame stacks overlap heavily across pricing decisions. Once a
+            # persistent hidden state exists, consume only the newest frame so
+            # the same historical frames are not replayed into the GRU.
+            sequence = sequence[:, -1:, :]
+        frames = self.actor_frame_encoder(sequence)
+        _, next_hidden = self.actor_recurrent(frames, hidden)
+        latent = self.actor_encoder(next_hidden[-1])
+        return self.pi_head(latent), next_hidden
 
-    def forward(
-        self, s: torch.Tensor, action_features: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        frames = s.reshape(-1, self.frame_stack, self.single_state_dim)
-        z = self._actor_latent(frames)
-        critic_z = self._critic_latent(frames)
-        response_frames = self.response_frame_encoder(frames)
-        response_temporal, _ = self.response_temporal_encoder(response_frames)
-        response_z = self.response_state_encoder(response_temporal[:, -1, :])
-        q_values = torch.empty(0, dtype=z.dtype, device=z.device)
-        if self.action_feature_dim > 0 and action_features is not None and self.action_encoder is not None:
-            af = torch.nan_to_num(action_features, nan=0.0, posinf=1.0, neginf=-1.0).to(dtype=z.dtype, device=z.device)
-            if af.ndim == 2:
-                af = af.unsqueeze(0)
-            a_emb = self.action_encoder(af)
-            z_expanded = z.unsqueeze(1).expand(-1, a_emb.shape[1], -1)
-            joint = torch.cat([z_expanded, a_emb], dim=-1)
-            logits = self.action_score_head(joint).squeeze(-1)
-            if self.critic_action_encoder is not None and self.action_q_head is not None:
-                critic_a_emb = self.critic_action_encoder(af)
-                critic_expanded = critic_z.unsqueeze(1).expand(
-                    -1, critic_a_emb.shape[1], -1
+    def critic_forward(
+        self,
+        state: torch.Tensor,
+        critic_state: Optional[torch.Tensor] = None,
+        hidden: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        sequence = self._public_sequence(state)
+        batch = sequence.shape[0]
+        if self.persistent_recurrence and hidden is not None:
+            sequence = sequence[:, -1:, :]
+        frames = self.critic_frame_encoder(sequence)
+        _, next_hidden = self.critic_recurrent(frames, hidden)
+        latent = self.critic_encoder(next_hidden[-1])
+        if self.privileged_critic:
+            if critic_state is None:
+                raise ValueError(
+                    "privileged critic requires a training-only critic_state"
                 )
-                q_values = self.action_q_head(
-                    torch.cat([critic_expanded, critic_a_emb], dim=-1)
-                ).squeeze(-1)
-            response_a_emb = self.response_action_encoder(af)
-            response_expanded = response_z.unsqueeze(1).expand(
-                -1, response_a_emb.shape[1], -1
+            critic_state = torch.nan_to_num(
+                critic_state, nan=0.0, posinf=1e3, neginf=-1e3
             )
-            response = self.response_head(
-                torch.cat([response_expanded, response_a_emb], dim=-1)
+            if critic_state.ndim == 1:
+                critic_state = critic_state.unsqueeze(0)
+            if critic_state.shape != (batch, self.critic_state_dim):
+                raise ValueError(
+                    "Critic state shape mismatch: got "
+                    f"{tuple(critic_state.shape)}, expected "
+                    f"({batch}, {self.critic_state_dim})"
+                )
+            assert self.critic_privileged_encoder is not None
+            privileged = self.critic_privileged_encoder(critic_state)
+            if self.privileged_value_only:
+                latent = privileged
+            else:
+                assert self.critic_fusion is not None
+                latent = self.critic_fusion(
+                    torch.cat((latent, privileged), dim=-1)
+                )
+        value = self.v_head(latent).squeeze(-1)
+        if self.normalize_values:
+            value = value * self.value_scale
+        action_values = state.new_empty((batch, 0))
+        return value, action_values, next_hidden
+
+    @torch.no_grad()
+    def update_value_scale(self, targets: torch.Tensor) -> float:
+        """Running return-RMS coordinates; preserve every raw value prediction.
+
+        Scaling both the head and its output avoids pushing bounded recurrent
+        features toward raw economic return levels. No reward/value is clipped.
+        Statistics are checkpoint buffers and update once per rollout, not epoch.
+        """
+        if not self.normalize_values:
+            return 1.0
+        targets = targets.detach().double()
+        if not bool(torch.isfinite(targets).all()):
+            raise ValueError("value normalization requires finite targets")
+        self.value_square_sum.add_(targets.square().sum())
+        self.value_count.add_(targets.numel())
+        scale = (self.value_square_sum / self.value_count).sqrt().float().clamp_min(1e-6)
+        ratio = self.value_scale / scale
+        self.v_head.weight.mul_(ratio)
+        self.v_head.bias.mul_(ratio)
+        self.value_scale.copy_(scale)
+        return float(ratio)
+
+    def q_forward(
+        self,
+        state: torch.Tensor,
+        *,
+        action_features: Optional[torch.Tensor] = None,
+        critic_state: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Independent action-value model; gradients never touch V or policy."""
+        if self.action_q_head is None:
+            batch = 1 if state.ndim == 1 else state.shape[0]
+            return state.new_empty((batch, 0))
+        assert self.q_state_encoder is not None
+        assert self.q_action_encoder is not None
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+        q_state = critic_state if self.privileged_critic else state
+        if q_state is None:
+            raise ValueError("privileged action Q requires critic_state")
+        if q_state.ndim == 1:
+            q_state = q_state.unsqueeze(0)
+        q_state = torch.nan_to_num(
+            q_state, nan=0.0, posinf=1e3, neginf=-1e3
+        )
+        batch = q_state.shape[0]
+        state_latent = self.q_state_encoder(q_state)
+        if self.action_feature_dim > 0:
+            if action_features is None:
+                raise ValueError("action Q requires action features")
+            if action_features.ndim == 2:
+                action_features = action_features.unsqueeze(0)
+            expected = (batch, self.action_dim, self.action_feature_dim)
+            if tuple(action_features.shape) != expected:
+                raise ValueError(
+                    f"action feature shape {tuple(action_features.shape)} != {expected}"
+                )
+            action_inputs = torch.nan_to_num(
+                action_features, nan=0.0, posinf=2.0, neginf=-2.0
             )
         else:
-            logits = self.pi_head(z)
-            response = self.response_head(response_z)
-        mag_mean = torch.tanh(self.mag_mean_head(z))
-        mag_logstd = self.mag_logstd.clamp(-2.5, 0.75).expand_as(mag_mean)
+            action_inputs = torch.eye(
+                self.action_dim, dtype=state.dtype, device=state.device
+            ).unsqueeze(0).expand(batch, -1, -1)
+        action_latent = self.q_action_encoder(action_inputs)
+        state_latent = state_latent.unsqueeze(1).expand(-1, self.action_dim, -1)
+        return self.action_q_head(
+            torch.cat((state_latent, action_latent), dim=-1)
+        ).squeeze(-1)
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        action_features: Optional[torch.Tensor] = None,
+        critic_state: Optional[torch.Tensor] = None,
+        actor_hidden: Optional[torch.Tensor] = None,
+        critic_hidden: Optional[torch.Tensor] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        logits, _ = self.actor_forward(state, actor_hidden)
+        value, _, _ = self.critic_forward(
+            state, critic_state=critic_state, hidden=critic_hidden
+        )
+        action_values = self.q_forward(
+            state,
+            action_features=action_features,
+            critic_state=critic_state,
+        )
+        batch = logits.shape[0]
+        zeros_like_logits = torch.zeros_like(logits)
+        constraint_values = state.new_zeros((batch, self.constraint_dim))
+        risk_values = state.new_zeros((batch,))
+        response = state.new_zeros((batch, self.response_dim))
         return (
             logits,
-            mag_mean,
-            mag_logstd,
-            self.v_head(critic_z).squeeze(-1),
-            self.constraint_head(critic_z),
-            self.risk_head(critic_z).squeeze(-1),
+            zeros_like_logits,
+            zeros_like_logits,
+            value,
+            constraint_values,
+            risk_values,
             response,
-            q_values,
+            action_values,
         )
-    
+
+
 @dataclass
 class Transition:
-    s: torch.Tensor
-    a: torch.Tensor
-    r: float
+    state: torch.Tensor
+    critic_state: torch.Tensor
+    action: torch.Tensor
+    raw_reward: float
+    reward: float
     done: bool
     truncated: bool
     discount: float
     duration: int
     old_logp: torch.Tensor
     old_value: torch.Tensor
-    magnitude: torch.Tensor
     exploration_rate: float
-    constraint_costs: torch.Tensor
-    risk_cost: float
-    response_target: torch.Tensor
+    reward_regime: str
     action_features: torch.Tensor
     action_mask: torch.Tensor
-    old_constraint_values: torch.Tensor
-    old_risk_value: torch.Tensor
     next_value_override: torch.Tensor
-    next_constraint_values_override: torch.Tensor
-    next_risk_value_override: torch.Tensor
+    actor_hidden: torch.Tensor
+    critic_hidden: torch.Tensor
+    counterfactual_values: torch.Tensor
+    counterfactual_mask: torch.Tensor
+    potential_delta: float
+    potential: float
+    next_potential_override: float
+    next_state_finalized: bool
+
 
 class PPOAgent:
+    """Vanilla clipped PPO for the discrete pricing action space.
+
+    V23 optimizes only the categorical policy and scalar reward value. Explicit
+    v24 gates can add critic-only counterfactual Q supervision, persistent
+    recurrence, a learned reward rate, KL stopping, and potential shaping.
+    """
+
     def __init__(
         self,
         state_dim: int,
@@ -547,6 +460,9 @@ class PPOAgent:
         ent_coeff: float = 0.01,
         min_ent_coeff: float = 0.001,
         ent_decay: float = 0.995,
+        max_ent_coeff: float = 0.08,
+        target_entropy_fraction: float = 0.45,
+        entropy_adaptation_rate: float = 0.20,
         max_grad_norm: float = 1.0,
         hidden_dim: int = 192,
         target_kl: float = 0.03,
@@ -556,14 +472,18 @@ class PPOAgent:
         max_lr: Optional[float] = None,
         value_clip_eps: float = 0.20,
         initial_exploration_rate: float = 0.20,
-        final_exploration_rate: float = 0.02,
-        exploration_fraction: float = 0.75,
+        final_exploration_rate: float = 0.05,
+        exploration_fraction: float = 1.00,
         exploration_warmup_fraction: float = 0.10,
         min_action_visits: int = 8,
-        constraint_dim: int = 5,
-        response_dim: int = 4,
+        constraint_dim: int = 0,
+        response_dim: int = 0,
+        opponent_forecast_dim: int = 0,
         action_feature_dim: int = 0,
         action_q_coeff: float = 0.0,
+        action_q_cql_coeff: float = 0.05,
+        objective_optimizer_weight: float = 1.25,
+        objective_optimizer_min_updates: int = 3,
         constraint_value_coeff: float = 0.25,
         risk_value_coeff: float = 0.15,
         response_coeff: float = 0.05,
@@ -573,274 +493,408 @@ class PPOAgent:
         single_state_dim: Optional[int] = None,
         frame_stack: int = 1,
         state_action_mi_coeff: float = 0.0,
+        direct_actor_credit_weight: float = 0.0,
         feature_groups: Optional[Dict[str, Sequence[int]]] = None,
+        hard_kl_stop: bool = False,
+        reward_rate_beta: float = 0.0,
+        center_rewards: bool = True,
+        critic_state_dim: Optional[int] = None,
+        privileged_critic: bool = False,
+        privileged_value_only: bool = False,
+        persistent_recurrence: bool = False,
+        enable_counterfactual_q: bool = False,
+        counterfactual_actor_weight: float = 0.0,
+        potential_shaping_scale: float = 0.0,
+        td_value_targets: bool = False,
+        normalize_values: bool = False,
+        scheduled_exploration: bool = False,
+        initial_hold_probability: Optional[float] = None,
         device: Optional[str] = None,
-    ):
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.constraint_dim = int(max(1, constraint_dim))
-        self.response_dim = int(max(1, response_dim))
+    ) -> None:
+        del (
+            final_clip_eps,
+            ent_decay,
+            lr_growth_on_stall,
+            max_lr,
+            value_clip_eps,
+            min_action_visits,
+            action_q_cql_coeff,
+            objective_optimizer_weight,
+            objective_optimizer_min_updates,
+            constraint_value_coeff,
+            risk_value_coeff,
+            response_coeff,
+            risk_coeff,
+            delayed_reward_horizon,
+            delayed_reward_blend,
+            state_action_mi_coeff,
+            direct_actor_credit_weight,
+        )
+        self.device = torch.device(
+            device or ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        self.state_dim = int(max(1, state_dim))
         self.action_dim = int(max(1, action_dim))
+        self.constraint_dim = int(max(0, constraint_dim))
+        self.response_dim = int(max(0, response_dim))
+        self.opponent_forecast_dim = int(
+            np.clip(opponent_forecast_dim, 0, self.response_dim)
+        )
         self.action_feature_dim = int(max(0, action_feature_dim))
-        self.action_q_coeff = float(max(0.0, action_q_coeff))
+        self.privileged_critic = bool(privileged_critic)
+        self.privileged_value_only = bool(
+            privileged_value_only and privileged_critic
+        )
+        self.persistent_recurrence = bool(persistent_recurrence)
+        self.critic_state_dim = int(
+            max(
+                1,
+                self.state_dim
+                if critic_state_dim is None
+                else critic_state_dim,
+            )
+        )
+        self.enable_counterfactual_q = bool(enable_counterfactual_q)
+        self.action_q_coeff = (
+            float(max(0.0, action_q_coeff))
+            if self.enable_counterfactual_q
+            else 0.0
+        )
+        self.counterfactual_actor_weight = float(
+            np.clip(counterfactual_actor_weight, 0.0, 1.0)
+        ) if self.enable_counterfactual_q else 0.0
+        self.potential_shaping_scale = float(max(0.0, potential_shaping_scale))
+        self.td_value_targets = bool(td_value_targets)
+        enable_action_q = bool(
+            self.action_q_coeff > 0.0
+            or self.counterfactual_actor_weight > 0.0
+        )
+
         self.net = ActorCritic(
-            state_dim,
-            action_dim,
+            state_dim=self.state_dim,
+            action_dim=self.action_dim,
             hidden=hidden_dim,
             constraint_dim=self.constraint_dim,
             response_dim=self.response_dim,
-            action_feature_dim=action_feature_dim,
-            enable_action_q=self.action_q_coeff > 0.0,
+            opponent_forecast_dim=self.opponent_forecast_dim,
+            action_feature_dim=self.action_feature_dim,
+            enable_action_q=enable_action_q,
+            critic_state_dim=self.critic_state_dim,
+            privileged_critic=self.privileged_critic,
+            privileged_value_only=self.privileged_value_only,
+            persistent_recurrence=self.persistent_recurrence,
             single_state_dim=single_state_dim,
             frame_stack=frame_stack,
             feature_groups=feature_groups,
+            normalize_values=normalize_values,
         ).to(self.device)
-        self.actor_opt = optim.Adam(
-            self.net.actor_parameters(),
-            lr=lr,
-            eps=1e-5,
-        )
-        # A faster critic repeatedly outran the actor when the opponent changed
-        # regimes, producing large value-target swings and poor late-stage
-        # advantages. Keep actor and critic on the same learning-rate schedule.
-        self.critic_lr_scale = 1.0
-        self.critic_opt = optim.Adam(
-            self.net.critic_parameters(),
-            lr=float(lr) * self.critic_lr_scale,
-            eps=1e-5,
-        )
-        self.response_opt = optim.Adam(
-            self.net.response_parameters(),
-            lr=float(lr),
-            eps=1e-5,
-        )
+        if initial_hold_probability is None:
+            self.initial_hold_probability = float(1.0 / self.action_dim)
+        else:
+            hold_probability = float(initial_hold_probability)
+            if self.action_dim < 2 or not 0.0 < hold_probability < 1.0:
+                raise ValueError(
+                    "initial_hold_probability must be in (0, 1) with at "
+                    "least two actions"
+                )
+            move_probability = float(
+                (1.0 - hold_probability) / (self.action_dim - 1)
+            )
+            with torch.no_grad():
+                self.net.pi_head.bias.fill_(math.log(move_probability))
+                self.net.pi_head.bias[0] = math.log(hold_probability)
+            self.initial_hold_probability = hold_probability
+
         self.base_lr = float(lr)
         self.curr_lr = float(lr)
+        # Long-horizon value targets move much farther than clipped policy
+        # logits. A fixed, separate critic rate lets the baseline catch the
+        # return level without changing the actor's PPO trust-region schedule.
+        self.critic_lr_multiplier = 3.0
         self.min_lr = float(max(1e-6, min_lr))
-        self.initial_max_lr = float(max_lr if max_lr is not None else max(lr, 6e-4))
-        self.max_lr = self.initial_max_lr
+        self.actor_opt = optim.Adam(
+            self.net.actor_parameters(), lr=self.curr_lr, eps=1e-5
+        )
+        self.critic_opt = optim.Adam(
+            self.net.critic_parameters(),
+            lr=self.curr_lr * self.critic_lr_multiplier,
+            eps=1e-5,
+        )
+        self.response_opt = None
+        q_parameters = self.net.q_parameters()
+        self.q_opt = (
+            optim.Adam(
+                q_parameters,
+                lr=self.curr_lr * self.critic_lr_multiplier,
+                eps=1e-5,
+            )
+            if q_parameters
+            else None
+        )
 
-        self.gamma = gamma
-        self.lam = lam
+        self.gamma = float(gamma)
+        self.lam = float(lam)
         self.initial_clip_eps = float(max(0.01, clip_eps))
-        self.final_clip_eps = float(np.clip(final_clip_eps, 0.01, self.initial_clip_eps))
         self.clip_eps = self.initial_clip_eps
-        self.v_coeff = v_coeff
-        self.action_feature_dim = int(max(0, action_feature_dim))
-        self.constraint_value_coeff = float(max(0.0, constraint_value_coeff))
-        self.risk_value_coeff = float(max(0.0, risk_value_coeff))
-        self.response_coeff = float(max(0.0, response_coeff))
-        self.risk_coeff = float(max(0.0, risk_coeff))
-        self.delayed_reward_horizon = int(max(1, delayed_reward_horizon))
-        self.delayed_reward_blend = float(np.clip(delayed_reward_blend, 0.0, 1.0))
-        self.state_action_mi_coeff = float(max(0.0, state_action_mi_coeff))
-        self.constraint_lambdas = torch.zeros(self.constraint_dim, dtype=torch.float32, device=self.device)
-        self.constraints_active = False
-        self.risk_active = False
-        self.ent_coeff = ent_coeff
-        self.max_ent_coeff = float(max(ent_coeff, min_ent_coeff))
-        self.min_ent_coeff = float(max(0.0, min_ent_coeff))
-        self.ent_decay = float(np.clip(ent_decay, 0.90, 1.0))
-        
-        self.max_grad_norm = max_grad_norm
-        self.update_calls = 0
+        self.v_coeff = float(max(0.0, v_coeff))
+        self.ent_coeff = float(max(0.0, ent_coeff))
+        self.base_ent_coeff = self.ent_coeff
+        self.max_ent_coeff = float(max(self.ent_coeff, max_ent_coeff))
+        self.min_ent_coeff = float(min(self.ent_coeff, max(0.0, min_ent_coeff)))
+        self.target_entropy_fraction = float(
+            np.clip(target_entropy_fraction, 0.05, 0.95)
+        )
+        self.entropy_adaptation_rate = float(
+            np.clip(entropy_adaptation_rate, 0.0, 1.0)
+        )
+        self.max_grad_norm = float(max(1e-6, max_grad_norm))
         self.target_kl = float(max(1e-4, target_kl))
         self.adv_clip = float(max(1.0, adv_clip))
-        self.lr_growth_on_stall = float(np.clip(lr_growth_on_stall, 1.0, 1.25))
-        self.value_clip_eps = float(max(0.05, value_clip_eps))
-        self.low_update_streak = 0
-        
-        self.initial_exploration_rate = float(np.clip(initial_exploration_rate, 0.0, 1.0))
+        self.hard_kl_stop = bool(hard_kl_stop)
+        self.reward_rate_beta = float(np.clip(reward_rate_beta, 0.0, 1.0))
+        self.center_rewards = bool(center_rewards)
+        self.average_reward_rate = 0.0
+        self.average_reward_initialized = False
+        self.reward_rate_by_regime: Dict[str, float] = {}
+
+        # The behavior policy is a scheduled mixture of the learned actor and
+        # a uniform distribution over feasible actions.  Crucially, the same
+        # mixture probability is retained in every transition and recomputed
+        # by PPO, so this is on-policy coverage rather than an epsilon-greedy
+        # action override with an incorrect likelihood ratio.  Hold remains in
+        # the feasible set and is never suppressed or forced.
+        self.scheduled_exploration = bool(scheduled_exploration)
+        self.initial_exploration_rate = float(
+            np.clip(initial_exploration_rate, 0.0, 1.0)
+            if self.scheduled_exploration
+            else 0.0
+        )
         self.final_exploration_rate = float(
-            np.clip(final_exploration_rate, 0.0, self.initial_exploration_rate)
+            np.clip(final_exploration_rate, 0.0, 1.0)
+            if self.scheduled_exploration
+            else 0.0
         )
-        self.exploration_fraction = float(np.clip(exploration_fraction, 1e-6, 1.0))
+        if self.final_exploration_rate > self.initial_exploration_rate:
+            raise ValueError(
+                "final_exploration_rate cannot exceed initial_exploration_rate"
+            )
         self.exploration_warmup_fraction = float(
-            np.clip(exploration_warmup_fraction, 0.0, self.exploration_fraction)
+            np.clip(exploration_warmup_fraction, 0.0, 1.0)
+            if self.scheduled_exploration
+            else 0.0
         )
-        self.min_action_visits = int(max(0, min_action_visits))
+        self.exploration_fraction = float(
+            np.clip(exploration_fraction, 0.0, 1.0)
+            if self.scheduled_exploration
+            else 0.0
+        )
+        if self.exploration_fraction < self.exploration_warmup_fraction:
+            raise ValueError(
+                "exploration_fraction must be at least the warmup fraction"
+            )
         self.exploration_rate = self.initial_exploration_rate
-        self.last_action_exploration_rate = self.exploration_rate
-        self.action_visits = np.zeros(int(action_dim), dtype=np.int64)
-        self.action_ever_feasible = np.zeros(int(action_dim), dtype=bool)
+        self.last_action_exploration_rate = 0.0
+        # The Q head is critic-only and is inactive unless its explicit v24
+        # supervision gate is non-zero.
+        self.action_q_cql_coeff = 0.0
+        self.objective_optimizer_weight = 0.0
+        self.objective_optimizer_min_updates = 0
+        self.deployment_optimizer_enabled = False
+        self.constraint_value_coeff = 0.0
+        self.risk_value_coeff = 0.0
+        self.response_coeff = 0.0
+        self.risk_coeff = 0.0
+        self.delayed_reward_horizon = 1
+        self.delayed_reward_blend = 0.0
+        self.state_action_mi_coeff = 0.0
+        self.direct_actor_credit_weight = 0.0
+        self.constraints_active = False
+        self.risk_active = False
+        self.constraint_lambdas = torch.zeros(
+            self.constraint_dim, dtype=torch.float32, device=self.device
+        )
+
+        self.buf: List[Transition] = []
+        self.action_visits = np.zeros(self.action_dim, dtype=np.int64)
+        self.action_ever_feasible = np.zeros(self.action_dim, dtype=bool)
         self.last_policy_entropy_fraction = 1.0
         self.last_continuous_magnitude = 0.0
         self.last_raw_argmax_concentration = 0.0
         self.last_state_action_sensitivity = 0.0
         self.last_state_action_mutual_information = 0.0
-        self.reward_normalizer = RunningNormalizer((), self.device)
-        self.constraint_normalizer = RunningNormalizer((self.constraint_dim,), self.device)
-        self.risk_normalizer = RunningNormalizer((), self.device)
-
-        self.buf: List[Transition] = []
-        self.last_constraint_values = torch.zeros(self.constraint_dim, dtype=torch.float32, device=self.device)
+        self.last_optimizer_action_changed = 0.0
+        self.last_optimizer_q_spread = 0.0
+        self.last_constraint_values = torch.zeros(
+            self.constraint_dim, dtype=torch.float32, device=self.device
+        )
         self.last_risk_value = torch.zeros((), dtype=torch.float32, device=self.device)
-        self.last_response_pred = torch.zeros(self.response_dim, dtype=torch.float32, device=self.device)
+        self.last_response_pred = torch.zeros(
+            self.response_dim, dtype=torch.float32, device=self.device
+        )
+        self.update_calls = 0
+        self.q_update_calls = 0
+        self._actor_hidden: Optional[torch.Tensor] = None
+        self._critic_hidden: Optional[torch.Tensor] = None
+        self._pending_actor_hidden = torch.empty(
+            0, dtype=torch.float32, device=self.device
+        )
+        self._pending_critic_hidden = torch.empty(
+            0, dtype=torch.float32, device=self.device
+        )
+        self._pending_critic_state = torch.empty(
+            0, dtype=torch.float32, device=self.device
+        )
+        self._pending_exploration_rate = 0.0
 
     @property
     def buffer_size(self) -> int:
-        """Number of on-policy SMDP transitions awaiting one PPO update."""
         return len(self.buf)
 
-    def _apply_control_floors(self) -> None:
-        """Clamp scheduled controls to their declared numeric ranges."""
-        self.exploration_rate = float(np.clip(
-            self.exploration_rate,
-            self.final_exploration_rate,
-            self.initial_exploration_rate,
-        ))
-        self.ent_coeff = float(np.clip(
-            self.ent_coeff,
-            self.min_ent_coeff,
-            self.max_ent_coeff,
-        ))
+    def discard_rollout(self) -> int:
+        """Drop an undersized rollout at an environment-regime boundary."""
+        count = len(self.buf)
+        self.buf.clear()
+        return int(count)
 
-    def _set_learning_rates(self, actor_lr: float) -> None:
-        actor_lr = float(np.clip(actor_lr, self.min_lr, self.max_lr))
-        self.curr_lr = actor_lr
-        critic_lr = float(max(self.min_lr, actor_lr * self.critic_lr_scale))
-        for group in self.actor_opt.param_groups:
-            group["lr"] = actor_lr
-        for group in self.critic_opt.param_groups:
-            group["lr"] = critic_lr
-        for group in self.response_opt.param_groups:
-            group["lr"] = actor_lr
-    
-    def set_optimization_context(
-        self,
-        constraint_lambdas: Optional[np.ndarray | List[float] | Tuple[float, ...]] = None,
-        risk_coeff: Optional[float] = None,
-        constraints_active: Optional[bool] = None,
-        risk_active: Optional[bool] = None,
-    ) -> None:
-        """Update Lagrangian pressure used by the structured PPO actor."""
-        if constraint_lambdas is not None:
-            arr = np.asarray(constraint_lambdas, dtype=np.float32).reshape(-1)
-            padded = np.zeros(self.constraint_dim, dtype=np.float32)
-            width = min(self.constraint_dim, arr.size)
-            if width > 0:
-                padded[:width] = np.maximum(arr[:width], 0.0)
-            self.constraint_lambdas = self._tensor_from_value(
-                padded, dtype=torch.float32, device=self.device
-            )
-        if risk_coeff is not None:
-            self.risk_coeff = float(max(0.0, risk_coeff))
-        if constraints_active is not None:
-            self.constraints_active = bool(constraints_active)
-        if risk_active is not None:
-            self.risk_active = bool(risk_active)
+    def reset_recurrent_state(self) -> None:
+        """Reset inference memory at a true episode/regime boundary."""
+        self._actor_hidden = None
+        self._critic_hidden = None
+        self._pending_actor_hidden = torch.empty(
+            0, dtype=torch.float32, device=self.device
+        )
+        self._pending_critic_hidden = torch.empty(
+            0, dtype=torch.float32, device=self.device
+        )
+        self._pending_critic_state = torch.empty(
+            0, dtype=torch.float32, device=self.device
+        )
 
-    def set_stage_controls(
-        self,
-        *,
-        exploration_rate: float,
-        entropy_scale: float = 1.0,
-        learning_rate_scale: float = 1.0,
-    ) -> None:
-        """Apply curriculum controls without changing the learned policy.
+    def reset_learning_context(self) -> None:
+        """Reset episode-local inference and aggregate reward diagnostics.
 
-        This is deliberately separate from action preferences: a later stage may
-        reduce random exploration and optimizer step size, but it never adds a
-        prior for the hold action (or for any intervention action).
+        Regime-keyed reward baselines deliberately persist: they were estimated
+        from completed prior episodes and are therefore action-independent for
+        the next episode. Policy and optimizer parameters remain untouched.
         """
-        self.exploration_rate = float(
-            np.clip(exploration_rate, self.final_exploration_rate, self.initial_exploration_rate)
-        )
-        entropy_scale_f = float(max(0.0, entropy_scale))
-        self.ent_coeff = float(
-            np.clip(self.max_ent_coeff * entropy_scale_f, self.min_ent_coeff, self.max_ent_coeff)
-        )
-        lr = float(np.clip(
-            self.base_lr * max(0.0, learning_rate_scale),
-            self.min_lr,
-            self.max_lr,
-        ))
-        self._set_learning_rates(lr)
-        self._apply_control_floors()
-            
-    def adapt_exploration(
-        self,
-        progress: float,
-        reward_converged: bool,
-        reward_std: Optional[float] = None,
-    ) -> None:
-        """Use a smooth, predetermined exploration schedule.
+        self.reset_recurrent_state()
+        self.average_reward_rate = 0.0
+        self.average_reward_initialized = False
 
-        The schedule is independent of short reward windows, so late reward
-        noise cannot repeatedly reopen or close exploration.
-        """
-        del reward_std
-        p = float(np.clip(progress, 0.0, 1.0))
-        covered = bool(
-            self.min_action_visits <= 0
-            or self._action_coverage() >= 1.0
+    @torch.no_grad()
+    def observe_recurrent_state(
+        self,
+        state: np.ndarray,
+        critic_state: Optional[np.ndarray | torch.Tensor] = None,
+    ) -> None:
+        """Advance recurrent memory on a public frame without choosing an action."""
+        if not self.persistent_recurrence:
+            return
+        state_t = self._tensor_from_value(
+            state, dtype=torch.float32, device=self.device
+        ).reshape(1, -1)
+        critic_state_t = (
+            None
+            if not self.privileged_critic
+            else self._tensor_from_value(
+                critic_state, dtype=torch.float32, device=self.device
+            ).reshape(1, -1)
         )
-        if p <= self.exploration_warmup_fraction or not covered:
-            rate = self.initial_exploration_rate
-        else:
-            decay_width = max(1e-6, self.exploration_fraction - self.exploration_warmup_fraction)
-            decay_progress = float(
-                np.clip((p - self.exploration_warmup_fraction) / decay_width, 0.0, 1.0)
-            )
-            cosine = 0.5 * (1.0 + np.cos(np.pi * decay_progress))
-            rate = self.final_exploration_rate + (
-                self.initial_exploration_rate - self.final_exploration_rate
-            ) * cosine
-        if reward_converged:
-            rate = self.final_exploration_rate
-        self.exploration_rate = float(
-            np.clip(rate, self.final_exploration_rate, self.initial_exploration_rate)
+        _, actor_hidden = self.net.actor_forward(state_t, self._actor_hidden)
+        _, _, critic_hidden = self.net.critic_forward(
+            state_t,
+            critic_state=critic_state_t,
+            hidden=self._critic_hidden,
         )
-        self._apply_control_floors()
+        self._actor_hidden = actor_hidden.detach()
+        self._critic_hidden = critic_hidden.detach()
+
+    def recurrent_state_dict(self) -> Dict[str, torch.Tensor]:
+        """Capture execution-only recurrent state for transactional evaluation."""
+        return {
+            "actor": (
+                torch.empty(0, device=self.device)
+                if self._actor_hidden is None
+                else self._actor_hidden.detach().clone()
+            ),
+            "critic": (
+                torch.empty(0, device=self.device)
+                if self._critic_hidden is None
+                else self._critic_hidden.detach().clone()
+            ),
+        }
+
+    def load_recurrent_state_dict(
+        self, state: Optional[Dict[str, torch.Tensor]]
+    ) -> None:
+        state = state or {}
+        actor = state.get("actor")
+        critic = state.get("critic")
+        self._actor_hidden = (
+            None
+            if actor is None or actor.numel() == 0
+            else actor.detach().clone().to(self.device)
+        )
+        self._critic_hidden = (
+            None
+            if critic is None or critic.numel() == 0
+            else critic.detach().clone().to(self.device)
+        )
 
     @staticmethod
     def _tensor_from_value(
-        value,
+        value: object,
         *,
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        """Create a tensor without requiring Torch's NumPy C-API bridge.
-
-        Some supported environments pair a Torch wheel compiled against NumPy
-        1.x with NumPy 2.x. Converting ndarray inputs to native containers first
-        keeps inference, Kaggle evaluation, and tests functional in that setup
-        without changing numeric values.
-        """
-        if isinstance(value, np.ndarray):
+        if isinstance(value, torch.Tensor):
+            return value.detach().to(device=device, dtype=dtype)
+        # Torch builds compiled against NumPy 1.x cannot reliably consume NumPy
+        # 2.x scalar/array objects directly (notably ``numpy.bool`` masks).
+        # Converting through Python containers keeps the public API unchanged
+        # and avoids depending on Torch's optional NumPy bridge.
+        if isinstance(value, (np.ndarray, np.generic)):
             value = value.tolist()
-        elif isinstance(value, np.generic):
-            value = value.item()
-        elif torch.is_tensor(value):
-            return value.detach().to(device=device, dtype=dtype).clone()
         return torch.tensor(value, dtype=dtype, device=device)
 
-    @staticmethod
+    @classmethod
     def _coerce_action_mask(
+        cls,
         action_mask: Optional[np.ndarray | List[bool] | torch.Tensor],
         logits: torch.Tensor,
     ) -> torch.Tensor:
-        """Return a broadcastable mask with at least the hold action feasible."""
+        if logits.ndim not in (1, 2):
+            raise ValueError("categorical logits must have one or two dimensions")
+        target_shape = logits.shape
         if action_mask is None:
-            mask = torch.ones_like(logits, dtype=torch.bool)
+            mask = torch.ones(target_shape, dtype=torch.bool, device=logits.device)
         else:
-            mask = PPOAgent._tensor_from_value(
-                action_mask,
-                dtype=torch.bool,
-                device=logits.device,
+            mask = cls._tensor_from_value(
+                action_mask, dtype=torch.bool, device=logits.device
             )
-            while mask.ndim < logits.ndim:
-                mask = mask.unsqueeze(0)
-            try:
-                mask = torch.broadcast_to(mask, logits.shape).clone()
-            except RuntimeError as exc:
-                raise ValueError(
-                    f"Action mask shape {tuple(mask.shape)} is incompatible with logits {tuple(logits.shape)}"
-                ) from exc
-        flat = mask.reshape(-1, mask.shape[-1])
-        empty_rows = ~flat.any(dim=-1)
-        if bool(empty_rows.any().item()):
-            flat[empty_rows, 0] = True
-        return flat.reshape(mask.shape)
+            if logits.ndim == 1:
+                mask = mask.reshape(-1)
+                if mask.shape != target_shape:
+                    raise ValueError(
+                        f"action mask shape {tuple(mask.shape)} != logits {tuple(target_shape)}"
+                    )
+            else:
+                if mask.ndim == 1 and mask.numel() == target_shape[-1]:
+                    mask = mask.reshape(1, -1).expand(target_shape[0], -1)
+                elif tuple(mask.shape) != tuple(target_shape):
+                    raise ValueError(
+                        f"action mask shape {tuple(mask.shape)} != logits {tuple(target_shape)}"
+                    )
+        mask = mask.clone()
+        if logits.ndim == 1:
+            if not bool(mask.any()):
+                mask[0] = True
+        else:
+            empty_rows = ~mask.any(dim=-1)
+            if bool(empty_rows.any()):
+                mask[empty_rows, 0] = True
+        return mask
 
     @classmethod
     def _masked_logits(
@@ -851,123 +905,6 @@ class PPOAgent:
         mask = cls._coerce_action_mask(action_mask, logits)
         return logits.masked_fill(~mask, -1e9)
 
-    @staticmethod
-    def _economic_group_probabilities(
-        logits: torch.Tensor,
-        action_features: Optional[torch.Tensor],
-        temperature: float = 0.20,
-    ) -> Optional[torch.Tensor]:
-        """Return sharpened lower/neutral/higher fare probabilities.
-
-        Mutual information computed from the ordinary softmax can be increased
-        through tiny changes in low-ranked action tails while deterministic
-        argmax remains identical in every state. Sharpening only the
-        specialization diagnostic/loss makes its gradient reflect economically
-        different deterministic choices; it does not change the PPO sampling
-        or deployment distribution.
-        """
-        if (
-            action_features is None
-            or action_features.ndim != 3
-            or action_features.shape[-1] < 14
-        ):
-            return None
-        specialization_probs = torch.softmax(
-            logits / max(1e-3, float(temperature)),
-            dim=-1,
-        )
-        # Match Core._economic_action_group exactly: the segment weights
-        # represent the broad-market mix and imply about 14.65 minutes,
-        # 3.95 miles, and 7.75% airport exposure. A simple unweighted segment
-        # average classified mixed rebalancing bundles differently during
-        # training and validation, allowing within-group switching to satisfy
-        # the optimizer while deployment still looked economically constant.
-        segment_weights = torch.as_tensor(
-            [0.35, 0.35, 0.20, 0.10],
-            dtype=action_features.dtype,
-            device=action_features.device,
-        )
-        fare_impact = (
-            action_features[:, :, 10:14] * segment_weights
-        ).sum(dim=-1)
-        # Action-feature fare impacts are stored in ``dollars / 20`` by the
-        # observation model. Core's deployment audit uses a five-cent
-        # broad-market threshold in dollars, so the matching threshold here is
-        # 0.05 / 20.0. Applying 0.05 directly made virtually every single-
-        # lever intervention look neutral to the optimizer even though the
-        # exact same action was lower/higher fare in the deployment audit.
-        normalized_fare_threshold = 0.05 / 20.0
-        lower_mask = (
-            fare_impact < -normalized_fare_threshold
-        ).to(specialization_probs.dtype)
-        higher_mask = (
-            fare_impact > normalized_fare_threshold
-        ).to(specialization_probs.dtype)
-        neutral_mask = 1.0 - torch.clamp(
-            lower_mask + higher_mask, 0.0, 1.0
-        )
-        economic_probs = torch.stack(
-            [
-                (specialization_probs * lower_mask).sum(dim=-1),
-                (specialization_probs * neutral_mask).sum(dim=-1),
-                (specialization_probs * higher_mask).sum(dim=-1),
-            ],
-            dim=-1,
-        )
-        return economic_probs / economic_probs.sum(
-            dim=-1,
-            keepdim=True,
-        ).clamp(min=1e-8)
-
-    @staticmethod
-    def _mutual_information(
-        probabilities: torch.Tensor,
-        state_weights: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Mutual information between sampled states and policy choices.
-
-        ``state_weights`` is detached economic credit, not another policy
-        target.  With positive-advantage weights, an unprofitable state cannot
-        earn the actor a specialization bonus merely by selecting a different
-        price direction.  If a minibatch has no positive advantages, the
-        auxiliary is disabled for that minibatch and PPO remains the sole
-        actor objective.
-        """
-        if probabilities.ndim != 2 or probabilities.shape[0] == 0:
-            return probabilities.new_zeros(())
-        if state_weights is None:
-            weights = probabilities.new_full(
-                (probabilities.shape[0],),
-                1.0 / float(probabilities.shape[0]),
-            )
-        else:
-            weights = torch.clamp(
-                state_weights.detach().to(
-                    dtype=probabilities.dtype,
-                    device=probabilities.device,
-                ),
-                min=0.0,
-            ).reshape(-1)
-            if weights.shape[0] != probabilities.shape[0]:
-                raise ValueError("state_weights must match probability rows")
-            weight_sum = weights.sum()
-            if float(weight_sum.item()) <= 1e-8:
-                return probabilities.new_zeros(())
-            weights = weights / weight_sum
-        row_entropy = -(
-            probabilities
-            * torch.log(probabilities.clamp(min=1e-8))
-        ).sum(dim=-1)
-        marginal = (probabilities * weights.unsqueeze(-1)).sum(dim=0)
-        marginal_entropy = -(
-            marginal * torch.log(marginal.clamp(min=1e-8))
-        ).sum()
-        conditional_entropy = (row_entropy * weights).sum()
-        return torch.clamp(
-            marginal_entropy - conditional_entropy,
-            min=0.0,
-        )
-
     @classmethod
     def _exploratory_distribution(
         cls,
@@ -976,260 +913,351 @@ class PPOAgent:
         action_mask: Optional[np.ndarray | List[bool] | torch.Tensor] = None,
     ) -> torch.distributions.Categorical:
         mask = cls._coerce_action_mask(action_mask, logits)
-        logits = cls._masked_logits(logits, mask)
-        policy_probs = torch.softmax(logits, dim=-1)
-        eps = torch.as_tensor(
-            exploration_rate, dtype=policy_probs.dtype, device=policy_probs.device
+        masked_logits = cls._masked_logits(logits, mask)
+        policy_probabilities = torch.softmax(masked_logits, dim=-1)
+        uniform_probabilities = mask.to(dtype=logits.dtype)
+        uniform_probabilities = uniform_probabilities / uniform_probabilities.sum(
+            dim=-1, keepdim=True
+        ).clamp(min=1.0)
+        epsilon = torch.as_tensor(
+            exploration_rate, dtype=logits.dtype, device=logits.device
+        ).clamp(0.0, 1.0)
+        if logits.ndim == 2:
+            if epsilon.ndim == 0:
+                epsilon = epsilon.expand(logits.shape[0])
+            epsilon = epsilon.reshape(-1, 1)
+            if epsilon.shape[0] != logits.shape[0]:
+                raise ValueError(
+                    "batched exploration rates must match the logits batch"
+                )
+        elif epsilon.numel() != 1:
+            raise ValueError("scalar logits require one exploration rate")
+        probabilities = (
+            (1.0 - epsilon) * policy_probabilities
+            + epsilon * uniform_probabilities
         )
-        if eps.ndim == 0:
-            eps = eps.expand(policy_probs.shape[:-1])
-        eps = eps.unsqueeze(-1)
-        feasible = mask.to(dtype=policy_probs.dtype)
-        uniform_feasible = feasible / feasible.sum(dim=-1, keepdim=True).clamp(min=1.0)
-        mixed_probs = (1.0 - eps) * policy_probs + eps * uniform_feasible
-        return torch.distributions.Categorical(probs=mixed_probs)
-    
-    @staticmethod
-    def _magnitude_dist(mean: torch.Tensor, logstd: torch.Tensor) -> torch.distributions.Normal:
-        return torch.distributions.Normal(mean, torch.exp(logstd))
+        return torch.distributions.Categorical(probs=probabilities)
 
-    @staticmethod
-    def _squash_magnitude(raw: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(raw) * 2.0
-
-    @staticmethod
-    def _unsquash_magnitude(magnitude: torch.Tensor) -> torch.Tensor:
-        y = torch.clamp(magnitude / 2.0, 1e-6, 1.0 - 1e-6)
-        return torch.log(y) - torch.log1p(-y)
-
-    @classmethod
-    def _magnitude_log_prob(cls, dist: torch.distributions.Normal, magnitude: torch.Tensor) -> torch.Tensor:
-        raw = cls._unsquash_magnitude(magnitude)
-        y = torch.clamp(magnitude / 2.0, 1e-6, 1.0 - 1e-6)
-        log_abs_det = torch.log(torch.clamp(2.0 * y * (1.0 - y), min=1e-6))
-        return dist.log_prob(raw) - log_abs_det
-    
-    def adapt_entropy(self, progress: float, reward_converged: bool) -> None:
-        """Smoothly anneal entropy without reward-triggered recovery floors."""
-        p = float(np.clip(progress, 0.0, 1.0))
-        target = self.min_ent_coeff + (
-            self.max_ent_coeff - self.min_ent_coeff
-        ) * max(0.0, 1.0 - p) ** 1.35
-        if reward_converged:
-            target = max(self.min_ent_coeff, 0.8 * target)
-        self.ent_coeff = float(
-            np.clip(target, self.min_ent_coeff, self.max_ent_coeff)
+    def exploration_rate_at_progress(self, progress: float) -> float:
+        """Cosine-decay behavior coverage after an initial warmup plateau."""
+        progress = float(np.clip(progress, 0.0, 1.0))
+        if progress <= self.exploration_warmup_fraction:
+            return self.initial_exploration_rate
+        if progress >= self.exploration_fraction:
+            return self.final_exploration_rate
+        span = max(
+            1e-12,
+            self.exploration_fraction - self.exploration_warmup_fraction,
         )
-        self._apply_control_floors()
-    
-    def adapt_optimization(self, progress: float, reward_converged: bool) -> None:
-        """Apply an exploration-first schedule for PPO updates.
-
-        Early training keeps the learning-rate cap and clip range wide so the
-        policy can move out of weak initial logits.  Later training decays both
-        controls for consolidation.  KL/clip-based adaptation in ``update`` can
-        still lower the rate further, but cannot grow beyond the scheduled cap.
-        """
-        p = float(np.clip(progress, 0.0, 1.0))
-        # Keep early optimization deliberately less conservative.  The cap stays
-        # at the initial maximum through the first third of training, then uses a
-        # cosine decay for consolidation.
-        decay_p = float(np.clip((p - 0.70) / 0.30, 0.0, 1.0))
-        cosine = 0.5 * (1.0 + np.cos(np.pi * decay_p))
-        scheduled_lr_cap = self.min_lr + (self.initial_max_lr - self.min_lr) * cosine
-        if reward_converged:
-            scheduled_lr_cap = min(scheduled_lr_cap, self.min_lr * 1.5)
-        self.max_lr = float(np.clip(scheduled_lr_cap, self.min_lr, self.initial_max_lr))
-        if self.curr_lr > self.max_lr:
-            self._set_learning_rates(self.max_lr)
-        
-        early_clip = self.initial_clip_eps
-        mid_clip = self.final_clip_eps
-        self.clip_eps = float(
-            mid_clip + (early_clip - mid_clip) * cosine
+        phase = (progress - self.exploration_warmup_fraction) / span
+        cosine_weight = 0.5 * (1.0 + math.cos(math.pi * phase))
+        return float(
+            self.final_exploration_rate
+            + (self.initial_exploration_rate - self.final_exploration_rate)
+            * cosine_weight
         )
-        if reward_converged:
-            self.clip_eps = min(self.clip_eps, self.final_clip_eps)
-    
+
+    def set_training_progress(self, progress: float) -> None:
+        self.exploration_rate = self.exploration_rate_at_progress(progress)
+
+    def _set_learning_rates(self, actor_lr: float) -> None:
+        self.curr_lr = float(max(self.min_lr, actor_lr))
+        for group in self.actor_opt.param_groups:
+            group["lr"] = self.curr_lr
+        for group in self.critic_opt.param_groups:
+            group["lr"] = self.curr_lr * self.critic_lr_multiplier
+        if self.q_opt is not None:
+            for group in self.q_opt.param_groups:
+                group["lr"] = self.curr_lr * self.critic_lr_multiplier
+
+    def set_stage_controls(
+        self,
+        *,
+        exploration_rate: float,
+        entropy_scale: float,
+        learning_rate_scale: float,
+    ) -> None:
+        del entropy_scale
+        self.exploration_rate = float(np.clip(exploration_rate, 0.0, 1.0))
+        self._set_learning_rates(
+            self.base_lr * float(max(1e-6, learning_rate_scale))
+        )
+
+    def set_optimization_context(
+        self,
+        constraint_lambdas: Optional[
+            np.ndarray | List[float] | Tuple[float, ...]
+        ] = None,
+        risk_coeff: Optional[float] = None,
+        constraints_active: Optional[bool] = None,
+        risk_active: Optional[bool] = None,
+    ) -> None:
+        del constraint_lambdas, risk_coeff, constraints_active, risk_active
+        self.constraint_lambdas.zero_()
+        self.risk_coeff = 0.0
+        self.constraints_active = False
+        self.risk_active = False
+
+    def _deployment_optimizer_logits(
+        self,
+        logits: torch.Tensor,
+        q_values: torch.Tensor,
+        action_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        del q_values, action_mask
+        return logits, {
+            "optimizer_ready": 0.0,
+            "optimizer_action_changed": 0.0,
+            "optimizer_q_spread": 0.0,
+        }
+
     @torch.no_grad()
     def policy_diagnostics(
         self,
-        s_np: np.ndarray,
+        state: np.ndarray,
         action_features: Optional[np.ndarray] = None,
         action_mask: Optional[np.ndarray] = None,
         temperature: float = 1.0,
     ) -> Dict[str, float]:
-        """Return raw-policy action diagnostics without the training exploration mix."""
-        s = self._tensor_from_value(
-            s_np, dtype=torch.float32, device=self.device
-        ).unsqueeze(0)
-        s = torch.nan_to_num(s, nan=0.0, posinf=1e3, neginf=-1e3)
-        af_tensor = None
-        if self.action_feature_dim > 0 and action_features is not None:
-            af_tensor = self._tensor_from_value(
-                action_features, dtype=torch.float32, device=self.device
-            )
-            af_tensor = af_tensor.reshape(1, af_tensor.shape[-2], af_tensor.shape[-1])
-        logits, mag_mean, mag_logstd, value, constraint_values, risk_value, response_pred, _ = self.net(s, af_tensor)
-        del mag_mean, mag_logstd, value, constraint_values, risk_value, response_pred
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).reshape(-1)
-        mask_t = self._coerce_action_mask(action_mask, logits)
-        logits = self._masked_logits(logits, mask_t)
-        temp = float(max(1e-6, temperature))
-        probs_t = torch.softmax(logits / temp, dim=-1)
-        probs = np.asarray(probs_t.detach().cpu().tolist(), dtype=float)
-        if probs.size == 0:
-            return {
-                "policy_top_action": -1.0,
-                "policy_second_action": -1.0,
-                "policy_top_prob": 0.0,
-                "policy_second_prob": 0.0,
-                "policy_action_margin": 0.0,
-                "policy_hold_prob": 0.0,
-                "policy_entropy": 0.0,
-                "policy_temperature": temp,
-            }
-        order = np.argsort(-probs)
-        top = int(order[0])
-        second = int(order[1]) if probs.size > 1 else top
-        safe_probs = np.clip(probs, 1e-12, 1.0)
+        del action_features
+        state_t = self._tensor_from_value(
+            state, dtype=torch.float32, device=self.device
+        ).reshape(1, -1)
+        logits, _ = self.net.actor_forward(
+            state_t,
+            self._actor_hidden if self.persistent_recurrence else None,
+        )
+        logits = torch.nan_to_num(
+            logits, nan=0.0, posinf=20.0, neginf=-20.0
+        ).clamp(-20.0, 20.0)
+        mask = self._coerce_action_mask(action_mask, logits)
+        logits = self._masked_logits(logits, mask)
+        temperature = float(max(1e-6, temperature))
+        probs = torch.softmax(logits / temperature, dim=-1).reshape(-1)
+        order = torch.argsort(probs, descending=True)
+        top = int(order[0].item())
+        second = int(order[1].item()) if order.numel() > 1 else top
+        top_prob = float(probs[top].item())
+        second_prob = float(probs[second].item()) if second != top else 0.0
+        entropy = float(
+            (-(probs * torch.log(probs.clamp(min=1e-12))).sum()).item()
+        )
         return {
             "policy_top_action": float(top),
             "policy_second_action": float(second),
-            "policy_top_prob": float(probs[top]),
-            "policy_second_prob": float(probs[second]) if second != top else 0.0,
-            "policy_action_margin": float(probs[top] - (probs[second] if second != top else 0.0)),
-            "policy_hold_prob": float(probs[0]) if probs.size > 0 else 0.0,
-            "policy_entropy": float(-np.sum(safe_probs * np.log(safe_probs))),
-            "policy_temperature": temp,
+            "policy_top_prob": top_prob,
+            "policy_second_prob": second_prob,
+            "policy_action_margin": top_prob - second_prob,
+            "policy_hold_prob": float(probs[0].item()),
+            "policy_entropy": entropy,
+            "policy_temperature": temperature,
+            "optimizer_top_action": float(top),
+            "optimizer_second_action": float(second),
+            "optimizer_top_prob": top_prob,
+            "optimizer_action_margin": top_prob - second_prob,
+            "optimizer_ready": 0.0,
+            "optimizer_action_changed": 0.0,
+            "optimizer_q_spread": 0.0,
         }
-    
+
     @torch.no_grad()
     def act(
         self,
-        s_np: np.ndarray,
+        state: np.ndarray,
         deterministic: bool = False,
         action_features: Optional[np.ndarray] = None,
         action_mask: Optional[np.ndarray] = None,
-        policy_mode: str = "argmax",
+        policy_mode: str = "argmax_raw",
         policy_temperature: float = 0.50,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        s = self._tensor_from_value(
-            s_np, dtype=torch.float32, device=self.device
-        ).unsqueeze(0)
-        s = torch.nan_to_num(s, nan=0.0, posinf=1e3, neginf=-1e3)
-        expected_dim = self.net.single_state_dim * self.net.frame_stack
-        if s.shape[-1] != expected_dim:
-            raise ValueError(f"State dim mismatch: got {s.shape[-1]}, expected {expected_dim}")
-        
-        af_tensor = None
-        if self.action_feature_dim > 0 and action_features is not None:
-            af_tensor = self._tensor_from_value(
-                action_features, dtype=torch.float32, device=self.device
+        critic_state: Optional[np.ndarray | torch.Tensor] = None,
+    ) -> Tuple[
+        int,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        state_t = self._tensor_from_value(
+            state, dtype=torch.float32, device=self.device
+        ).reshape(1, -1)
+        if state_t.shape[-1] != self.state_dim:
+            raise ValueError(
+                f"State dim mismatch: got {state_t.shape[-1]}, expected {self.state_dim}"
             )
-            af_tensor = af_tensor.reshape(1, af_tensor.shape[-2], af_tensor.shape[-1])
-        logits, mag_mean, mag_logstd, value, constraint_values, risk_value, response_pred, _ = self.net(s, af_tensor)
-        value = self.reward_normalizer.denormalize(value)
-        constraint_values = self.constraint_normalizer.denormalize(constraint_values)
-        risk_value = self.risk_normalizer.denormalize(risk_value)
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-        if not torch.isfinite(logits).all():
-            logits = torch.zeros_like(logits)
-        mask_t = self._coerce_action_mask(action_mask, logits)
-        feasible_now = np.asarray(mask_t.squeeze(0).detach().cpu().tolist(), dtype=bool)
-        self.action_ever_feasible[: feasible_now.size] |= feasible_now[: self.action_ever_feasible.size]
-        logits = self._masked_logits(logits, mask_t)
-        exploration_rate = 0.0 if deterministic else self.exploration_rate
-        self.last_action_exploration_rate = float(exploration_rate)
-        dist = self._exploratory_distribution(logits, exploration_rate, mask_t)
+        critic_state_t = (
+            state_t
+            if not self.privileged_critic
+            else self._tensor_from_value(
+                critic_state,
+                dtype=torch.float32,
+                device=self.device,
+            ).reshape(1, -1)
+            if critic_state is not None
+            else None
+        )
+        if self.action_feature_dim > 0:
+            if action_features is None:
+                raise ValueError(
+                    "action features are required when action_feature_dim > 0"
+                )
+            action_features_t = self._tensor_from_value(
+                action_features,
+                dtype=torch.float32,
+                device=self.device,
+            ).reshape(self.action_dim, self.action_feature_dim)
+        else:
+            action_features_t = torch.empty(
+                (self.action_dim, 0), dtype=torch.float32, device=self.device
+            )
+        actor_hidden_in = (
+            self._actor_hidden.detach().clone()
+            if self._actor_hidden is not None
+            else None
+        )
+        critic_hidden_in = (
+            self._critic_hidden.detach().clone()
+            if self._critic_hidden is not None
+            else None
+        )
+        logits, actor_hidden_out = self.net.actor_forward(
+            state_t,
+            actor_hidden_in if self.persistent_recurrence else None,
+        )
+        value, _, critic_hidden_out = self.net.critic_forward(
+            state_t,
+            critic_state=critic_state_t,
+            hidden=critic_hidden_in if self.persistent_recurrence else None,
+        )
+        constraint_values = state_t.new_zeros((1, self.constraint_dim))
+        risk_value = state_t.new_zeros((1,))
+        response = state_t.new_zeros((1, self.response_dim))
+        logits = torch.nan_to_num(
+            logits, nan=0.0, posinf=20.0, neginf=-20.0
+        ).clamp(-20.0, 20.0)
+        mask = self._coerce_action_mask(action_mask, logits)
+        logits = self._masked_logits(logits, mask)
+        feasible = np.asarray(mask.squeeze(0).cpu().tolist(), dtype=bool)
+        self.action_ever_feasible |= feasible
+
+        raw_policy_dist = torch.distributions.Categorical(logits=logits)
         if deterministic:
-            mode = str(policy_mode or "argmax").strip().lower()
-            raw_dist = torch.distributions.Categorical(logits=logits)
-            if mode == "sample_raw":
-                a = raw_dist.sample()
+            mode = str(policy_mode or "argmax_raw").strip().lower()
+            if mode in {"argmax", "argmax_raw"}:
+                action_t = torch.argmax(logits, dim=-1)
+            elif mode == "sample_raw":
+                action_t = raw_policy_dist.sample()
             elif mode == "sample_low_temp":
-                temp = float(max(1e-6, policy_temperature))
-                a = torch.distributions.Categorical(logits=logits / temp).sample()
-            elif mode == "argmax":
-                a = torch.argmax(logits, dim=-1)
+                action_t = torch.distributions.Categorical(
+                    logits=logits / float(max(1e-6, policy_temperature))
+                ).sample()
             else:
                 raise ValueError(
-                    "policy_mode must be one of: argmax, sample_raw, sample_low_temp"
+                    "policy_mode must be one of: argmax, argmax_raw, "
+                    "sample_raw, sample_low_temp"
                 )
         else:
-            a = dist.sample()
-        chosen_mean = mag_mean.gather(1, a.reshape(-1, 1)).squeeze(1)
-        chosen_logstd = mag_logstd.gather(1, a.reshape(-1, 1)).squeeze(1)
-        mag_dist = self._magnitude_dist(chosen_mean, chosen_logstd)
-        if deterministic:
-            magnitude = self._squash_magnitude(chosen_mean)
-        else:
-            magnitude = self._squash_magnitude(mag_dist.rsample())
-        magnitude = torch.where(a == 0, torch.zeros_like(magnitude), magnitude)
-        logp = dist.log_prob(a) + torch.where(a == 0, torch.zeros_like(magnitude), self._magnitude_log_prob(mag_dist, magnitude))
-        self.last_continuous_magnitude = float(magnitude.squeeze(0).detach().cpu().item())
-        self.last_constraint_values = torch.nan_to_num(
-            constraint_values.squeeze(0), nan=0.0, posinf=0.0, neginf=0.0
-        ).detach()
-        self.last_risk_value = torch.nan_to_num(
-            risk_value.squeeze(0), nan=0.0, posinf=0.0, neginf=0.0
-        ).detach()
-        if response_pred.ndim == 3:
-            chosen_response = response_pred.gather(
-                1,
-                a.reshape(-1, 1, 1).expand(-1, 1, self.response_dim),
-            ).squeeze(1)
-        else:
-            chosen_response = response_pred
-        self.last_response_pred = torch.nan_to_num(
-            chosen_response.squeeze(0), nan=0.0, posinf=0.0, neginf=0.0
-        ).detach()
+            behavior_dist = self._exploratory_distribution(
+                logits, self.exploration_rate, mask
+            )
+            action_t = behavior_dist.sample()
+
+        action = int(action_t.item())
+        applied_exploration_rate = (
+            0.0 if deterministic else float(self.exploration_rate)
+        )
+        self.last_action_exploration_rate = applied_exploration_rate
+        self._pending_exploration_rate = applied_exploration_rate
+        self.last_continuous_magnitude = 0.0 if action == 0 else 1.0
+        self.last_constraint_values = constraint_values.squeeze(0).detach()
+        self.last_risk_value = risk_value.squeeze(0).detach()
+        self.last_response_pred = response.squeeze(0).detach()
         if not deterministic:
-            self.action_visits[int(a.item())] += 1
-        af_out = af_tensor.squeeze(0).detach() if af_tensor is not None else torch.empty(0, dtype=torch.float32, device=self.device)
-        mask_out = mask_t.squeeze(0).detach()
-        return int(a.item()), s.squeeze(0), logp.squeeze(0), value.squeeze(0), af_out, mask_out
+            self.action_visits[action] += 1
+        if self.persistent_recurrence:
+            self._pending_actor_hidden = (
+                torch.empty(0, dtype=torch.float32, device=self.device)
+                if actor_hidden_in is None
+                else actor_hidden_in.squeeze(1).squeeze(0).detach().clone()
+            )
+            self._pending_critic_hidden = (
+                torch.empty(0, dtype=torch.float32, device=self.device)
+                if critic_hidden_in is None
+                else critic_hidden_in.squeeze(1).squeeze(0).detach().clone()
+            )
+            self._actor_hidden = actor_hidden_out.detach()
+            self._critic_hidden = critic_hidden_out.detach()
+        self._pending_critic_state = (
+            torch.empty(0, dtype=torch.float32, device=self.device)
+            if critic_state_t is None
+            else critic_state_t.squeeze(0).detach().clone()
+        )
+        return (
+            action,
+            state_t.squeeze(0).detach(),
+            (
+                raw_policy_dist if deterministic else behavior_dist
+            ).log_prob(action_t).squeeze(0).detach(),
+            value.squeeze(0).detach(),
+            action_features_t.detach(),
+            mask.squeeze(0).detach(),
+        )
 
     @torch.no_grad()
     def value_estimates(
         self,
-        s_np: np.ndarray,
+        state: np.ndarray,
         action_features: Optional[np.ndarray] = None,
+        critic_state: Optional[np.ndarray | torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Evaluate all critics for bootstrapping a truncated rollout."""
-        s = self._tensor_from_value(
-            s_np, dtype=torch.float32, device=self.device
+        del action_features
+        state_t = self._tensor_from_value(
+            state, dtype=torch.float32, device=self.device
         ).reshape(1, -1)
-        s = torch.nan_to_num(s, nan=0.0, posinf=1e3, neginf=-1e3)
-        af_tensor = None
-        if self.action_feature_dim > 0 and action_features is not None:
-            af_tensor = self._tensor_from_value(
-                action_features, dtype=torch.float32, device=self.device
-            )
-            af_tensor = af_tensor.reshape(1, af_tensor.shape[-2], af_tensor.shape[-1])
-        _, _, _, value, constraint_values, risk_value, _, _ = self.net(s, af_tensor)
-        value = self.reward_normalizer.denormalize(value)
-        constraint_values = self.constraint_normalizer.denormalize(constraint_values)
-        risk_value = self.risk_normalizer.denormalize(risk_value)
-        return (
-            torch.nan_to_num(value.squeeze(0), nan=0.0, posinf=0.0, neginf=0.0).detach(),
-            torch.nan_to_num(constraint_values.squeeze(0), nan=0.0, posinf=0.0, neginf=0.0).detach(),
-            torch.nan_to_num(risk_value.squeeze(0), nan=0.0, posinf=0.0, neginf=0.0).detach(),
+        critic_state_t = (
+            state_t
+            if not self.privileged_critic
+            else self._tensor_from_value(
+                critic_state,
+                dtype=torch.float32,
+                device=self.device,
+            ).reshape(1, -1)
+            if critic_state is not None
+            else None
         )
-    
+        value, _, _ = self.net.critic_forward(
+            state_t,
+            critic_state=critic_state_t,
+            hidden=self._critic_hidden if self.persistent_recurrence else None,
+        )
+        constraint_values = state_t.new_zeros((1, self.constraint_dim))
+        risk_value = state_t.new_zeros((1,))
+        return (
+            value.squeeze(0).detach(),
+            constraint_values.squeeze(0).detach(),
+            risk_value.squeeze(0).detach(),
+        )
+
     def store(
         self,
-        s: torch.Tensor,
-        a: int,
-        r: float,
+        state: torch.Tensor,
+        action: int,
+        reward: float,
         done: bool,
-        s_next: Optional[torch.Tensor],
+        next_state: Optional[torch.Tensor],
         old_logp: torch.Tensor,
         old_value: torch.Tensor,
-        constraint_costs: Optional[np.ndarray | List[float] | Tuple[float, ...] | torch.Tensor] = None,
+        actor_credit: float = 0.0,
+        constraint_costs: Optional[
+            np.ndarray | List[float] | Tuple[float, ...] | torch.Tensor
+        ] = None,
         risk_cost: float = 0.0,
-        response_target: Optional[np.ndarray | List[float] | Tuple[float, ...] | torch.Tensor] = None,
-        action_features: Optional[np.ndarray | List[List[float]] | torch.Tensor] = None,
+        response_target: Optional[
+            np.ndarray | List[float] | Tuple[float, ...] | torch.Tensor
+        ] = None,
+        action_features: Optional[
+            np.ndarray | List[List[float]] | torch.Tensor
+        ] = None,
         action_mask: Optional[np.ndarray | List[bool] | torch.Tensor] = None,
         discount: Optional[float] = None,
         duration: int = 1,
@@ -1237,145 +1265,265 @@ class PPOAgent:
         next_value: Optional[torch.Tensor | float] = None,
         next_constraint_values: Optional[torch.Tensor | np.ndarray] = None,
         next_risk_value: Optional[torch.Tensor | float] = None,
+        critic_state: Optional[np.ndarray | List[float] | torch.Tensor] = None,
+        counterfactual_action_values: Optional[
+            np.ndarray | List[float] | torch.Tensor
+        ] = None,
+        counterfactual_action_mask: Optional[
+            np.ndarray | List[bool] | torch.Tensor
+        ] = None,
+        potential: Optional[float] = None,
+        next_potential: Optional[float] = None,
+        reward_regime: str = "default",
     ) -> None:
-        del s_next
-        if constraint_costs is None:
-            constraint_tensor = torch.zeros(self.constraint_dim, dtype=torch.float32, device=self.device)
-        else:
-            constraint_tensor = self._tensor_from_value(
-                constraint_costs, dtype=torch.float32, device=self.device
-            ).reshape(-1)
-            if constraint_tensor.numel() != self.constraint_dim:
-                padded = torch.zeros(self.constraint_dim, dtype=torch.float32, device=self.device)
-                width = min(self.constraint_dim, constraint_tensor.numel())
-                if width > 0:
-                    padded[:width] = constraint_tensor[:width]
-                constraint_tensor = padded
-        if response_target is None:
-            response_tensor = self.last_response_pred.detach().clone()
-        else:
-            response_tensor = self._tensor_from_value(
-                response_target, dtype=torch.float32, device=self.device
-            ).reshape(-1)
-            if response_tensor.numel() != self.response_dim:
-                padded = torch.zeros(self.response_dim, dtype=torch.float32, device=self.device)
-                width = min(self.response_dim, response_tensor.numel())
-                if width > 0:
-                    padded[:width] = response_tensor[:width]
-                response_tensor = padded
-        
-        if action_features is None or self.action_feature_dim <= 0:
-            action_feature_tensor = torch.empty(0, dtype=torch.float32, device=self.device)
-        else:
-            action_feature_tensor = self._tensor_from_value(
-                action_features, dtype=torch.float32, device=self.device
-            )
-            action_feature_tensor = action_feature_tensor.reshape(-1, action_feature_tensor.shape[-1])
-            if action_feature_tensor.shape[-1] != self.action_feature_dim:
-                fixed = torch.zeros((self.action_visits.size, self.action_feature_dim), dtype=torch.float32, device=self.device)
-                rows = min(fixed.shape[0], action_feature_tensor.shape[0])
-                cols = min(fixed.shape[1], action_feature_tensor.shape[1])
-                fixed[:rows, :cols] = action_feature_tensor[:rows, :cols]
-                action_feature_tensor = fixed
-    
-        constraint_tensor = torch.nan_to_num(constraint_tensor, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0)
-        response_tensor = torch.nan_to_num(response_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
-        
-        action_feature_tensor = torch.nan_to_num(action_feature_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
-        action_mask_tensor = self._coerce_action_mask(action_mask, torch.zeros(self.action_dim, device=self.device)).reshape(-1)
-        transition_duration = int(max(1, duration))
-        transition_discount = float(
-            self.gamma ** transition_duration if discount is None else discount
+        del (
+            next_state,
+            actor_credit,
+            constraint_costs,
+            risk_cost,
+            response_target,
+            next_constraint_values,
+            next_risk_value,
         )
-        if not np.isfinite(transition_discount) or transition_discount < 0.0 or transition_discount > 1.0:
-            raise ValueError(f"transition discount must be finite and in [0, 1], got {transition_discount}")
-        next_value_tensor = torch.as_tensor(
+        duration = int(max(1, duration))
+        resolved_discount = float(
+            self.gamma**duration if discount is None else discount
+        )
+        if not np.isfinite(resolved_discount) or not 0.0 <= resolved_discount <= 1.0:
+            raise ValueError(
+                "transition discount must be finite and in [0, 1], "
+                f"got {resolved_discount}"
+            )
+        mask = self._coerce_action_mask(
+            action_mask,
+            torch.zeros(self.action_dim, dtype=torch.float32, device=self.device),
+        ).reshape(-1)
+        if self.action_feature_dim > 0:
+            if action_features is None:
+                raise ValueError(
+                    "action features are required when action_feature_dim > 0"
+                )
+            action_features_t = self._tensor_from_value(
+                action_features,
+                dtype=torch.float32,
+                device=self.device,
+            ).reshape(self.action_dim, self.action_feature_dim)
+        else:
+            action_features_t = torch.empty(
+                (self.action_dim, 0), dtype=torch.float32, device=self.device
+            )
+        next_value_t = torch.as_tensor(
             float("nan") if next_value is None else next_value,
             dtype=torch.float32,
             device=self.device,
         ).reshape(())
-        if next_constraint_values is None:
-            next_constraint_tensor = torch.full(
-                (self.constraint_dim,), float("nan"), dtype=torch.float32, device=self.device
+        critic_state_t = (
+            self._pending_critic_state.detach().clone()
+            if critic_state is None
+            else self._tensor_from_value(
+                critic_state, dtype=torch.float32, device=self.device
+            ).reshape(-1)
+        )
+        if self.privileged_critic and critic_state_t.numel() != self.critic_state_dim:
+            raise ValueError(
+                "privileged critic_state must have "
+                f"{self.critic_state_dim} values, got {critic_state_t.numel()}"
             )
-        else:
-            next_constraint_tensor = self._tensor_from_value(
-                next_constraint_values,
+        if not self.privileged_critic:
+            critic_state_t = torch.empty(
+                0, dtype=torch.float32, device=self.device
+            )
+
+        counterfactual_values_t = torch.full(
+            (self.action_dim,),
+            float("nan"),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if counterfactual_action_values is not None:
+            supplied = self._tensor_from_value(
+                counterfactual_action_values,
                 dtype=torch.float32,
                 device=self.device,
             ).reshape(-1)
-            if next_constraint_tensor.numel() != self.constraint_dim:
+            if supplied.numel() != self.action_dim:
                 raise ValueError(
-                    "next constraint value override width "
-                    f"{next_constraint_tensor.numel()} != {self.constraint_dim}"
+                    "counterfactual_action_values must match action_dim: "
+                    f"{supplied.numel()} != {self.action_dim}"
                 )
-        next_risk_tensor = torch.as_tensor(
-            float("nan") if next_risk_value is None else next_risk_value,
-            dtype=torch.float32,
-            device=self.device,
-        ).reshape(())
-        
+            counterfactual_values_t = supplied
+        counterfactual_mask_t = torch.isfinite(counterfactual_values_t)
+        if counterfactual_action_mask is not None:
+            supplied_mask = self._tensor_from_value(
+                counterfactual_action_mask,
+                dtype=torch.bool,
+                device=self.device,
+            ).reshape(-1)
+            if supplied_mask.numel() != self.action_dim:
+                raise ValueError(
+                    "counterfactual_action_mask must match action_dim"
+                )
+            counterfactual_mask_t &= supplied_mask
+
+        raw_reward = float(reward)
+        potential_delta = 0.0
+        if self.potential_shaping_scale > 0.0:
+            if potential is None:
+                raise ValueError(
+                    "potential shaping requires the current-state potential"
+                )
+            if next_potential is None and not done:
+                credited_reward = raw_reward
+            else:
+                credited_reward = self.potential_based_reward(
+                    raw_reward,
+                    resolved_discount,
+                    float(potential),
+                    0.0 if next_potential is None else float(next_potential),
+                    terminal=bool(done),
+                    scale=self.potential_shaping_scale,
+                )
+                potential_delta = credited_reward - raw_reward
+        else:
+            credited_reward = raw_reward
         self.buf.append(
             Transition(
-                s=s.detach(),
-                a=torch.tensor(a, dtype=torch.long, device=self.device),
-                r=float(r),
+                state=state.detach().to(self.device, dtype=torch.float32),
+                critic_state=critic_state_t.detach(),
+                action=torch.tensor(action, dtype=torch.long, device=self.device),
+                raw_reward=raw_reward,
+                reward=credited_reward,
                 done=bool(done),
                 truncated=bool(truncated),
-                discount=transition_discount,
-                duration=transition_duration,
-                old_logp=old_logp.detach(),
-                old_value=old_value.detach(),
-                magnitude=torch.tensor(float(getattr(self, "last_continuous_magnitude", 0.0)), dtype=torch.float32, device=self.device),
-                exploration_rate=float(
-                    np.clip(getattr(self, "last_action_exploration_rate", 0.0), 0.0, 1.0)
+                discount=resolved_discount,
+                duration=duration,
+                old_logp=old_logp.detach().to(self.device).reshape(()),
+                old_value=old_value.detach().to(self.device).reshape(()),
+                exploration_rate=float(self._pending_exploration_rate),
+                reward_regime=str(reward_regime or "default"),
+                action_features=action_features_t.detach(),
+                action_mask=mask.detach(),
+                next_value_override=next_value_t.detach(),
+                actor_hidden=self._pending_actor_hidden.detach().clone(),
+                critic_hidden=self._pending_critic_hidden.detach().clone(),
+                counterfactual_values=counterfactual_values_t.detach(),
+                counterfactual_mask=counterfactual_mask_t.detach(),
+                potential_delta=float(potential_delta),
+                potential=(
+                    float("nan") if potential is None else float(potential)
                 ),
-                constraint_costs=constraint_tensor.detach(),
-                risk_cost=float(max(0.0, np.nan_to_num(risk_cost, nan=0.0, posinf=1.0, neginf=0.0))),
-                response_target=response_tensor.detach(),
-                action_features=action_feature_tensor.detach(),
-                action_mask=action_mask_tensor.detach(),
-                old_constraint_values=self.last_constraint_values.detach().clone(),
-                old_risk_value=self.last_risk_value.detach().clone(),
-                next_value_override=next_value_tensor.detach(),
-                next_constraint_values_override=next_constraint_tensor.detach(),
-                next_risk_value_override=next_risk_tensor.detach(),
+                next_potential_override=(
+                    float("nan")
+                    if next_potential is None
+                    else float(next_potential)
+                ),
+                next_state_finalized=bool(
+                    done
+                    or (
+                        torch.isfinite(next_value_t).item()
+                        and (
+                            self.potential_shaping_scale <= 0.0
+                            or next_potential is not None
+                        )
+                    )
+                ),
             )
         )
-    
-    @torch.no_grad()
-    def _delayed_reward_credit(self, rewards: torch.Tensor, dones: torch.Tensor) -> torch.Tensor:
-        """Blend immediate rewards with bounded future-return credit.
+        self._pending_actor_hidden = torch.empty(
+            0, dtype=torch.float32, device=self.device
+        )
+        self._pending_critic_hidden = torch.empty(
+            0, dtype=torch.float32, device=self.device
+        )
+        self._pending_critic_state = torch.empty(
+            0, dtype=torch.float32, device=self.device
+        )
+        self._pending_exploration_rate = 0.0
 
-        Price manipulations can affect share and revenue several decision points
-        after the action is applied.  This light-weight reward redistribution
-        keeps the original immediate signal but adds a normalized, finite-horizon
-        future component before GAE, improving credit assignment without changing
-        PPO's on-policy objective.
+    def finalize_last_transition(
+        self,
+        *,
+        next_value: torch.Tensor | float,
+        next_potential: Optional[float] = None,
+    ) -> None:
+        """Attach the value/potential of the actual next actor decision state."""
+        if not self.buf:
+            raise ValueError("cannot finalize an empty rollout")
+        transition = self.buf[-1]
+        transition.next_value_override = torch.as_tensor(
+            next_value, dtype=torch.float32, device=self.device
+        ).reshape(()).detach()
+        if self.potential_shaping_scale > 0.0:
+            if not np.isfinite(transition.potential):
+                raise ValueError("stored transition is missing its potential")
+            if next_potential is None or not np.isfinite(float(next_potential)):
+                raise ValueError("a finite next potential is required")
+            transition.next_potential_override = float(next_potential)
+            transition.reward = self.potential_based_reward(
+                transition.raw_reward,
+                transition.discount,
+                transition.potential,
+                float(next_potential),
+                terminal=transition.done,
+                scale=self.potential_shaping_scale,
+            )
+            transition.potential_delta = (
+                transition.reward - transition.raw_reward
+            )
+        transition.next_state_finalized = True
+
+    @staticmethod
+    def potential_based_reward(
+        reward: float,
+        discount: float,
+        potential: float,
+        next_potential: float,
+        *,
+        terminal: bool = False,
+        scale: float = 1.0,
+    ) -> float:
+        """Return ``r + scale * (discount * Phi(s') - Phi(s))``.
+
+        Keeping this transform explicit makes the telescoping/invariance
+        contract independently testable and prevents reward-formula edits from
+        being hidden inside the market simulator.
         """
-        if self.delayed_reward_blend <= 0.0 or rewards.numel() <= 1:
-            return rewards
-        t_size = rewards.numel()
-        future = torch.zeros_like(rewards)
-        for t in range(t_size):
-            acc = torch.zeros((), dtype=torch.float32, device=self.device)
-            discount = 1.0
-            for k in range(1, self.delayed_reward_horizon + 1):
-                idx = t + k
-                if idx >= t_size:
-                    break
-                if bool(dones[idx - 1].item()):
-                    break
-                discount *= float(self.gamma)
-                acc = acc + discount * rewards[idx]
-            future[t] = acc
-        if rewards.numel() > 1:
-            scale = torch.std(future, unbiased=False) + 1e-8
-            centered_future = (future - torch.mean(future)) / scale
-            reward_scale = torch.std(rewards, unbiased=False) + 1e-8
-            future = centered_future * reward_scale
-        blended = (1.0 - self.delayed_reward_blend) * rewards + self.delayed_reward_blend * future
-        return torch.nan_to_num(blended, nan=0.0, posinf=0.0, neginf=0.0)
+        values = (reward, discount, potential, next_potential, scale)
+        if not all(np.isfinite(float(value)) for value in values):
+            raise ValueError("potential shaping inputs must be finite")
+        if not 0.0 <= float(discount) <= 1.0:
+            raise ValueError("potential shaping discount must be in [0, 1]")
+        return float(
+            reward
+            + scale
+            * (
+                float(discount) * float(next_potential) * (not terminal)
+                - float(potential)
+            )
+        )
+
+    @staticmethod
+    def center_smdp_reward_sums(
+        reward_sums: torch.Tensor,
+        exposures: torch.Tensor,
+    ) -> Tuple[torch.Tensor, float]:
+        """Center discounted SMDP returns with a per-market-step rate.
+
+        Both inputs retain their natural units: ``reward_sums`` is the
+        discounted sum accrued while an action was held and ``exposures`` is
+        the matching discounted count of primitive market steps.
+        """
+        reward_sums = torch.as_tensor(reward_sums, dtype=torch.float32)
+        exposures = torch.as_tensor(
+            exposures, dtype=torch.float32, device=reward_sums.device
+        )
+        if reward_sums.shape != exposures.shape:
+            raise ValueError("SMDP reward sums and exposures must align")
+        exposure = float(exposures.double().sum().item())
+        if not np.isfinite(exposure) or exposure <= 0.0:
+            raise ValueError("SMDP reward exposure must be finite and positive")
+        rate = float(reward_sums.double().sum().item() / exposure)
+        return reward_sums - rate * exposures, rate
 
     @torch.no_grad()
     def _gae_scalar(
@@ -1389,273 +1537,902 @@ class PPOAgent:
         truncations: Optional[torch.Tensor] = None,
         next_value_overrides: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Semi-MDP generalized advantage estimation.
+        rewards = rewards.to(self.device, dtype=torch.float32).reshape(-1)
+        old_values = old_values.to(self.device, dtype=torch.float32).reshape(-1)
+        dones = dones.to(self.device, dtype=torch.float32).reshape(-1)
+        size = rewards.numel()
+        if not (old_values.numel() == dones.numel() == size):
+            raise ValueError("GAE reward, value, and terminal vectors must align")
+        discounts = (
+            torch.full((size,), self.gamma, dtype=torch.float32, device=self.device)
+            if discounts is None
+            else torch.as_tensor(
+                discounts, dtype=torch.float32, device=self.device
+            ).reshape(-1)
+        )
+        truncations = (
+            torch.zeros(size, dtype=torch.float32, device=self.device)
+            if truncations is None
+            else torch.as_tensor(
+                truncations, dtype=torch.float32, device=self.device
+            ).reshape(-1)
+        )
+        next_value_overrides = (
+            torch.full(
+                (size,), float("nan"), dtype=torch.float32, device=self.device
+            )
+            if next_value_overrides is None
+            else torch.as_tensor(
+                next_value_overrides, dtype=torch.float32, device=self.device
+            ).reshape(-1)
+        )
+        if not (
+            discounts.numel()
+            == truncations.numel()
+            == next_value_overrides.numel()
+            == size
+        ):
+            raise ValueError("semi-MDP GAE metadata must match reward length")
 
-        A stored transition may represent several operational timesteps under
-        one held tariff. ``discounts[t]`` is therefore :math:`gamma^tau`, not
-        necessarily one-step gamma. Time-limit truncations bootstrap from the
-        final observation but stop the GAE trace so it cannot leak into the
-        next curriculum episode.
-        """
-        t_size = rewards.numel()
-        adv = torch.zeros(t_size, dtype=torch.float32, device=self.device)
-        ret = torch.zeros(t_size, dtype=torch.float32, device=self.device)
+        # This market is a continuing task. A rollout or training-horizon cut
+        # is not an economic terminal state, so silently substituting V=0 at
+        # the tail would teach the actor an artificial end-of-horizon policy.
+        # Require either a true terminal, a value of the final observation, or
+        # an explicit rollout-tail bootstrap. Internal time-limit boundaries
+        # always need their own final-observation value because the following
+        # transition may belong to a different episode or training stage.
+        if size:
+            internal_truncations_without_value = (
+                truncations[:-1] > 0.5
+            ) & (dones[:-1] <= 0.5) & ~torch.isfinite(
+                next_value_overrides[:-1]
+            )
+            if bool(internal_truncations_without_value.any().item()):
+                raise ValueError(
+                    "internal truncated transitions require a finite "
+                    "next_value override"
+                )
+            tail_is_terminal = bool(dones[-1].item() > 0.5)
+            tail_has_override = bool(
+                torch.isfinite(next_value_overrides[-1]).item()
+            )
+            if (
+                not tail_is_terminal
+                and not tail_has_override
+                and bootstrap_value is None
+            ):
+                raise ValueError(
+                    "non-terminal PPO rollout tails require bootstrap_value "
+                    "or a finite next_value override; zero bootstrapping would "
+                    "create finite-horizon end effects"
+                )
 
-        gae = torch.zeros((), dtype=torch.float32, device=self.device)
-        rollout_bootstrap = torch.as_tensor(
+        bootstrap = torch.as_tensor(
             0.0 if bootstrap_value is None else bootstrap_value,
             dtype=torch.float32,
             device=self.device,
         ).reshape(())
-        if discounts is None:
-            discounts = torch.full(
-                (t_size,), float(self.gamma), dtype=torch.float32, device=self.device
-            )
-        else:
-            discounts = torch.as_tensor(discounts, dtype=torch.float32, device=self.device).reshape(-1)
-        if truncations is None:
-            truncations = torch.zeros(t_size, dtype=torch.float32, device=self.device)
-        else:
-            truncations = torch.as_tensor(
-                truncations, dtype=torch.float32, device=self.device
-            ).reshape(-1)
-        if next_value_overrides is None:
-            next_value_overrides = torch.full(
-                (t_size,), float("nan"), dtype=torch.float32, device=self.device
-            )
-        else:
-            next_value_overrides = torch.as_tensor(
-                next_value_overrides, dtype=torch.float32, device=self.device
-            ).reshape(-1)
-        if not (
-            discounts.numel() == truncations.numel() == next_value_overrides.numel() == t_size
-        ):
-            raise ValueError("semi-MDP GAE metadata must match reward length")
-        for t in reversed(range(t_size)):
-            terminal = float(dones[t].item())
-            truncated = float(truncations[t].item())
-            if torch.isfinite(next_value_overrides[t]):
-                next_v = next_value_overrides[t]
-            elif t == t_size - 1:
-                next_v = rollout_bootstrap
+        advantages = torch.zeros(size, dtype=torch.float32, device=self.device)
+        gae = torch.zeros((), dtype=torch.float32, device=self.device)
+        for index in reversed(range(size)):
+            if torch.isfinite(next_value_overrides[index]):
+                next_value = next_value_overrides[index]
+            elif index == size - 1:
+                next_value = bootstrap
             else:
-                next_v = old_values[t + 1]
-            step_discount = discounts[t]
-            bootstrap_continuation = 1.0 - terminal
-            trace_continuation = max(0.0, 1.0 - terminal - truncated)
+                next_value = old_values[index + 1]
+            terminal = float(dones[index].item())
+            truncated = float(truncations[index].item())
             delta = (
-                rewards[t]
-                + step_discount * next_v * bootstrap_continuation
-                - old_values[t]
+                rewards[index]
+                + discounts[index] * next_value * (1.0 - terminal)
+                - old_values[index]
             )
+            trace_continuation = max(0.0, 1.0 - terminal - truncated)
             gae = (
                 delta
-                + step_discount * self.lam * trace_continuation * gae
+                + discounts[index]
+                * self.lam
+                * trace_continuation
+                * gae
             )
-            adv[t] = gae
-            ret[t] = adv[t] + old_values[t]
-
+            advantages[index] = gae
+        returns = advantages + old_values
         if normalize_advantage:
-            adv_mean = adv.mean()
-            adv_std = adv.std(unbiased=False)
-            if torch.isfinite(adv_std) and float(adv_std.item()) > 1e-8:
-                adv = (adv - adv_mean) / (adv_std + 1e-8)
-            else:
-                adv = adv - adv_mean
+            mean = advantages.mean()
+            std = advantages.std(unbiased=False)
+            advantages = (
+                (advantages - mean) / (std + 1e-8)
+                if float(std.item()) > 1e-8
+                else advantages - mean
+            )
+        return (
+            torch.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0),
+            torch.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0),
+        )
 
-        adv = torch.nan_to_num(adv, nan=0.0, posinf=0.0, neginf=0.0)
-        ret = torch.nan_to_num(ret, nan=0.0, posinf=0.0, neginf=0.0)
-        return adv, ret
+    def _empty_update_metrics(self) -> Dict[str, object]:
+        return {
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "critic_loss": 0.0,
+            "critic_grad_norm": 0.0,
+            "critic_grad_clip_fraction": 0.0,
+            "actor_grad_norm": 0.0,
+            "actor_grad_clip_fraction": 0.0,
+            "constraint_value_loss": 0.0,
+            "risk_value_loss": 0.0,
+            "action_q_loss": 0.0,
+            "action_q_cql_loss": 0.0,
+            "counterfactual_policy_loss": 0.0,
+            "response_loss": 0.0,
+            "opponent_forecast_loss": 0.0,
+            "lagrangian_adv_mean": 0.0,
+            "lagrangian_adv_std": 0.0,
+            "direct_actor_credit_mean": 0.0,
+            "direct_actor_credit_std": 0.0,
+            "direct_actor_credit_weight": 0.0,
+            "constraint_lambda_mean": 0.0,
+            "risk_coeff": 0.0,
+            "constraints_active": False,
+            "risk_active": False,
+            "entropy": 0.0,
+            "policy_entropy": 0.0,
+            "discrete_policy_entropy": 0.0,
+            "magnitude_entropy": 0.0,
+            "state_action_mi": 0.0,
+            "state_action_mutual_information": 0.0,
+            "raw_policy_entropy_fraction": 0.0,
+            "raw_policy_hold_probability": 0.0,
+            "raw_policy_argmax_concentration": 0.0,
+            "state_action_sensitivity": 0.0,
+            "approx_kl": 0.0,
+            "target_kl": self.target_kl,
+            "clipfrac": 0.0,
+            "update_performed": False,
+            "run_mode": "no_rollout_data",
+            "explained_variance": 0.0,
+            "ent_coeff": self.ent_coeff,
+            "target_entropy_fraction": self.target_entropy_fraction,
+            "entropy_fraction_error": 0.0,
+            "clip_eps": self.clip_eps,
+            "lr": self.curr_lr,
+            "critic_lr": self.curr_lr * self.critic_lr_multiplier,
+            "exploration_rate": float(self.exploration_rate),
+            "action_coverage": self._action_coverage(),
+            "rollout_action_diversity": 0.0,
+            "rollout_reward_std": 0.0,
+            "credited_reward_std": 0.0,
+            "rollout_reward_exposure": 0.0,
+            "rollout_reward_rate_residual": 0.0,
+            "critic_target_mean": 0.0,
+            "critic_target_std": 0.0,
+            "gae_return_mean": 0.0,
+            "gae_return_std": 0.0,
+            "critic_target_contract": (
+                "actual_next_decision_td0"
+                if self.td_value_targets
+                else "gae_lambda_return"
+            ),
+            "average_reward_rate": float(self.average_reward_rate),
+            "reward_rate_beta": self.reward_rate_beta,
+            "center_rewards": self.center_rewards,
+            "reward_rate_segment_count": 0,
+            "reward_rate_segment_std": 0.0,
+            "reward_rate_lagged_baseline_fraction": 0.0,
+            "opponent_segment_count": 0,
+            "opponent_regime_count": 0,
+            "opponent_sample_weight_min": 1.0,
+            "opponent_sample_weight_max": 1.0,
+            "delayed_reward_blend": 0.0,
+            "continuous_magnitude_mean": 0.0,
+            "continuous_magnitude_std": 0.0,
+            "learning_signal_ok": False,
+            "optimizer_steps": 0,
+            "actor_optimizer_steps": 0,
+            "critic_optimizer_steps": 0,
+            "actor_epochs_requested": 0,
+            "critic_epochs_requested": 0,
+            "response_optimizer_steps": 0,
+            "objective_q_optimizer_steps": 0,
+            "objective_q_update_calls": 0,
+            "objective_optimizer_ready": False,
+            "counterfactual_target_coverage": 0.0,
+            "counterfactual_actor_weight": self.counterfactual_actor_weight,
+            "potential_shaping_delta_mean": 0.0,
+            "stopped_early_kl": False,
+            "rollout_size": 0,
+            "effective_batch_size": 0,
+            "policy_entropy_fraction": self.last_policy_entropy_fraction,
+            "transition_duration_mean": 0.0,
+            "transition_discount_mean": 0.0,
+            "truncation_count": 0,
+        }
 
-    @torch.no_grad()
-    def _update_popart(
-        self,
-        normalizer: RunningNormalizer,
+    @staticmethod
+    def _critic_value_loss(
+        values: torch.Tensor,
         targets: torch.Tensor,
-        heads: List[nn.Linear],
-    ) -> None:
-        """Update target moments without changing denormalized predictions."""
-        old_mean = normalizer.mean.detach().clone()
-        old_std = torch.sqrt(normalizer.var.detach().clone() + 1e-6)
-        normalizer.update(targets)
-        new_mean = normalizer.mean.detach()
-        new_std = torch.sqrt(normalizer.var.detach() + 1e-6)
-        scale = (old_std / new_std).reshape(-1)
-        shift = ((old_mean - new_mean) / new_std).reshape(-1)
-        for head in heads:
-            if head.out_features != scale.numel():
-                raise ValueError(
-                    f"PopArt head width {head.out_features} != normalizer width {scale.numel()}"
-                )
-            head.weight.mul_(scale.reshape(-1, 1))
-            head.bias.mul_(scale).add_(shift)
+        sample_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Robust raw-value regression without suppressing its gradient.
+
+        Dividing both tensors by the rollout standard deviation and then
+        backpropagating through the divided prediction attenuates the critic
+        gradient by that standard deviation a second time.  Long-return
+        rollouts therefore produced an effectively frozen value function.
+        A raw Huber loss with ``beta`` set to the target scale has the same
+        robust transition from quadratic to linear error, while preserving a
+        useful gradient for the raw value head.
+        """
+        target_scale = targets.std(unbiased=False).detach().clamp(min=1.0)
+        errors = nn.functional.smooth_l1_loss(
+            values,
+            targets,
+            beta=float(target_scale.item()),
+            reduction="none",
+        )
+        if sample_weights is None:
+            return errors.mean()
+        weights = torch.as_tensor(
+            sample_weights, dtype=errors.dtype, device=errors.device
+        ).reshape_as(errors).clamp(min=0.0)
+        return (errors * weights).sum() / weights.sum().clamp(min=1e-8)
+
+    @staticmethod
+    def _one_step_value_targets(
+        rewards: torch.Tensor,
+        discounts: torch.Tensor,
+        dones: torch.Tensor,
+        next_values: torch.Tensor,
+    ) -> torch.Tensor:
+        """Exact decision-to-decision TD targets for the state-value critic."""
+        vectors = tuple(
+            torch.as_tensor(vector, dtype=torch.float32).reshape(-1)
+            for vector in (rewards, discounts, dones, next_values)
+        )
+        if len({vector.numel() for vector in vectors}) != 1:
+            raise ValueError("one-step value target vectors must align")
+        reward_t, discount_t, done_t, next_value_t = vectors
+        if not bool(torch.isfinite(next_value_t).all().item()):
+            raise ValueError(
+                "one-step value targets require every actual next-decision value"
+            )
+        return (
+            reward_t
+            + discount_t * next_value_t * (1.0 - done_t)
+        ).detach()
+
+    @staticmethod
+    def _regime_local_reward_baselines(
+        raw_rewards: torch.Tensor,
+        reward_exposures: torch.Tensor,
+        dones: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return a primitive reward rate for each terminal-delimited regime.
+
+        A stratified on-policy batch can contain several independently reset
+        opponent episodes. A batch-wide differential baseline would confound
+        opponent difficulty with action quality, so terminal markers define
+        the segments that are centered independently.
+        """
+        raw_rewards = raw_rewards.float().reshape(-1)
+        reward_exposures = reward_exposures.float().reshape(-1)
+        dones = dones.float().reshape(-1)
+        if not (
+            raw_rewards.numel()
+            == reward_exposures.numel()
+            == dones.numel()
+        ):
+            raise ValueError("reward baseline tensors must have equal length")
+        baselines = torch.zeros_like(raw_rewards)
+        rates: List[torch.Tensor] = []
+        start = 0
+        count = int(raw_rewards.numel())
+        for index in range(count):
+            if float(dones[index].item()) <= 0.0 and index + 1 < count:
+                continue
+            stop = index + 1
+            exposure = reward_exposures[start:stop].sum().clamp(min=1e-8)
+            rate = raw_rewards[start:stop].sum() / exposure
+            baselines[start:stop] = rate
+            rates.append(rate)
+            start = stop
+        return (
+            baselines,
+            torch.stack(rates) if rates else raw_rewards.new_zeros(0),
+        )
+
+    def _causal_regime_reward_baselines(
+        self,
+        raw_rewards: torch.Tensor,
+        reward_exposures: torch.Tensor,
+        dones: torch.Tensor,
+        reward_regimes: Sequence[str],
+    ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        """Return action-independent, lagged baselines for complete episodes.
+
+        A baseline estimated from the same trajectory depends on that
+        trajectory's actions and can remove the causal signal of a uniformly
+        better policy.  Each segment therefore uses its regime's rate from a
+        *previous* completed episode.  At cold start, it uses a leave-one-
+        segment-out population rate; when there is only one segment it uses
+        zero. Current rates update the cache only after all baselines have been
+        fixed.
+        """
+        raw_rewards = raw_rewards.float().reshape(-1)
+        reward_exposures = reward_exposures.float().reshape(-1)
+        dones = dones.float().reshape(-1)
+        if not (
+            raw_rewards.numel()
+            == reward_exposures.numel()
+            == dones.numel()
+            == len(reward_regimes)
+        ):
+            raise ValueError("causal reward baseline inputs must align")
+        segments: List[Tuple[int, int, str, torch.Tensor, torch.Tensor]] = []
+        start = 0
+        count = int(raw_rewards.numel())
+        for index in range(count):
+            if float(dones[index].item()) <= 0.0 and index + 1 < count:
+                continue
+            stop = index + 1
+            labels = {str(value or "default") for value in reward_regimes[start:stop]}
+            if len(labels) != 1:
+                raise ValueError("one terminal segment cannot mix reward regimes")
+            exposure = reward_exposures[start:stop].sum().clamp(min=1e-8)
+            reward_sum = raw_rewards[start:stop].sum()
+            segments.append((start, stop, labels.pop(), reward_sum, exposure))
+            start = stop
+        baselines = torch.zeros_like(raw_rewards)
+        rates = torch.stack(
+            [reward_sum / exposure for _, _, _, reward_sum, exposure in segments]
+        ) if segments else raw_rewards.new_zeros(0)
+        lagged_count = 0
+        for segment_index, (start, stop, regime, _, _) in enumerate(segments):
+            cached = self.reward_rate_by_regime.get(regime)
+            if cached is not None and np.isfinite(cached):
+                baseline = raw_rewards.new_tensor(float(cached))
+                lagged_count += 1
+            elif len(segments) > 1:
+                other_reward = torch.stack([
+                    candidate[3]
+                    for index, candidate in enumerate(segments)
+                    if index != segment_index
+                ]).sum()
+                other_exposure = torch.stack([
+                    candidate[4]
+                    for index, candidate in enumerate(segments)
+                    if index != segment_index
+                ]).sum().clamp(min=1e-8)
+                baseline = other_reward / other_exposure
+            else:
+                baseline = raw_rewards.new_zeros(())
+            baselines[start:stop] = baseline
+
+        # Update only after every current baseline is fixed, preventing any
+        # segment from leaking its own outcome into its actor advantages.
+        for _, _, regime, reward_sum, exposure in segments:
+            observed = float((reward_sum / exposure).item())
+            previous = self.reward_rate_by_regime.get(regime)
+            beta = float(np.clip(self.reward_rate_beta, 0.0, 1.0))
+            self.reward_rate_by_regime[regime] = (
+                observed
+                if previous is None
+                else float((1.0 - beta) * previous + beta * observed)
+            )
+        lagged_fraction = float(lagged_count / max(1, len(segments)))
+        return baselines, rates, lagged_fraction
+
+    @staticmethod
+    def _terminal_segment_weights(dones: torch.Tensor) -> torch.Tensor:
+        """Give every terminal-delimited opponent episode equal total mass.
+
+        Response-timescale episodes intentionally have different lengths. A
+        transition-uniform loss would therefore turn horizon length into an
+        unintended opponent-priority weight. The returned weights have mean
+        one, while every segment sums to the same value.
+        """
+        terminal = torch.as_tensor(dones, dtype=torch.float32).reshape(-1)
+        count = int(terminal.numel())
+        if count == 0:
+            return terminal
+        segments: List[Tuple[int, int]] = []
+        start = 0
+        for index in range(count):
+            if float(terminal[index].item()) > 0.0 or index + 1 == count:
+                segments.append((start, index + 1))
+                start = index + 1
+        segment_mass = float(count) / float(max(1, len(segments)))
+        weights = torch.empty_like(terminal)
+        for start, stop in segments:
+            weights[start:stop] = segment_mass / float(max(1, stop - start))
+        return weights
+
+    @staticmethod
+    def _regime_balanced_weights(
+        dones: torch.Tensor,
+        reward_regimes: Sequence[str],
+    ) -> torch.Tensor:
+        """Give every opponent class equal mass despite replicated openings."""
+        terminal = torch.as_tensor(dones, dtype=torch.float32).reshape(-1)
+        count = int(terminal.numel())
+        if count != len(reward_regimes):
+            raise ValueError("regime weights require one label per transition")
+        if count == 0:
+            return terminal
+        segments: List[Tuple[int, int, str]] = []
+        start = 0
+        for index in range(count):
+            if float(terminal[index].item()) > 0.0 or index + 1 == count:
+                labels = {
+                    str(value or "default")
+                    for value in reward_regimes[start : index + 1]
+                }
+                if len(labels) != 1:
+                    raise ValueError(
+                        "one terminal segment cannot mix reward regimes"
+                    )
+                segments.append((start, index + 1, labels.pop()))
+                start = index + 1
+        regime_episode_counts: Dict[str, int] = {}
+        for _, _, regime in segments:
+            regime_episode_counts[regime] = (
+                regime_episode_counts.get(regime, 0) + 1
+            )
+        regime_mass = float(count) / float(max(1, len(regime_episode_counts)))
+        weights = torch.empty_like(terminal)
+        for start, stop, regime in segments:
+            episode_mass = regime_mass / float(regime_episode_counts[regime])
+            weights[start:stop] = episode_mass / float(max(1, stop - start))
+        return weights
+
+    def _actor_logits_batch(
+        self,
+        states: torch.Tensor,
+        hidden_states: Optional[Sequence[torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        if not self.persistent_recurrence:
+            logits, _ = self.net.actor_forward(states, None)
+            return logits
+        outputs: List[torch.Tensor] = []
+        assert hidden_states is not None
+        for state, hidden in zip(states, hidden_states):
+            hidden_in = (
+                None
+                if hidden.numel() == 0
+                else hidden.reshape(1, 1, -1)
+            )
+            logits, _ = self.net.actor_forward(state.unsqueeze(0), hidden_in)
+            outputs.append(logits.squeeze(0))
+        return torch.stack(outputs)
+
+    def _critic_outputs_batch(
+        self,
+        states: torch.Tensor,
+        critic_states: Optional[torch.Tensor] = None,
+        hidden_states: Optional[Sequence[torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.persistent_recurrence:
+            values, action_values, _ = self.net.critic_forward(
+                states,
+                critic_state=critic_states if self.privileged_critic else None,
+                hidden=None,
+            )
+            return values, action_values
+        values_out: List[torch.Tensor] = []
+        actions_out: List[torch.Tensor] = []
+        assert hidden_states is not None
+        for index, (state, hidden) in enumerate(zip(states, hidden_states)):
+            hidden_in = (
+                None
+                if hidden.numel() == 0
+                else hidden.reshape(1, 1, -1)
+            )
+            critic_state = (
+                None
+                if not self.privileged_critic
+                else critic_states[index].unsqueeze(0)
+            )
+            value, action_values, _ = self.net.critic_forward(
+                state.unsqueeze(0),
+                critic_state=critic_state,
+                hidden=hidden_in,
+            )
+            values_out.append(value.squeeze(0))
+            actions_out.append(action_values.squeeze(0))
+        return torch.stack(values_out), torch.stack(actions_out)
+
+    @staticmethod
+    def _counterfactual_actor_advantages(
+        values: torch.Tensor,
+        masks: torch.Tensor,
+        actions: torch.Tensor,
+        *,
+        normalize: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return selected-action advantages from observed branches only.
+
+        Unsupervised Q outputs must never enter the actor baseline. Rows need
+        the selected action and at least one alternative branch; other rows
+        retain their ordinary PPO advantage.
+        """
+        values = values.float()
+        masks = masks.bool()
+        actions = actions.long().reshape(-1)
+        if values.shape != masks.shape or values.shape[0] != actions.numel():
+            raise ValueError("counterfactual tensors must have aligned shapes")
+        finite_masks = masks & torch.isfinite(values)
+        counts = finite_masks.sum(dim=-1)
+        selected_is_observed = finite_masks.gather(
+            1, actions.unsqueeze(-1)
+        ).squeeze(-1)
+        valid = selected_is_observed & (counts >= 2)
+        safe_values = torch.where(finite_masks, values, torch.zeros_like(values))
+        baselines = safe_values.sum(dim=-1) / counts.clamp(min=1)
+        selected = values.gather(1, actions.unsqueeze(-1)).squeeze(-1)
+        advantages = torch.where(
+            valid, selected - baselines, torch.zeros_like(selected)
+        )
+        if normalize and bool(valid.any()):
+            valid_values = advantages[valid]
+            mean = valid_values.mean()
+            std = valid_values.std(unbiased=False)
+            normalized = (
+                (valid_values - mean) / (std + 1e-8)
+                if float(std.item()) > 1e-8
+                else valid_values - mean
+            )
+            advantages = advantages.clone()
+            advantages[valid] = normalized
+        return advantages, valid
+
+    @staticmethod
+    def _counterfactual_pairwise_loss(
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        masks: torch.Tensor,
+        sample_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Fit within-state causal action differences, not noisy reward levels."""
+        valid = masks.bool() & torch.isfinite(targets)
+        pair_mask = valid.unsqueeze(2) & valid.unsqueeze(1)
+        upper = torch.triu(
+            torch.ones(
+                predictions.shape[-1],
+                predictions.shape[-1],
+                dtype=torch.bool,
+                device=predictions.device,
+            ),
+            diagonal=1,
+        )
+        pair_mask &= upper.unsqueeze(0)
+        if not bool(pair_mask.any()):
+            return predictions.sum() * 0.0
+        prediction_differences = predictions.unsqueeze(2) - predictions.unsqueeze(1)
+        target_differences = targets.unsqueeze(2) - targets.unsqueeze(1)
+        pair_errors = nn.functional.smooth_l1_loss(
+            prediction_differences[pair_mask],
+            target_differences[pair_mask],
+            reduction="none",
+        )
+        if sample_weights is None:
+            return pair_errors.mean()
+        pair_weights = torch.as_tensor(
+            sample_weights,
+            dtype=pair_errors.dtype,
+            device=pair_errors.device,
+        ).reshape(-1, 1, 1).expand_as(pair_mask)[pair_mask]
+        return (
+            (pair_errors * pair_weights).sum()
+            / pair_weights.sum().clamp(min=1e-8)
+        )
+
+    @staticmethod
+    def _observed_counterfactual_policy_loss(
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        masks: torch.Tensor,
+        sample_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Rank only action pairs replayed under common random numbers.
+
+        The sampled-action PPO surrogate can reject a poor selected action but
+        cannot identify which alternative should inherit its probability. The
+        transactional branches provide measured within-state comparisons for
+        a coverage-balanced action subset. This term uses only those observed
+        pairs. Unobserved actions receive no direct gradient, while tied
+        outcomes receive zero weight, so the update neither invents Q labels
+        nor requires the deployed policy to move.
+        """
+        if logits.shape != targets.shape or logits.shape != masks.shape:
+            raise ValueError(
+                "counterfactual policy tensors must have aligned shapes"
+            )
+        valid = masks.bool() & torch.isfinite(targets)
+        pair_mask = valid.unsqueeze(2) & valid.unsqueeze(1)
+        upper = torch.triu(
+            torch.ones(
+                logits.shape[-1],
+                logits.shape[-1],
+                dtype=torch.bool,
+                device=logits.device,
+            ),
+            diagonal=1,
+        )
+        pair_mask = pair_mask & upper.unsqueeze(0)
+        target_diff = torch.nan_to_num(
+            targets.unsqueeze(2) - targets.unsqueeze(1),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        informative = pair_mask & (target_diff.abs() > 1e-6)
+        if not bool(informative.any().item()):
+            return logits.sum() * 0.0
+        observed_abs_diff = target_diff.abs()[informative]
+        robust_scale = observed_abs_diff.median().detach().clamp(min=1e-4)
+        confidence = torch.tanh(target_diff.abs() / robust_scale)
+        signed_logit_diff = (
+            logits.unsqueeze(2) - logits.unsqueeze(1)
+        ) * torch.sign(target_diff)
+        pair_loss = nn.functional.softplus(-signed_logit_diff)
+        weights = confidence * informative.float()
+        if sample_weights is not None:
+            weights = weights * torch.as_tensor(
+                sample_weights,
+                dtype=weights.dtype,
+                device=weights.device,
+            ).reshape(-1, 1, 1)
+        return (pair_loss * weights).sum() / weights.sum().clamp(min=1e-8)
 
     def update(
         self,
-        epochs: int = 5,
-        batch_size: int = 256,
+        epochs: int = 4,
+        batch_size: int = 64,
         bootstrap_value: Optional[torch.Tensor | float] = None,
-        bootstrap_constraint_values: Optional[torch.Tensor | np.ndarray] = None,
+        bootstrap_constraint_values: Optional[torch.Tensor] = None,
         bootstrap_risk_value: Optional[torch.Tensor | float] = None,
-    ) -> dict:
+    ) -> Dict[str, object]:
+        del bootstrap_constraint_values, bootstrap_risk_value
         if not self.buf:
-            return {
-                "loss": 0.0,
-                "policy_loss": 0.0,
-                "value_loss": 0.0,
-                "constraint_value_loss": 0.0,
-                "risk_value_loss": 0.0,
-                "response_loss": 0.0,
-                "action_q_loss": 0.0,
-                "lagrangian_adv_mean": 0.0,
-                "lagrangian_adv_std": 0.0,
-                "constraint_lambda_mean": 0.0,
-                "risk_coeff": float(self.risk_coeff),
-                "entropy": 0.0,
-                "policy_entropy": 0.0,
-                "policy_entropy_fraction": float(self.last_policy_entropy_fraction),
-                "ent_coeff": float(self.ent_coeff),
-                "clip_eps": float(self.clip_eps),
-                "lr": float(self.curr_lr),
-                "exploration_rate": float(self.exploration_rate),
-                "action_coverage": self._action_coverage(),
-                "target_kl": float(self.target_kl),
-                "update_performed": False,
-                "run_mode": "no_rollout_data",
-                "optimizer_steps": 0,
-                "actor_optimizer_steps": 0,
-                "critic_optimizer_steps": 0,
-                "response_optimizer_steps": 0,
-            }
+            return self._empty_update_metrics()
 
-        reward_all = torch.tensor([tr.r for tr in self.buf], dtype=torch.float32, device=self.device)
-        done_all = torch.tensor([float(tr.done) for tr in self.buf], dtype=torch.float32, device=self.device)
-        truncated_all = torch.tensor(
-            [float(tr.truncated) for tr in self.buf], dtype=torch.float32, device=self.device
+        states = torch.stack([transition.state for transition in self.buf])
+        states = torch.nan_to_num(states, nan=0.0, posinf=1e3, neginf=-1e3)
+        critic_states = (
+            torch.stack([transition.critic_state for transition in self.buf])
+            if self.privileged_critic
+            else None
         )
-        discount_all = torch.tensor(
-            [tr.discount for tr in self.buf], dtype=torch.float32, device=self.device
+        actor_hiddens = [transition.actor_hidden for transition in self.buf]
+        critic_hiddens = [transition.critic_hidden for transition in self.buf]
+        actions = torch.stack([transition.action for transition in self.buf])
+        action_features = torch.stack(
+            [transition.action_features for transition in self.buf]
         )
-        next_reward_values_all = torch.stack(
-            [tr.next_value_override for tr in self.buf], dim=0
-        ).detach()
-        # Each transition already spans the full tariff hold interval and stores
-        # its exact discounted economic reward. A second redistribution pass
-        # would attribute the same future profit twice.
-        credited_reward_all = reward_all
-        old_reward_values_all = torch.stack([tr.old_value for tr in self.buf], dim=0).detach()
-        old_reward_values_all = torch.nan_to_num(old_reward_values_all, nan=0.0, posinf=0.0, neginf=0.0)
-        adv, ret = self._gae_scalar(
-            credited_reward_all,
-            old_reward_values_all,
-            done_all,
-            bootstrap_value=bootstrap_value,
-            normalize_advantage=False,
-            discounts=discount_all,
-            truncations=truncated_all,
-            next_value_overrides=next_reward_values_all,
-        )
-        constraint_costs_all = torch.stack([tr.constraint_costs for tr in self.buf], dim=0).detach()
-        old_constraint_values_all = torch.stack([tr.old_constraint_values for tr in self.buf], dim=0).detach()
-        next_constraint_values_all = torch.stack(
-            [tr.next_constraint_values_override for tr in self.buf], dim=0
-        ).detach()
-        constraint_adv_cols = []
-        constraint_ret_cols = []
-        for k in range(self.constraint_dim):
-            constraint_bootstrap_k = None
-            if bootstrap_constraint_values is not None:
-                constraint_bootstrap_k = torch.as_tensor(
-                    bootstrap_constraint_values, dtype=torch.float32, device=self.device
-                ).reshape(-1)[k]
-            adv_k, ret_k = self._gae_scalar(
-                constraint_costs_all[:, k],
-                old_constraint_values_all[:, k],
-                done_all,
-                bootstrap_value=constraint_bootstrap_k,
-                normalize_advantage=False,
-                discounts=discount_all,
-                truncations=truncated_all,
-                next_value_overrides=next_constraint_values_all[:, k],
-            )
-            constraint_adv_cols.append(adv_k)
-            constraint_ret_cols.append(ret_k)
-        constraint_adv_all = torch.stack(constraint_adv_cols, dim=1)
-        constraint_ret_all = torch.stack(constraint_ret_cols, dim=1)
-        risk_cost_all = torch.tensor([tr.risk_cost for tr in self.buf], dtype=torch.float32, device=self.device)
-        old_risk_value_all = torch.stack([tr.old_risk_value for tr in self.buf], dim=0).detach()
-        next_risk_values_all = torch.stack(
-            [tr.next_risk_value_override for tr in self.buf], dim=0
-        ).detach()
-        risk_adv_all, risk_ret_all = self._gae_scalar(
-            risk_cost_all,
-            old_risk_value_all,
-            done_all,
-            bootstrap_value=bootstrap_risk_value,
-            normalize_advantage=False,
-            discounts=discount_all,
-            truncations=truncated_all,
-            next_value_overrides=next_risk_values_all,
-        )
-        response_target_all = torch.stack([tr.response_target for tr in self.buf], dim=0).detach()
-        action_feature_items = [tr.action_features for tr in self.buf]
-        has_action_features = bool(action_feature_items and action_feature_items[0].numel() > 0)
-        action_features_all = torch.stack(action_feature_items, dim=0).detach() if has_action_features else None
-        action_masks_all = torch.stack([tr.action_mask for tr in self.buf], dim=0).detach().bool()
-        lambda_vec = (
-            self.constraint_lambdas.detach().to(self.device)
-            if self.constraints_active
-            else torch.zeros_like(self.constraint_lambdas)
-        )
-        effective_risk_coeff = self.risk_coeff if self.risk_active else 0.0
-        lagrangian_adv = (
-            adv
-            - torch.sum(constraint_adv_all * lambda_vec.unsqueeze(0), dim=1)
-            - effective_risk_coeff * risk_adv_all
-        )
-        lagrangian_adv = torch.nan_to_num(lagrangian_adv, nan=0.0, posinf=0.0, neginf=0.0)
-        lag_mean = lagrangian_adv.mean()
-        lag_std = lagrangian_adv.std(unbiased=False)
-        if torch.isfinite(lag_std) and float(lag_std.item()) > 1e-8:
-            lagrangian_adv = (lagrangian_adv - lag_mean) / (lag_std + 1e-8)
-        else:
-            lagrangian_adv = lagrangian_adv - lag_mean
-
-        s_all = torch.stack([tr.s for tr in self.buf], dim=0)
-        s_all = torch.nan_to_num(s_all, nan=0.0, posinf=1e3, neginf=-1e3)
-        a_all = torch.stack([tr.a for tr in self.buf], dim=0)
-        magnitude_all = torch.stack([tr.magnitude for tr in self.buf], dim=0).detach()
-        feasible_action_count = int(action_masks_all.any(dim=0).sum().item())
-        unique_action_fraction = float(
-            torch.unique(a_all.detach()).numel() / max(1, feasible_action_count)
-        )
-        old_logp_all = torch.stack([tr.old_logp for tr in self.buf], dim=0)
-        old_logp_all = torch.nan_to_num(old_logp_all, nan=0.0, posinf=20.0, neginf=-20.0)
-        exploration_all = torch.tensor(
-            [tr.exploration_rate for tr in self.buf],
+        raw_rewards = torch.tensor(
+            [transition.raw_reward for transition in self.buf],
             dtype=torch.float32,
             device=self.device,
         )
-        n = s_all.size(0)
+        rewards = torch.tensor(
+            [transition.reward for transition in self.buf],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        dones = torch.tensor(
+            [float(transition.done) for transition in self.buf],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        reward_regimes = [transition.reward_regime for transition in self.buf]
+        truncations = torch.tensor(
+            [float(transition.truncated) for transition in self.buf],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        # Opponent-episode boundaries partition baselines and loss weights.  In
+        # v25 they were stored as terminals; with v26 truncation bootstrapping
+        # they are time-limit truncations (done=False) that still end a
+        # segment, so segmentation uses done OR truncated.
+        segment_ends = torch.maximum(dones, truncations)
+        sample_weights = (
+            self._regime_balanced_weights(segment_ends, reward_regimes).to(self.device)
+            if self.td_value_targets
+            else torch.ones_like(dones)
+        )
+        discounts = torch.tensor(
+            [transition.discount for transition in self.buf],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        durations = np.asarray(
+            [transition.duration for transition in self.buf], dtype=float
+        )
+        if abs(1.0 - self.gamma) <= 1e-12:
+            reward_exposure_values = durations
+        else:
+            # Compute in host float64 from the original transition discounts.
+            # Using the float32 tensor here measurably perturbs even a one-step
+            # exposure away from 1.0 when gamma is close to one, which then
+            # biases the persistent average-reward estimate every rollout.
+            reward_exposure_values = np.asarray(
+                [
+                    (1.0 - float(transition.discount)) / (1.0 - self.gamma)
+                    for transition in self.buf
+                ],
+                dtype=float,
+            )
+        reward_exposures = torch.as_tensor(
+            reward_exposure_values, dtype=torch.float32, device=self.device
+        )
+        old_logp = torch.stack(
+            [transition.old_logp for transition in self.buf]
+        ).detach()
+        old_values = torch.stack(
+            [transition.old_value for transition in self.buf]
+        ).detach()
+        exploration_rates = torch.tensor(
+            [transition.exploration_rate for transition in self.buf],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        masks = torch.stack(
+            [transition.action_mask for transition in self.buf]
+        ).detach().bool()
+        next_values = torch.stack(
+            [transition.next_value_override for transition in self.buf]
+        ).detach()
+        counterfactual_values = torch.stack(
+            [transition.counterfactual_values for transition in self.buf]
+        ).detach()
+        counterfactual_masks = torch.stack(
+            [transition.counterfactual_mask for transition in self.buf]
+        ).detach().bool()
+        potential_deltas = np.asarray(
+            [transition.potential_delta for transition in self.buf], dtype=float
+        )
+
+        # Legacy continuing tasks use a differential reward rate. Episodic
+        # tasks must retain their actual discounted reward and terminal bonus:
+        # a mean estimated from this same rollout depends on its actions and
+        # is not an action-independent policy-gradient baseline.
+        rollout_reward_exposure = float(
+            max(1e-8, np.sum(reward_exposure_values, dtype=np.float64))
+        )
+        _, rollout_reward_rate = self.center_smdp_reward_sums(
+            raw_rewards,
+            reward_exposures,
+        )
+        reward_rate_segments = rewards.new_tensor([rollout_reward_rate])
+        reward_rate_lagged_baseline_fraction = 0.0
+        if not self.center_rewards:
+            reward_baselines = torch.zeros_like(rewards)
+        elif self.reward_rate_beta > 0.0:
+            if not self.average_reward_initialized:
+                self.average_reward_rate = rollout_reward_rate
+                self.average_reward_initialized = True
+            else:
+                beta = self.reward_rate_beta
+                self.average_reward_rate = float(
+                    (1.0 - beta) * self.average_reward_rate
+                    + beta * rollout_reward_rate
+                )
+            if self.td_value_targets:
+                (
+                    reward_baselines,
+                    reward_rate_segments,
+                    reward_rate_lagged_baseline_fraction,
+                ) = self._causal_regime_reward_baselines(
+                    raw_rewards,
+                    reward_exposures,
+                    segment_ends,
+                    reward_regimes,
+                )
+            else:
+                reward_baselines = torch.full_like(
+                    rewards, float(self.average_reward_rate)
+                )
+        else:
+            # Rewards are discounted sums over possibly multi-step pricing
+            # holds, so their action-independent baseline must be expressed as
+            # a per-market-step rate and then multiplied by each transition's
+            # exposure. Using mean transition return here mixed units and made
+            # constant rewards acquire large non-zero advantages.
+            reward_baselines = torch.full_like(
+                rewards, float(rollout_reward_rate)
+            )
+        centered_rewards = rewards - reward_baselines * reward_exposures
+        raw_advantages, returns = self._gae_scalar(
+            centered_rewards,
+            old_values,
+            dones,
+            bootstrap_value=bootstrap_value,
+            normalize_advantage=False,
+            discounts=discounts,
+            truncations=truncations,
+            next_value_overrides=next_values,
+        )
+        if self.td_value_targets:
+            unresolved = (dones < 0.5) & ~torch.isfinite(next_values)
+            if bool(unresolved.any().item()):
+                raise ValueError(
+                    "v25 TD critic received a non-terminal transition before "
+                    "its actual next decision state was finalized"
+                )
+            resolved_next_values = torch.where(
+                torch.isfinite(next_values),
+                next_values,
+                torch.zeros_like(next_values),
+            )
+            critic_targets = self._one_step_value_targets(
+                centered_rewards,
+                discounts,
+                dones,
+                resolved_next_values,
+            ).to(self.device)
+        else:
+            critic_targets = returns
+        if self.net.normalize_values:
+            ratio = self.net.update_value_scale(critic_targets)
+            # Adam moments follow the head's changed normalized-return units.
+            for parameter in self.net.v_head.parameters():
+                state = self.critic_opt.state.get(parameter, {})
+                if "exp_avg" in state:
+                    state["exp_avg"].mul_(ratio)
+                    state["exp_avg_sq"].mul_(ratio * ratio)
+        normalized_weight_sum = sample_weights.sum().clamp(min=1e-8)
+        advantage_mean = (
+            raw_advantages * sample_weights
+        ).sum() / normalized_weight_sum
+        advantage_variance = (
+            sample_weights * (raw_advantages - advantage_mean).square()
+        ).sum() / normalized_weight_sum
+        advantage_std = torch.sqrt(advantage_variance.clamp(min=0.0))
+        advantages = (
+            (raw_advantages - advantage_mean) / (advantage_std + 1e-8)
+            if float(advantage_std.item()) > 1e-8
+            else raw_advantages - advantage_mean
+        )
+        advantages = advantages.clamp(-self.adv_clip, self.adv_clip).detach()
+
+        count = states.shape[0]
+        # Honor the caller's PPO batch size. The previous implementation
+        # silently split every 32-transition rollout into four batches of 8,
+        # so eight requested epochs became 32 actor updates on the same small,
+        # noisy reaction-cycle sample. That mismatch caused dynamic-stage
+        # overfitting and erased policies learned in the static stage.
+        effective_batch_size = int(min(max(1, batch_size), count))
 
         with torch.no_grad():
-            raw_logits_all, _, _, _, _, _, _, _ = self.net(s_all, action_features_all)
-            raw_logits_all = self._masked_logits(
-                torch.nan_to_num(raw_logits_all, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0),
-                action_masks_all,
+            raw_logits = self._actor_logits_batch(states, actor_hiddens)
+            raw_logits = self._masked_logits(
+                torch.nan_to_num(
+                    raw_logits, nan=0.0, posinf=20.0, neginf=-20.0
+                ).clamp(-20.0, 20.0),
+                masks,
             )
-            raw_probs_all = torch.softmax(raw_logits_all, dim=-1)
-            raw_top_all = torch.argmax(raw_probs_all, dim=-1)
-            top_counts = torch.bincount(raw_top_all, minlength=self.action_dim).to(torch.float32)
-            raw_argmax_concentration = float(top_counts.max().item() / max(1, raw_top_all.numel()))
-            raw_hold_probability = float(raw_probs_all[:, 0].mean().item())
+            raw_probs = torch.softmax(raw_logits, dim=-1)
+            raw_top = torch.argmax(raw_probs, dim=-1)
+            top_counts = torch.bincount(
+                raw_top, minlength=self.action_dim
+            ).float()
+            raw_argmax_concentration = float(
+                top_counts.max().item() / max(1, raw_top.numel())
+            )
+            raw_hold_probability = float(raw_probs[:, 0].mean().item())
             state_action_sensitivity = float(
-                raw_probs_all.std(dim=0, unbiased=False).mean().item()
-                if raw_probs_all.shape[0] > 1 else 0.0
+                raw_probs.std(dim=0, unbiased=False).mean().item()
+                if count > 1
+                else 0.0
             )
-            row_entropy = -(raw_probs_all * torch.log(raw_probs_all.clamp(min=1e-8))).sum(dim=-1)
+            row_entropy = -(
+                raw_probs * torch.log(raw_probs.clamp(min=1e-12))
+            ).sum(dim=-1)
             feasible_entropy = torch.log(
-                action_masks_all.sum(dim=-1).to(torch.float32).clamp(min=1.0)
+                masks.sum(dim=-1).float().clamp(min=1.0)
             )
             raw_entropy_fraction = float(
                 (row_entropy / feasible_entropy.clamp(min=1e-8))
@@ -1663,452 +2440,421 @@ class PPOAgent:
                 .mean()
                 .item()
             )
-            economic_probs = self._economic_group_probabilities(
-                raw_logits_all,
-                action_features_all,
-            )
-            if economic_probs is not None:
-                state_action_mi = float(
-                    self._mutual_information(economic_probs).item()
-                )
-            else:
-                state_action_mi = float(
-                    self._mutual_information(raw_probs_all).item()
-                )
 
-        self.last_raw_argmax_concentration = raw_argmax_concentration
-        self.last_state_action_sensitivity = state_action_sensitivity
-        self.last_state_action_mutual_information = state_action_mi
-
-        target_minibatches = 4 if n >= 32 else 1
-        effective_batch_size = int(
-            min(max(1, batch_size), max(1, int(np.ceil(n / target_minibatches))))
+        # Maximum-entropy PPO prevents premature categorical collapse by
+        # strengthening or relaxing its own entropy term according to the
+        # observed policy distribution. It never replaces, masks, or forces an
+        # action and therefore remains part of the learned objective.
+        entropy_fraction_error = float(
+            self.target_entropy_fraction - raw_entropy_fraction
         )
+        self.ent_coeff = float(np.clip(
+            self.ent_coeff
+            * np.exp(self.entropy_adaptation_rate * entropy_fraction_error),
+            self.min_ent_coeff,
+            self.max_ent_coeff,
+        ))
 
-        # PopArt keeps economic-unit value predictions invariant while running
-        # target moments evolve. This is essential when profit regimes have very
-        # different scales.
-        reward_heads = [self.net.v_head[-1]]
-        if self.net.action_q_head is not None:
-            reward_heads.append(self.net.action_q_head[-1])
-        self._update_popart(self.reward_normalizer, ret, reward_heads)
-        if self.constraints_active:
-            self._update_popart(
-                self.constraint_normalizer,
-                constraint_ret_all,
-                [self.net.constraint_head[-1]],
-            )
-        if self.risk_active:
-            self._update_popart(
-                self.risk_normalizer,
-                risk_ret_all,
-                [self.net.risk_head[-1]],
-            )
-        ret_norm = self.reward_normalizer.normalize(ret).detach()
-        old_reward_values_norm = self.reward_normalizer.normalize(
-            old_reward_values_all
-        ).detach()
-        constraint_ret_norm = self.constraint_normalizer.normalize(constraint_ret_all).detach()
-        risk_ret_norm = self.risk_normalizer.normalize(risk_ret_all).detach()
-
-        critic_sums = {
-            "value_loss": 0.0,
-            "constraint_value_loss": 0.0,
-            "risk_value_loss": 0.0,
-            "action_q_loss": 0.0,
-            "critic_loss": 0.0,
-            "critic_grad_norm": 0.0,
-        }
+        critic_loss_sum = 0.0
+        critic_grad_sum = 0.0
+        critic_grad_clip_count = 0
         critic_steps = 0
-        # The state-value critic supports GAE.  Replaying each short,
-        # non-stationary rollout through more critic epochs than the policy
-        # made V fit the latest opponent regime while the actor still reflected
-        # the broader population.  Keep the update budgets aligned.
-        critic_epochs = max(1, min(4, int(epochs)))
-        critic_params = self.net.critic_parameters()
-        for _ in range(critic_epochs):
-            idx = torch.randperm(n, device=self.device)
-            for start in range(0, n, effective_batch_size):
-                j = idx[start : start + effective_batch_size]
-                s_b = s_all[j]
-                a_b = a_all[j]
-                action_features_b = action_features_all[j].detach() if action_features_all is not None else None
-                _, _, _, v, constraint_v, risk_v, _, q_values = self.net(
-                    s_b, action_features_b
+        action_q_loss_sum = 0.0
+        action_q_steps = 0
+        counterfactual_policy_loss_sum = 0.0
+        critic_parameters = self.net.critic_parameters()
+        actor_epoch_count = (
+            max(1, int(math.ceil(float(epochs) / 2.0)))
+            if self.td_value_targets
+            else max(1, int(epochs))
+        )
+        for _ in range(max(1, int(epochs))):
+            order = torch.randperm(count, device=self.device)
+            for start in range(0, count, effective_batch_size):
+                batch = order[start : start + effective_batch_size]
+                batch_indices = batch.detach().cpu().tolist()
+                values, _ = self._critic_outputs_batch(
+                    states[batch],
+                    None if critic_states is None else critic_states[batch],
+                    [critic_hiddens[index] for index in batch_indices],
                 )
-                old_v_b = old_reward_values_norm[j]
-                value_clipped = old_v_b + torch.clamp(
-                    v - old_v_b,
-                    -self.value_clip_eps,
-                    self.value_clip_eps,
+                value_loss = self._critic_value_loss(
+                    values / self.net.value_scale if self.net.normalize_values else values,
+                    critic_targets[batch] / self.net.value_scale if self.net.normalize_values else critic_targets[batch],
+                    sample_weights[batch],
                 )
-                value_loss_unclipped = nn.functional.smooth_l1_loss(
-                    v, ret_norm[j], beta=1.0, reduction="none"
-                )
-                value_loss_clipped = nn.functional.smooth_l1_loss(
-                    value_clipped, ret_norm[j], beta=1.0, reduction="none"
-                )
-                value_loss = torch.maximum(
-                    value_loss_unclipped, value_loss_clipped
-                ).mean()
-                constraint_value_loss = nn.functional.smooth_l1_loss(
-                    constraint_v, constraint_ret_norm[j], beta=1.0
-                )
-                risk_value_loss = nn.functional.smooth_l1_loss(
-                    risk_v, risk_ret_norm[j], beta=1.0
-                )
-                action_q_loss = torch.zeros((), dtype=torch.float32, device=self.device)
-                if q_values.numel() > 0:
-                    chosen_q = q_values.gather(1, a_b.reshape(-1, 1)).squeeze(1)
-                    action_q_loss = nn.functional.smooth_l1_loss(
-                        chosen_q, ret_norm[j], beta=1.0
-                    )
-                critic_loss = (
-                    value_loss
-                    + (
-                        self.constraint_value_coeff * constraint_value_loss
-                        if self.constraints_active
-                        else 0.0
-                    )
-                    + (
-                        self.risk_value_coeff * risk_value_loss
-                        if self.risk_active
-                        else 0.0
-                    )
-                    + self.action_q_coeff * action_q_loss
-                )
+                critic_loss = self.v_coeff * value_loss
                 if not torch.isfinite(critic_loss):
                     continue
                 self.critic_opt.zero_grad(set_to_none=True)
                 critic_loss.backward()
-                grad_norm = nn.utils.clip_grad_norm_(critic_params, 0.5)
+                grad_norm = nn.utils.clip_grad_norm_(
+                    critic_parameters, self.max_grad_norm
+                )
+                critic_grad_clip_count += int(
+                    float(grad_norm.item()) > self.max_grad_norm
+                )
                 self.critic_opt.step()
                 critic_steps += 1
-                critic_sums["value_loss"] += float(value_loss.item())
-                critic_sums["constraint_value_loss"] += float(constraint_value_loss.item())
-                critic_sums["risk_value_loss"] += float(risk_value_loss.item())
-                critic_sums["action_q_loss"] += float(action_q_loss.item())
-                critic_sums["critic_loss"] += float(critic_loss.item())
-                critic_sums["critic_grad_norm"] += float(grad_norm.item())
+                critic_loss_sum += float(value_loss.item())
+                critic_grad_sum += float(grad_norm.item())
 
-        # Opponent-response inference is an auxiliary supervised task.  It has
-        # its own encoder and optimizer so prediction error cannot pull the
-        # pricing actor or the return critic away from their PPO objectives.
-        response_loss_sum = 0.0
-        response_steps = 0
-        if self.response_coeff > 0.0 and response_target_all.numel() > 0:
-            response_params = self.net.response_parameters()
-            response_epochs = max(1, min(3, int(epochs)))
-            for _ in range(response_epochs):
-                idx = torch.randperm(n, device=self.device)
-                for start in range(0, n, effective_batch_size):
-                    j = idx[start : start + effective_batch_size]
-                    action_features_b = (
-                        action_features_all[j].detach()
-                        if action_features_all is not None
-                        else None
+        if self.action_q_coeff > 0.0 and self.q_opt is not None:
+            q_parameters = self.net.q_parameters()
+            for _ in range(max(1, int(epochs))):
+                order = torch.randperm(count, device=self.device)
+                for start in range(0, count, effective_batch_size):
+                    batch = order[start : start + effective_batch_size]
+                    q_predictions = self.net.q_forward(
+                        states[batch],
+                        action_features=action_features[batch],
+                        critic_state=(
+                            None
+                            if critic_states is None
+                            else critic_states[batch]
+                        ),
                     )
-                    with torch.enable_grad():
-                        _, _, _, _, _, _, response_pred, _ = self.net(
-                            s_all[j].detach(), action_features_b
-                        )
-                        if response_pred.ndim == 3:
-                            chosen_response = response_pred.gather(
-                                1,
-                                a_all[j].reshape(-1, 1, 1).expand(
-                                    -1, 1, self.response_dim
-                                ),
-                            ).squeeze(1)
-                        else:
-                            chosen_response = response_pred
-                        response_loss = nn.functional.smooth_l1_loss(
-                            chosen_response,
-                            response_target_all[j],
-                            beta=0.5,
-                        )
-                    if not torch.isfinite(response_loss):
+                    q_loss = self._counterfactual_pairwise_loss(
+                        q_predictions,
+                        counterfactual_values[batch],
+                        counterfactual_masks[batch],
+                        sample_weights[batch],
+                    )
+                    if not torch.isfinite(q_loss):
                         continue
-                    self.response_opt.zero_grad(set_to_none=True)
-                    response_loss.backward()
-                    nn.utils.clip_grad_norm_(response_params, self.max_grad_norm)
-                    self.response_opt.step()
-                    response_steps += 1
-                    response_loss_sum += float(response_loss.item())
+                    self.q_opt.zero_grad(set_to_none=True)
+                    (self.action_q_coeff * q_loss).backward()
+                    nn.utils.clip_grad_norm_(q_parameters, self.max_grad_norm)
+                    self.q_opt.step()
+                    action_q_loss_sum += float(q_loss.item())
+                    action_q_steps += 1
 
-        actor_sums = {
-            "loss": 0.0,
-            "policy_loss": 0.0,
-            "state_action_mi": 0.0,
-            "entropy": 0.0,
-            "policy_entropy": 0.0,
-            "discrete_policy_entropy": 0.0,
-            "magnitude_entropy": 0.0,
-            "approx_kl": 0.0,
-            "clipfrac": 0.0,
-        }
+        if self.counterfactual_actor_weight > 0.0:
+            with torch.no_grad():
+                q_advantages, q_valid = self._counterfactual_actor_advantages(
+                    counterfactual_values,
+                    counterfactual_masks,
+                    actions,
+                )
+                weight = self.counterfactual_actor_weight
+                blended = (
+                    (1.0 - weight) * advantages + weight * q_advantages
+                )
+                advantages = torch.where(
+                    q_valid, blended, advantages
+                ).clamp(-self.adv_clip, self.adv_clip).detach()
+
+        actor_loss_sum = 0.0
+        actor_grad_sum = 0.0
+        actor_grad_clip_count = 0
+        policy_loss_sum = 0.0
+        entropy_sum = 0.0
+        kl_sum = 0.0
+        clipfrac_sum = 0.0
         actor_steps = 0
         stopped_early_kl = False
-        actor_params = self.net.actor_parameters()
-        for _ in range(max(1, int(epochs))):
-            epoch_kl_sum = 0.0
-            epoch_kl_steps = 0
-            idx = torch.randperm(n, device=self.device)
-            for start in range(0, n, effective_batch_size):
-                j = idx[start : start + effective_batch_size]
-                s_b = s_all[j]
-                a_b = a_all[j]
-                adv_b = lagrangian_adv[j].detach().clamp(-self.adv_clip, self.adv_clip)
-                action_features_b = (
-                    action_features_all[j].detach()
-                    if action_features_all is not None
-                    else None
-                )
-                action_mask_b = action_masks_all[j].detach()
-                old_logp_b = old_logp_all[j].detach()
-                exploration_b = exploration_all[j].detach()
-                magnitude_b = magnitude_all[j].detach()
-                logits, mag_mean, mag_logstd, _, _, _, _, _ = self.net(
-                    s_b, action_features_b
+        actor_parameters = self.net.actor_parameters()
+        for _ in range(actor_epoch_count):
+            order = torch.randperm(count, device=self.device)
+            for start in range(0, count, effective_batch_size):
+                batch = order[start : start + effective_batch_size]
+                batch_indices = batch.detach().cpu().tolist()
+                logits = self._actor_logits_batch(
+                    states[batch],
+                    [actor_hiddens[index] for index in batch_indices],
                 )
                 logits = self._masked_logits(
                     torch.nan_to_num(
                         logits, nan=0.0, posinf=20.0, neginf=-20.0
                     ).clamp(-20.0, 20.0),
-                    action_mask_b,
+                    masks[batch],
                 )
-                if not torch.isfinite(logits).all():
-                    continue
-                dist = self._exploratory_distribution(
-                    logits, exploration_b, action_mask_b
+                # PPO ratios compare the exact behavior mixtures used to
+                # collect these actions. Entropy regularization is applied to
+                # the learned actor itself, not inflated by uniform coverage.
+                distribution = self._exploratory_distribution(
+                    logits, exploration_rates[batch], masks[batch]
                 )
-                policy_dist = torch.distributions.Categorical(logits=logits)
-                chosen_mean = mag_mean.gather(
-                    1, a_b.reshape(-1, 1)
-                ).squeeze(1)
-                chosen_logstd = mag_logstd.gather(
-                    1, a_b.reshape(-1, 1)
-                ).squeeze(1)
-                mag_dist = self._magnitude_dist(chosen_mean, chosen_logstd)
-                mag_logp = torch.where(
-                    a_b == 0,
-                    torch.zeros_like(magnitude_b),
-                    self._magnitude_log_prob(mag_dist, magnitude_b),
+                policy_distribution = torch.distributions.Categorical(
+                    logits=logits
                 )
-                logp = dist.log_prob(a_b) + mag_logp
-                ratio = torch.exp(logp - old_logp_b)
-                ratio = torch.nan_to_num(
-                    ratio,
-                    nan=1.0,
-                    posinf=1.0 + self.clip_eps,
-                    neginf=1.0 - self.clip_eps,
-                )
-                unclipped = ratio * adv_b
+                new_logp = distribution.log_prob(actions[batch])
+                log_ratio = new_logp - old_logp[batch]
+                ratio = torch.exp(log_ratio)
+                unclipped = ratio * advantages[batch]
                 clipped = torch.clamp(
                     ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps
-                ) * adv_b
-                policy_loss = -torch.min(unclipped, clipped).mean()
-                non_hold = (a_b != 0).to(dtype=logits.dtype)
-                mag_entropy_items = mag_dist.entropy()
-                mag_entropy = (
-                    (mag_entropy_items * non_hold).sum()
-                    / non_hold.sum().clamp(min=1.0)
-                )
-                discrete_entropy = policy_dist.entropy().mean()
-                exploratory_entropy = dist.entropy().mean()
-                entropy = exploratory_entropy + mag_entropy
-                raw_probs_b = torch.softmax(logits, dim=-1)
-                economic_probs_b = self._economic_group_probabilities(
-                    logits,
-                    action_features_b,
-                )
-                if economic_probs_b is not None:
-                    # Specialize economically meaningful direction, not raw
-                    # action identity. Columns 10:14 are representative fare
-                    # impacts for short through long trips. Grouping actions
-                    # into lower / neutral / higher fare prevents a policy
-                    # from earning this bonus through low-ranked probability
-                    # tails, airport-only chatter, or nearly equivalent
-                    # coefficient actions.
-                    state_action_mi_b = self._mutual_information(
-                        economic_probs_b,
-                        torch.relu(adv_b),
+                ) * advantages[batch]
+                batch_weights = sample_weights[batch]
+                batch_weight_sum = batch_weights.sum().clamp(min=1e-8)
+                policy_loss = -(
+                    torch.min(unclipped, clipped) * batch_weights
+                ).sum() / batch_weight_sum
+                entropy = (
+                    policy_distribution.entropy() * batch_weights
+                ).sum() / batch_weight_sum
+                counterfactual_policy_loss = (
+                    self._observed_counterfactual_policy_loss(
+                        logits,
+                        counterfactual_values[batch],
+                        counterfactual_masks[batch],
+                        batch_weights,
                     )
-                else:
-                    state_action_mi_b = self._mutual_information(
-                        raw_probs_b,
-                        torch.relu(adv_b),
-                    )
-                logratio = logp - old_logp_b
-                approx_kl = ((torch.exp(logratio) - 1.0) - logratio).mean()
-                clipfrac = (
-                    (ratio - 1.0).abs() > self.clip_eps
-                ).float().mean()
+                    if self.counterfactual_actor_weight > 0.0
+                    else logits.sum() * 0.0
+                )
+                # PPO remains the primary long-horizon objective. The lower-
+                # weight contextual term resolves only which measured branch
+                # should receive probability, under the same pre-step KL gate.
+                counterfactual_policy_coeff = (
+                    0.10 * self.counterfactual_actor_weight
+                )
                 actor_loss = (
                     policy_loss
-                    - self.ent_coeff * (discrete_entropy + mag_entropy)
-                    - self.state_action_mi_coeff * state_action_mi_b
+                    - self.ent_coeff * entropy
+                    + counterfactual_policy_coeff
+                    * counterfactual_policy_loss
                 )
                 if not torch.isfinite(actor_loss):
                     continue
+                approx_kl = (
+                    ((ratio - 1.0) - log_ratio) * batch_weights
+                ).sum() / batch_weight_sum
+                clipfrac = (
+                    (ratio - 1.0).abs() > self.clip_eps
+                ).float()
+                clipfrac = (
+                    clipfrac * batch_weights
+                ).sum() / batch_weight_sum
+                kl_value = float(approx_kl.item())
+                # This is an early-stop gate, not a post-hoc diagnostic. Once
+                # the current policy is already outside the KL trust region,
+                # do not apply one additional optimizer step that pushes it
+                # farther away from the behavior policy.
+                if self.hard_kl_stop and kl_value > self.target_kl:
+                    stopped_early_kl = True
+                    break
                 self.actor_opt.zero_grad(set_to_none=True)
                 actor_loss.backward()
-                nn.utils.clip_grad_norm_(actor_params, self.max_grad_norm)
+                actor_grad_norm = nn.utils.clip_grad_norm_(
+                    actor_parameters, self.max_grad_norm
+                )
+                actor_grad_sum += float(actor_grad_norm.item())
+                actor_grad_clip_count += int(
+                    float(actor_grad_norm.item()) > self.max_grad_norm
+                )
                 self.actor_opt.step()
                 actor_steps += 1
-                actor_sums["loss"] += float(actor_loss.item())
-                actor_sums["policy_loss"] += float(policy_loss.item())
-                actor_sums["state_action_mi"] += float(state_action_mi_b.item())
-                actor_sums["entropy"] += float(entropy.item())
-                actor_sums["policy_entropy"] += float(discrete_entropy.item())
-                actor_sums["discrete_policy_entropy"] += float(discrete_entropy.item())
-                actor_sums["magnitude_entropy"] += float(mag_entropy.item())
-                actor_sums["approx_kl"] += float(approx_kl.item())
-                actor_sums["clipfrac"] += float(clipfrac.item())
-                epoch_kl_sum += float(approx_kl.item())
-                epoch_kl_steps += 1
-            # A noisy minibatch must not terminate the entire actor update.
-            # Trust-region stopping is based on the completed epoch average.
-            if (
-                epoch_kl_steps > 0
-                and epoch_kl_sum / epoch_kl_steps > 1.5 * self.target_kl
-            ):
-                stopped_early_kl = True
+                actor_loss_sum += float(actor_loss.item())
+                policy_loss_sum += float(policy_loss.item())
+                entropy_sum += float(entropy.item())
+                counterfactual_policy_loss_sum += float(
+                    counterfactual_policy_loss.item()
+                )
+                kl_sum += kl_value
+                clipfrac_sum += float(clipfrac.item())
             if stopped_early_kl:
                 break
 
-        last = {
-            "loss": float(actor_sums["loss"] / max(1, actor_steps)),
-            "policy_loss": float(actor_sums["policy_loss"] / max(1, actor_steps)),
-            "value_loss": float(critic_sums["value_loss"] / max(1, critic_steps)),
-            "constraint_value_loss": float(
-                critic_sums["constraint_value_loss"] / max(1, critic_steps)
-            ),
-            "risk_value_loss": float(
-                critic_sums["risk_value_loss"] / max(1, critic_steps)
-            ),
-            "response_loss": float(response_loss_sum / max(1, response_steps)),
-            "action_q_loss": float(
-                critic_sums["action_q_loss"] / max(1, critic_steps)
-            ),
-            "critic_loss": float(
-                critic_sums["critic_loss"] / max(1, critic_steps)
-            ),
-            "critic_grad_norm": float(
-                critic_sums["critic_grad_norm"] / max(1, critic_steps)
-            ),
-            "lagrangian_adv_mean": float(lag_mean.item()),
-            "lagrangian_adv_std": float(lag_std.item()),
-            "constraint_lambda_mean": float(lambda_vec.mean().item()),
-            "risk_coeff": float(effective_risk_coeff),
-            "constraints_active": bool(self.constraints_active),
-            "risk_active": bool(self.risk_active),
-            "entropy": float(actor_sums["entropy"] / max(1, actor_steps)),
-            "policy_entropy": float(
-                actor_sums["policy_entropy"] / max(1, actor_steps)
-            ),
-            "discrete_policy_entropy": float(
-                actor_sums["discrete_policy_entropy"] / max(1, actor_steps)
-            ),
-            "magnitude_entropy": float(
-                actor_sums["magnitude_entropy"] / max(1, actor_steps)
-            ),
-            "state_action_mi": float(
-                actor_sums["state_action_mi"] / max(1, actor_steps)
-            ),
-            "state_action_mutual_information": float(state_action_mi),
-            "raw_policy_entropy_fraction": float(raw_entropy_fraction),
-            "raw_policy_hold_probability": float(raw_hold_probability),
-            "raw_policy_argmax_concentration": float(raw_argmax_concentration),
-            "state_action_sensitivity": float(state_action_sensitivity),
-            "approx_kl": float(actor_sums["approx_kl"] / max(1, actor_steps)),
-            "target_kl": float(self.target_kl),
-            "clipfrac": float(actor_sums["clipfrac"] / max(1, actor_steps)),
-            "update_performed": bool(actor_steps > 0 and critic_steps > 0),
-            "run_mode": "training_update",
-            "explained_variance": 0.0,
-            "ent_coeff": float(self.ent_coeff),
-            "clip_eps": float(self.clip_eps),
-            "lr": float(self.curr_lr),
-            "critic_lr": float(
-                self.critic_opt.param_groups[0]["lr"]
-            ),
-            "exploration_rate": float(self.exploration_rate),
-            "action_coverage": self._action_coverage(),
-            "rollout_action_diversity": float(unique_action_fraction),
-            "rollout_reward_std": float(
-                torch.std(reward_all, unbiased=False).item()
-            ) if reward_all.numel() > 1 else 0.0,
-            "credited_reward_std": float(
-                torch.std(credited_reward_all, unbiased=False).item()
-            ) if credited_reward_all.numel() > 1 else 0.0,
-            "critic_target_mean": float(ret.mean().item()),
-            "critic_target_std": float(
-                ret.std(unbiased=False).item()
-            ) if ret.numel() > 1 else 0.0,
-            "delayed_reward_blend": float(self.delayed_reward_blend),
-            "continuous_magnitude_mean": float(
-                torch.mean(magnitude_all).item()
-            ) if magnitude_all.numel() > 0 else 0.0,
-            "continuous_magnitude_std": float(
-                torch.std(magnitude_all, unbiased=False).item()
-            ) if magnitude_all.numel() > 1 else 0.0,
-            "learning_signal_ok": bool(
-                actor_steps > 0
-                and critic_steps > 0
-                and torch.isfinite(lag_std)
-            ),
-            "optimizer_steps": int(actor_steps + critic_steps + response_steps),
-            "actor_optimizer_steps": int(actor_steps),
-            "critic_optimizer_steps": int(critic_steps),
-            "response_optimizer_steps": int(response_steps),
-            "stopped_early_kl": bool(stopped_early_kl),
-            "rollout_size": int(n),
-            "effective_batch_size": int(effective_batch_size),
-        }
-
-        feasible_counts = action_masks_all.sum(dim=-1).to(dtype=torch.float32).clamp(min=1.0)
-        max_entropy = float(torch.log(feasible_counts).mean().item())
-        self.last_policy_entropy_fraction = float(
-            np.clip(last["discrete_policy_entropy"] / max_entropy, 0.0, 1.0)
-            if max_entropy > 1e-8
-            else 0.0
-        )
-        last["policy_entropy_fraction"] = self.last_policy_entropy_fraction
-        last["transition_duration_mean"] = float(
-            np.mean([tr.duration for tr in self.buf])
-        )
-        last["transition_discount_mean"] = float(discount_all.mean().item())
-        last["truncation_count"] = int(truncated_all.sum().item())
-
         with torch.no_grad():
-            _, _, _, new_value_norm, _, _, _, _ = self.net(
-                s_all, action_features_all
+            new_values, _ = self._critic_outputs_batch(
+                states, critic_states, critic_hiddens
             )
-            new_value = self.reward_normalizer.denormalize(new_value_norm)
-            ret_var = torch.var(ret, unbiased=False)
-            if torch.isfinite(ret_var) and float(ret_var.item()) > 1e-8:
-                prediction_error = torch.var(ret - new_value, unbiased=False)
-                last["explained_variance"] = float(
+            diagnostic_weight_sum = sample_weights.sum().clamp(min=1e-8)
+            target_mean_weighted = (
+                critic_targets * sample_weights
+            ).sum() / diagnostic_weight_sum
+            return_variance = (
+                sample_weights
+                * (critic_targets - target_mean_weighted).square()
+            ).sum() / diagnostic_weight_sum
+            explained_variance = 0.0
+            if float(return_variance.item()) > 1e-8:
+                residuals = critic_targets - new_values
+                residual_mean = (
+                    residuals * sample_weights
+                ).sum() / diagnostic_weight_sum
+                residual_variance = (
+                    sample_weights * (residuals - residual_mean).square()
+                ).sum() / diagnostic_weight_sum
+                explained_variance = float(
                     torch.clamp(
-                        1.0 - prediction_error / ret_var, -1.0, 1.0
+                        1.0
+                        - residual_variance / return_variance,
+                        -1.0,
+                        1.0,
                     ).item()
                 )
 
+        feasible_count = int(masks.any(dim=0).sum().item())
+        action_diversity = float(
+            torch.unique(actions).numel() / max(1, feasible_count)
+        )
+        magnitudes = (actions != 0).float()
+        max_entropy = float(
+            torch.log(masks.sum(dim=-1).float().clamp(min=1.0)).mean().item()
+        )
+        discrete_entropy = entropy_sum / max(1, actor_steps)
+        self.last_policy_entropy_fraction = float(
+            np.clip(discrete_entropy / max_entropy, 0.0, 1.0)
+            if max_entropy > 1e-8
+            else 0.0
+        )
+        self.last_raw_argmax_concentration = raw_argmax_concentration
+        self.last_state_action_sensitivity = state_action_sensitivity
+        self.last_state_action_mutual_information = 0.0
+
+        metrics = self._empty_update_metrics()
+        metrics.update(
+            {
+                "loss": actor_loss_sum / max(1, actor_steps),
+                "policy_loss": policy_loss_sum / max(1, actor_steps),
+                "value_loss": critic_loss_sum / max(1, critic_steps),
+                "critic_loss": critic_loss_sum / max(1, critic_steps),
+                "critic_grad_norm": critic_grad_sum / max(1, critic_steps),
+                "critic_grad_clip_fraction": float(
+                    critic_grad_clip_count / max(1, critic_steps)
+                ),
+                "actor_grad_norm": actor_grad_sum / max(1, actor_steps),
+                "actor_grad_clip_fraction": float(
+                    actor_grad_clip_count / max(1, actor_steps)
+                ),
+                "action_q_loss": action_q_loss_sum / max(1, action_q_steps),
+                "counterfactual_policy_loss": (
+                    counterfactual_policy_loss_sum / max(1, actor_steps)
+                ),
+                "lagrangian_adv_mean": float(advantage_mean.item()),
+                "lagrangian_adv_std": float(advantage_std.item()),
+                "entropy": discrete_entropy,
+                "policy_entropy": discrete_entropy,
+                "discrete_policy_entropy": discrete_entropy,
+                "raw_policy_entropy_fraction": raw_entropy_fraction,
+                "target_entropy_fraction": self.target_entropy_fraction,
+                "entropy_fraction_error": entropy_fraction_error,
+                "raw_policy_hold_probability": raw_hold_probability,
+                "raw_policy_argmax_concentration": raw_argmax_concentration,
+                "state_action_sensitivity": state_action_sensitivity,
+                "approx_kl": kl_sum / max(1, actor_steps),
+                "clipfrac": clipfrac_sum / max(1, actor_steps),
+                "update_performed": bool(actor_steps and critic_steps),
+                "run_mode": "training_update",
+                "explained_variance": explained_variance,
+                "ent_coeff": self.ent_coeff,
+                "exploration_rate": float(
+                    (
+                        exploration_rates * sample_weights
+                    ).sum().item()
+                    / max(1e-8, float(sample_weights.sum().item()))
+                ),
+                "action_coverage": self._action_coverage(),
+                "rollout_action_diversity": action_diversity,
+                "rollout_reward_std": float(raw_rewards.std(unbiased=False).item()),
+                "credited_reward_std": float(rewards.std(unbiased=False).item()),
+                "rollout_reward_exposure": rollout_reward_exposure,
+                "rollout_reward_rate_residual": float(
+                    rollout_reward_rate
+                    - float(
+                        (
+                            reward_baselines * reward_exposures
+                        ).sum().item()
+                        / max(1e-8, float(reward_exposures.sum().item()))
+                    )
+                ),
+                "reward_rate_segment_count": int(
+                    reward_rate_segments.numel()
+                ),
+                "reward_rate_segment_std": float(
+                    reward_rate_segments.std(unbiased=False).item()
+                    if reward_rate_segments.numel()
+                    else 0.0
+                ),
+                "reward_rate_lagged_baseline_fraction": float(
+                    reward_rate_lagged_baseline_fraction
+                ),
+                "opponent_segment_count": int(
+                    dones.sum().item()
+                    + (
+                        1
+                        if dones.numel()
+                        and float(dones[-1].item()) <= 0.0
+                        else 0
+                    )
+                ),
+                "opponent_regime_count": int(len(set(reward_regimes))),
+                "opponent_sample_weight_min": float(
+                    sample_weights.min().item()
+                ),
+                "opponent_sample_weight_max": float(
+                    sample_weights.max().item()
+                ),
+                "critic_target_mean": float(critic_targets.mean().item()),
+                "critic_target_std": float(
+                    critic_targets.std(unbiased=False).item()
+                ),
+                "gae_return_mean": float(returns.mean().item()),
+                "critic_value_scale": float(self.net.value_scale) if self.net.normalize_values else 1.0,
+                "gae_return_std": float(returns.std(unbiased=False).item()),
+                "critic_target_contract": (
+                    "actual_next_decision_td0"
+                    if self.td_value_targets
+                    else "gae_lambda_return"
+                ),
+                "average_reward_rate": float(
+                    self.average_reward_rate
+                    if self.reward_rate_beta > 0.0
+                    else rollout_reward_rate
+                ),
+                "reward_rate_beta": self.reward_rate_beta,
+                "center_rewards": self.center_rewards,
+                "continuous_magnitude_mean": float(magnitudes.mean().item()),
+                "continuous_magnitude_std": float(
+                    magnitudes.std(unbiased=False).item()
+                ),
+                "learning_signal_ok": bool(actor_steps and critic_steps),
+                "optimizer_steps": int(actor_steps + critic_steps),
+                "actor_optimizer_steps": int(actor_steps),
+                "actor_epochs_requested": int(actor_epoch_count),
+                "critic_epochs_requested": int(max(1, int(epochs))),
+                "critic_optimizer_steps": int(critic_steps),
+                "objective_q_optimizer_steps": int(action_q_steps),
+                "objective_q_update_calls": int(
+                    self.q_update_calls + int(action_q_steps > 0)
+                ),
+                "objective_optimizer_ready": bool(action_q_steps > 0),
+                "counterfactual_target_coverage": float(
+                    counterfactual_masks.float().mean().item()
+                ),
+                "counterfactual_actor_weight": self.counterfactual_actor_weight,
+                "potential_shaping_delta_mean": float(
+                    potential_deltas.mean() if potential_deltas.size else 0.0
+                ),
+                "stopped_early_kl": stopped_early_kl,
+                "rollout_size": int(count),
+                "effective_batch_size": effective_batch_size,
+                "policy_entropy_fraction": self.last_policy_entropy_fraction,
+                "transition_duration_mean": float(durations.mean()),
+                "transition_discount_mean": float(discounts.mean().item()),
+                "truncation_count": int(truncations.sum().item()),
+            }
+        )
         self.buf.clear()
         self.update_calls += 1
-        self._apply_control_floors()
-        last["ent_coeff"] = float(self.ent_coeff)
-        last["clip_eps"] = float(self.clip_eps)
-        last["lr"] = float(self.curr_lr)
-        last["exploration_rate"] = float(self.exploration_rate)
-        return last
+        self.q_update_calls += int(action_q_steps > 0)
+        # Hidden states were produced by the pre-update recurrent weights.
+        # Reusing them with the updated network mixes incompatible latent
+        # coordinate systems. The next action re-seeds memory from its full
+        # public frame stack.
+        self.reset_recurrent_state()
+        return metrics
 
     def optimizer_state_dict(self) -> Dict[str, object]:
-        return {
+        state: Dict[str, object] = {
             "actor": self.actor_opt.state_dict(),
             "critic": self.critic_opt.state_dict(),
-            "response": self.response_opt.state_dict(),
         }
+        if self.q_opt is not None:
+            state["q"] = self.q_opt.state_dict()
+        return state
 
     def load_optimizer_state_dict(self, state: Optional[Dict[str, object]]) -> None:
         if not state:
@@ -2119,30 +2865,45 @@ class PPOAgent:
             )
         self.actor_opt.load_state_dict(state["actor"])
         self.critic_opt.load_state_dict(state["critic"])
-        if "response" in state:
-            self.response_opt.load_state_dict(state["response"])
+        if self.q_opt is not None and "q" in state:
+            self.q_opt.load_state_dict(state["q"])
         self._set_learning_rates(self.curr_lr)
 
     def normalizer_state_dict(self) -> Dict[str, object]:
+        """Persist the optional continuing-task reward-rate estimator."""
+        if self.reward_rate_beta <= 0.0:
+            return {}
         return {
-            "reward": self.reward_normalizer.state_dict(),
-            "constraints": self.constraint_normalizer.state_dict(),
-            "risk": self.risk_normalizer.state_dict(),
+            "average_reward_rate": float(self.average_reward_rate),
+            "average_reward_initialized": bool(self.average_reward_initialized),
+            "reward_rate_beta": float(self.reward_rate_beta),
+            "reward_rate_by_regime": dict(self.reward_rate_by_regime),
         }
 
-    def load_normalizer_state_dict(self, state: Optional[Dict[str, object]]) -> None:
-        if not state:
+    def load_normalizer_state_dict(
+        self, state: Optional[Dict[str, object]]
+    ) -> None:
+        if not state or self.reward_rate_beta <= 0.0:
             return
-        self.reward_normalizer.load_state_dict(state.get("reward", {}))
-        self.constraint_normalizer.load_state_dict(state.get("constraints", {}))
-        self.risk_normalizer.load_state_dict(state.get("risk", {}))
+        saved_beta = float(state.get("reward_rate_beta", self.reward_rate_beta))
+        if not np.isclose(saved_beta, self.reward_rate_beta):
+            raise ValueError(
+                "reward-rate beta does not match the configured PPO agent: "
+                f"artifact={saved_beta}, runtime={self.reward_rate_beta}"
+            )
+        self.average_reward_rate = float(state.get("average_reward_rate", 0.0))
+        self.average_reward_initialized = bool(
+            state.get("average_reward_initialized", False)
+        )
+        saved_regimes = dict(state.get("reward_rate_by_regime", {}) or {})
+        self.reward_rate_by_regime = {
+            str(key): float(value)
+            for key, value in saved_regimes.items()
+            if np.isfinite(float(value))
+        }
 
     def _action_coverage(self) -> float:
-        if self.action_visits.size == 0:
-            return 1.0
-        eligible = self.action_ever_feasible
-        if not bool(np.any(eligible)):
+        if not bool(np.any(self.action_ever_feasible)):
             return 0.0
-        if self.min_action_visits <= 0:
-            return float(np.mean(self.action_visits[eligible] > 0))
-        return float(np.mean(self.action_visits[eligible] >= self.min_action_visits))
+        eligible = self.action_ever_feasible
+        return float(np.mean(self.action_visits[eligible] > 0))

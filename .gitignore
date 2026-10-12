@@ -7,4 +7,10 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.codex_deps/
 config/local.yaml
+
+# Public source datasets and normalized caches are reproducible downloads and
+# are intentionally kept out of version control.
+data/raw/
+data/processed/

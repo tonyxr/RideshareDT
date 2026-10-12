@@ -1,88 +1,128 @@
 from __future__ import annotations
 
-"""Platform-facing POMDP and constrained-control primitives.
+"""Platform-facing POMDP and robust objective-control primitives.
 
 The simulator may retain complete ground truth, while a firm receives only
 operational telemetry and noisy/delayed competitor quote probes.  Profit and
-market-share competitiveness are separate policy objectives with separate
+served-market competitiveness are separate policy objectives with separate
 reward mechanisms.  They intentionally share the same observation, action,
 PPO, staged-training, and reporting contracts.  Public quote gaps remain
 diagnostics rather than a proxy for competitiveness.  Service feasibility,
-waiting time, margin, and intervention stability remain genuine CMDP
-constraints.
+completed-market coverage, waiting time, and margin remain explicit audit
+channels for the named objectives.
 """
 
 from collections import deque
 from dataclasses import asdict, dataclass
-from typing import Any, Deque, Dict, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+
+from market_shocks import PUBLIC_SHOCK_FEATURE_KEYS
 
 
 SEGMENTS: Tuple[str, ...] = ("0_2", "2_5", "5_10", "10_plus")
 POLICY_OBJECTIVES: Tuple[str, ...] = (
     "profit_maximization",
+    "profit_with_dominance",
+    "profit_dominance_v30",
     "competitiveness",
-    "balanced",
-    "custom",
+    "profit_10_competitiveness_90",
+    "profit_30_competitiveness_70",
+    "profit_50_competitiveness_50",
+    "profit_70_competitiveness_30",
+    "profit_90_competitiveness_10",
 )
 
+OBJECTIVE_PROFIT_SHARES: Dict[str, float] = {
+    "profit_maximization": 1.0,
+    "profit_with_dominance": 1.0,
+    "profit_dominance_v30": 1.0,
+    "competitiveness": 0.0,
+    "profit_10_competitiveness_90": 0.10,
+    "profit_30_competitiveness_70": 0.30,
+    "profit_50_competitiveness_50": 0.50,
+    "profit_70_competitiveness_30": 0.70,
+    "profit_90_competitiveness_10": 0.90,
+}
 
-def policy_objective_defaults(objective: str) -> Dict[str, float]:
-    """Return the complete reward preset for a named policy objective.
+# Use the smallest non-degenerate economic decomposition for each objective.
+# Profit contains only profit terms. Competitiveness retains a small own-profit
+# term for sustainable service plus two completed-share terms. Zero-weight
+# terms remain visible in the common report schema but cannot send PPO credit.
+ENDPOINT_OBJECTIVE_REWARD_WEIGHTS: Dict[str, Dict[str, float]] = {
+    "profit_maximization": {
+        "own_profit": 0.80,
+        "profit_lead": 0.20,
+        "own_completed_share": 0.00,
+        "completed_share_lead": 0.00,
+    },
+    "profit_with_dominance": {
+        "own_profit": 1.00,
+        "profit_lead": 0.00,
+        "own_completed_share": 0.00,
+        "completed_share_lead": 0.00,
+    },
+    # v30 optimizes the reported monetary dominance metric directly. A separate
+    # own-profit bonus can reward an outcome whose profit lead has worsened.
+    "profit_dominance_v30": {
+        "own_profit": 0.00,
+        "profit_lead": 1.00,
+        "own_completed_share": 0.00,
+        "completed_share_lead": 0.00,
+    },
+    "competitiveness": {
+        "own_profit": 0.10,
+        "profit_lead": 0.00,
+        "own_completed_share": 0.20,
+        "completed_share_lead": 0.70,
+    },
+}
 
-    The profit preset intentionally reproduces the v6 reward weights.  The
-    other presets change only the economic objective; they do not swap the
-    policy architecture, observation model, action space, or training stages.
-    ``custom`` has no preset because its values come directly from the CLI or a
-    saved artifact.
-    """
+
+def objective_profit_share(objective: str) -> float:
+    """Return the preregistered profit share of an objective mixture."""
     name = str(objective or "profit_maximization").strip().lower()
-    if name not in POLICY_OBJECTIVES:
+    if name not in OBJECTIVE_PROFIT_SHARES:
         raise ValueError(
             f"policy objective must be one of {', '.join(POLICY_OBJECTIVES)}"
         )
-    presets: Dict[str, Dict[str, float]] = {
-        "profit_maximization": {
-            "long_term_profit_weight": 1.0,
-            "profit_dominance_weight": 0.10,
-            "market_share_competitiveness_weight": 0.0,
-            "market_share_target_gap": 0.10,
-            "market_share_gap_scale": 0.05,
-            "market_share_level_weight": 0.25,
-            "price_competitiveness_weight": 0.0,
-            "target_price_gap": 0.75,
-            "price_gap_reward_scale": 1.0,
-        },
-        "competitiveness": {
-            # Profitability is a certification constraint for this objective,
-            # never an additive source of reward. The learned target is a
-            # durable ten-point conditional choice-share lead, matching the
-            # intended market-leadership behavior.
-            "long_term_profit_weight": 0.0,
-            "profit_dominance_weight": 0.0,
-            "market_share_competitiveness_weight": 1.0,
-            "market_share_target_gap": 0.10,
-            "market_share_gap_scale": 0.05,
-            "market_share_level_weight": 0.25,
-            "price_competitiveness_weight": 0.0,
-            "target_price_gap": 0.75,
-            "price_gap_reward_scale": 1.0,
-        },
-        "balanced": {
-            "long_term_profit_weight": 0.70,
-            "profit_dominance_weight": 0.20,
-            "market_share_competitiveness_weight": 0.50,
-            "market_share_target_gap": 0.10,
-            "market_share_gap_scale": 0.05,
-            "market_share_level_weight": 0.25,
-            "price_competitiveness_weight": 0.0,
-            "target_price_gap": 0.75,
-            "price_gap_reward_scale": 1.0,
-        },
-        "custom": {},
+    return float(OBJECTIVE_PROFIT_SHARES[name])
+
+
+def objective_reward_weights(objective: str) -> Dict[str, float]:
+    """Return endpoint or preregistered convex-mixture economic weights."""
+    name = str(objective or "profit_maximization").strip().lower()
+    alpha = objective_profit_share(name)
+    if name in {"profit_with_dominance", "profit_dominance_v30"}:
+        return dict(ENDPOINT_OBJECTIVE_REWARD_WEIGHTS[name])
+    profit = ENDPOINT_OBJECTIVE_REWARD_WEIGHTS["profit_maximization"]
+    competitive = ENDPOINT_OBJECTIVE_REWARD_WEIGHTS["competitiveness"]
+    return {
+        key: float(alpha * profit[key] + (1.0 - alpha) * competitive[key])
+        for key in profit
     }
-    return dict(presets[name])
+
+
+def policy_objective_defaults(objective: str) -> Dict[str, float]:
+    """Return the complete, fixed reward preset for a named objective."""
+    name = str(objective or "profit_maximization").strip().lower()
+    weights = objective_reward_weights(name)
+    return {
+        "long_term_profit_weight": float(weights["own_profit"]),
+        "profit_dominance_weight": float(weights["profit_lead"]),
+        "market_share_competitiveness_weight": float(
+            weights["completed_share_lead"]
+        ),
+        "market_share_target_gap": 0.10,
+        "market_share_gap_scale": 0.10,
+        "market_share_level_weight": float(weights["own_completed_share"]),
+        "price_competitiveness_weight": 0.0,
+        "target_price_gap": 0.75,
+        "price_gap_reward_scale": 1.0,
+        "intervention_cost_weight": 0.0,
+        "reversal_cost_weight": 0.0,
+    }
 
 
 def conditional_competitive_shares(
@@ -191,45 +231,32 @@ class LongTermProfitRewardConfig:
 
     ``profit_per_request`` is contribution profit divided by *all incoming
     requests*, so it already incorporates price, conversion, fulfillment,
-    variable cost, and demand volume.  Relative profit is exactly
-    ``own_profit_per_request - rival_profit_per_request``; it is not revenue,
-    market share, margin, or profit per completed ride. ``asinh`` preserves the
-    sign and remains approximately linear around zero while preventing rare
-    market shocks from dominating a PPO rollout.
+    variable cost, and demand volume. The named profit reward is linear in this
+    quantity. A pointwise monotone nonlinear transform is not sufficient here:
+    under stochastic outcomes it can change the ordering of policies by
+    expected profit. Profit lead is a smaller competitive economic term; it is
+    not revenue, market share, margin, or profit per completed ride.
 
-    Named objectives do not infer behavior from weights:
-
-    * ``profit_maximization`` uses only own and relative contribution profit.
-    * ``competitiveness`` uses Firm 1's conditional two-firm choice share,
-      gated by Firm 1 fulfillment so unserviceable demand cannot earn a high
-      score.
-    * ``balanced`` deliberately combines the two mechanisms.
-    * ``custom`` preserves the legacy expert-weighted combination.
-
-    ``market_share_target_gap`` is the desired Firm 1 minus Firm 2 conditional
-    choice-share advantage. It is a certification threshold, not a saturating
-    reward target. ``market_share_gap_scale`` and ``market_share_level_weight``
-    are retained for old checkpoint compatibility. Quote-gap fields are
-    diagnostics only; named objectives never optimize them.
+    Both objectives draw from four reported linear economic outcomes: Firm 1
+    profit, its profit lead, its completed-request share, and its completed-
+    share lead. Zero-weight outcomes do not affect the selected objective.
+    Scales are unit conversions, not targets; rewards are never clipped. Quote
+    gaps, action changes, service thresholds, and terminal bonuses are
+    diagnostics only and cannot alter PPO credit.
     """
 
     objective_mode: str = "profit_maximization"
-    own_profit_scale: float = 4.0
-    profit_advantage_scale: float = 2.5
-    # Absolute contribution profit is the objective. Rival-relative profit is
-    # deliberately only a small tie-breaker and is gated by own profitability,
-    # so PPO cannot earn a high return merely by winning a destructive price war.
-    own_profit_weight: float = 1.0
-    profit_advantage_weight: float = 0.10
+    own_profit_scale: float = 2.0
+    profit_advantage_scale: float = 1.0
+    own_profit_weight: float = 0.0
+    profit_advantage_weight: float = 1.0
     dominance_quality_scale: float = 4.0
     market_share_competitiveness_weight: float = 0.0
     market_share_target_gap: float = 0.10
-    market_share_gap_scale: float = 0.05
+    market_share_gap_scale: float = 0.10
+    own_completed_share_scale: float = 0.40
     market_share_level_weight: float = 0.25
-    # Competitiveness is valuable only when the platform can serve the demand
-    # it wins. Below this floor the reward subtracts twice the service
-    # shortfall, giving PPO a direct reason to raise/rebalance price instead of
-    # continuing an unfulfillable price war.
+    # Retained for report compatibility; service never enters either reward.
     market_share_service_floor: float = 0.78
     # Deprecated reward field retained so old artifacts deserialize. Public
     # quote gaps are diagnostics/constraints and never enter named rewards.
@@ -238,8 +265,12 @@ class LongTermProfitRewardConfig:
     price_gap_scale: float = 1.0
     intervention_cost_weight: float = 0.0
     reversal_cost_weight: float = 0.0
-    minimum_reward: float = -2.0
-    maximum_reward: float = 2.0
+    # Retained only for report compatibility; direct rewards are not clipped.
+    minimum_reward: float = 0.0
+    maximum_reward: float = 1.0
+    # Used only by the opt-in v30 episode tracker.  Existing objectives retain
+    # their exact step rewards and receive no terminal reward.
+    terminal_profit_dominance_weight: float = 1.0
 
     def __post_init__(self) -> None:
         objective = str(self.objective_mode or "").strip().lower()
@@ -257,6 +288,7 @@ class LongTermProfitRewardConfig:
                 self.market_share_competitiveness_weight,
                 self.market_share_target_gap,
                 self.market_share_gap_scale,
+                self.own_completed_share_scale,
                 self.market_share_level_weight,
                 self.market_share_service_floor,
                 self.price_competitiveness_weight,
@@ -266,6 +298,7 @@ class LongTermProfitRewardConfig:
                 self.reversal_cost_weight,
                 self.minimum_reward,
                 self.maximum_reward,
+                self.terminal_profit_dominance_weight,
             ],
             dtype=float,
         )
@@ -276,6 +309,7 @@ class LongTermProfitRewardConfig:
             or self.profit_advantage_scale <= 0.0
             or self.dominance_quality_scale <= 0.0
             or self.market_share_gap_scale <= 0.0
+            or self.own_completed_share_scale <= 0.0
             or self.price_gap_scale <= 0.0
         ):
             raise ValueError("long-term profit reward scales must be positive")
@@ -292,28 +326,10 @@ class LongTermProfitRewardConfig:
             raise ValueError("market_share_level_weight must be in [0, 1]")
         if not 0.0 <= self.market_share_service_floor <= 1.0:
             raise ValueError("market_share_service_floor must be in [0, 1]")
-        relevant_weight = {
-            "profit_maximization": (
-                self.own_profit_weight + self.profit_advantage_weight
-            ),
-            "competitiveness": self.market_share_competitiveness_weight,
-            "balanced": (
-                self.own_profit_weight
-                + self.profit_advantage_weight
-                + self.market_share_competitiveness_weight
-            ),
-            "custom": (
-                self.own_profit_weight
-                + self.profit_advantage_weight
-                + self.market_share_competitiveness_weight
-            ),
-        }[objective]
-        if relevant_weight <= 0.0:
-            raise ValueError(
-                f"{objective} requires a positive objective-relevant reward weight"
-            )
         if self.intervention_cost_weight < 0.0 or self.reversal_cost_weight < 0.0:
             raise ValueError("long-term profit action costs must be non-negative")
+        if self.terminal_profit_dominance_weight < 0.0:
+            raise ValueError("terminal profit-dominance weight must be non-negative")
         if self.minimum_reward >= self.maximum_reward:
             raise ValueError("minimum_reward must be smaller than maximum_reward")
 
@@ -323,11 +339,17 @@ class LongTermProfitRewardConfig:
             + self.profit_advantage_weight
             + self.market_share_competitiveness_weight
         )
+        if total <= 0.0:
+            return (0.0, 0.0, 0.0)
         return (
             float(self.own_profit_weight / total),
             float(self.profit_advantage_weight / total),
             float(self.market_share_competitiveness_weight / total),
         )
+
+    def economic_weights(self) -> Dict[str, float]:
+        """The four active weights; legacy tunable fields cannot alter them."""
+        return objective_reward_weights(self.objective_mode)
 
 
 class _ObjectiveRewardBase:
@@ -358,16 +380,27 @@ class _ObjectiveRewardBase:
         rival_profit = float(np.nan_to_num(rival_profit_per_request, nan=0.0))
         intervention = float(np.clip(intervention_magnitude, 0.0, 1.0))
         reversal_flag = float(np.clip(reversal, 0.0, 1.0))
-        own_utility = float(np.arcsinh(own_profit / c.own_profit_scale))
+        # These bounded profit utilities are retained for explicit balanced and
+        # custom objectives. Named profit maximization uses the separate exact
+        # linear own-profit signal below, so its ordering cannot be changed by
+        # clipping or nonlinear transformation. Risk, service, coverage, and
+        # margin remain separate audit and feasibility channels.
+        profit_gain_utility = float(max(0.0, own_profit) / c.own_profit_scale)
+        profit_loss_utility = float(max(0.0, -own_profit) / c.own_profit_scale)
+        scaled_profit = float(own_profit / c.own_profit_scale)
+        own_utility = float(
+            0.5 * (1.0 + scaled_profit / (1.0 + abs(scaled_profit)))
+        )
         advantage_utility = float(
             np.tanh((own_profit - rival_profit) / c.profit_advantage_scale)
         )
         profit_quality = float(
             1.0 - np.exp(-max(0.0, own_profit) / c.dominance_quality_scale)
         )
-        # Explicit market-share inputs use the conditional two-firm choice
-        # definition. The completed-share aliases remain only so old model
-        # artifacts and callers can still be evaluated.
+        # Explicit market-share inputs are completed rides divided by all
+        # incoming requests. This makes the optimized signal include both
+        # customer choice and successful fulfillment; a policy cannot improve
+        # it by winning a vanishing conditional market while serving nobody.
         own_share = float(np.clip(
             np.nan_to_num(
                 own_completed_share
@@ -395,6 +428,39 @@ class _ObjectiveRewardBase:
         share_gap_error = float(
             share_advantage - c.market_share_target_gap
         )
+        # Legacy target-attainment diagnostics are retained for old report
+        # schemas. Named competitiveness never consumes them; its active
+        # reward is the unclipped linear completed-share lead below.
+        market_share_target_level = float(
+            np.clip(0.5 * (1.0 + c.market_share_target_gap), 1e-6, 1.0)
+        )
+        target_gap = float(c.market_share_target_gap)
+        if target_gap > 1e-6:
+            recovery_scale = float(max(
+                target_gap,
+                c.market_share_gap_scale,
+            ))
+            market_share_target_progress = float(min(
+                1.0,
+                np.exp(
+                    np.log(2.0)
+                    * (share_advantage - target_gap)
+                    / recovery_scale
+                ),
+            ))
+        else:
+            # A zero-gap objective regards parity as attainment.  Preserve a
+            # smooth recovery signal on the losing side using the configured
+            # share scale.
+            market_share_target_progress = float(
+                1.0
+                if share_advantage >= 0.0
+                else np.exp(
+                    np.log(2.0)
+                    * share_advantage
+                    / max(c.market_share_gap_scale, 1e-6)
+                )
+            )
         share_dominance_utility = float(
             0.5
             * (
@@ -404,17 +470,20 @@ class _ObjectiveRewardBase:
                 )
             )
         )
-        # Dense, monotone action credit. Unlike the former tanh-at-target
-        # objective, this continues to distinguish every improvement in Firm
-        # 1's share. The explicit service shortfall makes an unfulfillable
-        # near-monopoly worse than a smaller durable lead; without it, share
-        # times fulfillment still overvalued extreme discounting.
+        # Retain the legacy service-adjusted share utility only for
+        # backward-compatible report columns. Named objectives do not use it;
+        # their four active terms are the linear economic outcomes above.
         service_shortfall = float(max(
             0.0, c.market_share_service_floor - fulfillment_gate
         ))
-        service_shortfall_penalty = float(2.0 * service_shortfall)
+        # A linear penalty is intentionally steep near the floor.  With a
+        # quadratic term, an almost-monopoly at 67% fulfillment could still
+        # outrank a durable 75/25 lead at 80% fulfillment because the local
+        # penalty was too small.
+        service_shortfall_penalty = float(5.0 * service_shortfall)
+        target_shortfall = float(max(0.0, -share_gap_error))
         share_utility = float(
-            own_share * fulfillment_gate - service_shortfall_penalty
+            share_advantage - service_shortfall_penalty
         )
         observed_gap = float(
             c.price_gap_target
@@ -449,7 +518,13 @@ class _ObjectiveRewardBase:
         intervention_cost = float(c.intervention_cost_weight * intervention)
         reversal_cost = float(c.reversal_cost_weight * reversal_flag)
         return {
+            "reward_own_profit_linear": float(own_profit / c.own_profit_scale),
+            "reward_profit_advantage_linear": float(
+                (own_profit - rival_profit) / c.profit_advantage_scale
+            ),
             "reward_own_profit_utility": own_utility,
+            "reward_profit_gain_utility": profit_gain_utility,
+            "reward_profit_loss_utility": profit_loss_utility,
             "reward_profit_advantage_utility": advantage_utility,
             "reward_profit_quality_gate": profit_quality,
             "reward_market_share_utility": share_utility,
@@ -462,6 +537,13 @@ class _ObjectiveRewardBase:
             "reward_market_share_service_shortfall": service_shortfall,
             "reward_market_share_service_penalty": service_shortfall_penalty,
             "reward_market_share": own_share,
+            "reward_market_share_linear": own_share,
+            "reward_own_completed_share_linear": float(
+                own_share / c.own_completed_share_scale
+            ),
+            "reward_market_share_advantage_linear": float(
+                share_advantage / c.market_share_gap_scale
+            ),
             "reward_rival_market_share": rival_share,
             "reward_completed_share": own_share,
             "reward_rival_completed_share": rival_share,
@@ -469,7 +551,15 @@ class _ObjectiveRewardBase:
             "reward_market_share_target_gap": float(
                 c.market_share_target_gap
             ),
+            "reward_market_share_target_level": market_share_target_level,
+            "reward_market_share_target_progress": (
+                market_share_target_progress
+            ),
+            "reward_market_share_target_achieved": float(
+                share_advantage >= c.market_share_target_gap
+            ),
             "reward_market_share_gap_error": share_gap_error,
+            "reward_market_share_target_shortfall": target_shortfall,
             "reward_price_competitiveness_utility": competitiveness_utility,
             "reward_price_gap": observed_gap,
             "reward_price_gap_target": float(c.price_gap_target),
@@ -489,123 +579,501 @@ class _ObjectiveRewardBase:
         self,
         metrics: Dict[str, float],
         *,
-        own_component: float,
-        advantage_component: float,
-        competitiveness_component: float,
+        own_profit_component: float,
+        profit_lead_component: float,
+        own_share_component: float,
+        share_lead_component: float,
     ) -> Dict[str, float]:
-        c = self.config
+        weights = self.config.economic_weights()
         base = float(
-            own_component + advantage_component + competitiveness_component
-        )
-        raw_reward = float(
-            base
-            - metrics["reward_intervention_cost"]
-            - metrics["reward_reversal_cost"]
+            own_profit_component
+            + profit_lead_component
+            + own_share_component
+            + share_lead_component
         )
         return {
-            "reward": float(
-                np.clip(raw_reward, c.minimum_reward, c.maximum_reward)
-            ),
-            "reward_raw": raw_reward,
+            "reward": base,
+            "reward_raw": base,
             "reward_base": base,
-            "reward_own_profit_component": float(own_component),
-            "reward_profit_advantage_component": float(advantage_component),
+            "reward_own_profit_component": float(own_profit_component),
+            "reward_profit_advantage_component": float(profit_lead_component),
             "reward_market_share_competitiveness_component": float(
-                competitiveness_component
+                own_share_component + share_lead_component
+            ),
+            "reward_market_share_level_component": float(own_share_component),
+            "reward_market_share_advantage_component": float(
+                share_lead_component
             ),
             "reward_price_competitiveness_component": 0.0,
+            "reward_applied_action_regularization": 0.0,
+            "reward_active_component_count": float(sum(
+                float(value) > 0.0 for value in weights.values()
+            )),
+            "reward_weight_own_profit": float(weights["own_profit"]),
+            "reward_weight_profit_lead": float(weights["profit_lead"]),
+            "reward_weight_own_completed_share": float(
+                weights["own_completed_share"]
+            ),
+            "reward_weight_completed_share_lead": float(
+                weights["completed_share_lead"]
+            ),
             **metrics,
         }
 
 
 class ProfitMaximizationReward(_ObjectiveRewardBase):
-    """V6 economic objective with an explicitly defined relative-profit term."""
+    """Profit-only two-term normalized economic reward."""
 
-    mechanism_name = "profit_maximization_v6"
+    mechanism_name = "economic_profit_focus_v22"
 
     def compute(self, **kwargs: float) -> Dict[str, float]:
         metrics = self._metrics(**kwargs)
-        c = self.config
+        weights = self.config.economic_weights()
         return self._finish(
             metrics,
-            own_component=(
-                c.own_profit_weight * metrics["reward_own_profit_utility"]
+            own_profit_component=(
+                weights["own_profit"] * metrics["reward_own_profit_linear"]
             ),
-            advantage_component=(
-                c.profit_advantage_weight
-                * metrics["reward_profit_quality_gate"]
-                * metrics["reward_profit_advantage_utility"]
+            profit_lead_component=(
+                weights["profit_lead"]
+                * metrics["reward_profit_advantage_linear"]
             ),
-            competitiveness_component=0.0,
+            own_share_component=(
+                weights["own_completed_share"]
+                * metrics["reward_own_completed_share_linear"]
+            ),
+            share_lead_component=(
+                weights["completed_share_lead"]
+                * metrics["reward_market_share_advantage_linear"]
+            ),
         )
+
+
+class ProfitDominanceReward(_ObjectiveRewardBase):
+    """Own-minus-rival contribution profit, with no competing bonus or penalty.
+
+    This relative objective does not guarantee positive absolute profit; both
+    firms' absolute profits must still be reported, independently of reward.
+    """
+
+    mechanism_name = "profit_dominance_with_terminal_foresight_v30"
+
+    def compute(self, **kwargs: float) -> Dict[str, float]:
+        metrics = self._metrics(**kwargs)
+        weights = self.config.economic_weights()
+        return self._finish(
+            metrics,
+            own_profit_component=(
+                weights["own_profit"] * metrics["reward_own_profit_linear"]
+            ),
+            profit_lead_component=(
+                weights["profit_lead"]
+                * metrics["reward_profit_advantage_linear"]
+            ),
+            own_share_component=0.0,
+            share_lead_component=0.0,
+        )
+
+
+class EpisodeProfitDominanceTracker:
+    """Terminal objective: horizon * final-quarter mean monetary profit lead.
+
+    The horizon factor gives the late-performance objective the same order of
+    magnitude as the dense episode sum. The tail accumulator is critic-only
+    training context; the deployed actor sees just the public episode clock.
+    """
+
+    def __init__(self, config: LongTermProfitRewardConfig, horizon_steps: int = 1) -> None:
+        self.config = config
+        self.reset(horizon_steps=horizon_steps)
+
+    def reset(self, *, horizon_steps: Optional[int] = None) -> None:
+        if horizon_steps is not None:
+            if int(horizon_steps) != horizon_steps or horizon_steps <= 0:
+                raise ValueError("episode horizon must be a positive integer")
+            self.horizon_steps = int(horizon_steps)
+        self._count = 0
+        self._tail_profit_lead_sum = 0.0
+        self._tail_count = 0
+
+    def record(self, *, own_profit_per_request: float, rival_profit_per_request: float) -> None:
+        own = float(own_profit_per_request)
+        rival = float(rival_profit_per_request)
+        if not np.isfinite(own) or not np.isfinite(rival):
+            raise ValueError("episode profit observations must be finite")
+        if self._count >= int(0.75 * self.horizon_steps):
+            self._tail_profit_lead_sum += own - rival
+            self._tail_count += 1
+        self._count += 1
+
+    def critic_context(self) -> np.ndarray:
+        return np.asarray([np.arcsinh(
+            self._tail_profit_lead_sum / self.config.profit_advantage_scale
+        )], dtype=np.float32)
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def snapshot(self) -> Dict[str, float]:
+        """Return the exact in-progress episode totals.
+
+        Checkpoint validation runs counterfactual market episodes on the same
+        ``Core`` instance.  These totals therefore have to be restored along
+        with the market and policy execution state before online training
+        resumes.
+        """
+        return {
+            "count": int(self._count),
+            "horizon_steps": self.horizon_steps,
+            "tail_profit_lead_sum": self._tail_profit_lead_sum,
+            "tail_count": self._tail_count,
+        }
+
+    def restore(self, snapshot: Mapping[str, float]) -> None:
+        raw_count = snapshot["count"]
+        count = int(raw_count)
+        horizon = int(snapshot["horizon_steps"])
+        tail_count = int(snapshot["tail_count"])
+        tail_sum = float(snapshot["tail_profit_lead_sum"])
+        if (horizon <= 0 or not np.isfinite(tail_sum)
+                or count != raw_count or not 0 <= tail_count <= count):
+            raise ValueError("invalid episode profit-dominance snapshot")
+        self._count = count
+        self.horizon_steps = horizon
+        self._tail_count = tail_count
+        self._tail_profit_lead_sum = tail_sum
+
+    def terminal(self, *, reset: bool = True) -> Dict[str, float]:
+        if self._count <= 0:
+            result = {
+                "reward_terminal": 0.0,
+                "reward_terminal_profit_advantage_mean": 0.0,
+                "reward_terminal_observations": 0.0,
+            }
+        else:
+            if self._count != self.horizon_steps:
+                raise ValueError("terminal reward requires the completed planned episode")
+            advantage = self._tail_profit_lead_sum / float(self._tail_count)
+            terminal_reward = (
+                self.config.terminal_profit_dominance_weight
+                * self.horizon_steps * advantage / self.config.profit_advantage_scale
+            )
+            result = {
+                "reward_terminal": float(terminal_reward),
+                "reward_terminal_profit_advantage_mean": float(advantage),
+                "reward_terminal_observations": float(self._count),
+            }
+        result["reward_terminal_tail_observations"] = float(self._tail_count)
+        if reset:
+            self.reset()
+        return result
+
+
+class DominanceConstrainedProfitReward(_ObjectiveRewardBase):
+    """Profit reward with one hinge penalty when Firm 1 loses served share.
+
+    This is intentionally not a weighted profit/share mixture. Profit is the
+    sole objective while the hinge represents the single business constraint:
+    Firm 1 must complete at least as much demand as Firm 2.
+    """
+
+    mechanism_name = "profit_with_served_share_dominance_v29"
+
+    def compute(self, **kwargs: float) -> Dict[str, float]:
+        metrics = self._metrics(**kwargs)
+        profit = float(metrics["reward_own_profit_linear"])
+        share_lead = float(metrics["reward_market_share_advantage"])
+        penalty = float(max(0.0, -share_lead) / self.config.market_share_gap_scale)
+        result = self._finish(
+            metrics,
+            own_profit_component=profit,
+            profit_lead_component=0.0,
+            own_share_component=0.0,
+            share_lead_component=0.0,
+        )
+        reward = float(profit - penalty)
+        result.update({
+            "reward": reward,
+            "reward_raw": reward,
+            "reward_base": reward,
+            "reward_dominance_constraint_penalty": penalty,
+            "reward_dominance_constraint_satisfied": float(share_lead >= 0.0),
+            "reward_active_component_count": 2.0,
+        })
+        return result
 
 
 class MarketShareCompetitivenessReward(_ObjectiveRewardBase):
-    """Create a serviceable Firm 1 choice-share lead without profit shaping."""
+    """Completed-share-focused sustainable three-term normalized reward."""
 
-    mechanism_name = "serviceable_conditional_choice_share_v10"
-
-    def compute(self, **kwargs: float) -> Dict[str, float]:
-        metrics = self._metrics(**kwargs)
-        # Named competitiveness always has unit scale. Its configured weight is
-        # an enablement/compatibility field, not a route for profit terms to
-        # leak back into the objective.
-        return self._finish(
-            metrics,
-            own_component=0.0,
-            advantage_component=0.0,
-            competitiveness_component=metrics["reward_market_share_utility"],
-        )
-
-
-class BalancedPolicyReward(_ObjectiveRewardBase):
-    """Deliberate blend of normalized profit and competitiveness mechanisms."""
-
-    mechanism_name = "balanced_profit_and_market_share"
+    mechanism_name = "economic_competitiveness_focus_v22"
 
     def compute(self, **kwargs: float) -> Dict[str, float]:
         metrics = self._metrics(**kwargs)
-        c = self.config
-        own_weight, advantage_weight, gap_weight = c.normalized_weights()
+        weights = self.config.economic_weights()
         return self._finish(
             metrics,
-            own_component=(
-                own_weight * metrics["reward_own_profit_utility"]
+            own_profit_component=(
+                weights["own_profit"] * metrics["reward_own_profit_linear"]
             ),
-            advantage_component=(
-                advantage_weight
-                * metrics["reward_profit_quality_gate"]
-                * metrics["reward_profit_advantage_utility"]
+            profit_lead_component=(
+                weights["profit_lead"]
+                * metrics["reward_profit_advantage_linear"]
             ),
-            competitiveness_component=(
-                gap_weight * metrics["reward_market_share_utility"]
+            own_share_component=(
+                weights["own_completed_share"]
+                * metrics["reward_own_completed_share_linear"]
+            ),
+            share_lead_component=(
+                weights["completed_share_lead"]
+                * metrics["reward_market_share_advantage_linear"]
             ),
         )
 
 
-class CustomPolicyReward(_ObjectiveRewardBase):
-    """Backward-compatible unnormalized expert weighting."""
+class MixedEconomicReward(_ObjectiveRewardBase):
+    """Preregistered convex mixture of profit and competitiveness rewards."""
 
-    mechanism_name = "custom_weighted"
+    mechanism_name = "economic_profit_competitiveness_mix_v25"
 
     def compute(self, **kwargs: float) -> Dict[str, float]:
         metrics = self._metrics(**kwargs)
-        c = self.config
+        weights = self.config.economic_weights()
         return self._finish(
             metrics,
-            own_component=(
-                c.own_profit_weight * metrics["reward_own_profit_utility"]
+            own_profit_component=(
+                weights["own_profit"] * metrics["reward_own_profit_linear"]
             ),
-            advantage_component=(
-                c.profit_advantage_weight
-                * metrics["reward_profit_quality_gate"]
-                * metrics["reward_profit_advantage_utility"]
+            profit_lead_component=(
+                weights["profit_lead"]
+                * metrics["reward_profit_advantage_linear"]
             ),
-            competitiveness_component=(
-                c.market_share_competitiveness_weight
-                * metrics["reward_market_share_utility"]
+            own_share_component=(
+                weights["own_completed_share"]
+                * metrics["reward_own_completed_share_linear"]
+            ),
+            share_lead_component=(
+                weights["completed_share_lead"]
+                * metrics["reward_market_share_advantage_linear"]
             ),
         )
+
+
+class RobustObjectiveOptimizer:
+    """Rank checkpoints by the same reward, emphasizing its sustained tail."""
+
+    mechanism_name = "durable_economic_objective_v22"
+
+    def __init__(
+        self,
+        *,
+        objective: str,
+        own_profit_scale: float,
+        profit_advantage_target: float,
+        market_share_advantage_target: float,
+        fulfillment_floor: float,
+        completion_coverage_floor: float,
+        profit_advantage_scale: float = 1.0,
+        market_share_gap_scale: float = 0.10,
+        own_completed_share_scale: float = 0.40,
+        dominance_rate_floor: float = 0.90,
+        tail_weight: float = 0.60,
+    ) -> None:
+        self.objective = str(objective).strip().lower()
+        if self.objective not in POLICY_OBJECTIVES:
+            raise ValueError(f"unsupported policy objective: {objective!r}")
+        self.own_profit_scale = float(max(1e-6, own_profit_scale))
+        self.profit_advantage_scale = float(
+            max(1e-6, profit_advantage_scale)
+        )
+        self.profit_advantage_target = float(
+            max(0.0, profit_advantage_target)
+        )
+        self.market_share_advantage_target = float(
+            max(0.0, market_share_advantage_target)
+        )
+        self.fulfillment_floor = float(
+            np.clip(fulfillment_floor, 0.0, 1.0)
+        )
+        self.completion_coverage_floor = float(
+            np.clip(completion_coverage_floor, 0.0, 1.0)
+        )
+        self.market_share_gap_scale = float(
+            max(1e-6, market_share_gap_scale)
+        )
+        self.own_completed_share_scale = float(
+            max(1e-6, own_completed_share_scale)
+        )
+        self.dominance_rate_floor = float(
+            np.clip(dominance_rate_floor, 0.0, 1.0)
+        )
+        self.tail_weight = float(np.clip(tail_weight, 0.0, 1.0))
+        self.weights = objective_reward_weights(self.objective)
+
+    @staticmethod
+    def _finite_vector(values: Sequence[float], name: str) -> np.ndarray:
+        result = np.asarray(values, dtype=float).reshape(-1)
+        if result.size == 0:
+            raise ValueError(f"{name} cannot be empty")
+        if not np.all(np.isfinite(result)):
+            raise ValueError(f"{name} must be finite")
+        return result
+
+    @classmethod
+    def _unit_vector(cls, values: Sequence[float], name: str) -> np.ndarray:
+        result = cls._finite_vector(values, name)
+        if np.any((result < 0.0) | (result > 1.0)):
+            raise ValueError(f"{name} must be in [0, 1]")
+        return result
+
+    def summarize(
+        self,
+        *,
+        own_profit: Sequence[float],
+        rival_profit: Sequence[float],
+        own_market_share: Sequence[float],
+        rival_market_share: Sequence[float],
+        fulfillment: Sequence[float],
+        completion_coverage: Sequence[float],
+        objective_dominance_rate: Optional[Sequence[float]] = None,
+        tail_objective_reward: Optional[Sequence[float]] = None,
+    ) -> Dict[str, Any]:
+        own_profit_v = self._finite_vector(own_profit, "own_profit")
+        rival_profit_v = self._finite_vector(rival_profit, "rival_profit")
+        own_share_v = self._unit_vector(
+            own_market_share, "own_market_share"
+        )
+        rival_share_v = self._unit_vector(
+            rival_market_share, "rival_market_share"
+        )
+        fulfillment_v = self._unit_vector(fulfillment, "fulfillment")
+        coverage_v = self._unit_vector(
+            completion_coverage, "completion_coverage"
+        )
+        widths = {
+            vector.size
+            for vector in (
+                own_profit_v,
+                rival_profit_v,
+                own_share_v,
+                rival_share_v,
+                fulfillment_v,
+                coverage_v,
+            )
+        }
+        if len(widths) != 1:
+            raise ValueError("robust objective metric vectors must align")
+
+        if self.objective == "profit_with_dominance":
+            # Checkpoints must optimize the exact scalar reward seen by PPO.
+            # Treating this endpoint as its nominal one-term weight vector
+            # silently dropped the served-share hinge and could retain a
+            # profitable but non-dominant policy.
+            objective_values = (
+                own_profit_v / self.own_profit_scale
+                - np.maximum(0.0, rival_share_v - own_share_v)
+                / self.market_share_gap_scale
+            )
+        else:
+            objective_values = (
+                self.weights["own_profit"]
+                * own_profit_v / self.own_profit_scale
+                + self.weights["profit_lead"]
+                * (own_profit_v - rival_profit_v) / self.profit_advantage_scale
+                + self.weights["own_completed_share"]
+                * own_share_v / self.own_completed_share_scale
+                + self.weights["completed_share_lead"]
+                * (own_share_v - rival_share_v) / self.market_share_gap_scale
+            )
+
+        # Preserve the detailed audit fields for report compatibility.  None of
+        # them participate in checkpoint eligibility or ordering.
+        if objective_dominance_rate is None:
+            dominance_rate_v = np.ones_like(objective_values, dtype=float)
+        else:
+            dominance_rate_v = self._finite_vector(
+                objective_dominance_rate, "objective_dominance_rate"
+            )
+            if dominance_rate_v.size != own_profit_v.size:
+                raise ValueError(
+                    "objective_dominance_rate must align with robust metrics"
+                )
+            dominance_rate_v = np.clip(dominance_rate_v, 0.0, 1.0)
+        objective_mean = float(np.mean(objective_values))
+        objective_worst = float(np.min(objective_values))
+        objective_std = float(np.std(objective_values))
+        if tail_objective_reward is None:
+            tail_values = objective_values
+        else:
+            tail_values = self._finite_vector(
+                tail_objective_reward, "tail_objective_reward"
+            )
+            if tail_values.size != objective_values.size:
+                raise ValueError(
+                    "tail_objective_reward must align with robust metrics"
+                )
+        tail_objective_mean = float(np.mean(tail_values))
+        objective_score = float(
+            (1.0 - self.tail_weight) * objective_mean
+            + self.tail_weight * tail_objective_mean
+        )
+        feasible = dominance_rate_v >= self.dominance_rate_floor
+        normalized_mode_shortfall = np.maximum(
+            0.0,
+            self.dominance_rate_floor - dominance_rate_v,
+        ) / max(self.dominance_rate_floor, 1e-6)
+        pass_fraction = float(np.mean(feasible))
+        max_shortfall = float(np.max(normalized_mode_shortfall))
+        mean_shortfall = float(np.mean(normalized_mode_shortfall))
+        eligible = bool(np.all(feasible))
+        # Eligibility and dominance rates are business diagnostics. Checkpoint
+        # ordering must not introduce a second optimization objective that PPO
+        # never saw, so the selection key is exactly the mean normalized reward.
+        selection_key = (objective_score,)
+        return {
+            "optimizer_mechanism": self.mechanism_name,
+            "objective_score": objective_score,
+            "objective_mean": objective_mean,
+            "objective_worst": objective_worst,
+            "objective_std": objective_std,
+            "tail_objective_mean": tail_objective_mean,
+            "tail_weight": self.tail_weight,
+            "reward_weights": dict(self.weights),
+            "mean_objective_dominance_rate": float(
+                np.mean(dominance_rate_v)
+            ),
+            "worst_objective_dominance_rate": float(
+                np.min(dominance_rate_v)
+            ),
+            "mode_objective_dominance_rate": dominance_rate_v.tolist(),
+            "dominance_rate_floor": float(self.dominance_rate_floor),
+            "feasible_mode_fraction": pass_fraction,
+            "maximum_normalized_shortfall": max_shortfall,
+            "mean_normalized_shortfall": mean_shortfall,
+            "mode_normalized_shortfall": normalized_mode_shortfall.tolist(),
+            "mode_feasible": feasible.astype(float).tolist(),
+            "checkpoint_eligible": eligible,
+            "selection_key": selection_key,
+        }
+
+    @staticmethod
+    def candidate_is_better(
+        candidate_key: Sequence[float],
+        best_key: Optional[Sequence[float]],
+        *,
+        require_eligible: bool,
+    ) -> bool:
+        candidate = tuple(float(value) for value in candidate_key)
+        if not candidate or not all(np.isfinite(candidate)):
+            return False
+        del require_eligible
+        if best_key is None:
+            return True
+        best = tuple(float(value) for value in best_key)
+        # Equal durability and objective results prefer the later candidate,
+        # preserving completed dynamic-stage training.
+        return candidate >= best
 
 
 class PolicyObjectiveReward:
@@ -613,9 +1081,14 @@ class PolicyObjectiveReward:
 
     _mechanisms = {
         "profit_maximization": ProfitMaximizationReward,
+        "profit_with_dominance": DominanceConstrainedProfitReward,
+        "profit_dominance_v30": ProfitDominanceReward,
         "competitiveness": MarketShareCompetitivenessReward,
-        "balanced": BalancedPolicyReward,
-        "custom": CustomPolicyReward,
+        "profit_10_competitiveness_90": MixedEconomicReward,
+        "profit_30_competitiveness_70": MixedEconomicReward,
+        "profit_50_competitiveness_50": MixedEconomicReward,
+        "profit_70_competitiveness_30": MixedEconomicReward,
+        "profit_90_competitiveness_10": MixedEconomicReward,
     }
 
     def __init__(self, config: Optional[LongTermProfitRewardConfig] = None) -> None:
@@ -648,17 +1121,21 @@ class ConstraintConfig:
     segment_tolerances: Tuple[float, float, float, float] = (0.65, 0.60, 0.55, 0.55)
     gap_softness: float = 0.50
     fulfillment_floor: float = 0.78
+    # Conditional share can look dominant while nearly every rider chooses the
+    # outside option. This floor prevents "winning" a vanishing market and
+    # protects completed demand and revenue volume.
+    completion_coverage_floor: float = 0.55
     wait_limit_minutes: float = 8.0
     margin_floor: float = 0.10
     intervention_rate_budget: float = 0.35
     reversal_horizon: int = 4
     oscillation_window: int = 12
-    multiplier_lr: float = 0.035
-    multiplier_max: float = 1.5
+    multiplier_lr: float = 0.01
+    multiplier_max: float = 2.0
     cost_ema_alpha: float = 0.10
     # Only operational feasibility is optimized as a constraint.  Fare-gap
     # channels remain available in diagnostics and the observation model.
-    cost_budgets: Tuple[float, ...] = (0.01, 0.01, 0.01)
+    cost_budgets: Tuple[float, ...] = (0.01, 0.01, 0.01, 0.01)
 
 
 @dataclass(frozen=True)
@@ -666,6 +1143,7 @@ class TrainingStage:
     name: str
     start: float
     end: float
+    opponent_regime: str
     opponent_cadence_multiplier: int
     freeze_opponent: bool
     action_hold_steps: int
@@ -695,42 +1173,84 @@ class OperationalClock:
 
 
 class TrainingStageScheduler:
-    """Curriculum for learning control before full strategic competition."""
+    """Environment-only curriculum for progressively harder competition.
 
-    def __init__(self, mode: str = "staged") -> None:
-        mode = str(mode or "staged").strip().lower()
-        if mode not in {"staged", "direct"}:
-            raise ValueError("training curriculum must be 'staged' or 'direct'")
-        self.mode = mode
-        if mode == "direct":
+    Staging never changes the PPO objective or optimizer.  It changes only the
+    source of Firm 2's posted tariff: the city-market reference, a fixed rival,
+    and finally the configured dynamic rival. The first two stages establish
+    the basics; the final 60% supplies multiple long adaptive-opponent episodes.
+    """
+
+    def __init__(
+        self,
+        mode: str = "staged",
+        *,
+        stage_fractions: Tuple[float, float, float] = (0.20, 0.20, 0.60),
+        dynamic_episode_days: int = 600,
+        tariff_reset_fraction: float = 0.15,
+    ) -> None:
+        requested = str(mode or "staged").strip().lower()
+        if requested not in {"staged", "environment_then_opponent", "direct"}:
+            raise ValueError(
+                "training curriculum must be 'staged', "
+                "'environment_then_opponent', or 'direct'"
+            )
+        fractions = np.asarray(stage_fractions, dtype=float).reshape(-1)
+        if (
+            fractions.size != 3
+            or not np.all(np.isfinite(fractions))
+            or np.any(fractions <= 0.0)
+            or not np.isclose(float(fractions.sum()), 1.0)
+        ):
+            raise ValueError(
+                "training stage fractions must be three positive values summing to 1"
+            )
+        episode_days = int(dynamic_episode_days)
+        if episode_days <= 0:
+            raise ValueError("dynamic_episode_days must be positive")
+        reset_fraction = float(tariff_reset_fraction)
+        if not np.isfinite(reset_fraction) or not 0.02 <= reset_fraction <= 0.40:
+            raise ValueError("tariff_reset_fraction must be in [0.02, 0.40]")
+        self.mode = requested
+        if requested == "direct":
             self.stages = (
                 TrainingStage(
-                    # A normal training day contains four operational
-                    # decisions. Repeated 256-day episodes therefore rehearse
-                    # the full 1,000-period deployment horizon, including the
-                    # rival's late catch-up, before both firms receive a new
-                    # fair opening tariff.
-                    "direct", 0.0, 1.0, 1, False, 1, 1.0, 0.05, 0.45, 0.85,
-                    256, 8, 0.18,
+                    "direct", 0.0, 1.000001, "dynamic", 1, False, 1, 0.0,
+                    0.0, 1.0, 1.0, episode_days, 1, reset_fraction,
+                ),
+            )
+        elif requested == "environment_then_opponent":
+            environment_end = float(round(float(fractions[0] + fractions[1]), 12))
+            self.stages = (
+                TrainingStage(
+                    "environment", 0.0, environment_end, "market", 1, True,
+                    1, 0.0, 0.0, 1.0, 1.0, episode_days, 1,
+                    reset_fraction,
+                ),
+                TrainingStage(
+                    "opponent", environment_end, 1.000001, "dynamic", 1,
+                    False, 1, 0.0, 0.0, 1.0, 1.0, episode_days, 1,
+                    reset_fraction,
                 ),
             )
         else:
+            # Decimal CLI fractions such as 0.10 + 0.20 should switch exactly
+            # at the documented 0.30 boundary, not one float ulp later.
+            market_end = float(round(float(fractions[0]), 12))
+            static_end = float(round(float(fractions[0] + fractions[1]), 12))
             self.stages = (
                 TrainingStage(
-                    "foundation", 0.0, 0.18, 1, True, 1, 0.35, 0.18, 1.00, 1.00,
-                    48, 1, 0.12,
+                    "market", 0.0, market_end, "market", 1, True, 1, 0.0,
+                    0.0, 1.0, 1.0, 0, 1, reset_fraction,
                 ),
                 TrainingStage(
-                    "robustness", 0.18, 0.42, 2, False, 1, 0.70, 0.12, 0.75, 0.90,
-                    64, 4, 0.18,
+                    "static_opponent", market_end, static_end, "static", 1,
+                    True, 1, 0.0, 0.0, 1.0, 1.0, 0, 1, reset_fraction,
                 ),
                 TrainingStage(
-                    "competition", 0.42, 0.66, 1, False, 1, 1.00, 0.05, 0.45, 0.70,
-                    96, 8, 0.18,
-                ),
-                TrainingStage(
-                    "consolidation", 0.66, 1.000001, 1, False, 1, 1.00, 0.01, 0.00, 0.65,
-                    2048, 8, 0.08,
+                    "dynamic_opponent", static_end, 1.000001, "dynamic", 1,
+                    False, 1, 0.0, 0.0, 1.0, 1.0, episode_days, 4,
+                    reset_fraction,
                 ),
             )
 
@@ -742,41 +1262,12 @@ class TrainingStageScheduler:
         return self.stages[-1]
 
     def smooth_controls_at(self, progress: float) -> Dict[str, float]:
-        """Return continuous exploration/entropy/LR controls at stage edges.
-
-        Opponent pools and episode horizons remain genuinely staged, while PPO
-        controls transition with a smoothstep over the first 20% of each new
-        stage. This avoids an instantaneous change in rollout distribution and
-        value targets—the main source of artificial reward spikes at curriculum
-        boundaries.
-        """
-        p = float(np.clip(progress, 0.0, 1.0))
-        current = self.stage_at(p)
-        index = self.stages.index(current)
-        if index == 0:
-            return {
-                "exploration_rate": float(current.exploration_rate),
-                "entropy_scale": float(current.entropy_scale),
-                "learning_rate_scale": float(current.learning_rate_scale),
-            }
-        previous = self.stages[index - 1]
-        transition_width = max(1e-6, 0.20 * (current.end - current.start))
-        fraction = float(np.clip((p - current.start) / transition_width, 0.0, 1.0))
-        blend = fraction * fraction * (3.0 - 2.0 * fraction)
-
-        def interpolate(before: float, after: float) -> float:
-            return float(before + blend * (after - before))
-
+        """Return constant PPO controls; stages change the environment only."""
+        del progress
         return {
-            "exploration_rate": interpolate(
-                previous.exploration_rate, current.exploration_rate
-            ),
-            "entropy_scale": interpolate(
-                previous.entropy_scale, current.entropy_scale
-            ),
-            "learning_rate_scale": interpolate(
-                previous.learning_rate_scale, current.learning_rate_scale
-            ),
+            "exploration_rate": 0.0,
+            "entropy_scale": 1.0,
+            "learning_rate_scale": 1.0,
         }
 
     def as_dict(self) -> Dict[str, Any]:
@@ -818,30 +1309,81 @@ class PlatformObservationModel:
     )
     CITY_CONTEXT_KEYS: Tuple[str, ...] = (
         "demand_intensity",
-        "trip_distance_scale",
-        "trip_duration_scale",
-        "airport_intensity",
-        "income_index",
-        "price_elasticity",
-        "loyalty_intensity",
-        "new_rider_share",
-        "driver_cost_mile",
-        "driver_cost_minute",
-        "supply_intensity",
-        "weather_sensitivity",
     )
     # Layout (single frame):
-    #   0:25   immediate time/tariff/operational measurements
-    #   25:31  observable outcome changes caused by market/opponent dynamics
-    #   31:43  numeric city/digital-twin context (never a city identity)
-    #   43:51  current demand-mix measurements
-    #   51:75  public competitor quote history and its changes
-    #   75:81  the agent's own previous intervention
-    observation_dim: int = 81
+    #   0:4    cyclical hour and day
+    #   4:9    each own tariff coefficient relative to its market anchor
+    #   9:14   delayed own operating outcomes
+    #   14:18  current demand conditions (including weather-driven intensity)
+    #   18:22  public Firm2-minus-Firm1 quote gaps by trip segment
+    #   22:24  previous action direction and time since intervention
+    # Temporal momentum is supplied by the ordered frame stack, so explicit
+    # level duplicates, hand-built trend features, and static city constants
+    # are not repeated inside every frame.
+    observation_dim: int = 24
     action_feature_dim: int = 20
+    # v27: optional public shock context appended after the 24 base features
+    # (holiday calendar, storm warning/active, transit status, announced
+    # events).  The width is fixed per run by the Core constructor flag.
+    SHOCK_FEATURE_KEYS: Tuple[str, ...] = PUBLIC_SHOCK_FEATURE_KEYS
+    BASE_OBSERVATION_DIM: int = 24
+
+    # Compact v29 layout (single frame):
+    #   0:4    public clock
+    #   4:9    five independently controlled tariff coordinates
+    #   9:12   delayed share/profit/fulfilment telemetry
+    #   12:15  current demand, held-action-horizon forecast, airport mix
+    #   15:17  observed mean distance and duration
+    #   17:19  public short-trip and long-trip rival quote gaps
+    # The frame stack supplies trends and reveals the preceding tariff move,
+    # so explicit action-direction/timer features are deliberately omitted.
+    COMPACT_FORESIGHT_DIM: int = 19
 
     @classmethod
-    def feature_groups(cls) -> Dict[str, Tuple[int, ...]]:
+    def feature_names(
+        cls, shock_features: bool = False, compact_foresight: bool = False
+    ) -> Tuple[str, ...]:
+        if compact_foresight:
+            base = (
+                "hour_sin", "hour_cos", "day_sin", "day_cos",
+                "tariff_base_fare_asinh", "tariff_per_minute_asinh",
+                "tariff_per_mile_asinh", "tariff_booking_fee_asinh",
+                "tariff_airport_fee_asinh", "completed_share_delayed",
+                "profit_per_request_delayed", "fulfillment_delayed",
+                "demand_intensity_current", "demand_intensity_action_horizon",
+                "airport_trip_share", "mean_trip_distance",
+                "mean_trip_duration", "quote_gap_short_trip",
+                "quote_gap_long_trip",
+            )
+        else:
+            base = (
+                "hour_sin", "hour_cos", "day_sin", "day_cos",
+                "tariff_base_fare", "tariff_per_minute", "tariff_per_mile",
+                "tariff_booking_fee", "tariff_airport_fee",
+                "completed_share_delayed", "profit_per_request_delayed",
+                "fulfillment_delayed", "wait_delayed", "utilization_delayed",
+                "demand_intensity", "mean_trip_distance",
+                "mean_trip_duration", "airport_trip_share",
+                "quote_gap_0_2", "quote_gap_2_5", "quote_gap_5_10",
+                "quote_gap_10_plus", "last_action_direction",
+                "time_since_intervention",
+            )
+        names = base + (cls.SHOCK_FEATURE_KEYS if shock_features else tuple())
+        if len(names) != cls.dimension(shock_features, compact_foresight):
+            raise RuntimeError("platform observation schema width mismatch")
+        return tuple(names)
+
+    @classmethod
+    def dimension(
+        cls, shock_features: bool = False, compact_foresight: bool = False
+    ) -> int:
+        base = cls.COMPACT_FORESIGHT_DIM if compact_foresight else cls.BASE_OBSERVATION_DIM
+        return int(base + (len(cls.SHOCK_FEATURE_KEYS) if shock_features else 0))
+
+    @classmethod
+    def feature_groups(
+        cls, shock_features: bool = False, compact_foresight: bool = False
+    ) -> Dict[str, Tuple[int, ...]]:
         """Return semantic observation partitions for hierarchical encoders.
 
         Opponent features contain only observable consequences and public quote
@@ -849,21 +1391,31 @@ class PlatformObservationModel:
         deliberately absent.  City features are continuous calibrated market
         descriptors, so a policy cannot memorize an integer city identifier.
         """
+        if compact_foresight:
+            width = cls.dimension(shock_features, True)
+            return {
+                "immediate": tuple(list(range(0, 17)) + list(range(19, width))),
+                "opponent": (17, 18),
+                "city": tuple(),
+            }
         return {
             "immediate": tuple(
-                list(range(0, 25))
-                + list(range(43, 51))
-                + list(range(75, 81))
+                list(range(0, 18)) + list(range(22, cls.dimension(shock_features)))
             ),
-            "opponent": tuple(
-                list(range(25, 31))
-                + list(range(51, 75))
-            ),
-            "city": tuple(range(31, 43)),
+            "opponent": tuple(range(18, 22)),
+            "city": tuple(),
         }
 
-    def __init__(self, seed: int, config: Optional[ObservationConfig] = None) -> None:
+    def __init__(self, seed: int, config: Optional[ObservationConfig] = None,
+                 shock_features: bool = False,
+                 compact_foresight: bool = False) -> None:
         self.config = config or ObservationConfig()
+        self.shock_features = bool(shock_features)
+        self.compact_foresight = bool(compact_foresight)
+        # Instance width shadows the legacy class constant (24).
+        self.observation_dim = self.dimension(
+            self.shock_features, self.compact_foresight
+        )
         self.seed = int(seed)
         self.rng = np.random.default_rng(self.seed)
         self.reset()
@@ -1006,6 +1558,44 @@ class PlatformObservationModel:
     def quote_snapshot(self) -> Dict[str, Dict[str, float]]:
         return {segment: dict(values) for segment, values in self.quote_probes.items()}
 
+    def publish_public_quote_gaps(
+        self,
+        gaps: Mapping[str, float],
+        *,
+        gap_sign: float = 1.0,
+    ) -> None:
+        """Publish Firm 2's committed leader quote before Firm 1 acts.
+
+        A posted price is public at the point of sale, so this channel has no
+        telemetry delay or missingness.  It retains bounded quote noise and
+        uncertainty, exposes only representative ride-price gaps, and never
+        exposes the leader's coefficients, controller type, or private state.
+        Clearing queued pre-commit probes prevents an older delayed quote from
+        overwriting the newly posted leader price on the next market ingest.
+        """
+        self._probe_queue.clear()
+        for segment in SEGMENTS:
+            raw = float(gap_sign) * float(gaps.get(segment, 0.0))
+            self._latest_true_gaps[segment] = raw
+            uncertainty = float(
+                self.config.quote_noise_dollars
+                * (1.0 + 0.40 * self.rng.random())
+            )
+            estimate = raw + self._bounded_noise(
+                self.rng,
+                uncertainty,
+                3.0 * uncertainty,
+            )
+            self.previous_quote_probes[segment] = dict(
+                self.quote_probes[segment]
+            )
+            self.quote_probes[segment] = {
+                "gap": float(estimate),
+                "uncertainty": uncertainty,
+                "age": 0.0,
+                "available": 1.0,
+            }
+
     def build_observation(
         self,
         *,
@@ -1016,124 +1606,139 @@ class PlatformObservationModel:
         anchor_coefficients: Mapping[str, float],
         last_action: Optional[Mapping[str, float]] = None,
         city_context: Optional[Mapping[str, float]] = None,
+        shock_features: Optional[Mapping[str, float]] = None,
     ) -> np.ndarray:
         hour_f = float(int(hour) % 24)
         day_f = float(int(day_of_week) % 7)
-        weather_code = {"clear": 0.0, "cloudy": 0.33, "rain": 0.66, "snow": 1.0}.get(str(weather).lower(), 0.0)
+        # Weather already enters the observable demand-intensity descriptor.
+        # Keeping it a second time would spend a scarce frame slot on a
+        # duplicate while hiding which tariff coefficient the actor has
+        # already placed at an absolute target.
+        del weather
         time_features = [
             np.sin(2.0 * np.pi * hour_f / 24.0),
             np.cos(2.0 * np.pi * hour_f / 24.0),
             np.sin(2.0 * np.pi * day_f / 7.0),
             np.cos(2.0 * np.pi * day_f / 7.0),
-            float(day_f >= 5),
-            float((7 <= hour_f < 10) or (16 <= hour_f < 19)),
-            float(hour_f < 6 or hour_f >= 22),
-            weather_code,
         ]
-        coefficient_features = []
-        for key in ("base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"):
-            anchor = float(anchor_coefficients.get(key, 1.0))
-            coefficient_features.append(float(np.clip((float(own_coefficients.get(key, anchor)) - anchor) / max(abs(anchor), 1e-6), -1.0, 1.0)))
+        tariff_keys = (
+            "base_fare",
+            "per_minute",
+            "per_mile",
+            "booking_fee",
+            "airport_fee",
+        )
+        tariff_features = []
+        for key in tariff_keys:
+            anchor = float(anchor_coefficients.get(key, 0.0))
+            own = float(own_coefficients.get(key, anchor))
+            if self.compact_foresight:
+                # Independent v29 actions are additive and economically
+                # uncapped. A monotone asinh coordinate preserves sign and
+                # distinguishes every finite level without making negative
+                # promotional coefficients or zero anchors unobservable.
+                relative = float(np.arcsinh(
+                    (own - anchor) / max(abs(anchor), 1e-6)
+                ))
+            elif abs(anchor) <= 1e-8:
+                relative = 0.0 if abs(own) <= 1e-8 else np.sign(own) * 0.5
+            else:
+                relative = own / anchor - 1.0
+            tariff_features.append(
+                float(relative)
+                if self.compact_foresight
+                else float(np.clip(relative, -0.5, 0.5))
+            )
 
         c = self.config
         t = self.telemetry
         telemetry_features = [
-            float(np.clip(t.get("chosen_share_estimate", 0.0), 0.0, 1.0)),
             float(np.clip(t.get("completed_share_estimate", 0.0), 0.0, 1.0)),
-            float(np.clip(t.get("revenue_per_request", 0.0) / c.revenue_scale, 0.0, 1.5)),
-            float(np.clip(t.get("profit_per_request", 0.0) / c.profit_scale, -1.0, 1.0)),
+            # Preserve every finite profit level.  The former [-1, 1] clip made
+            # materially different losses/profits observationally identical.
+            float(np.arcsinh(
+                float(t.get("profit_per_request", 0.0))
+                / max(c.profit_scale, 1e-6)
+            )),
             float(np.clip(t.get("fulfillment_rate", 1.0), 0.0, 1.0)),
-            float(np.clip(t.get("acceptance_rate", 1.0), 0.0, 1.0)),
-            float(np.clip(t.get("wait_minutes", 0.0) / c.wait_scale_minutes, 0.0, 1.5)),
-            float(np.clip(t.get("driver_pay_per_request", 0.0) / c.driver_pay_scale, 0.0, 1.5)),
-            float(np.clip(t.get("idle_driver_share", 0.0), 0.0, 1.0)),
+            float(np.arcsinh(
+                max(0.0, float(t.get("wait_minutes", 0.0)))
+                / max(c.wait_scale_minutes, 1e-6)
+            )),
             float(np.clip(t.get("utilization", 0.0), 0.0, 1.0)),
-            float(np.clip(t.get("driver_earnings_per_hour", 0.0) / c.driver_earnings_scale, 0.0, 1.5)),
-            float(np.clip(t.get("telemetry_age", 0.0) / max(1, c.max_quote_age_steps), 0.0, 1.0)),
-        ]
-        p = self.previous_telemetry
-        trend_features = [
-            float(np.clip((t.get("chosen_share_estimate", 0.0) - p.get("chosen_share_estimate", 0.0)) / 0.15, -1.0, 1.0)),
-            float(np.clip((t.get("completed_share_estimate", 0.0) - p.get("completed_share_estimate", 0.0)) / 0.15, -1.0, 1.0)),
-            float(np.clip((t.get("revenue_per_request", 0.0) - p.get("revenue_per_request", 0.0)) / c.revenue_scale, -1.0, 1.0)),
-            float(np.clip((t.get("profit_per_request", 0.0) - p.get("profit_per_request", 0.0)) / c.profit_scale, -1.0, 1.0)),
-            float(np.clip((t.get("fulfillment_rate", 1.0) - p.get("fulfillment_rate", 1.0)) / 0.25, -1.0, 1.0)),
-            float(np.clip((t.get("wait_minutes", 0.0) - p.get("wait_minutes", 0.0)) / c.wait_scale_minutes, -1.0, 1.0)),
         ]
         numeric_city_context = city_context or {}
-        city_features = [
-            float(np.clip(numeric_city_context.get(key, 0.0), -1.5, 1.5))
-            for key in self.CITY_CONTEXT_KEYS
-        ]
         d = self.demand_mix
         demand_features = [
-            float(np.clip(d.get("distance_mean", 0.0) / 12.0, 0.0, 1.5)),
-            float(np.clip(d.get("distance_std", 0.0) / 8.0, 0.0, 1.5)),
-            float(np.clip(d.get("distance_q25", 0.0) / 12.0, 0.0, 1.5)),
-            float(np.clip(d.get("distance_q75", 0.0) / 16.0, 0.0, 1.5)),
-            float(np.clip(d.get("duration_mean", 0.0) / 45.0, 0.0, 1.5)),
-            float(np.clip(d.get("duration_std", 0.0) / 30.0, 0.0, 1.5)),
+            float(np.arcsinh(float(
+                numeric_city_context.get("demand_intensity", 0.0)
+            ))),
+            float(np.log1p(max(0.0, float(d.get("distance_mean", 0.0))) / 12.0)),
+            float(np.log1p(max(0.0, float(d.get("duration_mean", 0.0))) / 45.0)),
             float(np.clip(d.get("airport_rate", 0.0), 0.0, 1.0)),
-            float(np.clip(d.get("long_trip_share", 0.0), 0.0, 1.0)),
         ]
         probe_features = []
-        probe_trend_features = []
         for segment in SEGMENTS:
             probe = self.quote_probes[segment]
-            previous_probe = self.previous_quote_probes[segment]
-            probe_features.extend([
+            probe_features.append(
                 float(np.clip((probe.get("gap", 0.0)) / c.gap_scale_dollars, -1.5, 1.5)),
-                float(np.clip(probe.get("uncertainty", 1.0) / c.gap_scale_dollars, 0.0, 1.0)),
-                float(np.clip(probe.get("age", c.max_quote_age_steps) / max(1, c.max_quote_age_steps), 0.0, 1.0)),
-                float(np.clip(probe.get("available", 0.0), 0.0, 1.0)),
-            ])
-            both_available = float(
-                probe.get("available", 0.0) > 0.0
-                and previous_probe.get("available", 0.0) > 0.0
             )
-            probe_trend_features.extend([
-                float(
-                    np.clip(
-                        (
-                            probe.get("gap", 0.0)
-                            - previous_probe.get("gap", 0.0)
-                        )
-                        / c.gap_scale_dollars,
-                        -1.5,
-                        1.5,
-                    )
-                    * both_available
-                ),
-                float(
-                    np.clip(
-                        probe.get("available", 0.0)
-                        - previous_probe.get("available", 0.0),
-                        -1.0,
-                        1.0,
-                    )
-                ),
-            ])
         action = last_action or {}
         action_features = [
             float(np.clip(action.get("direction", 0.0), -1.0, 1.0)),
-            float(np.clip(action.get("target_index", 0.0), 0.0, 1.0)),
-            float(np.clip(action.get("magnitude", 0.0) / 2.0, 0.0, 1.0)),
-            float(np.clip(action.get("reversal", 0.0), 0.0, 1.0)),
-            float(np.clip(action.get("recent_intervention_rate", 0.0), 0.0, 1.0)),
             float(np.clip(action.get("time_since_intervention", 1.0), 0.0, 1.0)),
         ]
-        result = np.asarray(
-            time_features
-            + coefficient_features
-            + telemetry_features
-            + trend_features
-            + city_features
-            + demand_features
-            + probe_features
-            + probe_trend_features
-            + action_features,
-            dtype=np.float32,
-        )
+        shock_block: List[float] = []
+        if self.shock_features:
+            public = shock_features or {}
+            defaults = {"transit_availability": 1.0}
+            shock_block = [
+                float(np.clip(public.get(key, defaults.get(key, 0.0)), 0.0, 1.0))
+                for key in self.SHOCK_FEATURE_KEYS
+            ]
+        if self.compact_foresight:
+            # The endpoints identify the public quote curve without repeating
+            # four highly correlated probes.  Keeping trip basis alongside it
+            # lets the actor distinguish per-minute from per-mile effects.
+            short_gap = float(np.arcsinh(
+                self.quote_probes[SEGMENTS[0]].get("gap", 0.0)
+                / max(self.config.gap_scale_dollars, 1e-6)
+            ))
+            long_gap = float(np.arcsinh(
+                self.quote_probes[SEGMENTS[-1]].get("gap", 0.0)
+                / max(self.config.gap_scale_dollars, 1e-6)
+            ))
+            compact = (
+                time_features
+                + tariff_features
+                + telemetry_features[:3]
+                + [
+                    demand_features[0],
+                    float(np.arcsinh(float(
+                        numeric_city_context.get(
+                            "next_demand_intensity",
+                            numeric_city_context.get("demand_intensity", 0.0),
+                        )
+                    ))),
+                    demand_features[3],
+                    demand_features[1],
+                    demand_features[2],
+                    short_gap,
+                    long_gap,
+                ]
+            )
+            result = np.asarray(compact + shock_block, dtype=np.float32)
+        else:
+            result = np.asarray(
+                time_features
+                + tariff_features
+                + telemetry_features
+                + demand_features
+                + probe_features
+                + action_features
+                + shock_block,
+                dtype=np.float32,
+            )
         if result.size != self.observation_dim:
             raise RuntimeError(f"platform observation dimension mismatch: {result.size} != {self.observation_dim}")
         return np.nan_to_num(result, nan=0.0, posinf=1.5, neginf=-1.5)
@@ -1149,6 +1754,9 @@ class PlatformObservationModel:
         coefficient_bounds: Mapping[str, Tuple[float, float]],
         step_scale: float,
         target_gap: float,
+        action_target_keys: Optional[Mapping[int, str]] = None,
+        action_target_multipliers: Optional[Mapping[int, float]] = None,
+        unbounded_independent_steps: bool = False,
     ) -> np.ndarray:
         # Retained for artifact/API compatibility. Fare gaps are observations,
         # not an action objective, so action features must not identify the
@@ -1163,15 +1771,50 @@ class PlatformObservationModel:
         rows = []
         for action_id in range(len(action_steps)):
             mapping = dict(action_steps.get(action_id, {}))
-            active = [(k, int(v)) for k, v in mapping.items() if int(v) != 0 and k in action_keys]
+            target_key = (
+                None
+                if action_target_keys is None
+                else action_target_keys.get(action_id)
+            )
+            target_multiplier = (
+                None
+                if action_target_multipliers is None
+                else action_target_multipliers.get(action_id)
+            )
+            absolute_deltas: Dict[str, float] = {}
+            if target_multiplier is not None:
+                targeted_keys = (
+                    [target_key]
+                    if target_key in action_keys
+                    else list(action_keys)
+                )
+                active = []
+                for key in targeted_keys:
+                    anchor = float(anchor_coefficients[key])
+                    current = float(own_coefficients[key])
+                    lb, ub = coefficient_bounds[key]
+                    target_value = float(np.clip(
+                        anchor * float(target_multiplier), lb, ub
+                    ))
+                    delta = float(target_value - current)
+                    absolute_deltas[key] = delta
+                    # Keep zero-effect absolute targets distinct from hold.
+                    active.append((key, int(np.sign(delta))))
+            else:
+                active = [
+                    (k, int(v)) for k, v in mapping.items()
+                    if int(v) != 0 and k in action_keys
+                ]
             if not active:
                 rows.append([1.0, 0.0, *([0.0] * 5), 0.0, 1.0, 1.0, *([0.0] * 4), *([0.0] * 4), 1.0, 0.0])
                 continue
             all_keys = ("base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee")
             direction_by_key = {key: int(direction) for key, direction in active}
-            # Signed lever membership preserves the identity of mixed-direction
-            # short/long rebalancing actions.
-            key_signature = [float(direction_by_key.get(key, 0)) for key in all_keys]
+            # Absolute target actions need lever identity even when the target
+            # is exactly the current market level and realized direction is 0.
+            key_signature = [
+                float(key in direction_by_key) for key in all_keys
+            ]
             global_direction = float(np.clip(np.mean([direction for _, direction in active]), -1.0, 1.0))
             relative_deviations = []
             lower_distances = []
@@ -1182,12 +1825,29 @@ class PlatformObservationModel:
                 current = float(own_coefficients[key])
                 lb, ub = coefficient_bounds[key]
                 width = max(1e-6, float(ub - lb))
-                relative_deviations.append(
-                    float(np.clip((current - anchor) / max(abs(anchor), 1e-6), -1.0, 1.0))
-                )
-                lower_distances.append(float(np.clip((current - lb) / width, 0.0, 1.0)))
-                upper_distances.append(float(np.clip((ub - current) / width, 0.0, 1.0)))
-                delta_by_key[key] = float(direction) * float(coefficient_steps[key]) * float(step_scale)
+                if unbounded_independent_steps:
+                    relative_deviations.append(
+                        float(np.arcsinh(
+                            (current - anchor) / max(abs(anchor), 1e-6)
+                        ))
+                    )
+                    lower_distances.append(1.0)
+                    upper_distances.append(1.0)
+                    step = float(coefficient_steps[key]) * float(step_scale)
+                    delta_by_key[key] = float(direction) * step
+                else:
+                    relative_deviations.append(
+                        float(np.clip((current - anchor) / max(abs(anchor), 1e-6), -1.0, 1.0))
+                    )
+                    lower_distances.append(float(np.clip((current - lb) / width, 0.0, 1.0)))
+                    upper_distances.append(float(np.clip((ub - current) / width, 0.0, 1.0)))
+                    delta_by_key[key] = (
+                        absolute_deltas[key]
+                        if key in absolute_deltas
+                        else float(direction)
+                        * float(coefficient_steps[key])
+                        * float(step_scale)
+                    )
             impacts = [
                 float(sum(delta_by_key[key] * representative[segment][key] for key, _ in active))
                 for segment in SEGMENTS
@@ -1210,12 +1870,19 @@ class PlatformObservationModel:
                     * representative[segment][key]
                     for key in all_keys
                 ))
-                projected_relative_fares.append(float(np.clip(
-                    (current_fare + impact - anchor_fare)
-                    / max(abs(anchor_fare), 1e-6),
-                    -1.0,
-                    1.0,
-                )))
+                projected_fare = current_fare + impact
+                if unbounded_independent_steps:
+                    projected_relative_fares.append(float(np.arcsinh(
+                        (projected_fare - anchor_fare)
+                        / max(abs(anchor_fare), 1e-6)
+                    )))
+                else:
+                    projected_relative_fares.append(float(np.clip(
+                        (projected_fare - anchor_fare)
+                        / max(abs(anchor_fare), 1e-6),
+                        -1.0,
+                        1.0,
+                    )))
                 uncertainty_values.append(float(probe.get("uncertainty", self.config.gap_scale_dollars)))
             rows.append([
                 0.0,
@@ -1224,7 +1891,12 @@ class PlatformObservationModel:
                 float(np.mean(relative_deviations)),
                 float(np.min(lower_distances)),
                 float(np.min(upper_distances)),
-                *[float(np.clip(v / 20.0, -1.0, 1.0)) for v in impacts],
+                *[
+                    float(np.arcsinh(v / 20.0))
+                    if unbounded_independent_steps
+                    else float(np.clip(v / 20.0, -1.0, 1.0))
+                    for v in impacts
+                ],
                 *projected_relative_fares,
                 float(np.clip(np.mean(uncertainty_values) / self.config.gap_scale_dollars, 0.0, 1.0)),
                 float(len(active) / max(1, len(action_keys))),
@@ -1414,6 +2086,7 @@ class SoftConstraintController:
         "gap_5_10",
         "gap_10_plus",
         "fulfillment",
+        "coverage",
         "wait",
         "margin",
         "oscillation",
@@ -1421,7 +2094,7 @@ class SoftConstraintController:
     # These are true operating-feasibility constraints. Oscillation remains a
     # diagnostic, but is intentionally not a Lagrangian target: reacting to an
     # evolving opponent is part of the desired policy, not a violation.
-    names: Tuple[str, ...] = ("fulfillment", "wait", "margin")
+    names: Tuple[str, ...] = ("fulfillment", "coverage", "wait", "margin")
 
     def __init__(self, config: Optional[ConstraintConfig] = None) -> None:
         self.config = config or ConstraintConfig()
@@ -1443,6 +2116,7 @@ class SoftConstraintController:
         wait_minutes: float,
         profit_margin: float,
         oscillation_cost: float,
+        completion_coverage: float = 1.0,
     ) -> Dict[str, float]:
         c = self.config
         available = [p for p in observer.quote_probes.values() if p.get("available", 0.0) > 0.0]
@@ -1466,8 +2140,20 @@ class SoftConstraintController:
                 continue
             robust_error = abs(float(probe.get("gap", c.target_gap)) - c.target_gap) + 0.5 * float(probe.get("uncertainty", 0.0))
             costs[f"gap_{segment}"] = self._soft_cost(robust_error - tolerance, c.gap_softness)
+        fulfillment_cost = self._soft_cost(
+            c.fulfillment_floor - float(fulfillment_rate), 0.15
+        )
+        coverage_cost = self._soft_cost(
+            c.completion_coverage_floor - float(completion_coverage), 0.15
+        )
         costs.update({
-            "fulfillment": self._soft_cost(c.fulfillment_floor - float(fulfillment_rate), 0.15),
+            # Fulfillment and completed-market coverage have opposite pricing
+            # remedies in important states: excess unserved demand calls for
+            # less demand pressure, while safe spare capacity and a large
+            # outside option call for more.  Combining them with ``max`` made
+            # the constraint critic learn one ambiguous service signal.
+            "fulfillment": fulfillment_cost,
+            "coverage": coverage_cost,
             "wait": self._soft_cost(float(wait_minutes) - c.wait_limit_minutes, 4.0),
             "margin": self._soft_cost(c.margin_floor - float(profit_margin), 0.08),
             "oscillation": float(np.clip(oscillation_cost, 0.0, 1.0)),
@@ -1492,8 +2178,23 @@ class SoftConstraintController:
         return {"lambdas": self.lambdas.tolist(), "cost_ema": self.cost_ema.tolist()}
 
     def restore(self, snapshot: Mapping[str, Any]) -> None:
-        self.lambdas = np.asarray(snapshot.get("lambdas", self.lambdas), dtype=np.float32)
-        self.cost_ema = np.asarray(snapshot.get("cost_ema", self.cost_ema), dtype=np.float32)
+        lambdas = np.asarray(
+            snapshot.get("lambdas", self.lambdas), dtype=np.float32
+        ).reshape(-1)
+        cost_ema = np.asarray(
+            snapshot.get("cost_ema", self.cost_ema), dtype=np.float32
+        ).reshape(-1)
+        expected = len(self.names)
+        if lambdas.size != expected or cost_ema.size != expected:
+            raise ValueError(
+                "soft-constraint snapshot width does not match active "
+                f"constraints: lambdas={lambdas.size}, cost_ema={cost_ema.size}, "
+                f"expected={expected} ({', '.join(self.names)})"
+            )
+        self.lambdas = np.clip(
+            lambdas, 0.0, float(self.config.multiplier_max)
+        ).astype(np.float32)
+        self.cost_ema = np.clip(cost_ema, 0.0, 1.0).astype(np.float32)
 
     def diagnostics(self, costs: Mapping[str, float]) -> Dict[str, float]:
         result: Dict[str, float] = {}
@@ -1524,7 +2225,7 @@ def config_payload(
     return {
         "observation": asdict(observation),
         "active_reward": {
-            "type": "objective_separated_policy_reward_v4",
+            "type": "objective_separated_policy_reward_v8",
             "mechanism": PolicyObjectiveReward(
                 long_term_reward or LongTermProfitRewardConfig()
             ).mechanism_name,
@@ -1533,11 +2234,13 @@ def config_payload(
                 "contribution profit per incoming request"
             ),
             "market_share_competitiveness_definition": (
-                "Firm1 choice share conditional on choosing either firm, "
-                "multiplied by Firm1 fulfillment, minus twice any fulfillment "
-                "shortfall below the service floor; the two reported market "
-                "shares are exact complements and the configured lead is a "
-                "certification threshold rather than a reward plateau"
+                "linear Firm1-minus-Firm2 completed rides per incoming request "
+                "divided by 0.10 with no target cap; conditional choice share, "
+                "profit, public quote gaps, service, wait, and margin are "
+                "diagnostics"
+            ),
+            "robust_checkpoint_optimizer": (
+                RobustObjectiveOptimizer.mechanism_name
             ),
             "price_gap_metric_definition": (
                 "mean(abs((Firm2 public quote - Firm1 public quote) - "
@@ -1547,7 +2250,7 @@ def config_payload(
         },
         "positive_reward": asdict(reward),
         "constraints": asdict(constraints),
-        "active_constraint_names": list(SoftConstraintController.names),
+        "active_constraint_names": [],
         "diagnostic_constraint_names": list(SoftConstraintController.diagnostic_names),
         "training_curriculum": stages.as_dict(),
     }

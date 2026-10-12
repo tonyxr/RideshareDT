@@ -9,6 +9,8 @@ Created on Tue Mar  3 12:54:03 2026
 from __future__ import annotations
 
 import csv
+import json
+from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
@@ -152,4 +154,30 @@ def load_calibration_preset(name: str) -> Dict[str, Any]:
     calibration = payload["calibration"]
     if not isinstance(calibration, dict):
         raise ValueError(f"Calibration preset {name} has invalid 'calibration' object.")
+    return calibration
+
+
+def load_calibration_json(path: str, expected_city: Optional[str] = None) -> Dict[str, Any]:
+    """Load a preprocessing-generated calibration with city provenance checks."""
+
+    resolved = Path(path).expanduser().resolve()
+    with resolved.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Calibration JSON must contain an object: {resolved}")
+    calibration = payload.get("calibration", payload)
+    if not isinstance(calibration, dict):
+        raise ValueError(f"Calibration JSON has no valid calibration object: {resolved}")
+    if expected_city and payload.get("city"):
+        normalize = lambda value: "".join(ch for ch in str(value).lower() if ch.isalnum())
+        aliases = {
+            "nyc": "newyorkcity",
+            "newyork": "newyorkcity",
+        }
+        actual = aliases.get(normalize(payload["city"]), normalize(payload["city"]))
+        expected = aliases.get(normalize(expected_city), normalize(expected_city))
+        if actual != expected:
+            raise ValueError(
+                f"Calibration city mismatch: file={payload['city']!r}, expected={expected_city!r}"
+            )
     return calibration

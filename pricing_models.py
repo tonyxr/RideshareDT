@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 import copy
 import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
+mkl_config  # imported intentionally for its process-wide environment side effects
 import numpy as np
 from collections import deque
 
@@ -25,9 +26,9 @@ from optim_config import default_specs_for
 class ActionDescriptor:
     """Executed RL-selected coefficient intervention metadata.
 
-    PPO chooses hold, a single lever, or a coordinated tariff template together
-    with a continuous magnitude. Bounds are enforced by the application layer,
-    but no lower-layer heuristic decides the strategic move or its size.
+    Legacy PPO chooses an absolute whole-tariff target whose historical bounds
+    are enforced by the application layer. In v28, the same descriptor records
+    an unbounded scale of the currently posted tariff.
     """
 
     action_id: int = 0
@@ -44,6 +45,8 @@ class ActionDescriptor:
     magnitude_level: float = 0.0
     repeat_count: int = 0
     was_clipped: bool = False
+    numerical_rejection: bool = False
+    numerical_rejection_reason: str = ""
     is_reversal: bool = False
     reversal_count: int = 0
 
@@ -61,11 +64,25 @@ class FirmMetrics:
     pickup_minutes: float = 0.0
     driver_rejections: int = 0
     dispatch_offers: int = 0
+    # v26: when request volume varies by hour, money outcomes are normalized by
+    # the run's *base* requests per step so the reward is proportional to total
+    # contribution profit (a busy hour counts more than a quiet one).  Shares
+    # remain ratios over the step's realized requests.  0 = legacy behavior.
+    reference_total: int = 0
+    # v26 multi-homing: completed rides that first chose the other platform.
+    spillover_completed: int = 0
+    # Retry attempts received from riders who initially chose the other firm.
+    # These are dispatch opportunities, not additional initial choices.
+    spillover_attempts: int = 0
+
+    @property
+    def _money_denominator(self) -> int:
+        return int(self.reference_total) if int(self.reference_total) > 0 else int(self.total)
 
     @property
     def share(self) -> float:
         return (self.wins / self.total) if self.total > 0 else 0.0
-    
+
     @property
     def chosen_share(self) -> float:
         return (self.chosen / self.total) if self.total > 0 else 0.0
@@ -76,14 +93,18 @@ class FirmMetrics:
 
     @property
     def rev_per_request(self) -> float:
-        return (self.revenue / self.total) if self.total > 0 else 0.0
+        denominator = self._money_denominator
+        return (self.revenue / denominator) if denominator > 0 else 0.0
     
     @property
     def profit_per_request(self) -> float:
-        return (self.profit / self.total) if self.total > 0 else 0.0
+        denominator = self._money_denominator
+        return (self.profit / denominator) if denominator > 0 else 0.0
     
     @property
     def fulfillment_rate(self) -> float:
+        if self.dispatch_offers > 0:
+            return self.completed / self.dispatch_offers
         return (self.completed / self.chosen) if self.chosen > 0 else 1.0
 
     @property
@@ -95,14 +116,7 @@ class FirmMetrics:
         return ((self.dispatch_offers - self.driver_rejections) / self.dispatch_offers) if self.dispatch_offers > 0 else 1.0
     
 def build_discrete_action_space(opt_keys: List[str], max_coeffs: int = 5) -> Tuple[Dict[int, Dict[str, int]], List[str]]:
-    """Build single-lever and coordinated tariff interventions.
-
-    A one-coefficient action space cannot express common pricing responses such
-    as moving fixed fees together, changing time and distance rates together, or
-    rebalancing short- versus long-trip prices.  The expanded representation
-    keeps every action interpretable while allowing the actor to make coherent
-    multivariate moves with one shared continuous magnitude.
-    """
+    """Build hold plus one fixed up/down step for each pricing coefficient."""
     all_keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
     active_keys = [k for k in all_keys if k in list(opt_keys)[:max_coeffs]]
     action_to_steps: Dict[int, Dict[str, int]] = {0: {key: 0 for key in active_keys}}
@@ -119,29 +133,48 @@ def build_discrete_action_space(opt_keys: List[str], max_coeffs: int = 5) -> Tup
         for step in (-1, 1):
             add_action({key: step})
 
-    coordinated_groups = (
-        ("fixed_fees", ("base_fare", "booking_fee")),
-        ("usage_rates", ("per_minute", "per_mile")),
-        ("core_tariff", ("base_fare", "per_minute", "per_mile", "booking_fee")),
-        ("airport_trip", ("base_fare", "booking_fee", "airport_fee")),
-    )
-    for _, keys in coordinated_groups:
-        present = [key for key in keys if key in active_keys]
-        if len(present) >= 2:
-            for direction in (-1, 1):
-                add_action({key: direction for key in present})
-
-    # Segment rebalancing changes fixed and distance-sensitive levers in
-    # opposite directions.  This lets the controller react when short- and
-    # long-trip quote gaps move differently.
-    fixed = [key for key in ("base_fare", "booking_fee") if key in active_keys]
-    variable = [key for key in ("per_minute", "per_mile") if key in active_keys]
-    if fixed and variable:
-        for short_direction in (-1, 1):
-            changes = {key: short_direction for key in fixed}
-            changes.update({key: -short_direction for key in variable})
-            add_action(changes)
     return action_to_steps, active_keys
+
+
+def build_absolute_tariff_action_space(
+    opt_keys: List[str],
+    max_coeffs: int = 5,
+) -> Tuple[
+    Dict[int, Dict[str, int]],
+    Dict[int, float],
+    Dict[int, str],
+    List[str],
+]:
+    """Build hold plus stable absolute managed-tariff market targets.
+
+    One policy decision posts a coherent tariff over the experiment's fixed
+    1-5 coefficient scope instead of changing a single coefficient and asking
+    PPO to remember a multi-action composition. Every non-hold action sets all
+    managed coefficients to the same multiplier of their city anchors.
+    Repeating a target keeps that tariff posted and can never create
+    incremental drift.
+    """
+    all_keys = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
+    active_keys = [k for k in all_keys if k in list(opt_keys)[:max_coeffs]]
+    multipliers = (0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30)
+    action_to_steps: Dict[int, Dict[str, int]] = {
+        0: {key: 0 for key in active_keys}
+    }
+    action_to_multiplier: Dict[int, float] = {}
+    action_to_target_key: Dict[int, str] = {}
+    for multiplier in multipliers:
+        action = len(action_to_steps)
+        direction = int(np.sign(float(multiplier) - 1.0))
+        action_to_steps[action] = {
+            candidate: direction for candidate in active_keys
+        }
+        action_to_multiplier[action] = float(multiplier)
+    return (
+        action_to_steps,
+        action_to_multiplier,
+        action_to_target_key,
+        active_keys,
+    )
 
 class FirmStaticPricer:
     def __init__(self):
@@ -369,7 +402,6 @@ class FirmMarginGuardrailPricer(FirmHeuristicPricer):
             supply_state=supply_state,
             supply_state_vector=supply_state_vector,
         )
-        super().update(metrics=metrics, price_gap_mean=price_gap_mean)
 
         if self.cooldown > 0:
             return
@@ -1160,6 +1192,10 @@ class FirmRandomWalkPricer(FirmHeuristicPricer):
         
 class FirmRLPricer:
     MAX_MANIPULATED_COEFFS = 5
+    # This is not an economic price bound. It leaves headroom for float32
+    # policy features and downstream fare arithmetic; actions crossing it are
+    # rejected atomically and reported rather than silently clipped.
+    NUMERICAL_COEFFICIENT_LIMIT = float(np.finfo(np.float32).max / 1024.0)
 
     def _ensure_internal_state(self) -> None:
         """Backstop against partially initialized objects from stale environments."""
@@ -1169,30 +1205,50 @@ class FirmRLPricer:
             self.opt_keys = list(self.opt_keys[: self.MAX_MANIPULATED_COEFFS])
         if not hasattr(self, "config"):
             self.config = default_specs_for(self.opt_keys)
+        if not hasattr(self, "experimental_unbounded_economics"):
+            self.experimental_unbounded_economics = False
+        if not hasattr(self, "minimum_tariff_multiplier"):
+            self.minimum_tariff_multiplier = 0.0
+        if not hasattr(self, "numerical_action_rejection_count"):
+            self.numerical_action_rejection_count = 0
+        if not hasattr(self, "last_action_numerical_rejection"):
+            self.last_action_numerical_rejection = ""
     
     def __init__(
         self,
         seed: Optional[int],
         opt_keys: List[str],
-        state_frame_stack: int = 4,
-        single_state_dim: int = 89,
+        state_frame_stack: int = 16,
+        single_state_dim: int = 24,
         action_feature_dim: int = 20,
-        constraint_dim: int = 5,
-        response_dim: int = 12,
+        constraint_dim: int = 0,
+        response_dim: int = 0,
+        opponent_forecast_dim: int = 0,
         feature_groups: Optional[Dict[str, Sequence[int]]] = None,
-        gamma: float = 0.995,
-        gae_lambda: float = 0.97,
-        state_action_mi_weight: float = 0.10,
+        gamma: float = 0.999,
+        gae_lambda: float = 0.99,
+        state_action_mi_weight: float = 0.0,
+        direct_actor_credit_weight: float = 0.0,
+        critic_state_dim: int = 0,
+        privileged_critic: bool = False,
+        privileged_value_only: bool = False,
+        persistent_recurrence: bool = False,
+        counterfactual_q_coeff: float = 0.0,
+        counterfactual_actor_weight: float = 0.0,
+        potential_shaping_scale: float = 0.0,
+        hard_kl_stop: bool = False,
+        reward_rate_beta: float = 0.0,
+        center_rewards: bool = True,
+        td_value_targets: bool = False,
+        normalize_values: bool = False,
+        experimental_unbounded_economics: bool = False,
+        independent_coefficient_actions: bool = False,
+        minimum_tariff_multiplier: float = 0.0,
     ):
-        # Structured response-aware action design:
-        #   1) the PPO actor selects hold, a single lever, or a coordinated
-        #      multivariate tariff template;
-        #   2) a shared continuous magnitude controls the intervention size;
-        #   3) the simulator provides realized response targets used by the PPO
-        #      response head/world-model auxiliary loss.
-        # This removes the former lower-layer magnitude heuristic: the learned
-        # policy owns both "what to manipulate" and "how much to manipulate",
-        # while the application layer only clips to feasibility bounds.
+        # One action posts a stable target over the complete managed tariff
+        # scope. This removes the hidden multi-action composition problem from
+        # credit assignment regardless of whether the experiment controls
+        # one, several, or all five price coefficients.
         self.opt_keys = list(opt_keys[: self.MAX_MANIPULATED_COEFFS])
         if len(opt_keys) > self.MAX_MANIPULATED_COEFFS:
             print(
@@ -1200,20 +1256,35 @@ class FirmRLPricer:
                 f"limiting to first {self.MAX_MANIPULATED_COEFFS}: {self.opt_keys}"
             )
         self.config = default_specs_for(self.opt_keys)
+        self.experimental_unbounded_economics = bool(
+            experimental_unbounded_economics
+        )
+        self.independent_coefficient_actions = bool(
+            independent_coefficient_actions
+        )
+        self.minimum_tariff_multiplier = float(minimum_tariff_multiplier)
+        if (
+            not np.isfinite(self.minimum_tariff_multiplier)
+            or self.minimum_tariff_multiplier < 0.0
+        ):
+            raise ValueError("minimum_tariff_multiplier must be finite and non-negative")
         self.overrides = CoefficientOverrides()
         self.state_frame_stack = int(max(1, state_frame_stack))
         self._state_history: Deque[np.ndarray] = deque(maxlen=self.state_frame_stack)
         
-        self.base_step_scale = 1.75
+        # Compatibility values retained for reports. Independent v29 actions
+        # apply one fixed additive step to one coefficient; the scale is kept
+        # stationary so the action has the same meaning throughout training.
+        self.base_step_scale = 1.0
         self.converged_step_scale = 1.0
-        self.step_scale = self.base_step_scale
-        self.repeat_action_decay = 0.85
-        self.repeat_action_min_scale = 0.50
+        self.step_scale = 1.0
+        self.repeat_action_decay = 1.0
+        self.repeat_action_min_scale = 1.0
         self._last_applied_action = -1
         self._repeat_action_count = 0
-        self.base_max_relative_dev = 0.60
-        self.converged_max_relative_dev = 0.45
-        self.max_relative_dev = self.base_max_relative_dev
+        self.base_max_relative_dev = float("inf")
+        self.converged_max_relative_dev = float("inf")
+        self.max_relative_dev = float("inf")
         # Keep supply-side control available as an internal multiplier, but do
         # not expose it as a PPO action by default.  Early optimization is
         # easier when PPO only credits rider-facing price moves.
@@ -1227,6 +1298,8 @@ class FirmRLPricer:
         self.last_action_descriptor = ActionDescriptor()
         self.last_action_was_saturated = False
         self.last_action_was_zero_effect = False
+        self.last_action_numerical_rejection = ""
+        self.numerical_action_rejection_count = 0
         self.last_action_step_units: Dict[str, float] = {}
         self._last_action_target = "hold"
         self._last_action_direction = 0
@@ -1236,19 +1309,37 @@ class FirmRLPricer:
         self.aggressive_actions = set()
         self.allow_aggressive_actions = True
         
-        # Hybrid manipulation actions.  Index 0 is hold/status quo; remaining
-        # actions include both individual and coordinated coefficient changes.
-        # PPO's continuous magnitude head supplies the shared step multiplier.
-        self.action_to_steps, self.action_keys = build_discrete_action_space(self.opt_keys, self.MAX_MANIPULATED_COEFFS)
+        # Index 0 holds the tariff. Independent mode exposes one up/down pair
+        # per coefficient. The legacy whole-tariff path retains its absolute
+        # target vocabulary; v29 never uses that uniform control.
+        if self.independent_coefficient_actions:
+            self.action_to_steps, self.action_keys = build_discrete_action_space(
+                self.opt_keys, self.MAX_MANIPULATED_COEFFS
+            )
+            self.action_to_multiplier = {}
+            self.action_to_target_key = {
+                action: next(
+                    (key for key, step in mapping.items() if int(step) != 0),
+                    "hold",
+                )
+                for action, mapping in self.action_to_steps.items()
+            }
+        else:
+            (
+                self.action_to_steps,
+                self.action_to_multiplier,
+                self.action_to_target_key,
+                self.action_keys,
+            ) = build_absolute_tariff_action_space(
+                self.opt_keys,
+                self.MAX_MANIPULATED_COEFFS,
+            )
         action_dim = len(self.action_to_steps)
         
-        # State includes cyclical/flag time context, richer demand/WTP context,
-        # recent EMA/delta features, direct supply state, own and opponent fare-
-        # coefficient deltas, action-memory/oscillation stress features, and
-        # constrained-MDP context. Opponent deltas help PPO respond to heuristic
-        # rivals whose coefficients move before share/gap metrics fully react.
-        # Frame stacking appends recent encoded states so PPO can infer hidden
-        # demand/supply feedback without requiring a recurrent policy.
+        # Each compact public frame contains clock, five own tariff positions,
+        # delayed own outcomes, demand/route-basis context, and public rival
+        # quote endpoints. Ordered frame stacking supplies trajectory and
+        # momentum without exposing rival internals or duplicating action IDs.
         self.single_state_dim = int(max(1, single_state_dim))
         state_dim = self.single_state_dim * self.state_frame_stack
 
@@ -1257,30 +1348,32 @@ class FirmRLPricer:
             state_dim=state_dim,
             action_dim=action_dim,
             gamma=float(gamma),
+            normalize_values=normalize_values,
             lam=float(gae_lambda),
             hidden_dim=192,
             clip_eps=0.20,
             final_clip_eps=0.10,
-            max_grad_norm=0.8,
+            # The previous 0.8 threshold clipped 45/50 critic updates in the
+            # readiness run while critic explained variance stayed near zero.
+            # Five preserves protection against non-finite explosions without
+            # flattening ordinary raw-return value gradients.
+            max_grad_norm=5.0,
             ent_coeff=0.010,
             min_ent_coeff=0.0005,
+            max_ent_coeff=0.040,
+            target_entropy_fraction=0.30,
+            entropy_adaptation_rate=0.75,
             ent_decay=0.992,
             target_kl=0.020,
             max_lr=6.0e-4,
             value_clip_eps=0.30,
-            initial_exploration_rate=0.20,
-            final_exploration_rate=0.01,
+            initial_exploration_rate=0.30,
+            final_exploration_rate=0.05,
             action_feature_dim=self.action_feature_dim,
-            constraint_dim=int(max(1, constraint_dim)),
-            response_dim=int(max(1, response_dim)),
-            # PPO's GAE requires a state-value critic.  A second chosen-action
-            # Monte-Carlo Q regressor shared the critic trunk and supplied a
-            # conflicting target under changing opponents.
-            action_q_coeff=0.0,
-            # Response prediction is trained by an isolated auxiliary
-            # optimizer.  It validates the inferred opponent latent but cannot
-            # directly reshape the PPO policy gradient.
-            response_coeff=0.10,
+            constraint_dim=int(max(0, constraint_dim)),
+            response_dim=int(max(0, response_dim)),
+            opponent_forecast_dim=int(max(0, opponent_forecast_dim)),
+            response_coeff=0.0,
             # The Core training loop now records the exact discounted return for
             # each held pricing decision.  A second future-reward redistribution
             # would double count the same delayed outcomes.
@@ -1289,9 +1382,36 @@ class FirmRLPricer:
             single_state_dim=self.single_state_dim,
             frame_stack=self.state_frame_stack,
             state_action_mi_coeff=float(max(0.0, state_action_mi_weight)),
+            direct_actor_credit_weight=float(
+                np.clip(direct_actor_credit_weight, 0.0, 1.0)
+            ),
             feature_groups=feature_groups,
-            exploration_fraction=0.65,
-            exploration_warmup_fraction=0.10,
+            critic_state_dim=(
+                int(critic_state_dim) if int(critic_state_dim) > 0 else state_dim
+            ),
+            privileged_critic=bool(privileged_critic),
+            privileged_value_only=bool(privileged_value_only),
+            persistent_recurrence=bool(persistent_recurrence),
+            enable_counterfactual_q=float(counterfactual_q_coeff) > 0.0,
+            action_q_coeff=float(max(0.0, counterfactual_q_coeff)),
+            counterfactual_actor_weight=float(
+                np.clip(counterfactual_actor_weight, 0.0, 1.0)
+            ),
+            potential_shaping_scale=float(max(0.0, potential_shaping_scale)),
+            hard_kl_stop=bool(hard_kl_stop),
+            reward_rate_beta=float(np.clip(reward_rate_beta, 0.0, 1.0)),
+            center_rewards=bool(center_rewards),
+            td_value_targets=bool(td_value_targets),
+            # The original PPO stack samples directly from its categorical
+            # actor.  Independent coefficient actions must not silently add an
+            # epsilon-uniform controller: it changes the behavior policy and
+            # can make an unconstrained tariff walk look like learned action.
+            scheduled_exploration=bool(td_value_targets),
+            # No hand-authored hold prior.  Entropy in PPO supplies exploration
+            # and every one of the eleven actions begins with equal logits.
+            initial_hold_probability=None,
+            exploration_fraction=1.00,
+            exploration_warmup_fraction=0.05,
             min_action_visits=1,
         )
         
@@ -1307,11 +1427,62 @@ class FirmRLPricer:
         return dict(self.action_to_steps.get(int(action), {}))
 
     def action_label(self, action: int) -> str:
-        """Compact human-readable label for a discrete vector action."""
-        steps = self.action_steps(action)
-        if not steps or all(int(v) == 0 for v in steps.values()):
+        """Compact human-readable label for the selected tariff operation."""
+        if int(action) == 0:
             return "hold"
-        return ",".join(f"{k}:{int(v):+d}@continuous" for k, v in steps.items() if int(v) != 0)
+        if self.independent_coefficient_actions:
+            mapping = self.action_to_steps.get(int(action), {})
+            active = [(key, step) for key, step in mapping.items() if step]
+            if len(active) != 1:
+                return "invalid"
+            key, step = active[0]
+            return f"{key}:{'up' if step > 0 else 'down'}"
+        multiplier = self.action_to_multiplier.get(int(action))
+        if multiplier is None:
+            return "invalid"
+        relation = "current" if self.experimental_unbounded_economics else "market"
+        operation = "tariff_scale" if self.experimental_unbounded_economics else "tariff_target"
+        return f"{operation}:{multiplier:.3f}x_{relation}"
+
+    @classmethod
+    def _numerically_safe_scaled_value(
+        cls, current: float, multiplier: float
+    ) -> Tuple[Optional[float], str]:
+        """Scale a coefficient without imposing an economic range.
+
+        Returning ``None`` is an explicit atomic rejection signal. Values are
+        never projected onto ``NUMERICAL_COEFFICIENT_LIMIT`` because doing so
+        would turn overflow protection into a hidden policy action.
+        """
+        current_f = float(current)
+        multiplier_f = float(multiplier)
+        if not np.isfinite(current_f) or not np.isfinite(multiplier_f):
+            return None, "non_finite_input"
+        try:
+            target = current_f * multiplier_f
+        except OverflowError:
+            return None, "float_overflow"
+        if not np.isfinite(target):
+            return None, "non_finite_product"
+        if abs(target) > cls.NUMERICAL_COEFFICIENT_LIMIT:
+            return None, "float32_headroom_exceeded"
+        return float(target), ""
+
+    @classmethod
+    def _numerically_safe_added_value(
+        cls, current: float, delta: float
+    ) -> Tuple[Optional[float], str]:
+        """Add an uncapped coefficient step with numerical checks only."""
+        current_f = float(current)
+        delta_f = float(delta)
+        if not np.isfinite(current_f) or not np.isfinite(delta_f):
+            return None, "non_finite_input"
+        target = current_f + delta_f
+        if not np.isfinite(target):
+            return None, "non_finite_sum"
+        if abs(target) > cls.NUMERICAL_COEFFICIENT_LIMIT:
+            return None, "float32_headroom_exceeded"
+        return float(target), ""
         
     def last_action_magnitude(self) -> float:
         """Mean realized movement in standard coefficient-step units.
@@ -1320,6 +1491,18 @@ class FirmRLPricer:
         per-minute, and fixed-fee coefficients.  Moving every managed lever by
         one configured step has magnitude 1; one lever has magnitude 1/5.
         """
+        if self.independent_coefficient_actions:
+            return float(
+                sum(abs(v) for v in getattr(
+                    self, "last_action_step_units", {}
+                ).values())
+                / max(1, len(self.opt_keys))
+            )
+        if self.experimental_unbounded_economics:
+            multiplier = float(
+                getattr(self.last_action_descriptor, "magnitude_multiplier", 1.0)
+            )
+            return abs(multiplier - 1.0)
         return float(
             np.clip(
                 sum(abs(v) for v in getattr(self, "last_action_step_units", {}).values())
@@ -1342,6 +1525,8 @@ class FirmRLPricer:
         self.last_action_descriptor = ActionDescriptor()
         self.last_action_was_saturated = False
         self.last_action_was_zero_effect = False
+        self.last_action_numerical_rejection = ""
+        self.agent.reset_learning_context()
 
     def snapshot_execution_state(self) -> Dict[str, Any]:
         """Capture mutable inference state without copying policy parameters."""
@@ -1351,6 +1536,8 @@ class FirmRLPricer:
             "last_action_descriptor",
             "last_action_was_saturated",
             "last_action_was_zero_effect",
+            "last_action_numerical_rejection",
+            "numerical_action_rejection_count",
             "last_action_normalized_gap",
             "last_action_step_units",
             "last_action_steps",
@@ -1379,6 +1566,8 @@ class FirmRLPricer:
                 "last_constraint_values": self.agent.last_constraint_values.detach().clone(),
                 "last_risk_value": self.agent.last_risk_value.detach().clone(),
                 "last_response_pred": self.agent.last_response_pred.detach().clone(),
+                "recurrent_state": self.agent.recurrent_state_dict(),
+                "learning_context": self.agent.normalizer_state_dict(),
             },
         }
 
@@ -1408,6 +1597,10 @@ class FirmRLPricer:
         for name in ("last_constraint_values", "last_risk_value", "last_response_pred"):
             if name in agent_state:
                 setattr(self.agent, name, agent_state[name].detach().clone().to(self.agent.device))
+        self.agent.load_recurrent_state_dict(agent_state.get("recurrent_state"))
+        self.agent.load_normalizer_state_dict(
+            agent_state.get("learning_context")
+        )
         
     def update_response_context(self, share: float, gap: float, fulfillment: float) -> None:
         """Cache latest market response signals for state/action features."""
@@ -1435,31 +1628,39 @@ class FirmRLPricer:
         return np.concatenate(frames[-self.state_frame_stack:]).astype(np.float32, copy=False)
 
     def feasible_action_mask(self, market_interaction) -> np.ndarray:
-        """Mask interventions that cannot produce a nonzero bounded coefficient move."""
-        mask = np.zeros(len(self.action_to_steps), dtype=bool)
-        mask[0] = True
+        """Return the physically effective action set.
+
+        Repeating a whole-tariff target means keep that coherent tariff posted,
+        so it is intentionally legal.  In the v29 independent-action contract,
+        a downward action at the explicit coefficient floor is excluded because
+        executing it would be a mislabeled no-op.  No objective or business
+        performance rule masks an action.
+        """
+        mask = np.ones(len(self.action_to_steps), dtype=bool)
+        if not (
+            self.independent_coefficient_actions
+            and self.minimum_tariff_multiplier > 0.0
+        ):
+            return mask
         base = market_interaction.curr_market
-        for action, step_map in self.action_to_steps.items():
-            if int(action) == 0:
+        for action, mapping in self.action_to_steps.items():
+            active = [
+                (key, int(direction))
+                for key, direction in mapping.items()
+                if int(direction) != 0
+            ]
+            if len(active) != 1:
                 continue
-            active = [(k, int(v)) for k, v in step_map.items() if k in self.opt_keys and int(v) != 0]
-            if not active:
+            key, direction = active[0]
+            if direction >= 0:
                 continue
-            feasible = True
-            for key, direction in active:
-                anchor = float(getattr(base, key))
-                current_raw = getattr(self.overrides, key)
-                current = anchor if current_raw is None else float(current_raw)
-                lb, ub = self.config.bounds[key]
-                floor = max(float(lb), anchor * (1.0 - self.max_relative_dev))
-                ceil = min(float(ub), anchor * (1.0 + self.max_relative_dev))
-                if floor > ceil:
-                    floor, ceil = float(lb), float(ub)
-                if direction < 0:
-                    feasible = feasible and current > floor + 1e-8
-                else:
-                    feasible = feasible and current < ceil - 1e-8
-            mask[int(action)] = bool(feasible)
+            anchor = float(getattr(base, key))
+            current_raw = getattr(self.overrides, key)
+            current = anchor if current_raw is None else float(current_raw)
+            floor = anchor * self.minimum_tariff_multiplier
+            if current <= floor + 1e-10 * max(1.0, abs(floor)):
+                mask[int(action)] = False
+        mask[0] = True
         return mask
     
     def action_descriptor_vector(self) -> np.ndarray:
@@ -1491,14 +1692,19 @@ class FirmRLPricer:
         base = market_interaction.curr_market
         rows: List[List[float]] = []
         near_threshold = float(np.clip(ctx.get("near_threshold_share", 0.0), 0.0, 1.0))
-        threshold_mean = float(np.clip(ctx.get("price_threshold_mean", 1.5) / 8.0, 0.0, 1.0))
+        raw_threshold_mean = float(ctx.get("price_threshold_mean", 1.5))
+        threshold_mean = (
+            float(np.log1p(raw_threshold_mean) / np.log(9.0))
+            if self.experimental_unbounded_economics and raw_threshold_mean > 0.0
+            else float(np.clip(raw_threshold_mean / 8.0, 0.0, 1.0))
+        )
         no_ride_rate = float(np.clip(ctx.get("no_ride_rate", 0.0), 0.0, 1.0))
         peak = float(np.clip(ctx.get("peak_context", 0.0), 0.0, 1.0))
         airport_rate = float(np.clip(ctx.get("airport_rate", 0.0), 0.0, 1.0))
         for action in range(len(self.action_to_steps)):
-            step_map = self.action_steps(action)
-            active = [(k, int(v)) for k, v in step_map.items() if int(v) != 0 and k in self.action_keys]
-            if not active:
+            target_key = self.action_to_target_key.get(int(action))
+            multiplier = self.action_to_multiplier.get(int(action))
+            if multiplier is None:
                 rows.append([
                     1.0, 0.0, *([0.0] * 5), 0.0, 1.0, 1.0,
                     *([0.0] * 4),
@@ -1506,9 +1712,30 @@ class FirmRLPricer:
                     threshold_mean, 0.0,
                 ])
                 continue
+            target_keys = (
+                list(self.opt_keys)
+                if target_key is None
+                else [str(target_key)]
+            )
+            active: List[Tuple[str, int]] = []
+            targets: Dict[str, float] = {}
+            for key in target_keys:
+                anchor = float(getattr(base, key))
+                curr_raw = getattr(self.overrides, key)
+                current = anchor if curr_raw is None else float(curr_raw)
+                lb, ub = self.config.bounds[key]
+                if self.experimental_unbounded_economics:
+                    candidate, _ = self._numerically_safe_scaled_value(
+                        current, multiplier
+                    )
+                    target = current if candidate is None else candidate
+                else:
+                    target = float(np.clip(anchor * multiplier, lb, ub))
+                targets[key] = target
+                active.append((key, int(np.sign(target - current))))
             directions = {key: int(direction) for key, direction in active}
             signature = [
-                float(directions.get(key, 0))
+                float(key in directions)
                 for key in ("base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee")
             ]
             relative, lower, upper, deltas = [], [], [], {}
@@ -1519,9 +1746,17 @@ class FirmRLPricer:
                 lb, ub = self.config.bounds[key]
                 width = max(1e-6, float(ub - lb))
                 relative.append(float(np.clip((curr_f - anchor) / max(abs(anchor), 1e-6), -1.0, 1.0)))
-                lower.append(float(np.clip((curr_f - lb) / width, 0.0, 1.0)))
-                upper.append(float(np.clip((ub - curr_f) / width, 0.0, 1.0)))
-                deltas[key] = float(direction) * self.config.step[key] * self.step_scale
+                if self.experimental_unbounded_economics:
+                    candidate, _ = self._numerically_safe_scaled_value(
+                        curr_f, multiplier
+                    )
+                    numerical_room = 1.0 if candidate is not None else 0.0
+                    lower.append(numerical_room)
+                    upper.append(numerical_room)
+                else:
+                    lower.append(float(np.clip((curr_f - lb) / width, 0.0, 1.0)))
+                    upper.append(float(np.clip((ub - curr_f) / width, 0.0, 1.0)))
+                deltas[key] = float(targets[key] - curr_f)
             exposures = (
                 {"base_fare": 1.0, "per_minute": 8.0, "per_mile": 1.5, "booking_fee": 1.0, "airport_fee": 0.0},
                 {"base_fare": 1.0, "per_minute": 14.0, "per_mile": 3.5, "booking_fee": 1.0, "airport_fee": 0.05},
@@ -1555,32 +1790,17 @@ class FirmRLPricer:
         return result
         
     def configure_training_controls(self, progress: float, reward_converged: bool, reward_std: float) -> None:
-        """Adapt exploration and action aggressiveness across training phases."""
-        p = float(np.clip(progress, 0.0, 1.0))
-        # Low reward variance can mean convergence, but it can just as easily
-        # mean a collapsed fixed policy.  Only Core's dominance/diversity-aware
-        # convergence gate is allowed to tighten the action envelope.
-        stable = bool(reward_converged)
+        """Advance only PPO's predeclared behavior-coverage schedule.
 
-        self.allow_aggressive_actions = not stable
-        self.step_scale = self.converged_step_scale if stable else self.base_step_scale
-        self.max_relative_dev = self.converged_max_relative_dev if stable else self.base_max_relative_dev
-        self.agent.adapt_optimization(progress=p, reward_converged=stable)
-        self.agent.adapt_entropy(progress=p, reward_converged=stable)
-        self.agent.adapt_exploration(
-            progress=p,
-            reward_converged=stable,
-            reward_std=reward_std,
-        )
-    
-    @staticmethod
-    def _bounded_relative_move(value: float, anchor: float, max_relative_dev: float, lb: float, ub: float) -> float:
-        """Clamp a value to both absolute bounds and a relative envelope around anchor."""
-        floor = max(lb, anchor * (1.0 - max_relative_dev))
-        ceil = min(ub, anchor * (1.0 + max_relative_dev))
-        if floor > ceil:
-            floor, ceil = lb, ub
-        return float(np.clip(value, floor, ceil))
+        Reward convergence remains diagnostic: it cannot freeze the policy or
+        alter the action space.  The scheduled uniform component includes hold
+        and is accounted for by PPO's behavior likelihood.
+        """
+        del reward_converged, reward_std
+        self.agent.set_training_progress(progress)
+        self.allow_aggressive_actions = True
+        self.step_scale = 1.0
+        self.max_relative_dev = float("inf")
 
     def stabilize_after_batch(
         self,
@@ -1596,256 +1816,174 @@ class FirmRLPricer:
         target_price_gap: float = 0.0,
         target_gap_tolerance: float = 0.35,
     ) -> Dict[str, object]:
-        """Guard against extreme dynamic-market failure modes and report effects.
-
-        The guardrail is intentionally small: PPO still owns the strategy, but
-        it should not remain stuck in obviously dominated regions such as
-        overpricing with collapsing share, negative-profit share buying, or
-        severe driver-fulfillment stress.  Returning a structured diagnostic lets
-        evaluation separate learned RL actions from rule-based safety projection.
-        """
+        """Compatibility hook; no rule modifies a learned tariff."""
+        del (
+            share,
+            price_gap_f2_minus_f1,
+            city_base,
+            city_pmin,
+            city_pmile,
+            city_booking,
+            city_airport,
+            profit_per_request,
+            fulfillment_rate,
+            target_price_gap,
+            target_gap_tolerance,
+        )
         before = {k: getattr(self.overrides, k) for k in self.opt_keys}
-        moved: Dict[str, float] = {}
-        reasons: List[str] = []
-        share_f = float(np.clip(share, 0.0, 1.0))
-        gap = float(price_gap_f2_minus_f1)
-        profit = float(profit_per_request)
-        fulfill = float(np.clip(fulfillment_rate, 0.0, 1.0))
-        target_gap = float(target_price_gap)
-        gap_tol = float(max(0.05, target_gap_tolerance))
-        lower_gap = min(target_gap - gap_tol, target_gap)
-        upper_gap = target_gap + gap_tol
-        overpricing = share_f < 0.22 or gap < (max(self.recovery_gap_threshold, lower_gap) - 0.50)
-        over_discounting = gap > 2.25 and share_f >= self.recovery_share_threshold
-        loss_buying_share = profit < -1.00 and share_f >= self.recovery_share_threshold and gap >= 0.00
-        supply_stress = fulfill < 0.60 and profit >= -0.50
-        if not (overpricing or over_discounting or loss_buying_share or supply_stress):
-            return {"applied": False, "reasons": [], "deltas": {}, "before": before, "after": dict(before)}
-
-        anchors = {
-            "base_fare": float(city_base),
-            "per_minute": float(city_pmin),
-            "per_mile": float(city_pmile if city_pmile is not None else 1.50),
-            "booking_fee": float(city_booking if city_booking is not None else max(0.0, city_base - 0.25)),
-            "airport_fee": float(city_airport if city_airport is not None else 5.0),
-        }
-
-        def move(key: str, direction: int, multiplier: float = 1.0) -> None:
-            if key not in self.opt_keys:
-                return
-            curr = getattr(self.overrides, key)
-            anchor = anchors[key]
-            if curr is None:
-                curr = anchor
-            step = self.config.step[key] * self.step_scale * float(multiplier)
-            lb, ub = self.config.bounds[key]
-            old = float(curr)
-            nudged = old + float(np.sign(direction)) * step
-            new_value = self._bounded_relative_move(nudged, anchor, self.max_relative_dev, lb, ub)
-            setattr(self.overrides, key, new_value)
-            delta = float(new_value - old)
-            if abs(delta) > 1e-12:
-                moved[key] = moved.get(key, 0.0) + delta
-        
-        if overpricing:
-            reasons.append("overpricing")
-            # Restore competitiveness first through fixed fees, then segment
-            # levers if the mean gap shows a severe broad overprice.
-            move("base_fare", -1)
-            move("booking_fee", -1)
-            move("per_minute", -1, 0.5)
-            if gap < -1.00:
-                move("airport_fee", -1)
-            if gap < -2.00:
-                move("per_mile", -1, 0.75)
-        elif over_discounting:
-            reasons.append("over_discounting")
-            # If the realized market gap is already wider than the intended
-            # modest discount, lift broad/fixed fare levers before allowing the
-            # policy to keep compensating through one distance-heavy coefficient.
-            move("base_fare", +1)
-            move("booking_fee", +1)
-            move("per_minute", +1, 0.5)
-            if gap > 2.25:
-                move("per_mile", +1, 0.5)
-        elif loss_buying_share:
-            reasons.append("loss_buying_share")
-            # Repair unit economics without immediately giving up all share.
-            move("per_mile", +1, 0.75)
-            move("per_minute", +1, 0.75)
-            if gap > 0.75:
-                move("booking_fee", +1, 0.5)
-        elif supply_stress:
-            reasons.append("supply_stress")
-            # Temper demand only when Firm1 is at or above its intended discount
-            # band.  Otherwise this guardrail becomes a one-way variable-fare
-            # ratchet that can erase competitiveness and trigger oscillations.
-            if gap >= upper_gap:
-                move("per_minute", +1, 0.25)
-                move("per_mile", +1, 0.25)
-        after = {k: getattr(self.overrides, k) for k in self.opt_keys}
         return {
-            "applied": bool(moved),
-            "reasons": reasons,
-            "deltas": moved,
+            "applied": False,
+            "reasons": [],
+            "deltas": {},
             "before": before,
-            "after": after,
+            "after": dict(before),
         }
             
     def apply_action(self, action: int, market_interaction) -> None:
-        """Map discrete steps back into concrete market coefficient overrides."""
+        """Apply a legacy anchor target or an unbounded v28 tariff scale."""
         self.last_action_normalized_gap = {}
         self.last_action_step_units = {}
         self.last_action_was_saturated = False
         self.last_action_was_zero_effect = False
+        self.last_action_numerical_rejection = ""
         self.last_action_descriptor = ActionDescriptor(action_id=int(action))
         if action not in self.action_to_steps:
             return
-        
-        if (not self.allow_aggressive_actions) and action in self.aggressive_actions:
-            action = 0
-        
-        step_map = dict(self.action_to_steps[action])
-        if not any(int(v) != 0 for v in step_map.values()):
+
+        if self.independent_coefficient_actions:
+            self._apply_independent_coefficient_action(action, market_interaction)
+            return
+
+        if int(action) == 0:
             self._last_applied_action = int(action)
             self._repeat_action_count = 0
             self._last_action_target = "hold"
             self._last_action_direction = 0
             self._reversal_count = 0
-            self.last_action_steps = step_map
-            self.last_action_descriptor = ActionDescriptor(action_id=int(action), target="hold", direction=0)
+            self.last_action_steps = {
+                key: 0 for key in self.opt_keys
+            }
+            self.last_action_descriptor = ActionDescriptor(
+                action_id=int(action), target="hold", direction=0
+            )
             return
-        
-        if int(action) == self._last_applied_action and int(action) != 0:
+
+        multiplier = self.action_to_multiplier.get(int(action))
+        if multiplier is None:
+            return
+        if int(action) == self._last_applied_action:
             self._repeat_action_count += 1
         else:
             self._last_applied_action = int(action)
-            self._repeat_action_count = 1 if int(action) != 0 else 0
-        
+            self._repeat_action_count = 1
 
-        self.last_action_steps = dict(step_map)
-        fare_step_map = {k: v for k, v in step_map.items() if k in self.opt_keys and int(v) != 0}
-        supply_step = int(step_map.get("supply_incentive", 0))
-        if supply_step:
-            self.supply_incentive_multiplier = float(np.clip(
-                self.supply_incentive_multiplier + supply_step * self.supply_step * self.step_scale,
-                self.supply_min_multiplier,
-                self.supply_max_multiplier,
-            ))
-        if not fare_step_map:
-            self.last_action_normalized_gap = {"supply_incentive": float(supply_step) * self.supply_step} if supply_step else {}
-            return
-        
-        action_magnitude = float(np.clip(getattr(self.agent, "last_continuous_magnitude", 1.0), 0.0, 2.0))
-        multipliers = {k: action_magnitude for k in fare_step_map.keys()}
-        scaled_steps = {
-            k: self.config.step[k]
-            * self.step_scale
-            * multipliers[k]
-            for k in fare_step_map.keys()
-        }
-        pre_values = {}
-        for k in fare_step_map.keys():
-            curr = getattr(self.overrides, k)
-            pre_values[k] = float(getattr(market_interaction.curr_market, k) if curr is None else curr)
-        bounds = {k: self.config.bounds[k] for k in fare_step_map.keys()}
-        invalid_bound_actions = []
-        for key, direction in fare_step_map.items():
-            lb, ub = bounds[key]
-            width = max(1e-6, float(ub - lb))
-            pre = float(pre_values.get(key, getattr(market_interaction.curr_market, key)))
-            anchor = float(getattr(market_interaction.curr_market, key))
-            effective_floor = max(float(lb), anchor * (1.0 - self.max_relative_dev))
-            effective_ceil = min(float(ub), anchor * (1.0 + self.max_relative_dev))
-            if effective_floor > effective_ceil:
-                effective_floor, effective_ceil = float(lb), float(ub)
-            lower_distance = float((pre - lb) / width)
-            upper_distance = float((ub - pre) / width)
-            if int(direction) < 0 and (lower_distance <= 1e-4 or pre <= effective_floor + 1e-8):
-                invalid_bound_actions.append((key, int(direction), pre, lb, ub))
-            elif int(direction) > 0 and (upper_distance <= 1e-4 or pre >= effective_ceil - 1e-8):
-                invalid_bound_actions.append((key, int(direction), pre, lb, ub))
-        if invalid_bound_actions and len(invalid_bound_actions) == len(fare_step_map):
-            key, direction, pre, lb, ub = invalid_bound_actions[0]
-            width = max(1e-6, float(ub - lb))
-            if int(action) == self._last_applied_action and int(action) != 0:
-                self._repeat_action_count += 1
-            else:
-                self._last_applied_action = int(action)
-                self._repeat_action_count = 1 if int(action) != 0 else 0
-            self._last_action_target = str(key)
-            self._last_action_direction = int(direction)
-            self.last_action_was_saturated = True
-            self.last_action_was_zero_effect = True
-            self.last_action_steps = dict(step_map)
-            self.last_action_descriptor = ActionDescriptor(
-                action_id=int(action),
-                target=str(key),
-                direction=int(direction),
-                intended_step=0.0,
-                realized_delta=0.0,
-                realized_delta_norm=0.0,
-                pre_value=float(pre),
-                post_value=float(pre),
-                lower_distance=float(np.clip((pre - lb) / width, 0.0, 1.0)),
-                upper_distance=float(np.clip((ub - pre) / width, 0.0, 1.0)),
-                magnitude_multiplier=0.0,
-                magnitude_level=0.0,
-                repeat_count=int(self._repeat_action_count),
-                was_clipped=True,
-                is_reversal=False,
-                reversal_count=int(self._reversal_count),
-            )
-            return
-        # Detailed normalized one-unit gap per coefficient:
-        # one step => config.step[k], normalized by feasible range width.
-        self.last_action_normalized_gap = {
-            k: float(fare_step_map[k]) * float(scaled_steps[k]) / max(1e-6, float(bounds[k][1] - bounds[k][0]))
-            for k in fare_step_map.keys()
-        }
-        if supply_step:
-            self.last_action_normalized_gap["supply_incentive"] = float(supply_step) * self.supply_step
-        market_interaction.apply_step_actions_to_overrides(
-            overrides=self.overrides,
-            action_steps=fare_step_map,
-            step_size=scaled_steps,
-            bounds=bounds,
-        )
-        
         base = market_interaction.curr_market
+        pre_values: Dict[str, float] = {}
+        target_values: Dict[str, float] = {}
         realized_by_key: Dict[str, float] = {}
-        intended_by_key: Dict[str, float] = {}
         lower_distances: List[float] = []
         upper_distances: List[float] = []
+        directions: Dict[str, int] = {}
         clipped_any = False
-        for key in fare_step_map:
-            anchor = float(getattr(base, key))
-            lb, ub = bounds[key]
-            current = float(getattr(self.overrides, key))
-            bounded = self._bounded_relative_move(current, anchor, self.max_relative_dev, lb, ub)
-            setattr(self.overrides, key, bounded)
-            width = max(1e-6, float(ub - lb))
-            pre = float(pre_values.get(key, anchor))
-            realized = float(bounded - pre)
-            intended = float(np.sign(fare_step_map[key]) * scaled_steps[key])
-            realized_by_key[key] = realized
-            intended_by_key[key] = intended
-            if abs(realized) <= 1e-8 and abs(intended) > 1e-8:
-                self.last_action_was_zero_effect = True
-            lower_distances.append(float(np.clip((bounded - lb) / width, 0.0, 1.0)))
-            upper_distances.append(float(np.clip((ub - bounded) / width, 0.0, 1.0)))
-            clipped_any = clipped_any or bool(abs(realized - intended) > 1e-8)
-        self.last_action_step_units = {
-            key: float(realized_by_key[key] / max(1e-8, float(self.config.step[key])))
-            for key in fare_step_map
-        }
 
-        target = "+".join(sorted(fare_step_map))
-        signed_intended = float(sum(
-            intended_by_key[key] / max(1e-6, bounds[key][1] - bounds[key][0])
-            for key in fare_step_map
-        ))
-        aggregate_direction = int(np.sign(signed_intended))
+        # Resolve the complete action before mutating any coefficient. This
+        # makes numerical overflow a transparent all-or-nothing rejection.
+        for key in self.opt_keys:
+            anchor = float(getattr(base, key))
+            current_raw = getattr(self.overrides, key)
+            current = anchor if current_raw is None else float(current_raw)
+            lb, ub = self.config.bounds[key]
+            pre_values[key] = current
+            if self.experimental_unbounded_economics:
+                target_value, rejection_reason = self._numerically_safe_scaled_value(
+                    current, multiplier
+                )
+                if target_value is None:
+                    self.last_action_numerical_rejection = (
+                        f"{key}:{rejection_reason}"
+                    )
+                    self.numerical_action_rejection_count += 1
+                    self.last_action_was_zero_effect = True
+                    self.last_action_steps = {
+                        candidate: 0 for candidate in self.opt_keys
+                    }
+                    pre_mean = float(np.mean(list(pre_values.values())))
+                    self.last_action_descriptor = ActionDescriptor(
+                        action_id=int(action),
+                        target="whole_tariff_scale",
+                        direction=0,
+                        pre_value=pre_mean,
+                        post_value=pre_mean,
+                        lower_distance=0.0,
+                        upper_distance=0.0,
+                        magnitude_multiplier=float(multiplier),
+                        magnitude_level=float(multiplier),
+                        repeat_count=int(self._repeat_action_count),
+                        numerical_rejection=True,
+                        numerical_rejection_reason=self.last_action_numerical_rejection,
+                    )
+                    return
+            else:
+                raw_target = float(anchor * multiplier)
+                target_value = float(np.clip(raw_target, lb, ub))
+                clipped_any = bool(
+                    clipped_any or abs(target_value - raw_target) > 1e-8
+                )
+            target_values[key] = float(target_value)
+
+        for key in self.opt_keys:
+            anchor = float(getattr(base, key))
+            current = pre_values[key]
+            target_value = target_values[key]
+            lb, ub = self.config.bounds[key]
+            setattr(self.overrides, key, target_value)
+            width = max(1e-6, float(ub - lb))
+            realized = float(target_value - current)
+            realized_by_key[key] = realized
+            directions[key] = int(np.sign(realized))
+            if self.experimental_unbounded_economics:
+                lower_distances.append(1.0)
+                upper_distances.append(1.0)
+            else:
+                lower_distances.append(float(np.clip((target_value - lb) / width, 0.0, 1.0)))
+                upper_distances.append(float(np.clip((ub - target_value) / width, 0.0, 1.0)))
+
+        self.last_action_was_zero_effect = bool(
+            all(abs(delta) <= 1e-8 for delta in realized_by_key.values())
+        )
+        self.last_action_was_saturated = clipped_any
+        self.last_action_steps = {
+            key: int(directions.get(key, 0)) for key in self.opt_keys
+        }
+        self.last_action_step_units = {
+            key: float(realized_by_key.get(key, 0.0) / max(1e-8, float(self.config.step[key])))
+            for key in self.opt_keys
+        }
+        self.last_action_normalized_gap = {}
+        for key in self.opt_keys:
+            if self.experimental_unbounded_economics:
+                anchor = float(getattr(base, key))
+                denominator = max(
+                    1e-6, abs(float(pre_values[key])), abs(anchor)
+                )
+            else:
+                denominator = max(
+                    1e-6,
+                    self.config.bounds[key][1] - self.config.bounds[key][0],
+                )
+            self.last_action_normalized_gap[key] = float(
+                realized_by_key.get(key, 0.0) / denominator
+            )
+        # Direction is the realized move from the previously posted tariff,
+        # not the target's side of the city anchor. For example, 1.30x ->
+        # 1.15x is a downward move even though the new level remains above
+        # market. This is the direction exposed in the next observation frame.
+        aggregate_direction = int(np.sign(sum(realized_by_key.values())))
+        target = (
+            "whole_tariff_scale"
+            if self.experimental_unbounded_economics
+            else "whole_tariff"
+        )
         is_reversal = bool(
             target == str(getattr(self, "_last_action_target", "hold"))
             and aggregate_direction != 0
@@ -1858,20 +1996,150 @@ class FirmRLPricer:
             action_id=int(action),
             target=target,
             direction=aggregate_direction,
-            intended_step=float(sum(intended_by_key.values())),
+            intended_step=float(sum(realized_by_key.values())),
             realized_delta=float(sum(realized_by_key.values())),
             realized_delta_norm=float(sum(
-                realized_by_key[key] / max(1e-6, bounds[key][1] - bounds[key][0])
-                for key in fare_step_map
+                self.last_action_normalized_gap[key]
+                for key in self.opt_keys
             )),
             pre_value=float(np.mean(list(pre_values.values()))),
-            post_value=float(np.mean([float(getattr(self.overrides, key)) for key in fare_step_map])),
+            post_value=float(np.mean([
+                float(getattr(self.overrides, key)) for key in self.opt_keys
+            ])),
             lower_distance=float(min(lower_distances) if lower_distances else 0.0),
             upper_distance=float(min(upper_distances) if upper_distances else 0.0),
-            magnitude_multiplier=float(action_magnitude),
-            magnitude_level=float(action_magnitude),
+            magnitude_multiplier=float(multiplier),
+            magnitude_level=float(multiplier),
             repeat_count=int(self._repeat_action_count),
             was_clipped=clipped_any,
             is_reversal=is_reversal,
             reversal_count=int(self._reversal_count),
+        )
+
+    def _apply_independent_coefficient_action(self, action: int, market_interaction) -> None:
+        """Move exactly one tariff coefficient; never apply a uniform tariff move."""
+        mapping = dict(self.action_to_steps.get(int(action), {}))
+        active = [(key, int(step)) for key, step in mapping.items() if int(step)]
+        if not active:
+            self._last_applied_action = int(action)
+            self._repeat_action_count = 0
+            self._last_action_target = "hold"
+            self._last_action_direction = 0
+            self._reversal_count = 0
+            self.last_action_steps = {key: 0 for key in self.opt_keys}
+            self.last_action_descriptor = ActionDescriptor(
+                action_id=int(action), target="hold", direction=0
+            )
+            return
+        if len(active) != 1:
+            raise RuntimeError("independent coefficient action changed multiple levers")
+
+        key, direction = active[0]
+        base = market_interaction.curr_market
+        anchor = float(getattr(base, key))
+        current_raw = getattr(self.overrides, key)
+        current = anchor if current_raw is None else float(current_raw)
+        step = float(self.config.step[key]) * float(self.step_scale)
+        lb, ub = self.config.bounds[key]
+        clipped = False
+        if self.experimental_unbounded_economics:
+            # Preserve the original independent-action semantics: one action
+            # adds or subtracts one configured step from one coefficient. The
+            # v28 contract removes economic bounds, not the meaning or size of
+            # the action. Additive steps also keep a zero-valued fee reversible
+            # instead of making zero an absorbing state under multiplication.
+            target, reason = self._numerically_safe_added_value(
+                current, float(direction) * step
+            )
+            if target is None:
+                self.last_action_numerical_rejection = f"{key}:{reason}"
+                self.numerical_action_rejection_count += 1
+                self.last_action_was_zero_effect = True
+                self.last_action_steps = {candidate: 0 for candidate in self.opt_keys}
+                self.last_action_descriptor = ActionDescriptor(
+                    action_id=int(action), target=key, direction=0,
+                    pre_value=current, post_value=current,
+                    numerical_rejection=True,
+                    numerical_rejection_reason=self.last_action_numerical_rejection,
+                )
+                return
+            multiplier = (
+                float(target / current) if abs(current) > 1e-8 else 1.0
+            )
+        else:
+            raw_target = current + float(direction) * step
+            target = float(np.clip(raw_target, lb, ub))
+            clipped = bool(abs(target - raw_target) > 1e-8)
+            multiplier = float(target / current) if abs(current) > 1e-8 else 1.0
+
+        multiplier_floor_value = float(anchor) * float(
+            self.minimum_tariff_multiplier
+        )
+        if target < multiplier_floor_value:
+            target = multiplier_floor_value
+            clipped = True
+            multiplier = (
+                float(target / current) if abs(current) > 1e-8 else 1.0
+            )
+
+        if int(action) == self._last_applied_action:
+            self._repeat_action_count += 1
+        else:
+            self._last_applied_action = int(action)
+            self._repeat_action_count = 1
+        realized = float(target - current)
+        realized_direction = int(np.sign(realized))
+        previous_target = str(getattr(self, "_last_action_target", "hold"))
+        previous_direction = int(getattr(self, "_last_action_direction", 0) or 0)
+        reversal = bool(
+            previous_target == key
+            and realized_direction != 0
+            and realized_direction == -previous_direction
+        )
+        self._reversal_count = self._reversal_count + 1 if reversal else 0
+        self._last_action_target = key
+        self._last_action_direction = realized_direction
+        setattr(self.overrides, key, float(target))
+        self.last_action_was_saturated = clipped
+        self.last_action_was_zero_effect = abs(realized) <= 1e-8
+        self.last_action_steps = {
+            candidate: realized_direction if candidate == key else 0
+            for candidate in self.opt_keys
+        }
+        self.last_action_step_units = {
+            candidate: (
+                realized / max(1e-8, float(self.config.step[candidate]))
+                if candidate == key else 0.0
+            )
+            for candidate in self.opt_keys
+        }
+        denominator = (
+            max(abs(current), abs(anchor), 1e-6)
+            if self.experimental_unbounded_economics
+            else max(1e-6, ub - lb)
+        )
+        self.last_action_normalized_gap = {
+            candidate: realized / denominator if candidate == key else 0.0
+            for candidate in self.opt_keys
+        }
+        lower_distance = (
+            float((target - multiplier_floor_value) / max(abs(anchor), 1e-6))
+            if self.experimental_unbounded_economics
+            and self.minimum_tariff_multiplier > 0.0
+            else 1.0
+            if self.experimental_unbounded_economics
+            else float(np.clip((target - lb) / max(1e-6, ub - lb), 0.0, 1.0))
+        )
+        upper_distance = 1.0 if self.experimental_unbounded_economics else float(
+            np.clip((ub - target) / max(1e-6, ub - lb), 0.0, 1.0)
+        )
+        self.last_action_descriptor = ActionDescriptor(
+            action_id=int(action), target=key, direction=realized_direction,
+            intended_step=float(direction) * step, realized_delta=realized,
+            realized_delta_norm=float(realized / denominator),
+            pre_value=current, post_value=float(target),
+            lower_distance=lower_distance, upper_distance=upper_distance,
+            magnitude_multiplier=multiplier, magnitude_level=abs(realized) / max(step, 1e-8),
+            repeat_count=int(self._repeat_action_count), was_clipped=clipped,
+            is_reversal=reversal, reversal_count=int(self._reversal_count),
         )

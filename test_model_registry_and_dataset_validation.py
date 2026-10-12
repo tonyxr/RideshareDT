@@ -13,6 +13,216 @@ from model_registry import (
 
 
 class ModelRegistryAndDatasetValidationTests(unittest.TestCase):
+    def test_mixed_objective_artifact_round_trip_preserves_identity_and_weights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = os.path.join(directory, "mixed-policy.pt")
+            objective = "profit_70_competitiveness_30"
+            trained = Core(
+                market_name="New York City",
+                seed=37,
+                choice_mode="parametric",
+                firm1_mode="RL",
+                firm2_mode="static",
+                policy_objective=objective,
+                total_customers_pool=20,
+            )
+            trained.save_trained_model(model_path, model_id="mixed-policy")
+            artifact = core_module.torch.load(
+                model_path, map_location="cpu", weights_only=False
+            )
+            active = artifact["mdp_config"]["active_reward"]
+            self.assertEqual(artifact["policy_objective"], objective)
+            self.assertEqual(
+                artifact["reward_mechanism"],
+                "economic_profit_competitiveness_mix_v25",
+            )
+            self.assertAlmostEqual(active["own_profit_weight"], 0.59)
+            self.assertAlmostEqual(active["profit_advantage_weight"], 0.14)
+            self.assertAlmostEqual(active["market_share_level_weight"], 0.06)
+            self.assertAlmostEqual(
+                active["market_share_competitiveness_weight"], 0.21
+            )
+
+            matching = Core(
+                market_name="New York City",
+                seed=37,
+                choice_mode="parametric",
+                firm1_mode="RL",
+                firm2_mode="static",
+                policy_objective=objective,
+                total_customers_pool=20,
+            )
+            matching.load_trained_model(model_path)
+            mismatched = Core(
+                market_name="New York City",
+                seed=37,
+                choice_mode="parametric",
+                firm1_mode="RL",
+                firm2_mode="static",
+                policy_objective="profit_50_competitiveness_50",
+                total_customers_pool=20,
+            )
+            with self.assertRaisesRegex(ValueError, "objective does not match"):
+                mismatched.load_trained_model(model_path)
+
+    def test_manipulated_coefficient_scope_is_persisted_and_enforced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = os.path.join(directory, "three-coefficient-policy.pt")
+            trained = Core(
+                market_name="New York City",
+                seed=29,
+                choice_mode="parametric",
+                firm1_mode="RL",
+                firm2_mode="static",
+                manipulated_price_coefficients=3,
+                total_customers_pool=20,
+            )
+            trained.save_trained_model(model_path, model_id="three-coefficients")
+            artifact = core_module.torch.load(
+                model_path, map_location="cpu", weights_only=False
+            )
+
+            self.assertEqual(artifact["manipulated_price_coefficient_count"], 3)
+            self.assertEqual(
+                artifact["opt_keys"],
+                ["base_fare", "per_minute", "per_mile"],
+            )
+
+            matching = Core(
+                market_name="New York City",
+                seed=29,
+                choice_mode="parametric",
+                firm1_mode="RL",
+                firm2_mode="static",
+                manipulated_price_coefficients=3,
+                total_customers_pool=20,
+            )
+            matching.load_trained_model(model_path)
+
+            mismatched = Core(
+                market_name="New York City",
+                seed=29,
+                choice_mode="parametric",
+                firm1_mode="RL",
+                firm2_mode="static",
+                manipulated_price_coefficients=2,
+                total_customers_pool=20,
+            )
+            with self.assertRaisesRegex(
+                ValueError, "count does not match runtime"
+            ):
+                mismatched.load_trained_model(model_path)
+
+    def test_cached_population_contract_is_persisted_and_enforced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = os.path.join(directory, "nyc-thresholds.jsonl")
+            model_path = os.path.join(directory, "cached-policy.pt")
+            with open(cache_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    '{"PriceThreshold": 2.0, "ProfileMarket": "New York City"}\n'
+                )
+
+            trained = Core(
+                market_name="New York City",
+                seed=31,
+                choice_mode="parametric",
+                firm1_mode="RL",
+                firm2_mode="static",
+                total_customers_pool=20,
+                threshold_profile_source="cached",
+                threshold_cache_path=cache_path,
+            )
+            trained.save_trained_model(model_path, model_id="cached-policy")
+            artifact = core_module.torch.load(
+                model_path, map_location="cpu", weights_only=False
+            )
+            contract = artifact["case_study_population"]
+            self.assertEqual(artifact["version"], 23)
+            self.assertEqual(artifact["manipulated_price_coefficient_count"], 5)
+            self.assertEqual(
+                artifact["reward_mechanism"],
+                "economic_profit_focus_v22",
+            )
+            self.assertEqual(
+                artifact["action_semantics"],
+                "absolute_whole_tariff_target",
+            )
+            self.assertEqual(
+                artifact["architecture"],
+                "separate-gru-actor-critic-categorical-ppo",
+            )
+            self.assertEqual(
+                artifact["competition_protocol"]["name"],
+                "firm2_leader_then_firm1_follower",
+            )
+            self.assertEqual(
+                artifact["competition_protocol"][
+                    "shared_action_interval_steps"
+                ],
+                5,
+            )
+            self.assertEqual(
+                artifact["competition_protocol"]["steps_per_day"],
+                10,
+            )
+            self.assertNotIn("objective_q_update_calls", artifact)
+            self.assertEqual(artifact["response_dim"], 0)
+            self.assertEqual(artifact["opponent_forecast_dim"], 0)
+            self.assertEqual(contract["market_name"], "New York City")
+            self.assertEqual(contract["threshold_profile_source"], "cached")
+            self.assertTrue(contract["threshold_cache_sha256"])
+
+            wrong_objective = Core(
+                market_name="New York City",
+                seed=31,
+                choice_mode="parametric",
+                firm1_mode="RL",
+                firm2_mode="static",
+                policy_objective="competitiveness",
+                total_customers_pool=20,
+                threshold_profile_source="cached",
+                threshold_cache_path=cache_path,
+            )
+            self.assertEqual(
+                wrong_objective.long_term_profit_reward_config.own_profit_weight,
+                0.10,
+            )
+            self.assertEqual(
+                wrong_objective.long_term_profit_reward_config.market_share_competitiveness_weight,
+                0.70,
+            )
+            with self.assertRaisesRegex(ValueError, "objective does not match"):
+                wrong_objective.load_trained_model(model_path)
+
+            wrong_source = Core(
+                market_name="New York City",
+                seed=31,
+                choice_mode="parametric",
+                firm1_mode="RL",
+                firm2_mode="static",
+                total_customers_pool=20,
+                threshold_profile_source="generated",
+            )
+            with self.assertRaisesRegex(ValueError, "threshold population"):
+                wrong_source.load_trained_model(model_path)
+
+            with open(cache_path, "a", encoding="utf-8") as handle:
+                handle.write(
+                    '{"PriceThreshold": 3.0, "ProfileMarket": "New York City"}\n'
+                )
+            wrong_cache = Core(
+                market_name="New York City",
+                seed=31,
+                choice_mode="parametric",
+                firm1_mode="RL",
+                firm2_mode="static",
+                total_customers_pool=20,
+                threshold_profile_source="cached",
+                threshold_cache_path=cache_path,
+            )
+            with self.assertRaisesRegex(ValueError, "fingerprint"):
+                wrong_cache.load_trained_model(model_path)
+
     def test_registry_resolves_old_model_id_and_latest_independently(self):
         with tempfile.TemporaryDirectory() as directory:
             first = allocate_archive_path(directory, "run-a")

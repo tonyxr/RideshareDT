@@ -7,10 +7,13 @@ Created on Tue Jun  9 08:28:35 2026
 """
 
 import importlib
+import json
 import math
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 
 from gpt_threshold_utils import (
     build_threshold_profile,
@@ -55,6 +58,134 @@ class _FakeNumpy(types.SimpleNamespace):
 
 
 class PriceThresholdFlowTests(unittest.TestCase):
+    def test_structured_context_rubric_has_auditable_economic_components(self):
+        from Core import Core
+
+        rides = [{"firm1_price": 20.0, "firm2_price": 24.0} for _ in range(5)]
+        low_profile = {
+            "IncomeBracket": "<50k",
+            "HouseholdSize": 5,
+            "LoyaltyType": "New",
+            "LoyaltyStrength": 0.0,
+            "Gender": "Female",
+        }
+        high_profile = {
+            "IncomeBracket": "200k+",
+            "HouseholdSize": 1,
+            "LoyaltyType": "Returning",
+            "LoyaltyStrength": 0.90,
+            "Gender": "Male",
+        }
+        low = Core._rubric_price_threshold_result(
+            low_profile, rides, -0.25, source="gpt"
+        )
+        high = Core._rubric_price_threshold_result(
+            high_profile, rides, 0.25, source="gpt"
+        )
+        low_gender_changed = Core._rubric_price_threshold_result(
+            {**low_profile, "Gender": "Male"}, rides, -0.25, source="gpt"
+        )
+
+        self.assertEqual(low["price_threshold"], 0.50)
+        self.assertEqual(high["price_threshold"], 4.75)
+        self.assertEqual(low["price_threshold"], low_gender_changed["price_threshold"])
+        self.assertEqual(low["income_anchor"], 1.25)
+        self.assertEqual(high["loyalty_adjustment"], 0.75)
+
+    def test_coldstart_price_evidence_is_independent_of_live_opening_tariffs(self):
+        from Core import Core
+
+        core = Core(
+            market_name="New York City",
+            seed=71,
+            choice_mode="parametric",
+            firm1_mode="static",
+            firm2_mode="static",
+            total_customers_pool=20,
+        )
+        rides = [{
+            "Hour": 8,
+            "Weather": "clear",
+            "DistanceMiles": 4.0,
+            "DurationMinutes": 18.0,
+            "Service": "economy",
+            "Airport": False,
+            "DayOfWeek": 2,
+        }]
+        first = core._price_coldstart_rides(rides)
+        core.firm1.overrides.base_fare = 99.0
+        core.firm2.overrides.base_fare = 0.01
+        second = core._price_coldstart_rides(rides)
+
+        self.assertEqual(first, second)
+        self.assertGreater(first[0]["firm2_price"], first[0]["firm1_price"])
+
+    def test_prompt_repeat_reuses_exact_primary_profiles_and_rides(self):
+        from Core import Core
+
+        ride = {
+            "Hour": 8,
+            "Weather": "clear",
+            "DistanceMiles": 4.0,
+            "DurationMinutes": 18.0,
+            "Service": "economy",
+            "Airport": False,
+            "DayOfWeek": 2,
+        }
+        source_rows = [{
+            "ProfileID": index,
+            "ProfileMarket": "New York City",
+            "Age": 30 + index,
+            "IncomeBracket": "50k-100k",
+            "HouseholdSize": 2,
+            "LoyaltyType": "New",
+            "LoyaltyStrength": 0.0,
+            "ColdstartRides": [dict(ride) for _ in range(5)],
+            "PriceThreshold": 1.0,
+            "PriceThresholdSource": "gpt",
+        } for index in range(2)]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "primary.jsonl"
+            output = Path(directory) / "repeat.jsonl"
+            source.write_text(
+                "".join(json.dumps(row) + "\n" for row in source_rows),
+                encoding="utf-8",
+            )
+            core = Core(
+                market_name="New York City",
+                seed=99,
+                choice_mode="parametric",
+                firm1_mode="static",
+                firm2_mode="static",
+                total_customers_pool=2,
+                threshold_cache_path=str(output),
+                threshold_profile_source="generated",
+                threshold_prompt_repeat_source=str(source),
+            )
+            core.openai_api_key = ""
+            core._bootstrap_synthetic_profiles(2)
+
+        self.assertEqual(
+            [row["ProfileID"] for row in core.synthetic_profile_pool],
+            [0, 1],
+        )
+        self.assertTrue(all(
+            row["ColdstartRides"] == source_rows[index]["ColdstartRides"]
+            for index, row in enumerate(core.synthetic_profile_pool)
+        ))
+        self.assertTrue(all(
+            row["ThresholdEvidenceProtocol"] == "city_reference_tariffs_v1"
+            for row in core.synthetic_profile_pool
+        ))
+        self.assertTrue(all(
+            row["ThresholdPromptProtocol"] == "structured_context_rubric_v10"
+            for row in core.synthetic_profile_pool
+        ))
+        self.assertTrue(all(
+            row["ThresholdPromptBatchSize"] == 1
+            for row in core.synthetic_profile_pool
+        ))
+
     def test_transient_proxy_520_family_is_retryable(self):
         for status_code in (520, 521, 522, 523, 524):
             with self.subTest(status_code=status_code):

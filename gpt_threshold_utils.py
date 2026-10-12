@@ -9,6 +9,7 @@ Created on Tue Jun  9 08:28:07 2026
 from __future__ import annotations
 
 from collections import Counter
+import math
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping
 
 
@@ -61,14 +62,64 @@ def increment_gpt_threshold_usage(counts: MutableMapping[str, int], key: str, am
     counts[key] = int(counts.get(key, 0)) + int(amount)
 
 
-def clip_price_threshold(value: Any, lo: float = 0.50, hi: float = 5.00) -> float:
-    """Convert a threshold to float and clamp it to the GPT bootstrap contract."""
+def clip_price_threshold(
+    value: Any,
+    lo: float = 0.50,
+    hi: float = 5.00,
+    *,
+    experimental_unbounded_economics: bool = False,
+) -> float:
+    """Validate a threshold and, in legacy mode, apply its historical bounds.
+
+    The v28 experimental path deliberately has no finite economic upper bound.
+    A threshold is a positive scale used in a denominator, so zero/negative
+    values and NaN/Inf remain invalid numerical inputs rather than silently
+    becoming a different rider type.
+    """
     value_f = float(value)
+    if not math.isfinite(value_f):
+        raise ValueError(f"price threshold must be finite, got {value!r}")
+    if experimental_unbounded_economics:
+        if value_f <= 0.0:
+            raise ValueError(
+                f"unbounded price threshold must be positive, got {value_f!r}"
+            )
+        return value_f
     if value_f < lo:
         return float(lo)
     if value_f > hi:
         return float(hi)
     return float(value_f)
+
+
+def read_profile_price_threshold(
+    profile: Mapping[str, Any],
+    lo: float = 0.25,
+    hi: float = 8.00,
+    *,
+    default: float = 1.50,
+    experimental_unbounded_economics: bool = False,
+) -> float:
+    """Read a cached/profile threshold without hiding invalid v28 values.
+
+    Older profiles historically treated every false-y value as missing.  That
+    behavior remains intact in legacy mode.  In v28 only an absent/``None``
+    value receives the default, so an explicit zero or negative value reaches
+    validation and is rejected instead of being silently repaired to 1.50.
+    """
+    unbounded = bool(
+        experimental_unbounded_economics
+        or profile.get("ExperimentalUnboundedEconomics", False)
+    )
+    raw_value = profile.get("PriceThreshold", default)
+    if raw_value is None or (not unbounded and not raw_value):
+        raw_value = default
+    return clip_price_threshold(
+        raw_value,
+        lo,
+        hi,
+        experimental_unbounded_economics=unbounded,
+    )
 
 def summarize_priced_coldstart_rides(priced_rides: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
     """Aggregate cold-start rides into one profile-level pricing-evidence summary."""
@@ -108,15 +159,29 @@ def build_threshold_profile(
     profile: Mapping[str, Any],
     coldstart_rides: Iterable[Mapping[str, Any]],
     threshold: Mapping[str, Any],
+    *,
+    experimental_unbounded_economics: bool = False,
 ) -> Dict[str, Any]:
     """Attach a generated/fallback price threshold to a rider profile for later simulation use."""
-    return {
+    enriched = {
         **dict(profile),
         "ColdstartRides": list(coldstart_rides),
-        "PriceThreshold": clip_price_threshold(threshold["price_threshold"]),
+        "PriceThreshold": clip_price_threshold(
+            threshold["price_threshold"],
+            experimental_unbounded_economics=experimental_unbounded_economics,
+        ),
         "PriceThresholdRationale": threshold.get("rationale", ""),
         "PriceThresholdSource": str(threshold.get("source", "fallback")),
     }
+    if experimental_unbounded_economics:
+        enriched["ExperimentalUnboundedEconomics"] = True
+        enriched["ThresholdEconomicContract"] = (
+            "v28_unbounded_finite_positive"
+        )
+    else:
+        enriched.pop("ExperimentalUnboundedEconomics", None)
+        enriched["ThresholdEconomicContract"] = "legacy_bounded_0.50_5.00"
+    return enriched
 
 
 def format_gpt_threshold_usage_summary(counts: Mapping[str, int]) -> str:
