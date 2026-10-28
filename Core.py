@@ -811,6 +811,10 @@ class Core:
         v16_audit_every: int = 0,
         v16_store_cap: int = 0,
         v16_value_head: str = "none",
+        v16_policy_mode: str = "ppo",
+        v16_tau_start: float = 0.10,
+        v16_tau_end: float = 0.03,
+        v16_policy_epsilon: float = 0.05,
         momentum_features: bool = False,
         momentum_day_steps: int = 6,
         opponent_features: bool = False,
@@ -875,6 +879,25 @@ class Core:
             raise ValueError("v16_value_head must be none or concave2d")
         if self.v16_value_head == "concave2d" and not self.v16_store_cap:
             raise ValueError("concave2d value head requires v16_store_cap")
+        self.v16_policy_mode = str(v16_policy_mode)
+        if self.v16_policy_mode not in ("ppo", "q"):
+            raise ValueError("v16_policy_mode must be ppo or q")
+        self.v16_tau_start = float(v16_tau_start)
+        self.v16_tau_end = float(v16_tau_end)
+        self.v16_policy_epsilon = float(v16_policy_epsilon)
+        if not (
+            np.isfinite(self.v16_tau_start)
+            and np.isfinite(self.v16_tau_end)
+            and self.v16_tau_start >= self.v16_tau_end > 0.0
+        ):
+            raise ValueError("V17 tau must satisfy start >= end > 0")
+        if not (
+            np.isfinite(self.v16_policy_epsilon)
+            and 0.0 <= self.v16_policy_epsilon <= 1.0
+        ):
+            raise ValueError("v16_policy_epsilon must be in [0, 1]")
+        if self.v16_policy_mode == "q" and self.v16_value_head != "concave2d":
+            raise ValueError("V17 Q policy requires the concave2d value head")
         # Revision 11b: common-random-number day-branch credit for the actor.
         self.counterfactual_day_credit = int(max(0, counterfactual_day_credit))
         self.counterfactual_day_horizon_days = int(max(1, counterfactual_day_horizon_days))
@@ -1675,6 +1698,8 @@ class Core:
             "rival_completed_share",
         )
         self.v16_value_model = None
+        self.v16_value_target_model = None
+        self.v16_value_cells = np.empty((0, 2), dtype=np.float32)
         if self.v16_value_head == "concave2d":
             if self.firm1_mode != "RL":
                 raise ValueError("concave2d value head requires firm1_mode='RL'")
@@ -1687,6 +1712,18 @@ class Core:
                 frame_stack=int(self.firm1.state_frame_stack),
                 auxiliary_names=self.v16_value_auxiliary_names,
             ).to(self.firm1.agent.device)
+            self.v16_value_cells = np.asarray(
+                [
+                    self.firm1.action_to_two_lever_cell[action]
+                    for action in range(self.firm1.agent.action_dim)
+                ],
+                dtype=np.float32,
+            )
+            if self.v16_policy_mode == "q":
+                self.v16_value_target_model = copy.deepcopy(
+                    self.v16_value_model
+                ).eval()
+                self.v16_value_target_model.requires_grad_(False)
         if self.firm1_mode == "RL" and self.counterfactual_policy_coeff is not None:
             self.firm1.agent.counterfactual_policy_coeff_override = float(self.counterfactual_policy_coeff)
         if self.firm1_mode == "RL" and self.counterfactual_day_credit > 0:
@@ -2831,6 +2868,10 @@ class Core:
             "v16_value_auxiliary_names": list(
                 self.v16_value_auxiliary_names
             ),
+            "v16_policy_mode": self.v16_policy_mode,
+            "v16_tau_start": float(self.v16_tau_start),
+            "v16_tau_end": float(self.v16_tau_end),
+            "v16_policy_epsilon": float(self.v16_policy_epsilon),
             "momentum_features": bool(self.momentum_features),
             "momentum_day_steps": int(self.momentum_day_steps),
             "opponent_features": bool(self.opponent_features),
@@ -6577,6 +6618,18 @@ class Core:
                     self.v16_value_model.curvature_floor
                 ),
             }
+        if self.v16_value_target_model is not None:
+            artifact["v16_value_target_model_state"] = {
+                key: value.detach().cpu()
+                for key, value in self.v16_value_target_model.state_dict().items()
+            }
+            artifact["v16_q_policy_config"] = {
+                "mode": self.v16_policy_mode,
+                "tau_start": float(self.v16_tau_start),
+                "tau_end": float(self.v16_tau_end),
+                "epsilon": float(self.v16_policy_epsilon),
+                "target_source": "polyak_value_target",
+            }
         if independent_actions:
             artifact["action_factorization"] = {
                 "target_choices": ["hold", *list(self.shared_edit_keys)],
@@ -7067,6 +7120,27 @@ class Core:
             raise ValueError(
                 "training resume must configure the saved V17 value model"
             )
+        saved_target_state = artifact.get("v16_value_target_model_state")
+        saved_q_config = dict(artifact.get("v16_q_policy_config", {}) or {})
+        if self.v16_value_target_model is not None:
+            expected_q_config = {
+                "mode": self.v16_policy_mode,
+                "tau_start": float(self.v16_tau_start),
+                "tau_end": float(self.v16_tau_end),
+                "epsilon": float(self.v16_policy_epsilon),
+                "target_source": "polyak_value_target",
+            }
+            if saved_q_config != expected_q_config:
+                raise ValueError(
+                    "trained V17 Q-policy configuration does not match runtime"
+                )
+            if saved_target_state is None:
+                raise ValueError("trained policy lacks the V17 target value model")
+            self.v16_value_target_model.load_state_dict(saved_target_state)
+        elif load_optimizer and saved_target_state is not None:
+            raise ValueError(
+                "training resume must configure the saved V17 Q policy"
+            )
         if restore_tariff:
             if getattr(self.firm1, "level_step_actions", False):
                 raise ValueError(
@@ -7464,6 +7538,16 @@ class Core:
                             firm1_policy, firm1_decision_count
                         )
                         if learned_actor_due:
+                            policy_result, _ = self._firm1_policy_action(
+                                state,
+                                deterministic=True,
+                                action_features=action_features,
+                                action_mask=action_mask,
+                                critic_state=critic_state,
+                                training_progress=1.0,
+                                policy_mode=policy_mode,
+                                policy_temperature=policy_temperature,
+                            )
                             (
                                 action,
                                 _,
@@ -7471,15 +7555,7 @@ class Core:
                                 decision_value,
                                 _,
                                 _,
-                            ) = self.firm1.agent.act(
-                                state,
-                                deterministic=True,
-                                action_features=action_features,
-                                action_mask=action_mask,
-                                policy_mode=policy_mode,
-                                policy_temperature=policy_temperature,
-                                critic_state=critic_state,
-                            )
+                            ) = policy_result
                         else:
                             action = self._baseline_firm1_action(
                                 str(firm1_policy),
@@ -8925,6 +9001,165 @@ class Core:
                 "horizon_days": int(metadata.get("horizon_days", 0)),
             }
         )
+
+    def _v16_q_temperature(self, training_progress: float) -> float:
+        progress = float(np.clip(training_progress, 0.0, 1.0))
+        cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+        return float(
+            self.v16_tau_end
+            + (self.v16_tau_start - self.v16_tau_end) * cosine
+        )
+
+    @torch.no_grad()
+    def _v16_q_policy_decision(
+        self,
+        state: Any,
+        action_mask: Any,
+        *,
+        deterministic: bool,
+        training_progress: float,
+    ) -> Tuple[int, torch.Tensor, Dict[str, float]]:
+        """Select from the frozen Polyak target surface over all 25 cells."""
+        if self.v16_value_target_model is None:
+            raise RuntimeError("V17 Q policy has no target value model")
+        device = next(self.v16_value_target_model.parameters()).device
+        state_t = torch.as_tensor(
+            state, dtype=torch.float32, device=device
+        ).reshape(1, -1)
+        cells_t = torch.as_tensor(
+            self.v16_value_cells, dtype=torch.float32, device=device
+        )
+        q_values = self.v16_value_target_model(state_t, cells_t)["q"][0]
+        mask_t = torch.as_tensor(
+            action_mask, dtype=torch.bool, device=device
+        ).reshape(-1)
+        if q_values.numel() != 25 or mask_t.numel() != 25:
+            raise ValueError("V17 Q policy requires exactly 25 action cells")
+        if not torch.any(mask_t):
+            raise ValueError("V17 Q policy has no feasible action cell")
+        masked_q = q_values.masked_fill(~mask_t, float("-inf"))
+        temperature = self._v16_q_temperature(training_progress)
+        target_probs = torch.softmax(masked_q / temperature, dim=-1)
+        epsilon = 0.0 if deterministic else self.v16_policy_epsilon
+        uniform = mask_t.to(dtype=target_probs.dtype)
+        uniform = uniform / uniform.sum()
+        policy_probs = (1.0 - epsilon) * target_probs + epsilon * uniform
+        policy_probs = policy_probs / policy_probs.sum()
+        if deterministic:
+            action = int(torch.argmax(masked_q).item())
+        else:
+            probabilities = policy_probs.detach().cpu().numpy()
+            action = int(self.rng.choice(len(probabilities), p=probabilities))
+        log_probability = torch.log(policy_probs[action].clamp(min=1e-12))
+        order = torch.argsort(policy_probs, descending=True)
+        top = int(order[0].item())
+        second = int(order[1].item())
+        target_entropy = float(
+            (-(target_probs * torch.log(target_probs.clamp(min=1e-12))).sum())
+            .item()
+        )
+        policy_entropy = float(
+            (-(policy_probs * torch.log(policy_probs.clamp(min=1e-12))).sum())
+            .item()
+        )
+        incumbent = int(self._v16_incumbent_two_lever_action())
+        posted_distance, posted_time = self.v16_value_cells[action]
+        diagnostics = {
+            "policy_top_action": float(top),
+            "policy_second_action": float(second),
+            "policy_top_prob": float(policy_probs[top].item()),
+            "policy_second_prob": float(policy_probs[second].item()),
+            "policy_action_margin": float(
+                policy_probs[top].item() - policy_probs[second].item()
+            ),
+            "policy_hold_prob": float(policy_probs[incumbent].item()),
+            "policy_entropy": policy_entropy,
+            "policy_temperature": float(temperature),
+            "optimizer_top_action": float(top),
+            "optimizer_second_action": float(second),
+            "optimizer_top_prob": float(policy_probs[top].item()),
+            "optimizer_action_margin": float(
+                policy_probs[top].item() - policy_probs[second].item()
+            ),
+            "optimizer_ready": 1.0,
+            "optimizer_action_changed": float(action != incumbent),
+            "optimizer_q_spread": float(
+                masked_q[mask_t].max().item() - masked_q[mask_t].min().item()
+            ),
+            "v16_q_target_entropy": target_entropy,
+            "v16_q_policy_entropy": policy_entropy,
+            "v16_q_top_two_margin": float(
+                policy_probs[top].item() - policy_probs[second].item()
+            ),
+            "v16_q_top_two_value_margin": float(
+                masked_q[top].item() - masked_q[second].item()
+            ),
+            "v16_q_posted_distance": float(posted_distance),
+            "v16_q_posted_time": float(posted_time),
+            "v16_q_temperature": float(temperature),
+            "v16_q_epsilon": float(epsilon),
+        }
+        return action, log_probability.detach(), diagnostics
+
+    def _firm1_policy_action(
+        self,
+        state: Any,
+        *,
+        deterministic: bool,
+        action_features: Any,
+        action_mask: Any,
+        critic_state: Any,
+        training_progress: float = 0.0,
+        policy_mode: str = "argmax_raw",
+        policy_temperature: float = 0.50,
+    ) -> Tuple[
+        Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        Dict[str, float],
+    ]:
+        """Use the registered Q source or the unchanged PPO actor path."""
+        if self.v16_policy_mode != "q":
+            diagnostics = self.firm1.agent.policy_diagnostics(
+                state,
+                action_features=action_features,
+                action_mask=action_mask,
+                temperature=1.0,
+            )
+            result = self.firm1.agent.act(
+                state,
+                deterministic=deterministic,
+                action_features=action_features,
+                action_mask=action_mask,
+                policy_mode=policy_mode,
+                policy_temperature=policy_temperature,
+                critic_state=critic_state,
+            )
+            return result, diagnostics
+
+        scaffold = list(
+            self.firm1.agent.act(
+                state,
+                deterministic=True,
+                action_features=action_features,
+                action_mask=action_mask,
+                policy_mode="argmax_raw",
+                critic_state=critic_state,
+            )
+        )
+        action, log_probability, diagnostics = self._v16_q_policy_decision(
+            state,
+            action_mask,
+            deterministic=deterministic,
+            training_progress=training_progress,
+        )
+        scaffold[0] = int(action)
+        scaffold[2] = log_probability.to(self.firm1.agent.device)
+        epsilon = 0.0 if deterministic else self.v16_policy_epsilon
+        self.firm1.agent.last_action_exploration_rate = float(epsilon)
+        self.firm1.agent._pending_exploration_rate = float(epsilon)
+        self.firm1.agent.last_continuous_magnitude = 1.0
+        if not deterministic:
+            self.firm1.agent.action_visits[int(action)] += 1
+        return tuple(scaffold), diagnostics
 
     def _counterfactual_day_values(self, *, selected_action, action_mask, day_index,
             step_in_day, hours, day_ctx, presampled, customers_per_step,
@@ -10743,17 +10978,18 @@ class Core:
                         action_mask_regimes[
                             str(self.last_action_mask_regime)
                         ] += 1
-                        raw_diag = self.firm1.agent.policy_diagnostics(
+                        policy_result, raw_diag = self._firm1_policy_action(
                             s_vec,
-                            action_features=action_features,
-                            action_mask=action_mask,
-                        )
-                        action, s_ts, old_logp, val, af_ts, mask_ts = self.firm1.agent.act(
-                            s_vec,
+                            deterministic=False,
                             action_features=action_features,
                             action_mask=action_mask,
                             critic_state=critic_state,
+                            training_progress=(
+                                float(d)
+                                / max(1.0, float(train_timesteps - 1))
+                            ),
                         )
+                        action, s_ts, old_logp, val, af_ts, mask_ts = policy_result
                         _nmcc_stage_ok = bool(
                             self.counterfactual_day_credit > 0
                             and getattr(
@@ -11575,6 +11811,30 @@ class Core:
                 "raw_policy_top_prob": float(avg_policy_diag.get("policy_top_prob", 0.0)),
                 "raw_policy_action_margin": float(avg_policy_diag.get("policy_action_margin", 0.0)),
                 "raw_policy_entropy": float(avg_policy_diag.get("policy_entropy", 0.0)),
+                "v16_q_target_entropy": float(
+                    avg_policy_diag.get("v16_q_target_entropy", 0.0)
+                ),
+                "v16_q_policy_entropy": float(
+                    avg_policy_diag.get("v16_q_policy_entropy", 0.0)
+                ),
+                "v16_q_top_two_margin": float(
+                    avg_policy_diag.get("v16_q_top_two_margin", 0.0)
+                ),
+                "v16_q_top_two_value_margin": float(
+                    avg_policy_diag.get("v16_q_top_two_value_margin", 0.0)
+                ),
+                "v16_q_posted_distance": float(
+                    avg_policy_diag.get("v16_q_posted_distance", 0.0)
+                ),
+                "v16_q_posted_time": float(
+                    avg_policy_diag.get("v16_q_posted_time", 0.0)
+                ),
+                "v16_q_temperature": float(
+                    avg_policy_diag.get("v16_q_temperature", 0.0)
+                ),
+                "v16_q_epsilon": float(
+                    avg_policy_diag.get("v16_q_epsilon", 0.0)
+                ),
                 "objective_optimizer_ready": bool(
                     avg_policy_diag.get("optimizer_ready", 0.0) >= 0.5
                 ),
@@ -12693,21 +12953,17 @@ class Core:
                     action_mask = self._objective_action_mask(
                         self.firm1.feasible_action_mask(self.market)
                     )
-                    eval_policy_diag = self.firm1.agent.policy_diagnostics(
-                        s_vec,
-                        action_features=action_features,
-                        action_mask=action_mask,
-                        temperature=1.0,
-                    )
-                    action, *_ = self.firm1.agent.act(
+                    policy_result, eval_policy_diag = self._firm1_policy_action(
                         s_vec,
                         deterministic=True,
                         action_features=action_features,
                         action_mask=action_mask,
+                        training_progress=1.0,
                         policy_mode=eval_policy_mode,
                         policy_temperature=eval_policy_temperature,
                         critic_state=critic_state,
                     )
+                    action, *_ = policy_result
                     coeff_pre_action = self._coeff_snapshot()
                     self.firm1.apply_action(action, self.market)
                     coeff_post_action = self._coeff_snapshot()
@@ -13005,6 +13261,30 @@ class Core:
                 "policy_action_margin": float(eval_policy_diag.get("policy_action_margin", 0.0)),
                 "policy_hold_prob": float(eval_policy_diag.get("policy_hold_prob", 0.0)),
                 "policy_entropy": float(eval_policy_diag.get("policy_entropy", 0.0)),
+                "v16_q_target_entropy": float(
+                    eval_policy_diag.get("v16_q_target_entropy", 0.0)
+                ),
+                "v16_q_policy_entropy": float(
+                    eval_policy_diag.get("v16_q_policy_entropy", 0.0)
+                ),
+                "v16_q_top_two_margin": float(
+                    eval_policy_diag.get("v16_q_top_two_margin", 0.0)
+                ),
+                "v16_q_top_two_value_margin": float(
+                    eval_policy_diag.get("v16_q_top_two_value_margin", 0.0)
+                ),
+                "v16_q_posted_distance": float(
+                    eval_policy_diag.get("v16_q_posted_distance", 0.0)
+                ),
+                "v16_q_posted_time": float(
+                    eval_policy_diag.get("v16_q_posted_time", 0.0)
+                ),
+                "v16_q_temperature": float(
+                    eval_policy_diag.get("v16_q_temperature", 0.0)
+                ),
+                "v16_q_epsilon": float(
+                    eval_policy_diag.get("v16_q_epsilon", 0.0)
+                ),
                 "objective_optimizer_ready": bool(
                     eval_policy_diag.get("optimizer_ready", 0.0) >= 0.5
                 ),
@@ -13355,27 +13635,23 @@ class Core:
         action_mask = self._objective_action_mask(
             self.firm1.feasible_action_mask(self.market)
         )
-        policy_diag = self.firm1.agent.policy_diagnostics(
-            state,
-            action_features=action_features,
-            action_mask=action_mask,
-            temperature=1.0,
-        )
         baseline_price = float(self.market.quote_price(
             distance_miles=float(max(0.0, distance)),
             duration_minutes=float(max(0.0, duration)),
             ctx=ctx,
             overrides=self.firm1.overrides,
         ))
-        action, *_ = self.firm1.agent.act(
+        policy_result, policy_diag = self._firm1_policy_action(
             state,
             deterministic=True,
             action_features=action_features,
             action_mask=action_mask,
+            training_progress=1.0,
             policy_mode=policy_mode,
             policy_temperature=policy_temperature,
             critic_state=critic_state,
         )
+        action, *_ = policy_result
         self.firm1.apply_action(int(action), self.market)
         predicted_price = float(self.market.quote_price(
             distance_miles=float(max(0.0, distance)),
@@ -14052,12 +14328,16 @@ class Core:
             action_mask = self._objective_action_mask(
                 self.firm1.feasible_action_mask(self.market)
             )
-            action, s_ts, old_logp, val, af_ts, mask_ts = self.firm1.agent.act(
+            policy_result, _ = self._firm1_policy_action(
                 s_vec,
+                deterministic=bool(
+                    self.v16_policy_mode == "q" and not is_training
+                ),
                 action_features=action_features,
                 action_mask=action_mask,
                 critic_state=critic_state,
             )
+            action, s_ts, old_logp, val, af_ts, mask_ts = policy_result
             self.firm1.apply_action(action, self.market)
             rl_step = (
                 action, s_ts, old_logp, val, af_ts, mask_ts, critic_state
@@ -15255,13 +15535,15 @@ class Core:
                     action_mask = self._objective_action_mask(
                         self.firm1.feasible_action_mask(self.market)
                     )
-                    action, s_ts, old_logp, val, af_ts, mask_ts = self.firm1.agent.act(
+                    policy_result, _ = self._firm1_policy_action(
                         s_vec,
                         deterministic=True,
                         action_features=action_features,
                         action_mask=action_mask,
+                        training_progress=1.0,
                         critic_state=critic_state,
                     )
+                    action, s_ts, old_logp, val, af_ts, mask_ts = policy_result
                     self.firm1.apply_action(action, self.market)
                     action_counts[int(action)] += 1
                     last_action = int(action)
@@ -18200,6 +18482,18 @@ def main():
             "definite two-lever curvature matrix and auxiliary component heads."
         ),
     )
+    v17.add_argument(
+        "--v16_policy_mode",
+        choices=("ppo", "q"),
+        default="ppo",
+        help=(
+            "V17 acting source; q uses the Polyak target concave value model, "
+            "while ppo preserves the 15d actor path."
+        ),
+    )
+    v17.add_argument("--v16_tau_start", type=float, default=0.10)
+    v17.add_argument("--v16_tau_end", type=float, default=0.03)
+    v17.add_argument("--v16_policy_epsilon", type=float, default=0.05)
 
     v26r = parser.add_argument_group("v26r regime-switching market (all default off)")
     v26r.add_argument("--regime_market", action="store_true",
@@ -19275,6 +19569,10 @@ def main():
         v16_audit_every=args.v16_audit_every,
         v16_store_cap=args.v16_store_cap,
         v16_value_head=args.v16_value_head,
+        v16_policy_mode=args.v16_policy_mode,
+        v16_tau_start=args.v16_tau_start,
+        v16_tau_end=args.v16_tau_end,
+        v16_policy_epsilon=args.v16_policy_epsilon,
         enable_driver_supply=not args.disable_driver_supply,
         use_osmnx=args.use_osmnx,
         osmnx_place=args.osmnx_place or None,
