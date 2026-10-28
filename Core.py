@@ -2563,6 +2563,7 @@ class Core:
         supply_eta_day: float = 0.40,
         supply_eta_hour: float = 0.20,
         supply_reference_earnings: float = 0.0,
+        shortage_willingness_share: float = 0.0,
         supply_operating_point: Optional[Mapping[str, Any]] = None,
         supply_calibration_customers: int = 50,
         explicit_supply_settings: Optional[Mapping[str, Any]] = None,
@@ -2596,6 +2597,11 @@ class Core:
             cfg.supply_model = model
             cfg.eta_day = float(max(0.0, supply_eta_day))
             cfg.eta_hour = float(max(0.0, supply_eta_hour))
+            if not np.isfinite(shortage_willingness_share) or not 0.0 <= shortage_willingness_share <= 1.0:
+                raise ValueError("shortage_willingness_share must lie in [0, 1]")
+            if shortage_willingness_share > 0.0 and model != "v3":
+                raise ValueError("positive shortage willingness requires supply_model v3")
+            cfg.shortage_willingness_share = float(shortage_willingness_share)
             cfg.reference_earnings_per_hour = float(max(0.0, supply_reference_earnings))
             self._supply_reference_is_explicit = supply_reference_earnings > 0
             if cfg.supply_model in {"v2", "v3"}:
@@ -2664,6 +2670,9 @@ class Core:
             "supply_model": self.driver_supply.config.supply_model,
             "supply_eta_day": float(self.driver_supply.config.eta_day),
             "supply_eta_hour": float(self.driver_supply.config.eta_hour),
+            "shortage_willingness_share": float(
+                self.driver_supply.config.shortage_willingness_share
+            ),
             "supply_calibration_customers": self.supply_calibration_customers,
             "effective_supply_config": asdict(self.driver_supply.config),
             "supply_reference_earnings": float(self.driver_supply.config.reference_earnings_per_hour),
@@ -17186,6 +17195,15 @@ def main():
             "time/distance, and excludes pass-through from revenue and pay."
         ),
     )
+    v17.add_argument(
+        "--shortage_willingness_share",
+        type=float,
+        default=0.0,
+        help=(
+            "V17 M2 shortage share routed through reservation wages; "
+            "0 preserves the 15d/v2 shock and production uses 0.5."
+        ),
+    )
 
     v26r = parser.add_argument_group("v26r regime-switching market (all default off)")
     v26r.add_argument("--regime_market", action="store_true",
@@ -18515,11 +18533,13 @@ def main():
                 supply_eta_day=float(args.supply_eta_day),
                 supply_eta_hour=float(args.supply_eta_hour),
                 supply_reference_earnings=float(args.supply_reference_earnings),
+                shortage_willingness_share=float(args.shortage_willingness_share),
                 supply_calibration_customers=int(args.eval_customers if args.eval_only else args.train_customers),
                 explicit_supply_settings={key: getattr(args, flag) for flag, key in {
                     'supply_model': 'supply_model', 'supply_eta_day': 'eta_day', 'supply_eta_hour': 'eta_hour',
                     'stock_adjustment_rate': 'stock_adjustment_rate', 'stock_floor': 'stock_floor',
                     'supply_reference_earnings': 'reference_earnings_per_hour', 'fleet_scale': 'fleet_scale',
+                    'shortage_willingness_share': 'shortage_willingness_share',
                     'persistent_driver_stock': 'persistent_stock',
                 }.items() if '--'+flag in argv_flag_names},
                 supply_operating_point=(artifact_header.get('supply_operating_point') if args.trained_model_in else

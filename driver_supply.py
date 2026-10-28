@@ -82,6 +82,7 @@ class DriverSupplyConfig:
     eta_day: float = 0.40                   # daily labour-supply elasticity (Chen et al. 2019: 0.3-0.6)
     eta_hour: float = 0.20                  # within-day online response to current pay
     eta_v3: float = 0.60                    # V17 response to expected earnings per online hour
+    shortage_willingness_share: float = 0.0 # V17 M2 omega; default off
     reference_earnings_per_hour: float = 0.0  # 0 selects the fixed opportunity wage, never policy earnings
     availability_block_hours: float = 1.0
     driver_minute_capacity: bool = True  # used only by supply v2
@@ -95,6 +96,9 @@ class DriverSupplyConfig:
             raise ValueError("supply_model must be v1, v2, or v3")
         if not np.isfinite(self.eta_v3) or self.eta_v3 < 0:
             raise ValueError("eta_v3 must be finite and nonnegative")
+        if (not np.isfinite(self.shortage_willingness_share)
+                or not 0.0 <= self.shortage_willingness_share <= 1.0):
+            raise ValueError("shortage_willingness_share must lie in [0, 1]")
         self.acceptance_mode = str(self.acceptance_mode).lower().strip()
         if self.acceptance_mode not in {"expected", "stochastic"}:
             raise ValueError("acceptance_mode must be 'expected' or 'stochastic'")
@@ -275,6 +279,9 @@ class DriverSupplyLayer:
         self.hour_profile: Dict[int, float] = normalized_hour_profile(self.config.hour_profile)
         self.shock_fleet_multiplier: float = 1.0
         self.shock_wage_multiplier: float = 1.0
+        self.raw_shock_fleet_multiplier: float = 1.0
+        self.raw_shock_wage_multiplier: float = 1.0
+        self.shortage_willingness_multiplier: float = 1.0
         self.shock_firm_capacity: Dict[str, float] = {"Firm1": 1.0, "Firm2": 1.0}
         self._available_at = {f: np.empty(0) for f in self.pay_policies}
         self._batch_minute = 0.0
@@ -412,8 +419,27 @@ class DriverSupplyLayer:
             values = [fleet_multiplier, wage_multiplier, *(firm_capacity or {}).values()]
             if any(not np.isfinite(v) or v < 0 for v in values) or wage_multiplier == 0:
                 raise ValueError('supply shocks require nonnegative capacity and positive wage multipliers')
-            self.shock_fleet_multiplier = float(fleet_multiplier)
-            self.shock_wage_multiplier = float(wage_multiplier)
+            self.raw_shock_fleet_multiplier = float(fleet_multiplier)
+            self.raw_shock_wage_multiplier = float(wage_multiplier)
+            hard_fleet = float(fleet_multiplier)
+            willingness = 1.0
+            if self.supply_v3 and 0.0 < fleet_multiplier < 1.0:
+                omega = float(self.config.shortage_willingness_share)
+                if omega > 0.0:
+                    if self.config.eta_v3 <= 0.0:
+                        raise ValueError("positive shortage willingness requires eta_v3 > 0")
+                    # Split an original shortage m into a hard capacity part
+                    # m^(1-omega) and a reservation-wage part.  Because v3
+                    # participation is proportional to wage^(-eta), choosing
+                    # the latter as m^(-omega/eta) keeps total card-price
+                    # severity exactly m while making omega recoverable by pay.
+                    hard_fleet = float(fleet_multiplier) ** (1.0 - omega)
+                    willingness = float(fleet_multiplier) ** (
+                        -omega / float(self.config.eta_v3)
+                    )
+            self.shock_fleet_multiplier = hard_fleet
+            self.shortage_willingness_multiplier = willingness
+            self.shock_wage_multiplier = float(wage_multiplier) * willingness
             self.shock_firm_capacity = {f: float((firm_capacity or {}).get(f, 1.)) for f in ('Firm1', 'Firm2')}
             return
         self.shock_fleet_multiplier = float(max(0.05, fleet_multiplier))
