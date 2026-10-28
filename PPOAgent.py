@@ -2555,7 +2555,7 @@ class PPOAgent:
             advantages = torch.where(
                 valid, selected - baselines, torch.zeros_like(selected)
             )
-        if normalize and bool(valid.any()):
+        if normalize and scale != "none" and bool(valid.any()):
             valid_values = advantages[valid]
             if scale == "rms":
                 rms = valid_values.square().mean().sqrt()

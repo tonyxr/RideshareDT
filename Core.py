@@ -83,6 +83,7 @@ from pricing_models import (
     HYBRID_RELATIVE_ACTION_SEMANTICS,
     LEVEL_STEP_ACTION_SEMANTICS,
     TWO_LEVER_ACTION_SEMANTICS,
+    TWO_LEVER_LEVELS,
     LEVEL_STEP_EXPOSURE,
     TARIFF_LEVEL_GRID_STEP,
     snap_tariff_level,
@@ -802,6 +803,10 @@ class Core:
         nmcc_every_k_decisions: int = 1,
         nmcc_advantage_scale: str = "rms",
         nmcc_dump: str = "",
+        v16_branch_mode: str = "hold_h",
+        v16_branch_horizon_days: int = 7,
+        v16_branch_design: str = "all",
+        v16_audit_every: int = 0,
         momentum_features: bool = False,
         momentum_day_steps: int = 6,
         opponent_features: bool = False,
@@ -826,6 +831,34 @@ class Core:
         self.actor_true_shortage_flag = bool(actor_true_shortage_flag)
         # Revision 11: one multiplier moves the whole tariff in one decision.
         self.whole_tariff_actions = bool(whole_tariff_actions)
+        self.v16_branch_mode = str(v16_branch_mode)
+        if self.v16_branch_mode not in ("hold_h", "one_day_deviation"):
+            raise ValueError(
+                "v16_branch_mode must be hold_h or one_day_deviation"
+            )
+        self.v16_branch_design = str(v16_branch_design)
+        if self.v16_branch_design not in ("all", "stencil11"):
+            raise ValueError("v16_branch_design must be all or stencil11")
+        self.v16_branch_horizon_days = int(max(1, v16_branch_horizon_days))
+        self.v16_audit_every = int(max(0, v16_audit_every))
+        if self.v16_branch_mode == "one_day_deviation":
+            if self.v16_branch_design != "stencil11":
+                raise ValueError(
+                    "one_day_deviation requires v16_branch_design='stencil11'"
+                )
+            if int(counterfactual_day_credit) not in (0, 11):
+                raise ValueError(
+                    "one_day_deviation uses exactly 11 non-audit branch cells"
+                )
+            counterfactual_day_credit = 11
+            counterfactual_day_horizon_days = self.v16_branch_horizon_days
+            nmcc_advantage_scale = "none"
+            nmcc_stages = ("market", "static", "catchup", "profit")
+            nmcc_every_k_decisions = 1
+        elif self.v16_audit_every:
+            raise ValueError(
+                "v16_audit_every requires v16_branch_mode='one_day_deviation'"
+            )
         # Revision 11b: common-random-number day-branch credit for the actor.
         self.counterfactual_day_credit = int(max(0, counterfactual_day_credit))
         self.counterfactual_day_horizon_days = int(max(1, counterfactual_day_horizon_days))
@@ -849,8 +882,10 @@ class Core:
             )
         self.nmcc_every_k_decisions = int(max(1, nmcc_every_k_decisions))
         self.nmcc_advantage_scale = str(nmcc_advantage_scale)
-        if self.nmcc_advantage_scale not in ("rms", "zscore"):
-            raise ValueError("nmcc_advantage_scale must be 'rms' or 'zscore'")
+        if self.nmcc_advantage_scale not in ("rms", "zscore", "none"):
+            raise ValueError(
+                "nmcc_advantage_scale must be 'rms', 'zscore', or 'none'"
+            )
         self.nmcc_dump = str(nmcc_dump or "")
         if self.counterfactual_day_credit == 1:
             raise ValueError(
@@ -883,6 +918,15 @@ class Core:
             ExogenousTape(root_seed=self.seed) if self.v16_crn_tape else None
         )
         self._v16_tape_position: Optional[Tuple[int, int, int]] = None
+        if self.v16_branch_mode == "one_day_deviation":
+            if self.action_contract != "two_lever_v1":
+                raise ValueError(
+                    "one_day_deviation requires action_contract='two_lever_v1'"
+                )
+            if not self.v16_crn_tape:
+                raise ValueError(
+                    "one_day_deviation requires v16_crn_tape=True"
+                )
         self.relative_action_steps: Tuple[float, ...] = tuple(
             float(value) for value in relative_action_steps
         )
@@ -1602,10 +1646,16 @@ class Core:
         if self.firm1_mode == "RL" and self.counterfactual_policy_coeff is not None:
             self.firm1.agent.counterfactual_policy_coeff_override = float(self.counterfactual_policy_coeff)
         if self.firm1_mode == "RL" and self.counterfactual_day_credit > 0:
-            if self.firm1.action_label(0) != "hold":
+            if (
+                self.v16_branch_mode != "one_day_deviation"
+                and self.firm1.action_label(0) != "hold"
+            ):
                 raise ValueError("NMCC assumes action index 0 is hold")
             self.firm1.agent.counterfactual_baseline_mode = (
-                "provided" if self.nmcc_baseline == "hold" else "mean"
+                "provided"
+                if self.v16_branch_mode == "one_day_deviation"
+                or self.nmcc_baseline == "hold"
+                else "mean"
             )
             self.firm1.agent.counterfactual_advantage_scale = (
                 self.nmcc_advantage_scale
@@ -2726,6 +2776,12 @@ class Core:
             "nmcc_stages": list(self.nmcc_stages),
             "nmcc_every_k_decisions": int(self.nmcc_every_k_decisions),
             "nmcc_advantage_scale": self.nmcc_advantage_scale,
+            "v16_branch_mode": self.v16_branch_mode,
+            "v16_branch_horizon_days": int(
+                self.v16_branch_horizon_days
+            ),
+            "v16_branch_design": self.v16_branch_design,
+            "v16_audit_every": int(self.v16_audit_every),
             "momentum_features": bool(self.momentum_features),
             "momentum_day_steps": int(self.momentum_day_steps),
             "opponent_features": bool(self.opponent_features),
@@ -8323,6 +8379,379 @@ class Core:
             self._restore_counterfactual_state(snapshot)
         return scores
 
+    def _v16_incumbent_two_lever_action(self) -> int:
+        """Return the absolute card cell currently posted by Firm 1."""
+        mapping = getattr(self.firm1, "action_to_two_lever_cell", None)
+        if not mapping:
+            raise RuntimeError(
+                "the V17 branch design requires the two-lever action card"
+            )
+        base = self.market.curr_market
+        distance = float(get_coeff(
+            base, self.firm1.overrides, "per_mile"
+        )) / max(1e-12, float(base.per_mile))
+        time = float(get_coeff(
+            base, self.firm1.overrides, "per_minute"
+        )) / max(1e-12, float(base.per_minute))
+        return min(
+            mapping,
+            key=lambda action: (
+                (float(mapping[action][0]) - distance) ** 2
+                + (float(mapping[action][1]) - time) ** 2,
+                int(action),
+            ),
+        )
+
+    def _v16_branch_candidates(
+        self,
+        *,
+        selected_action: int,
+        action_mask: np.ndarray,
+        decision_count: int,
+    ) -> Tuple[List[int], int, bool]:
+        """Build the registered 3x3 stencil plus exploratory cells."""
+        mask = np.asarray(action_mask, dtype=bool).reshape(-1)
+        feasible = np.flatnonzero(mask).astype(int).tolist()
+        incumbent = self._v16_incumbent_two_lever_action()
+        if incumbent not in feasible:
+            raise RuntimeError("the incumbent V17 card cell is infeasible")
+        audit = bool(
+            self.v16_audit_every > 0
+            and int(decision_count) > 0
+            and int(decision_count) % int(self.v16_audit_every) == 0
+        )
+        if audit:
+            return feasible, int(incumbent), True
+
+        mapping = self.firm1.action_to_two_lever_cell
+        reverse = {
+            (float(cell[0]), float(cell[1])): int(action)
+            for action, cell in mapping.items()
+        }
+        center = mapping[int(incumbent)]
+        distance_index = TWO_LEVER_LEVELS.index(float(center[0]))
+        time_index = TWO_LEVER_LEVELS.index(float(center[1]))
+        candidates: List[int] = []
+        for di in (-1, 0, 1):
+            for dt in (-1, 0, 1):
+                i, j = distance_index + di, time_index + dt
+                if not (
+                    0 <= i < len(TWO_LEVER_LEVELS)
+                    and 0 <= j < len(TWO_LEVER_LEVELS)
+                ):
+                    continue
+                action = reverse[(
+                    float(TWO_LEVER_LEVELS[i]),
+                    float(TWO_LEVER_LEVELS[j]),
+                )]
+                if action in feasible and action not in candidates:
+                    candidates.append(action)
+
+        # The live sampled cell must have a measured credit for rank and policy
+        # diagnostics. When it is outside the local stencil it occupies one of
+        # the two exploratory slots.
+        selected = int(selected_action)
+        if selected in feasible and selected not in candidates:
+            candidates.append(selected)
+        remaining = [
+            action for action in feasible if action not in candidates
+        ]
+        if remaining:
+            rng = (
+                self._v16_tape_rng("endo")
+                if self.v16_crn_tape
+                and self._v16_tape_position is not None
+                else self.rng
+            )
+            order = rng.permutation(len(remaining)).tolist()
+            for index in order:
+                if len(candidates) >= min(11, len(feasible)):
+                    break
+                candidates.append(int(remaining[int(index)]))
+        return candidates, int(incumbent), False
+
+    def _v16_one_day_deviation_values(
+        self,
+        *,
+        selected_action,
+        action_mask,
+        day_index,
+        step_in_day,
+        hours,
+        day_ctx,
+        presampled,
+        customers_per_step,
+        firm2_interval_steps,
+        days_left=None,
+    ):
+        """V17 branch labels: deviate for day 0, then restore the incumbent."""
+        import time as _time
+
+        started = _time.perf_counter()
+        values = np.full(
+            self.firm1.agent.action_dim, np.nan, dtype=np.float32
+        )
+        mask = np.asarray(action_mask, dtype=bool).reshape(-1)
+        candidates, incumbent, audit = self._v16_branch_candidates(
+            selected_action=int(selected_action),
+            action_mask=mask,
+            decision_count=int(self._nmcc_decision_counter),
+        )
+        horizon_days = int(self.v16_branch_horizon_days)
+        if days_left is not None:
+            horizon_days = int(min(horizon_days, max(0, int(days_left))))
+        if horizon_days < 1 or len(candidates) < 2:
+            return values, np.zeros_like(mask)
+        for action in candidates:
+            self.counterfactual_action_counts[int(action)] += 1
+
+        spd = int(max(1, len(hours)))
+        gamma_day = float(self.firm1.agent.gamma) ** spd
+        snapshot = self._snapshot_counterfactual_state(presampled[1])
+        raw_values: Dict[int, float] = {}
+        component_returns: Dict[int, List[float]] = {}
+        posted_actions: Dict[int, List[int]] = {}
+        try:
+            for action in candidates:
+                self._restore_counterfactual_state(snapshot)
+                self.firm1.apply_action(int(action), self.market)
+                total = 0.0
+                components = np.zeros(4, dtype=float)
+                previous = None
+                offset = 0
+                posted_by_day: List[int] = []
+                for k in range(horizon_days):
+                    if k == 0:
+                        ctx = day_ctx
+                        day_hours = list(hours)
+                        start_t = int(step_in_day)
+                    else:
+                        if k == 1:
+                            self.firm1.apply_action(int(incumbent), self.market)
+                        if self.v16_crn_tape:
+                            ctx, day_hours = self._sample_v16_day_and_hours(
+                                int(day_index) + k,
+                                spd,
+                            )
+                        else:
+                            ctx = self.market.sample_day_context()
+                            day_hours = [
+                                self.market.sample_timestep_hour().hour
+                                for _ in range(spd)
+                            ]
+                        self._regime_day_start(
+                            day_hours,
+                            episode_seed=(
+                                self.seed + 50_000 + int(day_index) + k
+                            ),
+                        )
+                        start_t = 0
+                    posted_by_day.append(
+                        int(action) if k == 0 else int(incumbent)
+                    )
+                    for t in range(start_t, len(day_hours)):
+                        if self.v16_crn_tape:
+                            self._set_v16_tape_position(
+                                int(day_index) + k, int(t)
+                            )
+                        hour = int(day_hours[t])
+                        if offset > 0:
+                            self._firm2_leader_step(
+                                previous_metrics=previous,
+                                day_of_week=ctx.day_of_week,
+                                hour=hour,
+                                weather=ctx.weather,
+                                enabled=(
+                                    offset
+                                    % int(max(1, firm2_interval_steps))
+                                    == 0
+                                ),
+                            )
+                            count = self._step_customers(
+                                customers_per_step,
+                                hour=hour,
+                                day_of_week=ctx.day_of_week,
+                                weather=ctx.weather,
+                            )
+                            profiles = self._sample_profiles_from_pool(
+                                self._effective_simulation_sample_size(count)
+                            )
+                        else:
+                            count, profiles = presampled
+                        _, own, rival, gap, _, _ = self.simulate_batch(
+                            day_of_week=ctx.day_of_week,
+                            hour=hour,
+                            weather=ctx.weather,
+                            customers_per_step=count,
+                            sampled_profiles=profiles,
+                            collect_rows=False,
+                            supply_reference_customers=customers_per_step,
+                        )
+                        diag = self._reward_diagnostics(
+                            training_regime=(
+                                self.current_training_stage.opponent_regime
+                            ),
+                            share=float(own.chosen_share),
+                            completed_share=float(own.completed_share),
+                            rev_per_request=float(own.rev_per_request),
+                            mean_gap=float(gap),
+                            prev_share=float(self.last_share),
+                            prev_rev_per_request=float(self.last_revpr),
+                            prev_profit_per_request=float(self.last_profitpr),
+                            prev_rival_profit_per_request=float(
+                                self.last_firm2_profitpr
+                            ),
+                            prev_rival_market_share=float(
+                                self.last_firm2_share
+                            ),
+                            prev_fulfillment_rate=float(
+                                self.last_fulfillment
+                            ),
+                            prev_gap=float(self.last_gap),
+                            profit_per_request=float(
+                                own.profit_per_request
+                            ),
+                            profit_margin=self._profit_margin(own),
+                            fulfillment_rate=float(own.fulfillment_rate),
+                            avg_wait_minutes=float(own.avg_wait_minutes),
+                            driver_acceptance_rate=float(
+                                own.driver_acceptance_rate
+                            ),
+                            action_change_magnitude=(
+                                float(self.firm1.last_action_magnitude())
+                                if offset == 0
+                                else 0.0
+                            ),
+                            baseline_share=float(rival.chosen_share),
+                            baseline_completed_share=float(
+                                rival.completed_share
+                            ),
+                            baseline_rev_per_request=float(
+                                rival.rev_per_request
+                            ),
+                            baseline_profit_per_request=float(
+                                rival.profit_per_request
+                            ),
+                            action_event=(offset == 0),
+                            price_gap_abs_error=float(
+                                self.last_price_gap_metrics.get("mae", 0.0)
+                            ),
+                            update_temporal_reward_state=False,
+                        )
+                        weight = gamma_day ** k / float(spd)
+                        total += weight * float(diag["reward"])
+                        components += weight * np.asarray(
+                            [
+                                own.profit_per_request,
+                                rival.profit_per_request,
+                                own.completed_share,
+                                rival.completed_share,
+                            ],
+                            dtype=float,
+                        )
+                        self._ingest_platform_observations(own, rival)
+                        self._update_recent_response_emas(own, gap, m2=rival)
+                        previous = rival
+                        offset += 1
+                raw_values[int(action)] = float(total)
+                component_returns[int(action)] = components.tolist()
+                posted_actions[int(action)] = posted_by_day
+                values[int(action)] = float(total)
+        finally:
+            self._restore_counterfactual_state(snapshot)
+
+        target_mask = np.isfinite(values)
+        baseline_value = float(values[int(incumbent)])
+        values[target_mask] -= baseline_value
+        incumbent_components = np.asarray(
+            component_returns[int(incumbent)], dtype=float
+        )
+        component_credits = {
+            int(action): (
+                np.asarray(component_returns[int(action)], dtype=float)
+                - incumbent_components
+            ).tolist()
+            for action in candidates
+        }
+        best = max(candidates, key=lambda a: (float(values[a]), -int(a)))
+        self._nmcc_last = {
+            "day": int(day_index),
+            "stage": str(self.current_training_stage.opponent_regime),
+            "rival": str(self.firm2_mode),
+            "regime": list(
+                getattr(
+                    getattr(self, "_regime_last_effect", None),
+                    "active",
+                    (),
+                )
+                or ()
+            ),
+            "tape_seed": (
+                None
+                if self.exogenous_tape is None
+                else int(self.exogenous_tape.root_seed)
+            ),
+            "tape_id": (
+                None
+                if self._v16_tape_position is None
+                else int(self._v16_tape_position[2])
+            ),
+            "branch_mode": "one_day_deviation",
+            "branch_design": "all25" if audit else "stencil11",
+            "audit": bool(audit),
+            "horizon_days": int(horizon_days),
+            "incumbent": self.firm1.action_label(int(incumbent)),
+            "selected": self.firm1.action_label(int(selected_action)),
+            "selected_advantage": float(values[int(selected_action)]),
+            "best": self.firm1.action_label(int(best)),
+            "candidate_actions": [
+                self.firm1.action_label(int(action))
+                for action in candidates
+            ],
+            "raw_values": {
+                self.firm1.action_label(int(action)): float(
+                    raw_values[int(action)]
+                )
+                for action in candidates
+            },
+            "action_advantages": {
+                self.firm1.action_label(int(action)): float(
+                    values[int(action)]
+                )
+                for action in candidates
+            },
+            "component_credits": {
+                self.firm1.action_label(int(action)): component_credits[
+                    int(action)
+                ]
+                for action in candidates
+            },
+            "posted_actions_by_day": {
+                self.firm1.action_label(int(action)): [
+                    self.firm1.action_label(int(posted))
+                    for posted in posted_actions[int(action)]
+                ]
+                for action in candidates
+            },
+            "feasible_action_count": int(mask.sum()),
+            "computed_action_count": int(target_mask.sum()),
+            "advantage_coverage": float(
+                target_mask.sum() / max(1, int(mask.sum()))
+            ),
+        }
+        elapsed = _time.perf_counter() - started
+        self._nmcc_last["seconds"] = float(elapsed)
+        self.counterfactual_day_seconds += elapsed
+        self.counterfactual_day_calls += 1
+        dump_path = self.nmcc_dump or os.environ.get("R11B_CF_DUMP", "")
+        if dump_path:
+            try:
+                with open(dump_path, "a") as handle:
+                    handle.write(json.dumps(self._nmcc_last) + "\n")
+            except Exception as exc:
+                print(f">>> [v17] branch dump failed: {exc!r}")
+        return values, target_mask
+
     def _counterfactual_day_values(self, *, selected_action, action_mask, day_index,
             step_in_day, hours, day_ctx, presampled, customers_per_step,
             firm2_interval_steps, days_left=None):
@@ -8335,6 +8764,19 @@ class Core:
         discounted per day, centred on the hold branch (or on the candidate mean).
         Training credit only; the actor input never sees these values.
         """
+        if self.v16_branch_mode == "one_day_deviation":
+            return self._v16_one_day_deviation_values(
+                selected_action=selected_action,
+                action_mask=action_mask,
+                day_index=day_index,
+                step_in_day=step_in_day,
+                hours=hours,
+                day_ctx=day_ctx,
+                presampled=presampled,
+                customers_per_step=customers_per_step,
+                firm2_interval_steps=firm2_interval_steps,
+                days_left=days_left,
+            )
         import time as _time
         started = _time.perf_counter()
         values = np.full(self.firm1.agent.action_dim, np.nan, dtype=np.float32)
@@ -17527,6 +17969,39 @@ def main():
             "cells; endogenous noise realigns at every market step."
         ),
     )
+    v17.add_argument(
+        "--v16_branch_mode",
+        choices=("hold_h", "one_day_deviation"),
+        default="hold_h",
+        help=(
+            "V17 credit assignment. one_day_deviation posts a candidate for "
+            "day 0 and restores the incumbent card cell from day 1."
+        ),
+    )
+    v17.add_argument(
+        "--v16_branch_horizon_days",
+        type=int,
+        default=7,
+        help="V17 one-day-deviation return horizon; T3 compares 5 and 7.",
+    )
+    v17.add_argument(
+        "--v16_branch_design",
+        choices=("all", "stencil11"),
+        default="all",
+        help=(
+            "V17 branch cells: incumbent 3x3 neighbourhood plus exploratory "
+            "cells, with all feasible cells on audit decisions."
+        ),
+    )
+    v17.add_argument(
+        "--v16_audit_every",
+        type=int,
+        default=0,
+        help=(
+            "Branch all 25 cells every Nth V17 decision (10 production, "
+            "4 in T3; 0 disables audits)."
+        ),
+    )
 
     v26r = parser.add_argument_group("v26r regime-switching market (all default off)")
     v26r.add_argument("--regime_market", action="store_true",
@@ -18596,6 +19071,10 @@ def main():
         action_contract=args.action_contract,
         rivals_two_lever=args.rivals_two_lever,
         v16_crn_tape=args.v16_crn_tape,
+        v16_branch_mode=args.v16_branch_mode,
+        v16_branch_horizon_days=args.v16_branch_horizon_days,
+        v16_branch_design=args.v16_branch_design,
+        v16_audit_every=args.v16_audit_every,
         enable_driver_supply=not args.disable_driver_supply,
         use_osmnx=args.use_osmnx,
         osmnx_place=args.osmnx_place or None,
