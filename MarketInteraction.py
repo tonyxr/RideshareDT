@@ -77,6 +77,15 @@ class RideContext:
     service: str  
 
 
+@dataclass(frozen=True)
+class FareQuote:
+    """Auditable split between the rider charge and platform economics."""
+
+    rider_fare: float
+    platform_fare: float
+    pass_through: float
+
+
 class MarketInteraction:
     MARKET_ALIASES: Dict[str, str] = {
         "general": "General",
@@ -114,6 +123,14 @@ class MarketInteraction:
         self.shocks: Optional[ShockProcess] = None
         self.shock_training_openings = False
         self.shock_training_episode_days = 30
+        # V17 M4.  Legacy is the byte-compatible default.
+        self.fare_model = "legacy"
+
+    def configure_fare_model(self, fare_model: str = "legacy") -> None:
+        model = str(fare_model).strip().lower()
+        if model not in {"legacy", "realistic"}:
+            raise ValueError("fare_model must be 'legacy' or 'realistic'")
+        self.fare_model = model
 
     # ---------- v26 dynamics ----------
     def configure_dynamics(
@@ -636,14 +653,14 @@ class MarketInteraction:
                     return float(mult)
         return 1.0
 
-    def quote_price(
+    def quote_components(
         self,
         distance_miles: float,
         duration_minutes: float,
         ctx: RideContext,
         overrides: Optional[CoefficientOverrides] = None,
         extra_fees: float = 0.0,
-    ) -> float:
+    ) -> FareQuote:
         m = self.curr_market
         o = overrides or CoefficientOverrides()
 
@@ -665,12 +682,45 @@ class MarketInteraction:
         wco = float(weather_map.get(ctx.weather, 1.0))
         sco = float(service_map.get(ctx.service, 1.0))
 
-        price = (base + variable) * tod * dow * wco * sco
+        context = tod * dow * wco * sco
+        if self.fare_model == "realistic":
+            # V17 M4: the fixed charges stay fixed; context affects only the
+            # time/distance portion.  Airport and external fees are collected
+            # from the rider but excluded from platform revenue and driver pay.
+            platform_fare = max(base + variable * context, 0.0)
+            pass_through = max(
+                (airport_fee if ctx.airport else 0.0) + float(extra_fees),
+                0.0,
+            )
+            rider_fare = round(platform_fare + pass_through, 2)
+            pass_through = round(min(pass_through, rider_fare), 2)
+            platform_fare = round(rider_fare - pass_through, 2)
+            return FareQuote(rider_fare, platform_fare, pass_through)
+
+        # Historical behavior: every charge is platform fare and the context
+        # multiplier applies to fixed and variable components alike.
+        price = (base + variable) * context
         if ctx.airport:
             price += airport_fee
-
         price += float(extra_fees)
-        return round(max(price, 0.0), 2)
+        rider_fare = round(max(price, 0.0), 2)
+        return FareQuote(rider_fare, rider_fare, 0.0)
+
+    def quote_price(
+        self,
+        distance_miles: float,
+        duration_minutes: float,
+        ctx: RideContext,
+        overrides: Optional[CoefficientOverrides] = None,
+        extra_fees: float = 0.0,
+    ) -> float:
+        return self.quote_components(
+            distance_miles,
+            duration_minutes,
+            ctx,
+            overrides=overrides,
+            extra_fees=extra_fees,
+        ).rider_fare
     
     def flatten_ride_context(self, ctx: RideContext) -> np.ndarray:
         """Numerical encoding of a RideContext for RL state construction."""

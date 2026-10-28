@@ -724,6 +724,7 @@ class Core:
         driver_cost_per_minute: float = 0.12,
         fixed_trip_cost: float = 1.25,
         airport_cost: float = 2.00,
+        fare_model: str = "legacy",
         enable_driver_supply: bool = True,
         use_osmnx: bool = False,
         osmnx_place: Optional[str] = None,
@@ -949,6 +950,8 @@ class Core:
         self._seed_all_rngs(self.seed, deterministic_torch=deterministic_torch)
         self.rng = np.random.default_rng(self.seed)
         self.market = MarketInteraction(city_name=market_name, seed=self.seed)
+        self.market.configure_fare_model(fare_model)
+        self.fare_model = str(self.market.fare_model)
 
         self.market_name = str(self.market.current_city)
 
@@ -13813,20 +13816,38 @@ class Core:
                 service=service,
             )
 
-            p1 = self.market.quote_price(travel_distance, duration, ctx, overrides=self.firm1.overrides)
-            p2 = self.market.quote_price(travel_distance, duration, ctx, overrides=self.firm2.overrides)
+            quote1 = self.market.quote_components(
+                travel_distance, duration, ctx, overrides=self.firm1.overrides
+            )
+            quote2 = self.market.quote_components(
+                travel_distance, duration, ctx, overrides=self.firm2.overrides
+            )
+            p1 = float(quote1.rider_fare)
+            p2 = float(quote2.rider_fare)
+            platform_fare1 = float(quote1.platform_fare)
+            platform_fare2 = float(quote2.platform_fare)
             pre_discount_fare2 = float(p2)
+            pre_discount_platform_fare2 = float(platform_fare2)
             if self.regime_market and self._firm2_regime_price_multiplier != 1.0:
                 # Rival promotion: Firm 2's posted quotes are discounted for the
                 # window; its controller state and overrides are untouched.
-                p2 = float(p2) * float(self._firm2_regime_price_multiplier)
+                promotion = float(self._firm2_regime_price_multiplier)
+                if self.fare_model == "realistic":
+                    platform_fare2 = round(platform_fare2 * promotion, 2)
+                    p2 = round(platform_fare2 + float(quote2.pass_through), 2)
+                else:
+                    # Preserve the 15d floating-point path exactly when M4 is off.
+                    p2 = float(p2) * promotion
+                    platform_fare2 = float(p2)
             pay_reference_fare = (
-                float(self.market.quote_price(travel_distance, duration, ctx, overrides=None))
+                float(self.market.quote_components(
+                    travel_distance, duration, ctx, overrides=None
+                ).platform_fare)
                 if v26_dynamics and self.market_dynamics.driver_pay_basis == "anchor"
                 else None
             )
             # A platform-funded rider promotion does not cut driver gross pay.
-            pay_reference_fare2 = (pre_discount_fare2 if self.regime_market
+            pay_reference_fare2 = (pre_discount_platform_fare2 if self.regime_market
                 and self.market_dynamics.driver_pay_basis == "fare" else pay_reference_fare)
 
             realized_gap = float(p2 - p1)
@@ -13900,7 +13921,7 @@ class Core:
             if choice == "Firm1":
                 firm1.chosen += 1
                 if self.enable_driver_supply:
-                    dispatch = self.driver_supply.dispatch("Firm1", p1, travel_distance, duration, airport=airport, weather=weather, pay_reference_fare=pay_reference_fare)
+                    dispatch = self.driver_supply.dispatch("Firm1", platform_fare1, travel_distance, duration, airport=airport, weather=weather, pay_reference_fare=pay_reference_fare)
                     firm1.dispatch_offers += 1
                     acceptance_prob = float(dispatch.acceptance_probability)
                     pickup_minutes = float(dispatch.pickup_minutes)
@@ -13911,11 +13932,11 @@ class Core:
                         firm1.completed += 1
                         firm1.wins += 1
                         matched_firm = "Firm1"
-                        firm1.revenue += float(p1)
+                        firm1.revenue += platform_fare1
                         firm1.driver_pay += driver_pay
                         firm1.wait_minutes += wait_minutes
                         firm1.pickup_minutes += pickup_minutes
-                        firm1.profit += float(p1) - driver_pay - float(dispatch.platform_variable_cost)
+                        firm1.profit += platform_fare1 - driver_pay - float(dispatch.platform_variable_cost)
                         match_status = "Completed"
                     else:
                         firm1.unfulfilled += 1
@@ -13927,13 +13948,13 @@ class Core:
                     firm1.completed += 1
                     firm1.wins += 1
                     matched_firm = "Firm1"
-                    firm1.revenue += float(p1)
-                    firm1.profit += float(p1) - trip_cost
+                    firm1.revenue += platform_fare1
+                    firm1.profit += platform_fare1 - trip_cost
                     match_status = "Completed"
             elif choice == "Firm2":
                 firm2.chosen += 1
                 if self.enable_driver_supply:
-                    dispatch = self.driver_supply.dispatch("Firm2", p2, travel_distance, duration, airport=airport, weather=weather, pay_reference_fare=pay_reference_fare2)
+                    dispatch = self.driver_supply.dispatch("Firm2", platform_fare2, travel_distance, duration, airport=airport, weather=weather, pay_reference_fare=pay_reference_fare2)
                     firm2.dispatch_offers += 1
                     acceptance_prob = float(dispatch.acceptance_probability)
                     pickup_minutes = float(dispatch.pickup_minutes)
@@ -13944,11 +13965,11 @@ class Core:
                         firm2.completed += 1
                         firm2.wins += 1
                         matched_firm = "Firm2"
-                        firm2.revenue += float(p2)
+                        firm2.revenue += platform_fare2
                         firm2.driver_pay += driver_pay
                         firm2.wait_minutes += wait_minutes
                         firm2.pickup_minutes += pickup_minutes
-                        firm2.profit += float(p2) - driver_pay - float(dispatch.platform_variable_cost)
+                        firm2.profit += platform_fare2 - driver_pay - float(dispatch.platform_variable_cost)
                         match_status = "Completed"
                     else:
                         firm2.unfulfilled += 1
@@ -13960,8 +13981,8 @@ class Core:
                     firm2.completed += 1
                     firm2.wins += 1
                     matched_firm = "Firm2"
-                    firm2.revenue += float(p2)
-                    firm2.profit += float(p2) - trip_cost
+                    firm2.revenue += platform_fare2
+                    firm2.profit += platform_fare2 - trip_cost
                     match_status = "Completed"
             if (
                 v26_dynamics
@@ -13974,6 +13995,9 @@ class Core:
                 other_name = "Firm2" if choice == "Firm1" else "Firm1"
                 other_metrics = firm2 if other_name == "Firm2" else firm1
                 other_price = float(p2 if other_name == "Firm2" else p1)
+                other_platform_fare = float(
+                    platform_fare2 if other_name == "Firm2" else platform_fare1
+                )
                 reservation_fn = getattr(self.choice_model, "_reservation_price", None)
                 reservation = (
                     float(reservation_fn(profile, scenario))
@@ -14001,7 +14025,7 @@ class Core:
                 if float(self.rng.random()) < retry_probability:
                     other_metrics.spillover_attempts += 1
                     retry = self.driver_supply.dispatch(
-                        other_name, other_price, travel_distance, duration,
+                        other_name, other_platform_fare, travel_distance, duration,
                         airport=airport, weather=weather,
                         pay_reference_fare=pay_reference_fare2 if other_name == "Firm2" else pay_reference_fare,
                     )
@@ -14012,12 +14036,12 @@ class Core:
                         other_metrics.wins += 1
                         other_metrics.spillover_completed += 1
                         matched_firm = other_name
-                        other_metrics.revenue += other_price
+                        other_metrics.revenue += other_platform_fare
                         other_metrics.driver_pay += float(retry.driver_pay)
                         other_metrics.wait_minutes += float(retry.wait_minutes)
                         other_metrics.pickup_minutes += float(retry.pickup_minutes)
                         other_metrics.profit += (
-                            other_price
+                            other_platform_fare
                             - float(retry.driver_pay)
                             - float(retry.platform_variable_cost)
                         )
@@ -14084,7 +14108,7 @@ class Core:
                 distance_bin_firm1_choices[distance_bin] += 1
             if fulfilled and matched_firm == "Firm1":
                 distance_bin_firm1_completed[distance_bin] += 1
-                distance_bin_firm1_revenue_sum[distance_bin] += float(p1)
+                distance_bin_firm1_revenue_sum[distance_bin] += platform_fare1
             
             if collect_rows:
                 rows.append({
@@ -17145,6 +17169,18 @@ def main():
     v26.add_argument("--ood_perturbed_variants", type=int, default=None)
     v26.add_argument("--ood_perturbation_scale", type=float, default=0.25)
 
+    v17 = parser.add_argument_group("v17 market and learner (all default off)")
+    v17.add_argument(
+        "--fare_model",
+        choices=("legacy", "realistic"),
+        default="legacy",
+        help=(
+            "V17 M4 realistic fare composition; legacy preserves 15d. "
+            "Realistic keeps base/booking fixed, applies context only to "
+            "time/distance, and excludes pass-through from revenue and pay."
+        ),
+    )
+
     v26r = parser.add_argument_group("v26r regime-switching market (all default off)")
     v26r.add_argument("--regime_market", action="store_true",
                       help="Enable the stochastic regime process (holidays, storms with forecasts, "
@@ -18177,6 +18213,7 @@ def main():
         driver_cost_per_minute=args.driver_cost_per_minute,
         fixed_trip_cost=args.fixed_trip_cost,
         airport_cost=args.airport_cost,
+        fare_model=args.fare_model,
         enable_driver_supply=not args.disable_driver_supply,
         use_osmnx=args.use_osmnx,
         osmnx_place=args.osmnx_place or None,
