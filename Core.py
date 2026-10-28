@@ -81,6 +81,7 @@ from pricing_models import (
     FirmRLPricer,
     HYBRID_RELATIVE_ACTION_SEMANTICS,
     LEVEL_STEP_ACTION_SEMANTICS,
+    TWO_LEVER_ACTION_SEMANTICS,
     LEVEL_STEP_EXPOSURE,
     TARIFF_LEVEL_GRID_STEP,
     snap_tariff_level,
@@ -726,6 +727,7 @@ class Core:
         airport_cost: float = 2.00,
         fare_model: str = "legacy",
         price_sensitivity_units: str = "legacy",
+        action_contract: str = "legacy",
         enable_driver_supply: bool = True,
         use_osmnx: bool = False,
         osmnx_place: Optional[str] = None,
@@ -869,6 +871,9 @@ class Core:
         # branch imitation. Every option defaults off (Revision 14 identity).
         self.level_step_actions = bool(level_step_actions)
         self.hybrid_relative_actions = bool(hybrid_relative_actions)
+        self.action_contract = str(action_contract)
+        if self.action_contract not in ("legacy", "two_lever_v1"):
+            raise ValueError("action_contract must be legacy or two_lever_v1")
         self.relative_action_steps: Tuple[float, ...] = tuple(
             float(value) for value in relative_action_steps
         )
@@ -893,7 +898,18 @@ class Core:
             or self.branch_imitation_temperature_scale <= 0.0
         ):
             raise ValueError("branch_imitation_temperature_scale must be positive")
-        if self.hybrid_relative_actions:
+        if self.action_contract == "two_lever_v1":
+            if self.level_step_actions or self.hybrid_relative_actions or self.whole_tariff_actions:
+                raise ValueError(
+                    "two_lever_v1 conflicts with legacy revised action flags"
+                )
+            if self.tariff_targets or self.tariff_structure_payload is not None:
+                raise ValueError("two_lever_v1 has a fixed 25-cell grid")
+            if tuple(self.driver_incentive_levels) != (1.0,):
+                raise ValueError(
+                    "two_lever_v1 requires driver_incentive_levels=(1.0,)"
+                )
+        elif self.hybrid_relative_actions:
             if self.level_step_actions or self.whole_tariff_actions:
                 raise ValueError(
                     "hybrid-relative, level-step, and whole-tariff actions are exclusive"
@@ -1550,9 +1566,11 @@ class Core:
                     and not self.whole_tariff_actions
                     and not self.level_step_actions
                     and not self.hybrid_relative_actions
+                    and self.action_contract == "legacy"
                 ),
                 level_step_actions=self.level_step_actions,
                 hybrid_relative_actions=self.hybrid_relative_actions,
+                action_contract=self.action_contract,
                 relative_action_steps=self.relative_action_steps,
                 tariff_structure=self.tariff_structure_payload,
                 tariff_level_bounds=(
@@ -2368,6 +2386,11 @@ class Core:
                 "the hybrid-relative contract has no absolute-target warm start; "
                 "pass --rl_warm_start_target 0"
             )
+        if getattr(self.firm1, "two_lever_actions", False):
+            raise ValueError(
+                "the two-lever contract has no scalar warm start; "
+                "pass --rl_warm_start_target 0"
+            )
         if not self.firm1.independent_coefficient_actions:
             table = dict(self.firm1.action_to_multiplier)
             action, multiplier = min(
@@ -2699,6 +2722,7 @@ class Core:
             "tariff_targets": list(self.tariff_targets) if self.tariff_targets else "v26_default",
             "level_step_actions": bool(self.level_step_actions),
             "hybrid_relative_actions": bool(self.hybrid_relative_actions),
+            "action_contract": self.action_contract,
             "relative_action_steps": list(self.relative_action_steps),
             "tariff_structure": (
                 copy.deepcopy(getattr(self.firm1, "tariff_structure", None))
@@ -4023,6 +4047,8 @@ class Core:
         config = getattr(pricer, "config", None)
         if config is None:
             return None
+        if getattr(pricer, "two_lever_actions", False):
+            return pricer.build_action_feature_matrix(self.market, crowd_context)
         firm_name = "Firm2" if pricer is self.firm2 else "Firm1"
         anchors = {key: float(getattr(base, key)) for key in self.opt_keys}
         coefficients = {
@@ -5940,8 +5966,13 @@ class Core:
         hybrid_actions = bool(
             getattr(self.firm1, "hybrid_relative_actions", False)
         )
+        two_lever_actions = bool(
+            getattr(self.firm1, "two_lever_actions", False)
+        )
         action_semantics = (
-            LEVEL_STEP_ACTION_SEMANTICS
+            TWO_LEVER_ACTION_SEMANTICS
+            if two_lever_actions
+            else LEVEL_STEP_ACTION_SEMANTICS
             if level_actions
             else HYBRID_RELATIVE_ACTION_SEMANTICS
             if hybrid_actions
@@ -5973,6 +6004,9 @@ class Core:
             "action_to_relative_step": copy.deepcopy(
                 getattr(self.firm1, "action_to_relative_step", {})
             ),
+            "action_to_two_lever_cell": copy.deepcopy(
+                getattr(self.firm1, "action_to_two_lever_cell", {})
+            ),
             "tariff_structure": copy.deepcopy(
                 getattr(self.firm1, "tariff_structure", None)
             ),
@@ -5988,7 +6022,9 @@ class Core:
             "observation_feature_groups": {},
             "city_context_keys": list(PlatformObservationModel.CITY_CONTEXT_KEYS),
             "architecture": (
-                "stateful-public-gru-level-step-actor-centralized-v-independent-action-q-ppo"
+                "stateful-public-gru-two-lever-card-actor-centralized-v-independent-action-q-ppo"
+                if two_lever_actions
+                else "stateful-public-gru-level-step-actor-centralized-v-independent-action-q-ppo"
                 if level_actions
                 else "stateful-public-gru-hybrid-relative-factorized-actor-centralized-v-independent-action-q-ppo"
                 if hybrid_actions
@@ -6535,7 +6571,9 @@ class Core:
         if artifact.get("action_to_target_key") != self.firm1.action_to_target_key:
             raise ValueError("trained model coefficient targets do not match runtime")
         expected_action_semantics = (
-            LEVEL_STEP_ACTION_SEMANTICS
+            TWO_LEVER_ACTION_SEMANTICS
+            if getattr(self.firm1, "two_lever_actions", False)
+            else LEVEL_STEP_ACTION_SEMANTICS
             if getattr(self.firm1, "level_step_actions", False)
             else HYBRID_RELATIVE_ACTION_SEMANTICS
             if getattr(self.firm1, "hybrid_relative_actions", False)
@@ -6549,6 +6587,14 @@ class Core:
                 f"artifact={artifact.get('action_semantics')!r}, "
                 f"runtime={expected_action_semantics!r}"
             )
+        if getattr(self.firm1, "two_lever_actions", False):
+            if (
+                artifact.get("action_to_two_lever_cell")
+                != self.firm1.action_to_two_lever_cell
+            ):
+                raise ValueError(
+                    "trained model two-lever cells do not match runtime"
+                )
         if getattr(self.firm1, "level_step_actions", False):
             if artifact.get("action_to_level_step") != self.firm1.action_to_level_step:
                 raise ValueError("trained model level steps do not match runtime")
@@ -17225,6 +17271,15 @@ def main():
             "same units; legacy preserves 15d."
         ),
     )
+    v17.add_argument(
+        "--action_contract",
+        choices=("legacy", "two_lever_v1"),
+        default="legacy",
+        help=(
+            "V17 M5 absolute distance/time card: 25 cells over "
+            "{0.8,0.9,1.0,1.2,1.5}; legacy preserves 15d."
+        ),
+    )
 
     v26r = parser.add_argument_group("v26r regime-switching market (all default off)")
     v26r.add_argument("--regime_market", action="store_true",
@@ -17460,13 +17515,30 @@ def main():
             or artifact_header.get("action_semantics")
             == HYBRID_RELATIVE_ACTION_SEMANTICS
         )
+        if artifact_header.get("action_semantics") == TWO_LEVER_ACTION_SEMANTICS:
+            args.action_contract = "two_lever_v1"
         if int(artifact_header.get("version", 0)) < 21:
             parser.error(
                 "--trained_model_in predates the version-23 coherent-tariff, "
                 "differential semi-MDP reward, and corrected critic contract; "
                 "retrain it with the current staged PPO path"
             )
-        if artifact_header.get("action_semantics") == LEVEL_STEP_ACTION_SEMANTICS:
+        if artifact_header.get("action_semantics") == TWO_LEVER_ACTION_SEMANTICS:
+            if (
+                args.level_step_actions
+                or args.hybrid_relative_actions
+                or args.whole_tariff_actions
+                or args.tariff_targets
+                or args.tariff_structure
+            ):
+                parser.error(
+                    "legacy action flags conflict with the saved two-lever contract"
+                )
+            saved_cells = artifact_header.get("action_to_two_lever_cell", {})
+            if len(saved_cells) != 25:
+                parser.error("saved two-lever policy lacks its 25-cell grid")
+            args.action_contract = "two_lever_v1"
+        elif artifact_header.get("action_semantics") == LEVEL_STEP_ACTION_SEMANTICS:
             # Revision 15: the saved structure, steps and bounds define the action contract.
             if args.tariff_targets:
                 parser.error("--tariff_targets conflicts with the saved level-step contract")
@@ -18048,7 +18120,18 @@ def main():
         if args.tariff_structure:
             with open(os.path.expanduser(args.tariff_structure)) as handle:
                 args.tariff_structure_payload = json.load(handle)
-    if args.hybrid_relative_actions:
+    if args.action_contract == "two_lever_v1":
+        if args.level_step_actions or args.hybrid_relative_actions or args.whole_tariff_actions:
+            parser.error(
+                "--action_contract two_lever_v1 conflicts with legacy action flags"
+            )
+        if args.tariff_targets or args.tariff_structure_payload is not None:
+            parser.error(
+                "--action_contract two_lever_v1 uses its fixed 25-cell grid"
+            )
+        if str(args.rl_warm_start_target).strip() not in ("", "0", "0.0"):
+            parser.error("the two-lever contract has no scalar warm start")
+    elif args.hybrid_relative_actions:
         if not args.learning_corrections:
             parser.error("--hybrid_relative_actions requires --learning_corrections")
         if args.level_step_actions or args.whole_tariff_actions:
@@ -18263,6 +18346,7 @@ def main():
         airport_cost=args.airport_cost,
         fare_model=args.fare_model,
         price_sensitivity_units=args.price_sensitivity_units,
+        action_contract=args.action_contract,
         enable_driver_supply=not args.disable_driver_supply,
         use_osmnx=args.use_osmnx,
         osmnx_place=args.osmnx_place or None,

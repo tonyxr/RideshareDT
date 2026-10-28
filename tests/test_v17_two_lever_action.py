@@ -1,0 +1,133 @@
+"""V17 M5 absolute distance/time action-card contract."""
+import copy
+
+import pytest
+
+from MarketInteraction import MarketInteraction, RideContext
+from pricing_models import FirmRLPricer, TWO_LEVER_LEVELS
+
+
+KEYS = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
+
+
+def make_pricer():
+    return FirmRLPricer(
+        seed=17,
+        opt_keys=KEYS,
+        independent_coefficient_actions=False,
+        action_contract="two_lever_v1",
+    )
+
+
+def action_for(pricer, distance, time):
+    return next(
+        action for action, cell in pricer.action_to_two_lever_cell.items()
+        if cell == pytest.approx((distance, time))
+    )
+
+
+def test_registered_grid_has_exactly_25_feasible_absolute_cells():
+    pricer = make_pricer()
+    market = MarketInteraction(city_name="Chicago", seed=17)
+    assert pricer.agent.action_dim == 25
+    assert set(pricer.action_to_two_lever_cell.values()) == {
+        (distance, time)
+        for distance in TWO_LEVER_LEVELS
+        for time in TWO_LEVER_LEVELS
+    }
+    assert pricer.feasible_action_mask(market).tolist() == [True] * 25
+    assert pricer.action_label(action_for(pricer, 0.8, 1.5)) == (
+        "cell:distance=0.8,time=1.5"
+    )
+
+
+@pytest.mark.parametrize("distance,time", [
+    (distance, time)
+    for distance in TWO_LEVER_LEVELS
+    for time in TWO_LEVER_LEVELS
+])
+def test_each_cell_posts_only_absolute_distance_and_time(distance, time):
+    pricer = make_pricer()
+    market = MarketInteraction(city_name="Chicago", seed=18)
+    anchor = market.curr_market
+    pricer.apply_action(action_for(pricer, distance, time), market)
+    assert pricer.overrides.per_mile == pytest.approx(anchor.per_mile * distance)
+    assert pricer.overrides.per_minute == pytest.approx(anchor.per_minute * time)
+    assert pricer.overrides.base_fare is None
+    assert pricer.overrides.booking_fee is None
+    assert pricer.overrides.airport_fee is None
+    assert not pricer.last_action_was_saturated
+
+
+def test_repeating_a_cell_holds_the_posted_fare_exactly():
+    pricer = make_pricer()
+    market = MarketInteraction(city_name="New York City", seed=19)
+    action = action_for(pricer, 1.2, 0.9)
+    pricer.apply_action(action, market)
+    before = copy.deepcopy(pricer.overrides)
+    context = RideContext(
+        day_of_week=2,
+        hour=12,
+        weather="clear",
+        airport=False,
+        service="economy",
+    )
+    quote_before = market.quote_price(
+        4.0, 15.0, context, overrides=pricer.overrides
+    )
+    pricer.apply_action(action, market)
+    quote_after = market.quote_price(
+        4.0, 15.0, context, overrides=pricer.overrides
+    )
+    assert pricer.overrides == before
+    assert quote_after == pytest.approx(quote_before, abs=0.0)
+    assert pricer.last_action_was_zero_effect
+
+
+def test_legacy_contract_is_unchanged_when_flag_is_off():
+    legacy = FirmRLPricer(
+        seed=20,
+        opt_keys=KEYS,
+        tariff_targets=(0.8, 1.0, 1.2),
+    )
+    assert not legacy.two_lever_actions
+    assert legacy.action_label(0) == "hold"
+    assert not hasattr(legacy, "action_to_two_lever_cell")
+
+
+def test_two_lever_grid_rejects_legacy_target_inputs():
+    with pytest.raises(ValueError, match="tariff_targets"):
+        FirmRLPricer(
+            seed=21,
+            opt_keys=KEYS,
+            independent_coefficient_actions=False,
+            action_contract="two_lever_v1",
+            tariff_targets=(0.8, 1.0),
+        )
+
+
+def test_core_flag_wires_and_persists_the_25_cell_contract(tmp_path):
+    from Core import Core
+    import torch
+
+    core = Core(
+        "Chicago",
+        seed=22,
+        firm1_mode="RL",
+        firm2_mode="static",
+        total_customers_pool=8,
+        simulation_sample_cap=8,
+        enable_driver_supply=False,
+        openai_api_key="",
+        action_contract="two_lever_v1",
+    )
+    assert core.action_contract == "two_lever_v1"
+    assert core.firm1.two_lever_actions
+    assert core.firm1.agent.action_dim == 25
+    assert core._action_feature_matrix_for_pricer(core.firm1, {}).shape == (25, 20)
+    artifact_path = tmp_path / "two-lever-policy.pt"
+    core.save_trained_model(str(artifact_path))
+    artifact = torch.load(artifact_path, weights_only=False, map_location="cpu")
+    assert artifact["action_semantics"] == "two_lever_absolute_card_v1"
+    assert len(artifact["action_to_two_lever_cell"]) == 25
+    core.load_trained_model(str(artifact_path))

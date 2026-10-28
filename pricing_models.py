@@ -218,6 +218,48 @@ def build_independent_coefficient_action_space(
     )
 
 
+# V17 M5: one absolute card cell controls distance and time components only.
+TWO_LEVER_ACTION_SEMANTICS = "two_lever_absolute_card_v1"
+TWO_LEVER_LEVELS: Tuple[float, ...] = (0.8, 0.9, 1.0, 1.2, 1.5)
+
+
+def build_two_lever_action_space(
+    opt_keys: List[str],
+    levels: Sequence[float] = TWO_LEVER_LEVELS,
+) -> Tuple[Dict[int, Dict[str, int]], Dict[int, Tuple[float, float]], List[str]]:
+    """Return the 25 absolute (distance, time) cells registered for V17."""
+    required = ("per_mile", "per_minute")
+    if not set(required).issubset(opt_keys):
+        raise ValueError("two_lever_v1 requires per_mile and per_minute")
+    resolved = tuple(float(value) for value in levels)
+    if (
+        resolved != TWO_LEVER_LEVELS
+        or len(set(resolved)) != len(resolved)
+        or not all(np.isfinite(value) and value > 0.0 for value in resolved)
+    ):
+        raise ValueError(f"two_lever_v1 levels are fixed at {TWO_LEVER_LEVELS}")
+    action_to_steps: Dict[int, Dict[str, int]] = {}
+    action_to_cell: Dict[int, Tuple[float, float]] = {}
+    for distance_multiplier in resolved:
+        for time_multiplier in resolved:
+            action = len(action_to_cell)
+            action_to_cell[action] = (
+                float(distance_multiplier),
+                float(time_multiplier),
+            )
+            action_to_steps[action] = {
+                key: (
+                    int(np.sign(distance_multiplier - 1.0))
+                    if key == "per_mile"
+                    else int(np.sign(time_multiplier - 1.0))
+                    if key == "per_minute"
+                    else 0
+                )
+                for key in opt_keys
+            }
+    return action_to_steps, action_to_cell, list(required)
+
+
 # ---------------------------------------------------------------------------
 # Revision 15d: compact hybrid relative action contract.
 # ---------------------------------------------------------------------------
@@ -1935,6 +1977,7 @@ class FirmRLPricer:
         independent_coefficient_actions: bool = True,
         level_step_actions: bool = False,
         hybrid_relative_actions: bool = False,
+        action_contract: str = "legacy",
         relative_action_steps: Sequence[float] = HYBRID_RELATIVE_STEP_MAGNITUDES,
         tariff_structure: Optional[Mapping[str, Any]] = None,
         tariff_level_bounds: Optional[Tuple[float, float]] = None,
@@ -1946,6 +1989,10 @@ class FirmRLPricer:
             independent_coefficient_actions
         )
         self.hybrid_relative_actions = bool(hybrid_relative_actions)
+        self.action_contract = str(action_contract)
+        if self.action_contract not in ("legacy", "two_lever_v1"):
+            raise ValueError("action_contract must be legacy or two_lever_v1")
+        self.two_lever_actions = self.action_contract == "two_lever_v1"
         # Revision 15: hold or a relative step of the tariff level L on a fixed
         # structure S; every coefficient is posted as anchor * S * L.
         self.level_step_actions = bool(level_step_actions)
@@ -1953,9 +2000,10 @@ class FirmRLPricer:
             self.level_step_actions,
             self.independent_coefficient_actions,
             self.hybrid_relative_actions,
+            self.two_lever_actions,
         )) > 1:
             raise ValueError(
-                "level-step, absolute-target, and hybrid-relative actions are exclusive"
+                "level-step, absolute-target, hybrid-relative, and two-lever actions are exclusive"
             )
         if entropy_coeff_start is not None and not (
             np.isfinite(float(entropy_coeff_start)) and float(entropy_coeff_start) > 0.0
@@ -2006,7 +2054,23 @@ class FirmRLPricer:
         self.aggressive_actions = set()
         self.allow_aggressive_actions = True
         
-        if self.hybrid_relative_actions:
+        if self.two_lever_actions:
+            if tariff_targets:
+                raise ValueError("two_lever_v1 does not use tariff_targets")
+            if tariff_structure is not None or tariff_level_bounds is not None:
+                raise ValueError("two_lever_v1 does not use a tariff structure")
+            (
+                self.action_to_steps,
+                self.action_to_two_lever_cell,
+                self.action_keys,
+            ) = build_two_lever_action_space(self.opt_keys)
+            self.action_to_multiplier = {}
+            self.action_to_target_key = {}
+            self.action_to_level_step = {}
+            self.action_to_relative_step = {}
+            self.tariff_structure = None
+            self.tariff_level_bounds = None
+        elif self.hybrid_relative_actions:
             if tariff_targets:
                 raise ValueError("hybrid relative actions do not use tariff_targets")
             if tariff_structure is not None or tariff_level_bounds is not None:
@@ -2079,6 +2143,7 @@ class FirmRLPricer:
             self.independent_coefficient_actions
             or self.level_step_actions
             or self.hybrid_relative_actions
+            or self.two_lever_actions
         ):
             if len(levels) != 1 or abs(levels[0] - 1.0) > 1e-9:
                 raise ValueError(
@@ -2222,6 +2287,13 @@ class FirmRLPricer:
 
     def action_label(self, action: int) -> str:
         """Compact label for the active action-space contract."""
+        if self.two_lever_actions:
+            cell = self.action_to_two_lever_cell.get(int(action))
+            return (
+                "invalid"
+                if cell is None
+                else f"cell:distance={cell[0]:.1f},time={cell[1]:.1f}"
+            )
         if int(action) == 0:
             return "hold"
         if self.level_step_actions:
@@ -2387,6 +2459,9 @@ class FirmRLPricer:
         resulting level stays inside the level bounds; with no posted level
         (a comparator posted the tariff) only hold is defined.
         """
+        if self.two_lever_actions:
+            del market_interaction
+            return np.ones(len(self.action_to_steps), dtype=bool)
         if self.level_step_actions:
             mask = np.zeros(len(self.action_to_steps), dtype=bool)
             mask[0] = True
@@ -2525,7 +2600,16 @@ class FirmRLPricer:
             multiplier = self.action_to_multiplier.get(int(action))
             relative_step = self.action_to_relative_step.get(int(action))
             level_values = level_targets.get(int(action))
-            if multiplier is None and relative_step is None and level_values is None:
+            two_lever_cell = (
+                self.action_to_two_lever_cell.get(int(action))
+                if self.two_lever_actions else None
+            )
+            if (
+                multiplier is None
+                and relative_step is None
+                and level_values is None
+                and two_lever_cell is None
+            ):
                 rows.append([
                     1.0, 0.0, *([0.0] * 5), 0.0, 1.0, 1.0,
                     *([0.0] * 4),
@@ -2534,7 +2618,9 @@ class FirmRLPricer:
                 ])
                 continue
             target_keys = (
-                list(self.opt_keys)
+                ["per_mile", "per_minute"]
+                if two_lever_cell is not None
+                else list(self.opt_keys)
                 if target_key is None or target_key == "whole_tariff"
                 else [str(target_key)]
             )
@@ -2546,7 +2632,9 @@ class FirmRLPricer:
                 current = anchor if curr_raw is None else float(curr_raw)
                 lb, ub = self.config.bounds[key]
                 target = (
-                    float(level_values[key])
+                    float(anchor * two_lever_cell[0 if key == "per_mile" else 1])
+                    if two_lever_cell is not None
+                    else float(level_values[key])
                     if level_values is not None
                     else float(np.clip(
                         current + anchor * float(relative_step), lb, ub
@@ -2672,6 +2760,12 @@ class FirmRLPricer:
                 np.clip(self.action_to_incentive.get(full_action, 1.0), 0.85, 1.25)
             )
             action = full_action % int(self.base_action_count)
+
+        if self.two_lever_actions:
+            self._apply_two_lever_cell(
+                int(action), int(full_action), market_interaction
+            )
+            return
 
         if int(action) == 0:
             self._last_applied_action = int(action)
@@ -2823,6 +2917,102 @@ class FirmRLPricer:
             was_clipped=clipped_any,
             is_reversal=is_reversal,
             reversal_count=int(self._reversal_count),
+        )
+
+    def _apply_two_lever_cell(
+        self, action: int, full_action: int, market_interaction
+    ) -> None:
+        """Post one absolute V17 card cell; repeating it leaves fares unchanged."""
+        cell = self.action_to_two_lever_cell.get(int(action))
+        if cell is None:
+            return
+        base = market_interaction.curr_market
+        multipliers = {
+            "per_mile": float(cell[0]),
+            "per_minute": float(cell[1]),
+        }
+        pre_values: Dict[str, float] = {}
+        realized_by_key: Dict[str, float] = {}
+        lower_distances: List[float] = []
+        upper_distances: List[float] = []
+        clipped_any = False
+        for key, multiplier in multipliers.items():
+            anchor = float(getattr(base, key))
+            current_raw = getattr(self.overrides, key)
+            current = anchor if current_raw is None else float(current_raw)
+            lower, upper = self.config.bounds[key]
+            raw_target = anchor * multiplier
+            target = float(np.clip(raw_target, lower, upper))
+            clipped_any = bool(
+                clipped_any
+                or not np.isclose(target, raw_target, rtol=0.0, atol=1e-9)
+            )
+            pre_values[key] = current
+            realized_by_key[key] = target - current
+            setattr(self.overrides, key, target)
+            width = max(1e-9, upper - lower)
+            lower_distances.append(
+                float(np.clip((target - lower) / width, 0.0, 1.0))
+            )
+            upper_distances.append(
+                float(np.clip((upper - target) / width, 0.0, 1.0))
+            )
+        # M5 exposes only distance and time. Every other rate-card component
+        # remains at the calibrated card even if this object was previously
+        # used by another action contract.
+        for key in self.opt_keys:
+            if key not in multipliers:
+                setattr(self.overrides, key, None)
+        repeated = int(action) == self._last_applied_action
+        self._repeat_action_count = self._repeat_action_count + 1 if repeated else 1
+        self._last_applied_action = int(action)
+        self.last_action_was_zero_effect = all(
+            abs(delta) <= 1e-9 for delta in realized_by_key.values()
+        )
+        self.last_action_was_saturated = clipped_any
+        self.last_action_steps = {
+            key: int(np.sign(realized_by_key.get(key, 0.0)))
+            for key in self.opt_keys
+        }
+        self.last_action_step_units = {
+            key: float(
+                realized_by_key.get(key, 0.0)
+                / max(1e-9, self.config.step[key])
+            )
+            for key in self.opt_keys
+        }
+        self.last_action_normalized_gap = {
+            key: float(realized_by_key.get(key, 0.0))
+            / max(
+                1e-9,
+                self.config.bounds[key][1] - self.config.bounds[key][0],
+            )
+            for key in self.opt_keys
+        }
+        aggregate_direction = int(np.sign(sum(realized_by_key.values())))
+        self._last_action_target = "per_mile+per_minute"
+        self._last_action_direction = aggregate_direction
+        self._reversal_count = 0
+        self.last_action_descriptor = ActionDescriptor(
+            action_id=int(full_action),
+            target="per_mile+per_minute",
+            direction=aggregate_direction,
+            intended_step=float(sum(realized_by_key.values())),
+            realized_delta=float(sum(realized_by_key.values())),
+            realized_delta_norm=float(
+                sum(self.last_action_normalized_gap.values())
+            ),
+            pre_value=float(np.mean(list(pre_values.values()))),
+            post_value=float(np.mean([
+                float(self.overrides.per_mile),
+                float(self.overrides.per_minute),
+            ])),
+            lower_distance=float(min(lower_distances)),
+            upper_distance=float(min(upper_distances)),
+            magnitude_multiplier=float(np.mean(cell)),
+            magnitude_level=float(np.mean(cell)),
+            repeat_count=int(self._repeat_action_count),
+            was_clipped=clipped_any,
         )
 
     def _apply_level_step(self, action: int, full_action: int, market_interaction) -> None:
