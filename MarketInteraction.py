@@ -543,7 +543,13 @@ class MarketInteraction:
         hour = int(self.rng.choice(np.arange(24), p=self.hour_probs))
         return TimeContext(hour=hour)
 
-    def sample_day_context(self) -> DayContext:
+    def sample_day_context(
+        self,
+        *,
+        calendar_rng: Optional[np.random.Generator] = None,
+        weather_rng: Optional[np.random.Generator] = None,
+        hour_rng: Optional[np.random.Generator] = None,
+    ) -> DayContext:
         """Next operating day.
 
         Legacy: an i.i.d. weekday and weather.  v26 sequential calendar:
@@ -551,13 +557,25 @@ class MarketInteraction:
         intra-day time blocks (consumed by ``sample_timestep_hour``).
         """
         if not self.sequential_calendar:
-            return self._iid_day_context()
+            if calendar_rng is None and weather_rng is None and hour_rng is None:
+                return self._iid_day_context()
+            primary_rng = self.rng if calendar_rng is None else calendar_rng
+            weather_source = primary_rng if weather_rng is None else weather_rng
+            day = int(primary_rng.choice(7, p=self.day_of_week_probs))
+            keys = list(self.weather_probs.keys())
+            probs = np.array([self.weather_probs[k] for k in keys], dtype=float)
+            probs = probs / probs.sum()
+            weather = str(weather_source.choice(keys, p=probs))
+            return DayContext(day_of_week=day, weather=weather)
+        primary_rng = self.rng if calendar_rng is None else calendar_rng
+        weather_source = primary_rng if weather_rng is None else weather_rng
         shocks = self.active_shocks
         if self.calendar.day_index < 0:
             self.calendar.reset(
-                self.rng,
+                primary_rng,
                 day_of_week_probs=np.asarray(self.day_of_week_probs, dtype=float),
                 weather_probs=self.weather_probs,
+                weather_rng=weather_source,
             )
             if shocks is not None:
                 shocks.reset(
@@ -565,11 +583,13 @@ class MarketInteraction:
                     training_episode_days=int(self.shock_training_episode_days),
                 )
         self.calendar.advance_day(
-            self.rng,
+            primary_rng,
             steps_per_day=self.dynamics_steps_per_day,
             hour_probs=np.asarray(self.hour_probs, dtype=float),
             weather_probs=self.weather_probs,
             persistence=float(self.dynamics.weather_persistence),
+            weather_rng=weather_source,
+            hour_rng=(primary_rng if hour_rng is None else hour_rng),
         )
         weather = str(self.calendar.weather)
         if shocks is not None:
@@ -587,10 +607,16 @@ class MarketInteraction:
             weather=weather,
         )
 
-    def sample_timestep_hour(self) -> TimeContext:
+    def sample_timestep_hour(
+        self, rng: Optional[np.random.Generator] = None
+    ) -> TimeContext:
         """Next operating step's hour (ordered blocks in v26, i.i.d. otherwise)."""
         if not self.sequential_calendar:
-            return self._iid_hour()
+            if rng is None:
+                return self._iid_hour()
+            return TimeContext(
+                hour=int(rng.choice(np.arange(24), p=self.hour_probs))
+            )
         if self.calendar.day_index < 0:
             self.sample_day_context()
         if self.calendar.block + 1 >= len(self.calendar._day_hours):
@@ -601,8 +627,11 @@ class MarketInteraction:
         _, hour, _ = self.calendar.next_block()
         return TimeContext(hour=int(hour))
 
-    def sample_airport_flag(self) -> bool:
-        return bool(self.rng.random() < self.airport_prob)
+    def sample_airport_flag(
+        self, rng: Optional[np.random.Generator] = None
+    ) -> bool:
+        source = self.rng if rng is None else rng
+        return bool(source.random() < self.airport_prob)
 
     # ---------- v26r regime process ----------
     @property
@@ -634,11 +663,14 @@ class MarketInteraction:
             return {}
         return dict(self.shock_effect(int(hour)).public)
 
-    def sample_service(self) -> str:
+    def sample_service(
+        self, rng: Optional[np.random.Generator] = None
+    ) -> str:
         keys = list(self.service_probs.keys())
         probs = np.array([self.service_probs[k] for k in keys], dtype=float)
         probs = probs / probs.sum()
-        return str(self.rng.choice(keys, p=probs))
+        source = self.rng if rng is None else rng
+        return str(source.choice(keys, p=probs))
 
     # ---------- Pricing ----------
     def _time_multiplier(self, hour: int) -> float:

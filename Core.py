@@ -47,6 +47,7 @@ from diagnostic_logging import DiagnosticJournal
 from model_contract import OPPONENT_PROFIT_LEAD_WEIGHT
 from simulation_noise import isolated_batch_noise, rider_streams
 from strategic_benchmarks import solve_tariff_game
+from v17_tape import ExogenousTape
 
 
 from MarketInteraction import MarketInteraction, RideContext
@@ -729,6 +730,7 @@ class Core:
         price_sensitivity_units: str = "legacy",
         action_contract: str = "legacy",
         rivals_two_lever: bool = False,
+        v16_crn_tape: bool = False,
         enable_driver_supply: bool = True,
         use_osmnx: bool = False,
         osmnx_place: Optional[str] = None,
@@ -876,6 +878,11 @@ class Core:
         if self.action_contract not in ("legacy", "two_lever_v1"):
             raise ValueError("action_contract must be legacy or two_lever_v1")
         self.rivals_two_lever = bool(rivals_two_lever)
+        self.v16_crn_tape = bool(v16_crn_tape)
+        self.exogenous_tape = (
+            ExogenousTape(root_seed=self.seed) if self.v16_crn_tape else None
+        )
+        self._v16_tape_position: Optional[Tuple[int, int, int]] = None
         self.relative_action_steps: Tuple[float, ...] = tuple(
             float(value) for value in relative_action_steps
         )
@@ -2830,14 +2837,20 @@ class Core:
                 setattr(self.firm2, "_ride_response_mode", new_mode)
             self._regime_rival_switch_applied[index] = new_mode
 
-    def _regime_resample_airport(self, airport: bool, multiplier: float) -> bool:
+    def _regime_resample_airport(
+        self,
+        airport: bool,
+        multiplier: float,
+        rng: Optional[np.random.Generator] = None,
+    ) -> bool:
         """Shift the airport share of trips by ``multiplier`` (holiday/storm waves)."""
+        source = self.rng if rng is None else rng
         p = float(np.clip(self.market.airport_prob, 1e-6, 0.95))
         if multiplier > 1.0 and not airport:
             flip = float(np.clip(p * (multiplier - 1.0) / max(1e-6, 1.0 - p), 0.0, 0.95))
-            return bool(self.rng.random() < flip)
+            return bool(source.random() < flip)
         if multiplier < 1.0 and airport:
-            return bool(self.rng.random() >= (1.0 - float(multiplier)))
+            return bool(source.random() >= (1.0 - float(multiplier)))
         return bool(airport)
 
     def _regime_critic_features(self) -> List[float]:
@@ -2922,8 +2935,13 @@ class Core:
                 shocks.defer(expected * (1.0 / max(0.05, storm_factor) - 1.0))
             release = shocks.release_backlog(storm_active="winter_storm" in effect.active)
             multiplier = float(multiplier) * volume + float(release) / float(base)
+        request_rng = (
+            self._v16_tape_rng("requests")
+            if self.v16_crn_tape and self._v16_tape_position is not None
+            else self.market.rng
+        )
         return realized_request_count(
-            self.market.rng,
+            request_rng,
             base_customers=base,
             multiplier=multiplier,
             noise=str(config.demand_noise),
@@ -2983,6 +3001,60 @@ class Core:
             torch.use_deterministic_algorithms(True)
             if hasattr(torch.backends, "cudnn"):
                 torch.backends.cudnn.benchmark = False
+
+    def _set_v16_tape_position(
+        self, day: int, step: int, *, tape_id: int = 0
+    ) -> None:
+        """Select the address used by V17 exogenous and endogenous streams."""
+        if not self.v16_crn_tape:
+            return
+        day_i, step_i, tape_i = int(day), int(step), int(tape_id)
+        if day_i < 0 or step_i < 0 or tape_i < 0:
+            raise ValueError("tape day, step, and tape_id must be non-negative")
+        self._v16_tape_position = (day_i, step_i, tape_i)
+
+    def _v16_tape_rng(self, purpose: str) -> np.random.Generator:
+        if not self.v16_crn_tape or self.exogenous_tape is None:
+            raise RuntimeError("the V17 exogenous tape is not enabled")
+        if self._v16_tape_position is None:
+            raise RuntimeError("the V17 exogenous tape position is not set")
+        day, step, tape_id = self._v16_tape_position
+        return self.exogenous_tape.gen(
+            day, step, purpose, tape_id=tape_id
+        )
+
+    def _sample_v16_day_and_hours(
+        self, day: int, steps_per_day: int, *, tape_id: int = 0
+    ) -> Tuple[Any, List[int]]:
+        """Advance market state using addressable calendar/hour/shock streams."""
+        steps = int(max(1, steps_per_day))
+        if not self.v16_crn_tape:
+            day_ctx = self.market.sample_day_context()
+            return day_ctx, [
+                self.market.sample_timestep_hour().hour for _ in range(steps)
+            ]
+        self._set_v16_tape_position(day, 0, tape_id=tape_id)
+        shocks = getattr(self.market, "shocks", None)
+        previous_shock_rng = getattr(shocks, "rng", None)
+        try:
+            if shocks is not None:
+                shocks.rng = self._v16_tape_rng("shock")
+            calendar_rng = self._v16_tape_rng("calendar")
+            weather_rng = self._v16_tape_rng("weather")
+            hour_rng = self._v16_tape_rng("hours")
+            day_ctx = self.market.sample_day_context(
+                calendar_rng=calendar_rng,
+                weather_rng=weather_rng,
+                hour_rng=hour_rng,
+            )
+            hours = [
+                self.market.sample_timestep_hour(rng=hour_rng).hour
+                for _ in range(steps)
+            ]
+            return day_ctx, hours
+        finally:
+            if shocks is not None:
+                shocks.rng = previous_shock_rng
 
     @staticmethod
     def _ema(curr: float, prev: float, alpha: float = 0.2) -> float:
@@ -6018,9 +6090,14 @@ class Core:
                     f"case-study profile sampling is {self.market_name}-only; "
                     f"requested holdout city was {requested_city!r}"
                 )
+        sample_rng = (
+            self._v16_tape_rng("profiles")
+            if self.v16_crn_tape and self._v16_tape_position is not None
+            else self.rng
+        )
         sampled: List[Dict[str, Any]] = []
         if primary_count:
-            primary_idx = self.rng.integers(
+            primary_idx = sample_rng.integers(
                 0, len(primary_pool), size=primary_count
             )
             sampled.extend(
@@ -6028,7 +6105,7 @@ class Core:
                 for index in primary_idx
             )
         if robust_count:
-            robust_idx = self.rng.integers(
+            robust_idx = sample_rng.integers(
                 0, len(robust_pool), size=robust_count
             )
             sampled.extend(robust_pool[int(index)] for index in robust_idx)
@@ -6037,11 +6114,11 @@ class Core:
             # the episode's active riders, who carry their loyalty stocks.
             returning = int(round(len(sampled) * float(self.returning_rider_share)))
             if returning > 0:
-                active_idx = self.rng.integers(0, len(self._active_rider_pool), size=returning)
+                active_idx = sample_rng.integers(0, len(self._active_rider_pool), size=returning)
                 for position, index in enumerate(active_idx):
                     sampled[position] = self._active_rider_pool[int(index)]
         if len(sampled) > 1:
-            order = self.rng.permutation(len(sampled))
+            order = sample_rng.permutation(len(sampled))
             sampled = [sampled[int(index)] for index in order]
         # Choice/simulation code treats profiles as read-only, so dictionary
         # reuse keeps same-distribution holdout sampling inexpensive.
@@ -9876,8 +9953,9 @@ class Core:
             stage_action_interval_steps = int(
                 effective_firm2_interval_steps
             )
-            day_ctx = self.market.sample_day_context()
-            hours = [self.market.sample_timestep_hour().hour for _ in range(max(1, int(train_steps_per_day)))]
+            day_ctx, hours = self._sample_v16_day_and_hours(
+                d, max(1, int(train_steps_per_day))
+            )
             self._regime_day_start(hours, episode_seed=self.seed + 50_000 + d)
 
             reward_sum = 0.0
@@ -9933,6 +10011,7 @@ class Core:
             inline_ppo_metrics: Optional[Dict[str, Any]] = None
             boundary_flush_transitions = 0
             for t, hour in enumerate(hours):
+                self._set_v16_tape_position(d, t)
                 base = self.market.curr_market
                 rl_step = None
                 interval_closed_this_step = False
@@ -11908,6 +11987,7 @@ class Core:
         eval_clock = OperationalClock()
         eval_previous_firm2_metrics: Optional[FirmMetrics] = None
         eval_day_ctx = None
+        eval_day_hours: List[int] = []
         if self.regime_market and getattr(self.market, "shocks", None) is not None:
             # Revision 11: the primary evaluation uses the natural shock process,
             # never the training-episode sampler left over from the last episode.
@@ -11917,10 +11997,16 @@ class Core:
         self.evaluation_tariff_log = []
         for t in range(eval_timesteps):
             if eval_day_ctx is None or t % train_steps_per_day == 0:
-                eval_day_ctx = self.market.sample_day_context()
+                eval_day_index = int(t // max(1, train_steps_per_day))
+                eval_tape_day = 1_000_000 + eval_day_index
+                eval_day_ctx, eval_day_hours = self._sample_v16_day_and_hours(
+                    eval_tape_day, max(1, int(train_steps_per_day))
+                )
                 self._regime_day_start(None, episode_seed=self.seed + 60_000 + t)
             day_ctx = eval_day_ctx
-            hour = self.market.sample_timestep_hour().hour
+            eval_step = int(t % max(1, train_steps_per_day))
+            self._set_v16_tape_position(eval_tape_day, eval_step)
+            hour = eval_day_hours[eval_step]
             # Evaluation uses rows held out from training but drawn from the
             # same market and threshold source.
             step_customers = self._step_customers(
@@ -13684,6 +13770,7 @@ class Core:
         tracked += (
             "_rival_gap_history", "_returning_share_ema",
             "_durable_profit_lead_ema", "_temporal_reward_state_initialized",
+            "_v16_tape_position",
         )
         if self.regime_market:
             tracked += ("_regime_last_effect", "_firm2_regime_price_multiplier", "_regime_rival_switch_applied")
@@ -13963,8 +14050,13 @@ class Core:
                 weather=weather,
                 supply_multiplier=self.market.driver_supply_multiplier(hour=int(hour)),
             )
+        trip_rng = (
+            self._v16_tape_rng("trip")
+            if self.v16_crn_tape and self._v16_tape_position is not None
+            else self.rng
+        )
         empirical_trips = self.market.sample_operational_trips(
-            self.rng, hour=int(hour), day_of_week=int(day_of_week), size=len(profiles)
+            trip_rng, hour=int(hour), day_of_week=int(day_of_week), size=len(profiles)
         )
 
         for profile_index, profile in enumerate(profiles):
@@ -13978,7 +14070,7 @@ class Core:
                 travel_distance = float(empirical_trips["distance"][profile_index])
             else:
                 # Legacy v25 scenario-side draw (city-independent).
-                travel_distance = round(float(self.rng.exponential(4.0)), 2)
+                travel_distance = round(float(trip_rng.exponential(4.0)), 2)
             
             if travel_distance < 2.0:
                 distance_bin = "0_2"
@@ -13994,10 +14086,14 @@ class Core:
                 airport = bool(empirical_trips["airport"][profile_index])
                 service = str(empirical_trips["service"][profile_index])
             else:
-                airport = self.market.sample_airport_flag()
-                service = self.market.sample_service()
+                airport = self.market.sample_airport_flag(rng=trip_rng)
+                service = self.market.sample_service(rng=trip_rng)
             if self.regime_market and regime_effect.airport_share_multiplier != 1.0:
-                airport = self._regime_resample_airport(airport, float(regime_effect.airport_share_multiplier))
+                airport = self._regime_resample_airport(
+                    airport,
+                    float(regime_effect.airport_share_multiplier),
+                    rng=trip_rng,
+                )
             airport_count += int(airport)
             dist_sum += float(travel_distance)
             distance_values.append(float(travel_distance))
@@ -14474,8 +14570,9 @@ class Core:
         for d in range(days):
             train_progress = float(d + 1) / max(1.0, float(days))
             self._configure_constraint_curriculum(train_progress)
-            day_ctx = self.market.sample_day_context()
-            hours = [self.market.sample_timestep_hour().hour for _ in range(timesteps_per_day)]
+            day_ctx, hours = self._sample_v16_day_and_hours(
+                d, timesteps_per_day
+            )
 
             # day accumulators for logging
             share_sum = 0.0
@@ -14505,6 +14602,7 @@ class Core:
             no_ride_share_sum = 0.0
 
             for t in range(timesteps_per_day):
+                self._set_v16_tape_position(d, t)
                 hour = hours[t]
                 base = self.market.curr_market
 
@@ -17420,6 +17518,15 @@ def main():
             "profit rivals search that diagonal."
         ),
     )
+    v17.add_argument(
+        "--v16_crn_tape",
+        action="store_true",
+        help=(
+            "V17 addressable exogenous/common-random-number tape. Calendar, "
+            "hours, weather, requests, profiles, and trips are shared across "
+            "cells; endogenous noise realigns at every market step."
+        ),
+    )
 
     v26r = parser.add_argument_group("v26r regime-switching market (all default off)")
     v26r.add_argument("--regime_market", action="store_true",
@@ -18488,6 +18595,7 @@ def main():
         price_sensitivity_units=args.price_sensitivity_units,
         action_contract=args.action_contract,
         rivals_two_lever=args.rivals_two_lever,
+        v16_crn_tape=args.v16_crn_tape,
         enable_driver_supply=not args.disable_driver_supply,
         use_osmnx=args.use_osmnx,
         osmnx_place=args.osmnx_place or None,

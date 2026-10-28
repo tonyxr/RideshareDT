@@ -359,11 +359,20 @@ class MarketCalendar:
     _day_hours: List[int] = field(default_factory=list)
     _day_block_shares: List[float] = field(default_factory=list)
 
-    def reset(self, rng: np.random.Generator, *, day_of_week_probs: np.ndarray, weather_probs: Mapping[str, float]) -> None:
+    def reset(
+        self,
+        rng: np.random.Generator,
+        *,
+        day_of_week_probs: np.ndarray,
+        weather_probs: Mapping[str, float],
+        weather_rng: Optional[np.random.Generator] = None,
+    ) -> None:
         self.day_index = -1
         self.block = -1
         self.day_of_week = int(rng.choice(7, p=_normalized(day_of_week_probs)))
-        self.weather = _draw_weather(rng, weather_probs)
+        self.weather = _draw_weather(
+            rng if weather_rng is None else weather_rng, weather_probs
+        )
         self._day_hours = []
         self._day_block_shares = []
 
@@ -375,11 +384,15 @@ class MarketCalendar:
         hour_probs: np.ndarray,
         weather_probs: Mapping[str, float],
         persistence: float,
+        weather_rng: Optional[np.random.Generator] = None,
+        hour_rng: Optional[np.random.Generator] = None,
     ) -> None:
+        weather_source = rng if weather_rng is None else weather_rng
+        hour_source = rng if hour_rng is None else hour_rng
         if self.day_index >= 0:
             self.day_of_week = (self.day_of_week + 1) % 7
-            if float(rng.random()) >= float(persistence):
-                self.weather = _draw_weather(rng, weather_probs)
+            if float(weather_source.random()) >= float(persistence):
+                self.weather = _draw_weather(weather_source, weather_probs)
         self.day_index += 1
         self.block = -1
         self.steps_per_day = int(max(1, steps_per_day))
@@ -393,7 +406,7 @@ class MarketCalendar:
             weights = probs[block_hours]
             share = float(weights.sum())
             within = weights / share if share > 0 else np.ones_like(weights) / len(weights)
-            hours.append(int(rng.choice(block_hours, p=within)))
+            hours.append(int(hour_source.choice(block_hours, p=within)))
             shares.append(share)
         self._day_hours = hours
         self._day_block_shares = shares
