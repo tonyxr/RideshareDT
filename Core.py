@@ -2117,7 +2117,7 @@ class Core:
         noise use common random numbers across candidates, and the full
         simulator state is restored afterwards.
         """
-        if self.driver_supply.supply_v2:
+        if self.driver_supply.supply_v2 or self.driver_supply.supply_v3:
             from city_supply_calibration import calibrate_capacity
             volume = self.supply_calibration_customers if sample_size is None else sample_size
             return calibrate_capacity(self, sample_size=volume, iterations=iterations,
@@ -2585,20 +2585,25 @@ class Core:
         self._install_regime_process(self.market, seed=int(self.seed) + 70_000, training_openings=True)
         if self.enable_driver_supply:
             cfg = self.driver_supply.config
-            cfg.persistent_stock = bool(persistent_driver_stock) or str(supply_model).lower() == "v2"
+            model = str(supply_model).lower()
+            if model not in {"v1", "v2", "v3"}:
+                raise ValueError("supply_model must be v1, v2, or v3")
+            if model == "v3" and persistent_driver_stock:
+                raise ValueError("supply v3 is an expected-earnings response, not a persistent-stock model")
+            cfg.persistent_stock = bool(persistent_driver_stock) or model == "v2"
             cfg.stock_adjustment_rate = float(np.clip(stock_adjustment_rate, 0.0, 1.0))
             cfg.stock_floor = float(max(0.0, stock_floor))
-            cfg.supply_model = str(supply_model).lower()
+            cfg.supply_model = model
             cfg.eta_day = float(max(0.0, supply_eta_day))
             cfg.eta_hour = float(max(0.0, supply_eta_hour))
             cfg.reference_earnings_per_hour = float(max(0.0, supply_reference_earnings))
             self._supply_reference_is_explicit = supply_reference_earnings > 0
-            if cfg.supply_model == "v2":
+            if cfg.supply_model in {"v2", "v3"}:
                 if cfg.reference_earnings_per_hour == 0:
                     cfg.reference_earnings_per_hour = float(cfg.reservation_wage_per_hour)
                 cfg.availability_block_hours = 24.0 / int(self.shared_steps_per_day)
-            if cfg.supply_model == "v2" and self.market_dynamics.driver_pay_basis != "fare":
-                print("[v26r] WARNING: supply v2 with driver_pay_basis='anchor': the posted fare does not move pay; "
+            if cfg.supply_model in {"v2", "v3"} and self.market_dynamics.driver_pay_basis != "fare":
+                print(f"[v26r] WARNING: supply {cfg.supply_model} with driver_pay_basis='anchor': the posted fare does not move pay; "
                       "use --driver_pay_basis fare for the pay-elastic channel.")
             self.driver_supply.reset_stock()
             if supply_operating_point is not None:
@@ -5994,7 +5999,7 @@ class Core:
                 'hour_profile': dict(self.driver_supply.hour_profile),
                 'pay_policies': {f: asdict(p) for f, p in self.driver_supply.pay_policies.items()},
                 'calibration': copy.deepcopy(self.v26_settings.get('driver_capacity_calibration', {}))}
-                if self.driver_supply.supply_v2 else None),
+                if (self.driver_supply.supply_v2 or self.driver_supply.supply_v3) else None),
             "competition_protocol": {
                 "name": "firm2_leader_then_firm1_follower",
                 "leader": "Firm2",
@@ -6730,7 +6735,7 @@ class Core:
     def _check_supply_calibration_volume(self, customers: int) -> None:
         """Integer dispatch is not invariant to simulation-volume rescaling."""
         calibration = getattr(self, 'v26_settings', {}).get('driver_capacity_calibration', {})
-        if (self.driver_supply.supply_v2 and calibration.get('enabled')
+        if ((self.driver_supply.supply_v2 or self.driver_supply.supply_v3) and calibration.get('enabled')
                 and int(customers) != int(calibration['sample_size'])):
             raise ValueError(f"Supply calibrated at {calibration['sample_size']} requests, not {customers}; "
                              "recalibrate at the requested simulation volume")
@@ -13733,7 +13738,8 @@ class Core:
         regime_effect = self._regime_effect(int(hour))
         if self.enable_driver_supply:
             self._sync_driver_incentive_multipliers()
-            if getattr(self.driver_supply, "supply_v2", False):
+            if (getattr(self.driver_supply, "supply_v2", False)
+                    or getattr(self.driver_supply, "supply_v3", False)):
                 # Posted pay level this block (fare multiplier x incentive) for
                 # the within-day online response.
                 base_market = self.market.curr_market
@@ -17280,8 +17286,9 @@ def main():
                            "controls exactly one rider-facing price coefficient or holds.")
     v26r.add_argument("--persistent_driver_stock", default=None, action=argparse.BooleanOptionalAction,
                       help="Daily partial-adjustment online-driver stock (default: on when --regime_market).")
-    v26r.add_argument("--supply_model", type=str, default="v1", choices=["v1", "v2"],
-                      help="v2: pay-elastic daily participation stock + hour-of-day availability profile.")
+    v26r.add_argument("--supply_model", type=str, default="v1", choices=["v1", "v2", "v3"],
+                      help=("v2: pay-elastic daily participation stock; "
+                            "v3: V17 expected-earnings response with eta=0.6."))
     v26r.add_argument("--supply_eta_day", type=float, default=0.40)
     v26r.add_argument("--supply_eta_hour", type=float, default=0.20)
     v26r.add_argument("--supply_reference_earnings", type=float, default=0.0,
@@ -17344,7 +17351,9 @@ def main():
     if args.actor_true_shortage_flag and not args.regime_market:
         parser.error("--actor_true_shortage_flag requires --regime_market")
     if args.persistent_driver_stock is None:
-        args.persistent_driver_stock = bool(args.regime_market)
+        args.persistent_driver_stock = bool(
+            args.regime_market and str(args.supply_model).lower() != "v3"
+        )
     if args.spillover_price_aware is None:
         args.spillover_price_aware = bool(args.regime_market)
     explicit_reward_flags = {

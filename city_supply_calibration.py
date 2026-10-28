@@ -1,4 +1,4 @@
-"""Capacity calibration under the installed v2 model, never under a scored policy."""
+"""Capacity calibration under the installed v2/v3 model, never under a scored policy."""
 import copy
 import numpy as np
 from coeff_utils import CoefficientOverrides
@@ -9,8 +9,8 @@ def calibrate_capacity(core, *, sample_size=50, days=30, burnin_days=15, iterati
     target = float(core.market_dynamics.capacity_target_fulfillment)
     if not (core.market_dynamics.enabled and core.enable_driver_supply and target > 0):
         return {"enabled": False, "base_active_drivers": core.driver_supply.config.base_active_drivers}
-    if not core.driver_supply.supply_v2:
-        raise ValueError("v2 capacity calibration requires the installed v2 supply model")
+    if not (core.driver_supply.supply_v2 or core.driver_supply.supply_v3):
+        raise ValueError("capacity calibration requires the installed v2 or v3 supply model")
     if days <= burnin_days:
         raise ValueError("calibration must include post-burn-in days")
     if not core.training_profile_pool:
@@ -84,7 +84,7 @@ def calibrate_capacity(core, *, sample_size=50, days=30, burnin_days=15, iterati
                                   for f in ('Firm1', 'Firm2')},
                    final_stock=dict(core.driver_supply.online_stock))
         history.append(row)
-        print(f'[capacity-v2] {core.market_name}: {row}', flush=True)
+        print(f'[capacity-{core.driver_supply.config.supply_model}] {core.market_name}: {row}', flush=True)
         return row
 
     try:
@@ -96,7 +96,7 @@ def calibrate_capacity(core, *, sample_size=50, days=30, burnin_days=15, iterati
         low, high = 20, 4000
         maximum = evaluate(high)
         if maximum['fulfillment'] < target:
-            raise RuntimeError(f"v2 capacity target unreachable: {maximum}; target={target}. "
+            raise RuntimeError(f"{core.driver_supply.config.supply_model} capacity target unreachable: {maximum}; target={target}. "
                                "No substitute fleet or lower target was installed.")
         for _ in range(iterations):
             middle = round(np.sqrt(low * high))
@@ -112,7 +112,8 @@ def calibrate_capacity(core, *, sample_size=50, days=30, burnin_days=15, iterati
     core.driver_supply.config.reference_earnings_per_hour = selected['reference_earnings']
     core.driver_supply.config.initial_online_stock = selected['opening_stock']
     core.driver_supply.reset_stock()
-    return dict(enabled=True, supply_model='v2', reference_earnings=selected['reference_earnings'],
+    return dict(enabled=True, supply_model=core.driver_supply.config.supply_model,
+        reference_earnings=selected['reference_earnings'],
         reference_contract=('measured_calm_1x_training_calibration_then_fixed' if measure_reference
                             else 'explicit_reference'), target_fulfillment=target,
         initial_online_stock=selected['opening_stock'], final_online_stock=selected['final_stock'],

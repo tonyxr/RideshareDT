@@ -78,9 +78,10 @@ class DriverSupplyConfig:
     #   S_{d+1} = (1-kappa) S_d + kappa (E_d / E_ref)^eta_day
     #   A(h)    = N * S_d * phi(h) * weather * posted_pay_index^eta_hour
     # Realized earnings move the daily stock, not the posted-pay response too.
-    supply_model: str = "v1"                # "v1" (v26 behaviour) | "v2"
+    supply_model: str = "v1"                # "v1" (v26 behaviour) | "v2" | V17 "v3"
     eta_day: float = 0.40                   # daily labour-supply elasticity (Chen et al. 2019: 0.3-0.6)
     eta_hour: float = 0.20                  # within-day online response to current pay
+    eta_v3: float = 0.60                    # V17 response to expected earnings per online hour
     reference_earnings_per_hour: float = 0.0  # 0 selects the fixed opportunity wage, never policy earnings
     availability_block_hours: float = 1.0
     driver_minute_capacity: bool = True  # used only by supply v2
@@ -89,6 +90,11 @@ class DriverSupplyConfig:
     stock_ceiling: float = 2.0
 
     def __post_init__(self) -> None:
+        self.supply_model = str(self.supply_model).lower().strip()
+        if self.supply_model not in {"v1", "v2", "v3"}:
+            raise ValueError("supply_model must be v1, v2, or v3")
+        if not np.isfinite(self.eta_v3) or self.eta_v3 < 0:
+            raise ValueError("eta_v3 must be finite and nonnegative")
         self.acceptance_mode = str(self.acceptance_mode).lower().strip()
         if self.acceptance_mode not in {"expected", "stochastic"}:
             raise ValueError("acceptance_mode must be 'expected' or 'stochastic'")
@@ -275,7 +281,7 @@ class DriverSupplyLayer:
         self._daily_pay = {f: 0.0 for f in self.pay_policies}
         self._daily_online = {f: 0.0 for f in self.pay_policies}
         self._observed_blocks = 0
-        if self.supply_v2:
+        if self.supply_v2 or self.supply_v3:
             self.reset_stock()
 
     # ---------- v26r regime market ----------
@@ -285,14 +291,14 @@ class DriverSupplyLayer:
         self.pay_index = {"Firm1": 1.0, "Firm2": 1.0}
         self.pay_index_smoothed = {"Firm1": 1.0, "Firm2": 1.0}
         reference = float(self.config.reference_earnings_per_hour)
-        if self.supply_v2 and reference == 0:
+        if (self.supply_v2 or self.supply_v3) and reference == 0:
             reference = float(self.config.reservation_wage_per_hour)
         self.reference_earnings = {f: reference for f in ("Firm1", "Firm2")}
         self._available_at = {f: np.empty(0) for f in self.pay_policies}
         self._batch_minute = 0.0
         self._daily_pay = {f: 0.0 for f in self.pay_policies}
         self._daily_online = {f: 0.0 for f in self.pay_policies}
-        if self.supply_v2:
+        if self.supply_v2 or self.supply_v3:
             self._observed_blocks = 0
             # New episodes cannot inherit the previous policy's pay history.
             self.last_states = {f: FirmDriverBatchState() for f in ("Firm1", "Firm2")}
@@ -303,9 +309,13 @@ class DriverSupplyLayer:
     def supply_v2(self) -> bool:
         return str(self.config.supply_model).lower() == "v2"
 
+    @property
+    def supply_v3(self) -> bool:
+        return str(self.config.supply_model).lower() == "v3"
+
     def set_pay_index(self, firm: str, index: float) -> None:
         """Posted pay level this block relative to the anchor (fare multiplier x incentive)."""
-        if self.supply_v2:
+        if self.supply_v2 or self.supply_v3:
             if not np.isfinite(index) or index < 0:
                 raise ValueError('posted pay index must be finite and nonnegative')
             self.pay_index[firm] = float(index)
@@ -332,10 +342,10 @@ class DriverSupplyLayer:
         ref = float(self.reference_earnings.get(firm, 0.0))
         if ref > 0.0:
             return ref
-        if not self.supply_v2:
+        if not (self.supply_v2 or self.supply_v3):
             previous = self.smoothed_states.get(firm, self.last_states.get(firm, FirmDriverBatchState()))
             return float(previous.driver_earnings_per_online_hour or self.config.reservation_wage_per_hour)
-        raise ValueError('supply v2 requires positive fixed reference earnings')
+        raise ValueError('supply v2/v3 requires positive fixed reference earnings')
 
     def expected_block_earnings(self, firm: str) -> float:
         """Posted earning opportunity for prospective drivers (online-hour units).
@@ -353,10 +363,52 @@ class DriverSupplyLayer:
         ratio = float(self.pay_index.get(firm, 1.0)) / max(1e-6, float(self.pay_index_smoothed.get(firm, 1.0)))
         return smoothed * ratio
 
+    def supply_v3_expected_earnings(self, firm: str) -> Tuple[float, float, float]:
+        """Return pay/trip, trips/hour, and their product for V17 supply v3.
+
+        The most recent public block fixes utilisation (trips per online hour).
+        The posted pay index moves expected pay per trip relative to that block.
+        With no exposed block, the fixed city earnings reference is the neutral
+        opportunity.  This makes the registered M1 mechanism explicit and
+        auditable instead of hiding it inside an earnings-per-hour shortcut.
+        """
+        if not self.supply_v3:
+            raise ValueError("supply_v3_expected_earnings requires supply_model='v3'")
+        previous = self.smoothed_states.get(
+            firm, self.last_states.get(firm, FirmDriverBatchState())
+        )
+        online_hours = float(previous.total_online_minutes) / 60.0
+        if online_hours > 0.0 and previous.completed_rides > 0:
+            trips_per_hour = float(previous.completed_rides) / online_hours
+            observed_pay_per_trip = (
+                float(previous.total_driver_pay) / float(previous.completed_rides)
+            )
+            pay_ratio = float(self.pay_index.get(firm, 1.0)) / max(
+                1e-12, float(self.pay_index_smoothed.get(firm, 1.0))
+            )
+            pay_per_trip = observed_pay_per_trip * pay_ratio
+        else:
+            trips_per_hour = 1.0
+            pay_per_trip = self._earnings_reference(firm) * float(
+                self.pay_index.get(firm, 1.0)
+            )
+        expected = pay_per_trip * trips_per_hour
+        return float(pay_per_trip), float(trips_per_hour), float(expected)
+
+    def supply_v3_online_response(self, firm: str) -> float:
+        """Continuous V17 online-driver response before fleet realization."""
+        _, _, expected = self.supply_v3_expected_earnings(firm)
+        wage_reference = self._earnings_reference(firm) * float(
+            self.shock_wage_multiplier
+        )
+        if not np.isfinite(expected) or not np.isfinite(wage_reference) or wage_reference <= 0:
+            raise ValueError("supply v3 requires finite earnings and a positive reference")
+        return float(max(0.0, expected / wage_reference) ** float(self.config.eta_v3))
+
     def apply_shock(self, *, fleet_multiplier: float = 1.0, wage_multiplier: float = 1.0,
                     firm_capacity: Optional[Dict[str, float]] = None) -> None:
         """Install the current block's regime multipliers (from ``ShockEffect``)."""
-        if self.supply_v2:
+        if self.supply_v2 or self.supply_v3:
             values = [fleet_multiplier, wage_multiplier, *(firm_capacity or {}).values()]
             if any(not np.isfinite(v) or v < 0 for v in values) or wage_multiplier == 0:
                 raise ValueError('supply shocks require nonnegative capacity and positive wage multipliers')
@@ -465,6 +517,14 @@ class DriverSupplyLayer:
                 ) * hour_response
                 peak = 1.0
                 hourly = self.hour_availability(int(hour))
+            elif self.supply_v3:
+                # V17 M1: participation responds to expected earnings, written
+                # explicitly as pay per trip times trips per online hour.
+                online_response = self.supply_v3_online_response(firm) * float(
+                    self.shock_fleet_multiplier
+                ) * float(self.shock_firm_capacity.get(firm, 1.0))
+                peak = 1.0
+                hourly = self.hour_availability(int(hour))
             elif self.config.persistent_stock:
                 # v26r: the daily stock carries the lagged supply response; the
                 # block-level regime capacity cut (an outage) applies at once.
@@ -478,7 +538,7 @@ class DriverSupplyLayer:
                 if self.shock_fleet_multiplier != 1.0 or self.shock_firm_capacity.get(firm, 1.0) != 1.0:
                     online_response *= float(self.shock_fleet_multiplier) * float(self.shock_firm_capacity.get(firm, 1.0))
             expected_active = self.config.base_active_drivers * demand_scale * peak * hourly * weather_supply * bias * online_response
-            if self.supply_v2:
+            if self.supply_v2 or self.supply_v3:
                 # Unbiased integer realization, including fleets below one.
                 # No minimum driver and no deterministic rounding dead zone.
                 whole = int(np.floor(expected_active))
@@ -490,7 +550,7 @@ class DriverSupplyLayer:
             idle = max(1, active - busy)
             state = FirmDriverBatchState(active_drivers=active, idle_drivers=idle, busy_drivers=busy)
             state.total_online_minutes = float(active * 60.0)
-            if self.supply_v2 and self.config.driver_minute_capacity:
+            if (self.supply_v2 or self.supply_v3) and self.config.driver_minute_capacity:
                 duration = 60. * self.config.availability_block_hours
                 # Trips crossing a block boundary keep their remaining time.
                 remaining = np.maximum(0., self._available_at[firm] - duration)
@@ -505,7 +565,7 @@ class DriverSupplyLayer:
 
     def advance_request_time(self, fraction: float) -> None:
         """Release completed drivers at the next within-block request arrival."""
-        if not (self.supply_v2 and self.config.driver_minute_capacity):
+        if not ((self.supply_v2 or self.supply_v3) and self.config.driver_minute_capacity):
             return
         minute = float(fraction) * 60. * self.config.availability_block_hours
         if not 0 <= fraction <= 1 or minute < self._batch_minute:
@@ -648,7 +708,7 @@ class DriverSupplyLayer:
         state.total_pickup_minutes += pickup_minutes
         state.total_pickup_miles += pickup_miles
         engaged = pickup_minutes + max(0.0, float(duration_minutes))
-        if self.supply_v2 and self.config.driver_minute_capacity:
+        if (self.supply_v2 or self.supply_v3) and self.config.driver_minute_capacity:
             driver = int(np.argmin(self._available_at[firm]))
             self._available_at[firm][driver] = self._batch_minute + engaged
             engaged = min(engaged, 60. * self.config.availability_block_hours - self._batch_minute)
@@ -672,7 +732,7 @@ class DriverSupplyLayer:
         for firm, state in self.last_states.items():
             self._daily_pay[firm] += state.total_driver_pay
             self._daily_online[firm] += state.total_online_minutes
-            if self.supply_v2:
+            if self.supply_v2 or self.supply_v3:
                 # Same block clock and EMA weight as the associated earnings.
                 self.pay_index_smoothed[firm] = ((1-alpha) * self.pay_index_smoothed[firm]
                                                  + alpha * self.pay_index[firm])
@@ -704,14 +764,14 @@ class DriverSupplyLayer:
         other = self.smoothed_states.get(opponent, self.last_states.get(opponent, FirmDriverBatchState()))
         features = [
             (np.arcsinh(own.active_drivers / getattr(self, '_feature_capacity_reference', self.config.base_active_drivers))
-             if self.supply_v2 else np.clip(own.active_drivers / 800.0, 0.0, 1.0)),
+             if (self.supply_v2 or self.supply_v3) else np.clip(own.active_drivers / 800.0, 0.0, 1.0)),
             np.clip(own.idle_driver_share, 0.0, 1.0),
             np.clip(own.utilization, 0.0, 1.0),
             np.clip(own.acceptance_rate, 0.0, 1.0),
             np.clip(own.fulfillment_rate, 0.0, 1.0),
             np.clip(own.avg_wait_minutes / 20.0, 0.0, 1.0),
             (np.arcsinh(own.driver_earnings_per_online_hour / self._earnings_reference(firm))
-             if self.supply_v2 else np.clip(own.driver_earnings_per_hour / 60.0, 0.0, 1.0)),
+             if (self.supply_v2 or self.supply_v3) else np.clip(own.driver_earnings_per_hour / 60.0, 0.0, 1.0)),
             np.clip((other.avg_wait_minutes - own.avg_wait_minutes + 10.0) / 20.0, 0.0, 1.0),
         ]
         return np.asarray(features, dtype=np.float32)
