@@ -49,6 +49,7 @@ from simulation_noise import isolated_batch_noise, rider_streams
 from strategic_benchmarks import solve_tariff_game
 from v17_branch_store import BranchReplayStore
 from v17_tape import ExogenousTape
+from v17_value_model import V17ConcaveValueModel
 
 
 from MarketInteraction import MarketInteraction, RideContext
@@ -809,6 +810,7 @@ class Core:
         v16_branch_design: str = "all",
         v16_audit_every: int = 0,
         v16_store_cap: int = 0,
+        v16_value_head: str = "none",
         momentum_features: bool = False,
         momentum_day_steps: int = 6,
         opponent_features: bool = False,
@@ -868,6 +870,11 @@ class Core:
             raise ValueError(
                 "v16_store_cap requires v16_branch_mode='one_day_deviation'"
             )
+        self.v16_value_head = str(v16_value_head)
+        if self.v16_value_head not in ("none", "concave2d"):
+            raise ValueError("v16_value_head must be none or concave2d")
+        if self.v16_value_head == "concave2d" and not self.v16_store_cap:
+            raise ValueError("concave2d value head requires v16_store_cap")
         # Revision 11b: common-random-number day-branch credit for the actor.
         self.counterfactual_day_credit = int(max(0, counterfactual_day_credit))
         self.counterfactual_day_horizon_days = int(max(1, counterfactual_day_horizon_days))
@@ -1661,6 +1668,25 @@ class Core:
             self.firm1.agent.action_dim if self.firm1_mode == "RL" else 0,
             dtype=np.int64,
         )
+        self.v16_value_auxiliary_names = (
+            "own_profit_per_request",
+            "rival_profit_per_request",
+            "own_completed_share",
+            "rival_completed_share",
+        )
+        self.v16_value_model = None
+        if self.v16_value_head == "concave2d":
+            if self.firm1_mode != "RL":
+                raise ValueError("concave2d value head requires firm1_mode='RL'")
+            if self.action_contract != "two_lever_v1":
+                raise ValueError(
+                    "concave2d value head requires action_contract='two_lever_v1'"
+                )
+            self.v16_value_model = V17ConcaveValueModel(
+                observation_dim=self.platform_observation_dim,
+                frame_stack=int(self.firm1.state_frame_stack),
+                auxiliary_names=self.v16_value_auxiliary_names,
+            ).to(self.firm1.agent.device)
         if self.firm1_mode == "RL" and self.counterfactual_policy_coeff is not None:
             self.firm1.agent.counterfactual_policy_coeff_override = float(self.counterfactual_policy_coeff)
         if self.firm1_mode == "RL" and self.counterfactual_day_credit > 0:
@@ -2801,6 +2827,10 @@ class Core:
             "v16_branch_design": self.v16_branch_design,
             "v16_audit_every": int(self.v16_audit_every),
             "v16_store_cap": int(self.v16_store_cap),
+            "v16_value_head": self.v16_value_head,
+            "v16_value_auxiliary_names": list(
+                self.v16_value_auxiliary_names
+            ),
             "momentum_features": bool(self.momentum_features),
             "momentum_day_steps": int(self.momentum_day_steps),
             "opponent_features": bool(self.opponent_features),
@@ -6533,6 +6563,20 @@ class Core:
             artifact["v16_branch_store_state"] = (
                 self.v16_branch_store.state_dict()
             )
+        if self.v16_value_model is not None:
+            artifact["v16_value_model_state"] = {
+                key: value.detach().cpu()
+                for key, value in self.v16_value_model.state_dict().items()
+            }
+            artifact["v16_value_model_config"] = {
+                "head": self.v16_value_head,
+                "observation_dim": int(self.platform_observation_dim),
+                "frame_stack": int(self.firm1.state_frame_stack),
+                "auxiliary_names": list(self.v16_value_auxiliary_names),
+                "curvature_floor": float(
+                    self.v16_value_model.curvature_floor
+                ),
+            }
         if independent_actions:
             artifact["action_factorization"] = {
                 "target_choices": ["hold", *list(self.shared_edit_keys)],
@@ -6997,6 +7041,31 @@ class Core:
         elif load_optimizer and saved_branch_store is not None:
             raise ValueError(
                 "training resume must configure the saved V17 branch store"
+            )
+        saved_value_state = artifact.get("v16_value_model_state")
+        saved_value_config = dict(
+            artifact.get("v16_value_model_config", {}) or {}
+        )
+        if self.v16_value_model is not None:
+            expected_value_config = {
+                "head": self.v16_value_head,
+                "observation_dim": int(self.platform_observation_dim),
+                "frame_stack": int(self.firm1.state_frame_stack),
+                "auxiliary_names": list(self.v16_value_auxiliary_names),
+                "curvature_floor": float(
+                    self.v16_value_model.curvature_floor
+                ),
+            }
+            if saved_value_config != expected_value_config:
+                raise ValueError(
+                    "trained V17 value-model configuration does not match runtime"
+                )
+            if saved_value_state is None:
+                raise ValueError("trained policy lacks the V17 value model")
+            self.v16_value_model.load_state_dict(saved_value_state)
+        elif load_optimizer and saved_value_state is not None:
+            raise ValueError(
+                "training resume must configure the saved V17 value model"
             )
         if restore_tariff:
             if getattr(self.firm1, "level_step_actions", False):
@@ -18122,6 +18191,15 @@ def main():
             "production uses exactly 20000 rows."
         ),
     )
+    v17.add_argument(
+        "--v16_value_head",
+        choices=("none", "concave2d"),
+        default="none",
+        help=(
+            "V17 public-observation value surface; concave2d uses a positive-"
+            "definite two-lever curvature matrix and auxiliary component heads."
+        ),
+    )
 
     v26r = parser.add_argument_group("v26r regime-switching market (all default off)")
     v26r.add_argument("--regime_market", action="store_true",
@@ -19196,6 +19274,7 @@ def main():
         v16_branch_design=args.v16_branch_design,
         v16_audit_every=args.v16_audit_every,
         v16_store_cap=args.v16_store_cap,
+        v16_value_head=args.v16_value_head,
         enable_driver_supply=not args.disable_driver_supply,
         use_osmnx=args.use_osmnx,
         osmnx_place=args.osmnx_place or None,
