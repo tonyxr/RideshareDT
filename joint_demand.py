@@ -12,6 +12,7 @@ from choice_models import CognitiveChoiceModel, ChoiceResult
 
 CONTRACT = 'revision7-joint-contextual-logit-v1'
 ALTERNATIVES = ('Firm1', 'Firm2', 'NoRide')
+PRICE_SENSITIVITY_UNITS = ('legacy', 'relative')
 
 
 def positive(value, name):
@@ -30,6 +31,9 @@ def validate_spec(spec, city):
         positive(spec[key], key)
     if not spec.get('evidence'):
         raise ValueError('demand calibration must declare its evidence and limitations')
+    units = str(spec.get('price_sensitivity_units', 'legacy'))
+    if units not in PRICE_SENSITIVITY_UNITS:
+        raise ValueError(f'price_sensitivity_units must be one of {PRICE_SENSITIVITY_UNITS}')
 
 
 def softmax(logits):
@@ -58,6 +62,7 @@ class JointChoiceModel(CognitiveChoiceModel):
         model = cls()
         model.__dict__.update(copy.deepcopy(legacy.__dict__))
         model.demand_spec = copy.deepcopy(spec)
+        model.price_sensitivity_units = str(spec.get('price_sensitivity_units', 'legacy'))
         return model
 
     def components(self, profile, scenario):
@@ -76,7 +81,12 @@ class JointChoiceModel(CognitiveChoiceModel):
         shock = positive(scenario.get('ShockPriceSensitivityMultiplier', 1.), 'shock sensitivity')
         if scenario.get('Airport', False):
             shock *= positive(scenario.get('ShockAirportPriceSensitivityMultiplier', 1.), 'airport sensitivity')
-        return np.log(probabilities), heterogeneity * shock / spec['typical_fare'], reference
+        # Legacy 15d normalizes every price gap by one city-level typical fare.
+        # V17 M3 instead expresses the gap as a share of this trip's exogenous
+        # reference fare.  The mode is carried by the fitted calibration so a
+        # legacy beta can never be silently reused under relative units.
+        denominator = reference if self.price_sensitivity_units == 'relative' else spec['typical_fare']
+        return np.log(probabilities), heterogeneity * shock / denominator, reference
 
     def probabilities(self, profile, scenario, price1, price2):
         prices = np.asarray([price1, price2], dtype=float)

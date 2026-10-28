@@ -71,7 +71,7 @@ def responses(model, rows, grid):
     return dict(n=len(rows), curves=curves, elasticities=elasticities)
 
 
-def audit(slug, out, targets, n):
+def audit(slug, out, targets, n, *, price_sensitivity_units='legacy'):
     import numpy as np
     city_out = out/slug
     city_out.mkdir()
@@ -80,6 +80,9 @@ def audit(slug, out, targets, n):
     legacy.reputation = None
     provisional = dict(format=CONTRACT, city=core.market_name, typical_fare=core.city_reference_fare,
         threshold_reference=1., beta=1., evidence={'type': 'calibration_scaffold_not_for_deployment'})
+    if price_sensitivity_units != 'legacy':
+        provisional['price_sensitivity_units'] = price_sensitivity_units
+    core.price_sensitivity_units = price_sensitivity_units
     core.configure_joint_demand(provisional)
     core._refresh_profile_pool(rides_per_timestep=50)
     fit = records(core, evaluation=False, n=n, seed=70231)
@@ -155,6 +158,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--elasticities', nargs='+', type=float, required=True)
     parser.add_argument('--records', type=int, default=2000)
+    parser.add_argument('--price-sensitivity-units', choices=('legacy', 'relative'), default='legacy')
     args = parser.parse_args()
     if args.records < 1 or any(not (-float('inf') < v < 0) for v in args.elasticities):
         parser.error('positive record count and negative finite elasticity targets are required')
@@ -167,7 +171,8 @@ def main():
     try:
         for slug in CITIES:
             (out/'status.txt').write_text(f'{slug}: demand-only calibration and held-out diagnostics\n')
-            audit(slug, out, args.elasticities, args.records)
+            audit(slug, out, args.elasticities, args.records,
+                  price_sensitivity_units=args.price_sensitivity_units)
         if json.loads((out/'sources.json').read_text()) != source_hashes():
             raise RuntimeError('source changed during the demand audit')
         (out/'status.txt').write_text('completed: all prior arms retained; no RL/supply inference\n')

@@ -54,6 +54,47 @@ def test_exact_elasticity_fit_recovers_synthetic_parameter_and_joint_market_resp
         assert demand(1.05, True)[1] < demand(.95, True)[1]
 
 
+@pytest.mark.parametrize('city,typical,threshold,references', [
+    ('New York City', 23.02, 2.5, (11., 23.02, 48.)),
+    ('Boston', 17.165, 1.85, (8., 17.165, 37.)),
+    ('Chicago', 12.97, 1.8, (6., 12.97, 31.)),
+])
+def test_relative_units_refit_same_elasticity_target_per_city(
+        city, typical, threshold, references):
+    m = model(
+        city=city,
+        typical_fare=typical,
+        threshold_reference=threshold,
+        price_sensitivity_units='relative',
+    )
+    rows = [
+        (dict(PROFILE, PriceThreshold=value),
+         dict(SCENARIO, ReferenceFare=fare), fare)
+        for value, fare in zip((.6 * threshold, threshold, 1.8 * threshold), references)
+    ]
+    target = -1.15
+    m.demand_spec['beta'] = fit_local_own_elasticity(m, rows, target)
+    delta = 1e-5
+    def level(multiplier):
+        return np.mean([
+            m.probabilities(profile, scenario, fare * multiplier, fare)['Firm1']
+            for profile, scenario, fare in rows
+        ])
+    measured = np.log(level(1 + delta) / level(1 - delta)) / np.log((1 + delta) / (1 - delta))
+    assert measured == pytest.approx(target, rel=.01)
+
+
+def test_relative_units_are_trip_reference_scaled_and_require_declared_refit():
+    relative = model(price_sensitivity_units='relative')
+    _, low_slope, low_reference = relative.components(
+        PROFILE, dict(SCENARIO, ReferenceFare=10.))
+    _, high_slope, high_reference = relative.components(
+        PROFILE, dict(SCENARIO, ReferenceFare=50.))
+    assert low_slope * low_reference == pytest.approx(high_slope * high_reference)
+    with pytest.raises(ValueError, match='price_sensitivity_units'):
+        model(price_sensitivity_units='unknown')
+
+
 def test_currency_invariance_and_firm_exchange_symmetry():
     values = []
     for scale in (.01, .53, 1., 2., 100.):

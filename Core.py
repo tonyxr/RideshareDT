@@ -725,6 +725,7 @@ class Core:
         fixed_trip_cost: float = 1.25,
         airport_cost: float = 2.00,
         fare_model: str = "legacy",
+        price_sensitivity_units: str = "legacy",
         enable_driver_supply: bool = True,
         use_osmnx: bool = False,
         osmnx_place: Optional[str] = None,
@@ -952,6 +953,9 @@ class Core:
         self.market = MarketInteraction(city_name=market_name, seed=self.seed)
         self.market.configure_fare_model(fare_model)
         self.fare_model = str(self.market.fare_model)
+        self.price_sensitivity_units = str(price_sensitivity_units)
+        if self.price_sensitivity_units not in ("legacy", "relative"):
+            raise ValueError("price_sensitivity_units must be legacy or relative")
 
         self.market_name = str(self.market.current_city)
 
@@ -2545,6 +2549,13 @@ class Core:
         """Install the declared demand contract before any capacity fitting."""
         from joint_demand import JointChoiceModel, validate_spec
         validate_spec(spec, self.market_name)
+        fitted_units = str(spec.get('price_sensitivity_units', 'legacy'))
+        if fitted_units != self.price_sensitivity_units:
+            raise ValueError(
+                'demand calibration price-sensitivity units do not match '
+                f'--price_sensitivity_units ({fitted_units!r} != '
+                f'{self.price_sensitivity_units!r})'
+            )
         if not self.regime_market or not self.market_dynamics.enabled:
             raise ValueError('joint demand requires the v26 regime-market configuration')
         self.choice_model = JointChoiceModel.from_legacy(self.choice_model, spec)
@@ -17204,6 +17215,16 @@ def main():
             "0 preserves the 15d/v2 shock and production uses 0.5."
         ),
     )
+    v17.add_argument(
+        "--price_sensitivity_units",
+        choices=("legacy", "relative"),
+        default="legacy",
+        help=(
+            "V17 M3 price-gap units. Relative divides each gap by that "
+            "trip's reference fare and requires a calibration refit in the "
+            "same units; legacy preserves 15d."
+        ),
+    )
 
     v26r = parser.add_argument_group("v26r regime-switching market (all default off)")
     v26r.add_argument("--regime_market", action="store_true",
@@ -18241,6 +18262,7 @@ def main():
         fixed_trip_cost=args.fixed_trip_cost,
         airport_cost=args.airport_cost,
         fare_model=args.fare_model,
+        price_sensitivity_units=args.price_sensitivity_units,
         enable_driver_supply=not args.disable_driver_supply,
         use_osmnx=args.use_osmnx,
         osmnx_place=args.osmnx_place or None,

@@ -90,6 +90,21 @@ def test_raw_thresholds_not_silently_clipped_for_joint_model(core, tmp_path):
     assert core.synthetic_profile_pool[0]['PriceThreshold'] == 12.5
 
 
+def test_relative_units_reject_legacy_beta_and_accept_matching_refit(core):
+    core.price_sensitivity_units = 'relative'
+    with pytest.raises(ValueError, match='price-sensitivity units'):
+        core.configure_joint_demand(
+            specification(core.market_name, typical_fare=core.city_reference_fare)
+        )
+    spec = specification(
+        core.market_name,
+        typical_fare=core.city_reference_fare,
+        price_sensitivity_units='relative',
+    )
+    core.configure_joint_demand(spec)
+    assert core.choice_model.price_sensitivity_units == 'relative'
+
+
 @pytest.mark.parametrize('slug', ['nyc', 'boston', 'chicago'])
 def test_actual_audit_entrypoint_all_prior_arms_no_supply_or_training(slug, tmp_path, monkeypatch):
     from scripts.audit_joint_demand import audit
