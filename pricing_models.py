@@ -1561,8 +1561,8 @@ class FirmTwinProfitOptimizerMixin:
     Candidate evaluation belongs to :class:`Core`, which owns the digital
     twin and can transactionally restore rider, supply, loyalty, and RNG state.
     These controllers only declare their information/horizon contract and
-    apply the selected 13-point grid tariff.  The existing benchmark classes
-    remain untouched.
+    apply the selected 13-point grid tariff. Under the V17 M6 flag, that grid
+    is the distance/time diagonal and all fixed components stay on the card.
     """
 
     source_benchmark = "myopic"
@@ -1670,7 +1670,16 @@ class FirmTwinProfitOptimizerMixin:
             anchors,
         )
         changed = False
-        for key in self.managed_keys:
+        two_lever = bool(getattr(self, "rivals_two_lever", False))
+        keys = (
+            ("per_mile", "per_minute")
+            if two_lever
+            else tuple(self.managed_keys)
+        )
+        if two_lever:
+            for key in ("base_fare", "booking_fee", "airport_fee"):
+                setattr(self.overrides, key, None)
+        for key in keys:
             lower, upper = self.config.bounds[key]
             value = float(np.clip(float(anchors[key]) * float(target), lower, upper))
             changed |= abs(value - float(getattr(self.overrides, key))) > 1e-12

@@ -728,6 +728,7 @@ class Core:
         fare_model: str = "legacy",
         price_sensitivity_units: str = "legacy",
         action_contract: str = "legacy",
+        rivals_two_lever: bool = False,
         enable_driver_supply: bool = True,
         use_osmnx: bool = False,
         osmnx_place: Optional[str] = None,
@@ -874,6 +875,7 @@ class Core:
         self.action_contract = str(action_contract)
         if self.action_contract not in ("legacy", "two_lever_v1"):
             raise ValueError("action_contract must be legacy or two_lever_v1")
+        self.rivals_two_lever = bool(rivals_two_lever)
         self.relative_action_steps: Tuple[float, ...] = tuple(
             float(value) for value in relative_action_steps
         )
@@ -933,6 +935,10 @@ class Core:
                 raise ValueError("level-step actions require driver_incentive_levels=(1.0,)")
         elif self.tariff_structure_payload is not None:
             raise ValueError("a tariff structure requires level-step actions")
+        if self.rivals_two_lever and self.action_contract != "two_lever_v1":
+            raise ValueError(
+                "rivals_two_lever requires action_contract='two_lever_v1'"
+            )
         self.shock_config: ShockConfig = ShockConfig(enabled=False)
         self.shock_scenario: Optional[ShockScenario] = None
         self.training_scenario_curriculum: Tuple[Tuple[str, Optional[ShockScenario]], ...] = ()
@@ -1620,6 +1626,11 @@ class Core:
         else:
             self.firm2 = FirmStaticPricer()
         setattr(self.firm2, "_ride_response_mode", str(self.firm2_mode))
+        setattr(
+            self.firm2,
+            "rivals_two_lever",
+            bool(self.rivals_two_lever and not isinstance(self.firm2, FirmStaticPricer)),
+        )
         if isinstance(self.firm2, FirmAdaptiveBestResponsePricer):
             self.firm2.operational_clock = self.regime_market
             self.firm2.reference_window_steps = int(self.shared_steps_per_day)
@@ -1816,18 +1827,33 @@ class Core:
         if self.firm2_mode == "static" or not hasattr(self.firm1, "action_to_steps"):
             return
         mismatches: List[str] = []
-        if getattr(self.firm1, "action_keys", None) != getattr(self.firm2, "action_keys", None):
+        firm1_keys = tuple(getattr(self.firm1, "action_keys", ()) or ())
+        firm2_keys = tuple(getattr(self.firm2, "action_keys", ()) or ())
+        parity_keys = (
+            ("per_mile", "per_minute")
+            if self.rivals_two_lever
+            else firm1_keys
+        )
+        if self.rivals_two_lever:
+            if firm1_keys != parity_keys or not set(parity_keys) <= set(firm2_keys):
+                mismatches.append(
+                    f"two-lever action keys Firm1={list(firm1_keys)} "
+                    f"Firm2={list(firm2_keys)}"
+                )
+        elif firm1_keys != firm2_keys:
             mismatches.append(
-                f"action_keys Firm1={getattr(self.firm1, 'action_keys', None)} "
-                f"Firm2={getattr(self.firm2, 'action_keys', None)}"
+                f"action_keys Firm1={list(firm1_keys)} Firm2={list(firm2_keys)}"
             )
         f1_cfg = getattr(self.firm1, "config", None)
         f2_cfg = getattr(self.firm2, "config", None)
         if f1_cfg is not None and f2_cfg is not None:
-            if dict(f1_cfg.step) != dict(f2_cfg.step):
-                mismatches.append(f"step Firm1={dict(f1_cfg.step)} Firm2={dict(f2_cfg.step)}")
-            if dict(f1_cfg.bounds) != dict(f2_cfg.bounds):
-                mismatches.append(f"bounds Firm1={dict(f1_cfg.bounds)} Firm2={dict(f2_cfg.bounds)}")
+            for field in ("step", "bounds"):
+                first = getattr(f1_cfg, field)
+                second = getattr(f2_cfg, field)
+                if any(first[key] != second[key] for key in parity_keys):
+                    mismatches.append(
+                        f"{field} Firm1={dict(first)} Firm2={dict(second)}"
+                    )
         if mismatches:
             raise ValueError("Firm1/Firm2 parity violation; only decision policy may differ: " + "; ".join(mismatches))
         print(
@@ -3022,6 +3048,11 @@ class Core:
             "_ride_response_mode",
             mode if cls is not None else "static",
         )
+        setattr(
+            pricer,
+            "rivals_two_lever",
+            bool(self.rivals_two_lever and cls is not None),
+        )
         return pricer
 
     def _reseed_environment(self, episode_seed: int) -> None:
@@ -3659,7 +3690,17 @@ class Core:
         """Post one whole-tariff grid candidate within controller bounds."""
         base = self.market.curr_market
         config = getattr(pricer, "config", None)
-        for key in self.shared_edit_keys:
+        two_lever_rival = bool(getattr(pricer, "rivals_two_lever", False))
+        keys = (
+            ("per_mile", "per_minute")
+            if two_lever_rival
+            else tuple(self.shared_edit_keys)
+        )
+        if two_lever_rival:
+            for key in MANIPULATABLE_PRICE_COEFFICIENT_KEYS:
+                if key not in keys:
+                    setattr(pricer.overrides, key, None)
+        for key in keys:
             value = float(getattr(base, key)) * float(multiplier)
             if config is not None and key in getattr(config, "bounds", {}):
                 value = float(np.clip(value, *config.bounds[key]))
@@ -3667,13 +3708,101 @@ class Core:
 
     def _tariff_grid_multiplier(self, pricer) -> float:
         base = self.market.curr_market
+        keys = (
+            ("per_mile", "per_minute")
+            if bool(getattr(pricer, "rivals_two_lever", False))
+            else tuple(self.shared_edit_keys)
+        )
         ratios = [
             float(get_coeff(base, pricer.overrides, key))
             / max(1e-9, float(getattr(base, key)))
-            for key in self.shared_edit_keys
+            for key in keys
             if float(getattr(base, key)) > 0.0
         ]
         return float(np.mean(ratios)) if ratios else 1.0
+
+    @staticmethod
+    def _v17_reference_trip_context() -> RideContext:
+        """Registered calm reference trip used for rival-fare remapping."""
+        return RideContext(
+            day_of_week=2,
+            weather="clear",
+            hour=12,
+            airport=False,
+            service="economy",
+        )
+
+    def _firm2_reference_trip_quote(self) -> float:
+        return float(self.market.quote_price(
+            4.0,
+            15.0,
+            self._v17_reference_trip_context(),
+            overrides=self.firm2.overrides,
+        ))
+
+    def _map_firm2_to_two_lever_diagonal(
+        self, target_quote: Optional[float] = None
+    ) -> Optional[float]:
+        """Map a legacy rival target fare to the two-lever diagonal.
+
+        Reactive and memory controllers continue to compute their registered
+        15d target internally. Only the posted tariff is remapped: base,
+        booking and pass-through components stay at the city card, while the
+        distance and time rates share one continuous level. A monotone binary
+        search preserves the registered 4-mile/15-minute reference-trip fare.
+        """
+        if not self.rivals_two_lever or isinstance(self.firm2, FirmStaticPricer):
+            return None
+        target = float(
+            self._firm2_reference_trip_quote()
+            if target_quote is None
+            else target_quote
+        )
+        if not np.isfinite(target) or target < 0.0:
+            raise ValueError("rival reference-trip target must be finite and non-negative")
+        base = self.market.curr_market
+        config = getattr(self.firm2, "config", None)
+        lower, upper = 0.0, float("inf")
+        for key in ("per_mile", "per_minute"):
+            anchor = max(1e-12, float(getattr(base, key)))
+            if config is not None and key in getattr(config, "bounds", {}):
+                lo_bound, hi_bound = config.bounds[key]
+                lower = max(lower, float(lo_bound) / anchor)
+                upper = min(upper, float(hi_bound) / anchor)
+        if not np.isfinite(upper):
+            upper = 4.0
+        if lower > upper:
+            raise ValueError("rival diagonal has no feasible distance/time level")
+
+        context = self._v17_reference_trip_context()
+
+        def quote(level: float) -> float:
+            overrides = CoefficientOverrides(
+                per_mile=float(base.per_mile) * float(level),
+                per_minute=float(base.per_minute) * float(level),
+            )
+            return float(self.market.quote_price(
+                4.0, 15.0, context, overrides=overrides
+            ))
+
+        lo, hi = float(lower), float(upper)
+        for _ in range(80):
+            mid = 0.5 * (lo + hi)
+            if quote(mid) < target:
+                lo = mid
+            else:
+                hi = mid
+        candidates = (float(lower), lo, 0.5 * (lo + hi), hi, float(upper))
+        level = min(candidates, key=lambda value: (abs(quote(value) - target), value))
+        for key in MANIPULATABLE_PRICE_COEFFICIENT_KEYS:
+            setattr(self.firm2.overrides, key, None)
+        self.firm2.overrides.per_mile = float(base.per_mile) * float(level)
+        self.firm2.overrides.per_minute = float(base.per_minute) * float(level)
+        posted = self._firm2_reference_trip_quote()
+        self.firm2.last_two_lever_target_quote = float(target)
+        self.firm2.last_two_lever_posted_quote = float(posted)
+        self.firm2.last_two_lever_level = float(level)
+        return float(level)
 
     def _firm2_profit_best_response_plan(
         self,
@@ -3975,6 +4104,8 @@ class Core:
             hour=hour,
             weather=weather,
         )
+        if self.rivals_two_lever:
+            self._map_firm2_to_two_lever_diagonal()
         after = self._pricer_coeff_snapshot(self.firm2)
         target = self._opponent_action_target(before, after, self.firm2)
         self._publish_firm2_leader_quotes(
@@ -17280,6 +17411,15 @@ def main():
             "{0.8,0.9,1.0,1.2,1.5}; legacy preserves 15d."
         ),
     )
+    v17.add_argument(
+        "--rivals_two_lever",
+        action="store_true",
+        help=(
+            "V17 M6 rival tariff structure. Reactive and memory rivals map "
+            "their 15d reference-fare target to a distance/time diagonal; "
+            "profit rivals search that diagonal."
+        ),
+    )
 
     v26r = parser.add_argument_group("v26r regime-switching market (all default off)")
     v26r.add_argument("--regime_market", action="store_true",
@@ -18347,6 +18487,7 @@ def main():
         fare_model=args.fare_model,
         price_sensitivity_units=args.price_sensitivity_units,
         action_contract=args.action_contract,
+        rivals_two_lever=args.rivals_two_lever,
         enable_driver_supply=not args.disable_driver_supply,
         use_osmnx=args.use_osmnx,
         osmnx_place=args.osmnx_place or None,
