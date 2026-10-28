@@ -333,6 +333,7 @@ class LongTermProfitRewardConfig:
     """
 
     objective_mode: str = "profit_maximization"
+    fixed_economic_reward_v16: bool = False
     stage_specific_rewards: bool = False
     four_stage_curriculum_rewards: bool = False
     learning_corrections: bool = False
@@ -384,6 +385,17 @@ class LongTermProfitRewardConfig:
             )
         if self.stage_specific_rewards and objective != "profit_maximization":
             raise ValueError("stage_specific_rewards requires profit_maximization")
+        if self.fixed_economic_reward_v16 and objective != "profit_maximization":
+            raise ValueError(
+                "fixed V16 reward requires the profit_maximization objective"
+            )
+        if (
+            self.fixed_economic_reward_v16
+            and self.temporal_competitive_reward
+        ):
+            raise ValueError(
+                "fixed V16 reward cannot be combined with the legacy temporal reward"
+            )
         if not 0.0 <= self.opponent_profit_lead_weight <= 1.0:
             raise ValueError("opponent_profit_lead_weight must be a finite fraction in [0, 1]")
         if self.opponent_profit_lead_weight != 0.5 and not self.stage_specific_rewards:
@@ -542,6 +554,24 @@ class LongTermProfitRewardConfig:
 
     def economic_weights(self, training_regime: Optional[str] = None) -> Dict[str, float]:
         """Active economic weights, including optional temporal competition."""
+        if self.fixed_economic_reward_v16:
+            if training_regime not in (
+                None,
+                "market",
+                "static",
+                "dynamic",
+                "catchup",
+                "profit",
+            ):
+                raise ValueError(
+                    f"unknown reward training regime: {training_regime!r}"
+                )
+            return {
+                "own_profit": 0.70,
+                "profit_lead": 0.30,
+                "own_completed_share": 0.0,
+                "completed_share_lead": 0.0,
+            }
         if self.stage_specific_rewards:
             if training_regime not in (
                 None,
@@ -673,7 +703,9 @@ class LongTermProfitRewardConfig:
         """
         weights = self.economic_weights(training_regime)
         profit_lead_scale = (
-            self.own_profit_scale
+            self.profit_advantage_scale
+            if self.fixed_economic_reward_v16
+            else self.own_profit_scale
             if self.learning_corrections
             else self.profit_advantage_scale
         )
@@ -688,7 +720,8 @@ class LongTermProfitRewardConfig:
         # four/six-component layouts when share or temporal channels are
         # explicitly requested so older artifacts remain loadable.
         if (
-            not self.temporal_competitive_reward
+            not self.fixed_economic_reward_v16
+            and not self.temporal_competitive_reward
             and weights["own_completed_share"] == 0.0
             and weights["completed_share_lead"] == 0.0
             and self.stage_market_share_competitiveness_weights is None
@@ -1019,7 +1052,10 @@ class ProfitMaximizationReward(_ObjectiveRewardBase):
     def compute(self, *, training_regime: Optional[str] = None, **kwargs: float) -> Dict[str, float]:
         metrics = self._metrics(**kwargs)
         weights = self.config.economic_weights(training_regime)
-        if self.config.learning_corrections:
+        if (
+            self.config.learning_corrections
+            and not self.config.fixed_economic_reward_v16
+        ):
             # Use the SAME dollar-unit conversion for both economic terms.
             metrics["reward_profit_advantage_linear"] = (
                 metrics["reward_profit_advantage_per_request"] / self.config.own_profit_scale
@@ -1396,6 +1432,8 @@ class PolicyObjectiveReward:
                 self.mechanism_name = (
                     "staged_temporal_dominance_residual_v28_corrected"
                 )
+        if self.config.fixed_economic_reward_v16:
+            self.mechanism_name = "fixed_70_30_scaled_economic_v17"
 
     def compute(self, **kwargs: float) -> Dict[str, float]:
         return self.implementation.compute(**kwargs)

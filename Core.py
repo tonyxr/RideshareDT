@@ -816,6 +816,7 @@ class Core:
         v16_tau_end: float = 0.03,
         v16_policy_epsilon: float = 0.05,
         v16_action_credit_scale: float = 1.0,
+        v16_reward: bool = False,
         momentum_features: bool = False,
         momentum_day_steps: int = 6,
         opponent_features: bool = False,
@@ -887,6 +888,7 @@ class Core:
         self.v16_tau_end = float(v16_tau_end)
         self.v16_policy_epsilon = float(v16_policy_epsilon)
         self.v16_action_credit_scale = float(v16_action_credit_scale)
+        self.v16_reward = bool(v16_reward)
         if not (
             np.isfinite(self.v16_tau_start)
             and np.isfinite(self.v16_tau_end)
@@ -1460,6 +1462,7 @@ class Core:
         self.long_term_profit_reward_config = LongTermProfitRewardConfig(
             learning_corrections=self.learning_corrections,
             share_dominance_reward=self.learning_corrections,
+            fixed_economic_reward_v16=self.v16_reward,
             stage_specific_rewards=bool(stage_specific_rewards),
             four_stage_curriculum_rewards=(
                 str(training_curriculum) == "staged"
@@ -1478,7 +1481,13 @@ class Core:
             ),
             objective_mode=str(policy_objective),
             own_profit_scale=float(long_term_profit_scale),
-            profit_advantage_scale=float(long_term_profit_scale if self.learning_corrections else long_term_profit_advantage_scale),
+            profit_advantage_scale=float(
+                long_term_profit_advantage_scale
+                if self.v16_reward
+                else long_term_profit_scale
+                if self.learning_corrections
+                else long_term_profit_advantage_scale
+            ),
             own_profit_weight=float(
                 1.0 - opponent_profit_lead_weight if stage_specific_rewards else objective_preset["long_term_profit_weight"]
             ),
@@ -2906,6 +2915,7 @@ class Core:
             "v16_action_credit_scale": float(
                 self.v16_action_credit_scale
             ),
+            "v16_reward": bool(self.v16_reward),
             "v16_value_fit_steps": int(self.v16_value_fit_steps),
             "v16_value_fit_batch_size": int(
                 self.v16_value_fit_batch_size
@@ -6817,6 +6827,24 @@ class Core:
         saved_active_reward = dict(
             artifact.get("mdp_config", {}).get("active_reward", {}) or {}
         )
+        saved_fixed_reward = bool(
+            saved_active_reward.get("fixed_economic_reward_v16", False)
+        )
+        if saved_fixed_reward != self.v16_reward:
+            raise ValueError(
+                "trained policy fixed V16 reward setting does not match runtime"
+            )
+        for field in ("own_profit_scale", "profit_advantage_scale"):
+            runtime_value = float(
+                getattr(self.long_term_profit_reward_config, field)
+            )
+            saved_value = float(saved_active_reward.get(field, runtime_value))
+            if not np.isclose(
+                saved_value, runtime_value, rtol=0.0, atol=1e-12
+            ):
+                raise ValueError(
+                    f"trained policy reward {field} does not match runtime"
+                )
         runtime_stage_lead_weights = (
             self.long_term_profit_reward_config.stage_profit_lead_weights
         )
@@ -18887,6 +18915,14 @@ def main():
             "Huber delta is exactly 0.5*s_A."
         ),
     )
+    v17.add_argument(
+        "--v16_reward",
+        action="store_true",
+        help=(
+            "Use the fixed every-stage V17 economic reward: 0.7 scaled own "
+            "profit plus 0.3 scaled own-minus-competitor profit."
+        ),
+    )
 
     v26r = parser.add_argument_group("v26r regime-switching market (all default off)")
     v26r.add_argument("--regime_market", action="store_true",
@@ -19356,6 +19392,14 @@ def main():
         saved_observation = saved_mdp.get("observation", {})
         saved_reward = saved_mdp.get("positive_reward", {})
         saved_active_reward = saved_mdp.get("active_reward", {})
+        saved_v16_reward = bool(
+            saved_active_reward.get("fixed_economic_reward_v16", False)
+        )
+        if args.v16_reward and not saved_v16_reward:
+            parser.error(
+                "--v16_reward conflicts with the saved reward contract"
+            )
+        args.v16_reward = saved_v16_reward
         saved_staged_rewards = bool(saved_active_reward.get("stage_specific_rewards", False))
         if args.stage_specific_rewards and not saved_staged_rewards:
             parser.error("--stage_specific_rewards conflicts with the saved reward contract")
@@ -19967,6 +20011,7 @@ def main():
         v16_tau_end=args.v16_tau_end,
         v16_policy_epsilon=args.v16_policy_epsilon,
         v16_action_credit_scale=args.v16_action_credit_scale,
+        v16_reward=args.v16_reward,
         enable_driver_supply=not args.disable_driver_supply,
         use_osmnx=args.use_osmnx,
         osmnx_place=args.osmnx_place or None,
