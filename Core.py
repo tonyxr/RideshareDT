@@ -47,6 +47,7 @@ from diagnostic_logging import DiagnosticJournal
 from model_contract import OPPONENT_PROFIT_LEAD_WEIGHT
 from simulation_noise import isolated_batch_noise, rider_streams
 from strategic_benchmarks import solve_tariff_game
+from v17_branch_store import BranchReplayStore
 from v17_tape import ExogenousTape
 
 
@@ -807,6 +808,7 @@ class Core:
         v16_branch_horizon_days: int = 7,
         v16_branch_design: str = "all",
         v16_audit_every: int = 0,
+        v16_store_cap: int = 0,
         momentum_features: bool = False,
         momentum_day_steps: int = 6,
         opponent_features: bool = False,
@@ -841,6 +843,9 @@ class Core:
             raise ValueError("v16_branch_design must be all or stencil11")
         self.v16_branch_horizon_days = int(max(1, v16_branch_horizon_days))
         self.v16_audit_every = int(max(0, v16_audit_every))
+        self.v16_store_cap = int(v16_store_cap)
+        if self.v16_store_cap < 0:
+            raise ValueError("v16_store_cap must be non-negative")
         if self.v16_branch_mode == "one_day_deviation":
             if self.v16_branch_design != "stencil11":
                 raise ValueError(
@@ -858,6 +863,10 @@ class Core:
         elif self.v16_audit_every:
             raise ValueError(
                 "v16_audit_every requires v16_branch_mode='one_day_deviation'"
+            )
+        if self.v16_store_cap and self.v16_branch_mode != "one_day_deviation":
+            raise ValueError(
+                "v16_store_cap requires v16_branch_mode='one_day_deviation'"
             )
         # Revision 11b: common-random-number day-branch credit for the actor.
         self.counterfactual_day_credit = int(max(0, counterfactual_day_credit))
@@ -893,6 +902,15 @@ class Core:
             )
         self._nmcc_decision_counter = 0
         self._nmcc_last: Dict[str, Any] = {}
+        self.v16_branch_store = (
+            BranchReplayStore(
+                self.v16_store_cap,
+                seed=self.seed + 17_000_011,
+                model_version="v17-value-v1",
+            )
+            if self.v16_store_cap
+            else None
+        )
         # Revision 14: momentum and opponent observation options.
         self.momentum_features = bool(momentum_features)
         self.momentum_day_steps = int(max(1, momentum_day_steps))
@@ -2782,6 +2800,7 @@ class Core:
             ),
             "v16_branch_design": self.v16_branch_design,
             "v16_audit_every": int(self.v16_audit_every),
+            "v16_store_cap": int(self.v16_store_cap),
             "momentum_features": bool(self.momentum_features),
             "momentum_day_steps": int(self.momentum_day_steps),
             "opponent_features": bool(self.opponent_features),
@@ -6510,6 +6529,10 @@ class Core:
             ),
             "metadata": dict(metadata or {}),
         }
+        if self.v16_branch_store is not None:
+            artifact["v16_branch_store_state"] = (
+                self.v16_branch_store.state_dict()
+            )
         if independent_actions:
             artifact["action_factorization"] = {
                 "target_choices": ["hold", *list(self.shared_edit_keys)],
@@ -6963,6 +6986,17 @@ class Core:
         if load_optimizer and artifact.get("optimizer_state"):
             self.firm1.agent.load_optimizer_state_dict(
                 artifact["optimizer_state"]
+            )
+        saved_branch_store = artifact.get("v16_branch_store_state")
+        if self.v16_branch_store is not None and saved_branch_store is not None:
+            self.v16_branch_store.load_state_dict(saved_branch_store)
+        elif load_optimizer and self.v16_branch_store is not None:
+            raise ValueError(
+                "training resume requires a saved V17 branch store"
+            )
+        elif load_optimizer and saved_branch_store is not None:
+            raise ValueError(
+                "training resume must configure the saved V17 branch store"
             )
         if restore_tariff:
             if getattr(self.firm1, "level_step_actions", False):
@@ -8673,6 +8707,11 @@ class Core:
             ).tolist()
             for action in candidates
         }
+        component_credit_matrix: List[Optional[List[float]]] = [
+            None for _ in range(self.firm1.agent.action_dim)
+        ]
+        for action, credit in component_credits.items():
+            component_credit_matrix[int(action)] = list(credit)
         best = max(candidates, key=lambda a: (float(values[a]), -int(a)))
         self._nmcc_last = {
             "day": int(day_index),
@@ -8700,10 +8739,16 @@ class Core:
             "branch_design": "all25" if audit else "stencil11",
             "audit": bool(audit),
             "horizon_days": int(horizon_days),
+            "incumbent_action": int(incumbent),
             "incumbent": self.firm1.action_label(int(incumbent)),
+            "selected_action": int(selected_action),
             "selected": self.firm1.action_label(int(selected_action)),
             "selected_advantage": float(values[int(selected_action)]),
+            "best_action": int(best),
             "best": self.firm1.action_label(int(best)),
+            "candidate_action_indices": [
+                int(action) for action in candidates
+            ],
             "candidate_actions": [
                 self.firm1.action_label(int(action))
                 for action in candidates
@@ -8726,6 +8771,13 @@ class Core:
                 ]
                 for action in candidates
             },
+            "component_credit_names": [
+                "own_profit_per_request",
+                "rival_profit_per_request",
+                "own_completed_share",
+                "rival_completed_share",
+            ],
+            "component_credit_matrix": component_credit_matrix,
             "posted_actions_by_day": {
                 self.firm1.action_label(int(action)): [
                     self.firm1.action_label(int(posted))
@@ -8751,6 +8803,59 @@ class Core:
             except Exception as exc:
                 print(f">>> [v17] branch dump failed: {exc!r}")
         return values, target_mask
+
+    def _append_v16_branch_store_row(
+        self,
+        *,
+        observation_window: Any,
+        counterfactual_values: np.ndarray,
+        counterfactual_mask: np.ndarray,
+    ) -> None:
+        """Persist one public-observation branch label for later value fits."""
+        if self.v16_branch_store is None:
+            return
+        mask = np.asarray(counterfactual_mask, dtype=bool).reshape(-1)
+        values = np.asarray(counterfactual_values, dtype=np.float32).reshape(-1)
+        if not np.any(mask):
+            return
+        if isinstance(observation_window, torch.Tensor):
+            observation = (
+                observation_window.detach().cpu().numpy().astype(np.float32)
+            )
+        else:
+            observation = np.asarray(observation_window, dtype=np.float32)
+        metadata = dict(self._nmcc_last)
+        regimes = sorted(str(value) for value in metadata.get("regime", []))
+        regime_label = "+".join(regimes) if regimes else "calm"
+        component_matrix = metadata.get("component_credit_matrix")
+        if not isinstance(component_matrix, list):
+            raise RuntimeError("V17 branch metadata lacks component credits")
+        self.v16_branch_store.add(
+            {
+                "observation_window": observation.reshape(-1).tolist(),
+                "observation_shape": list(observation.shape),
+                "incumbent_action": int(metadata["incumbent_action"]),
+                "selected_action": int(metadata["selected_action"]),
+                "candidate_actions": list(
+                    metadata["candidate_action_indices"]
+                ),
+                "action_credits": values.tolist(),
+                "action_credit_mask": mask.tolist(),
+                "component_credit_names": list(
+                    metadata["component_credit_names"]
+                ),
+                "component_credit_matrix": copy.deepcopy(component_matrix),
+                "regime_label": regime_label,
+                "regime_events": list(metadata.get("regime", [])),
+                "stage": str(metadata.get("stage", "")),
+                "rival": str(metadata.get("rival", "")),
+                "day": int(metadata.get("day", -1)),
+                "tape_seed": metadata.get("tape_seed"),
+                "tape_id": metadata.get("tape_id"),
+                "audit": bool(metadata.get("audit", False)),
+                "horizon_days": int(metadata.get("horizon_days", 0)),
+            }
+        )
 
     def _counterfactual_day_values(self, *, selected_action, action_mask, day_index,
             step_in_day, hours, day_ctx, presampled, customers_per_step,
@@ -10645,6 +10750,12 @@ class Core:
                                 ),
                             )
                         )
+                        if _day_credit_active:
+                            self._append_v16_branch_store_row(
+                                observation_window=s_ts,
+                                counterfactual_values=counterfactual_values,
+                                counterfactual_mask=counterfactual_mask,
+                            )
                         # Branch restoration replaces the copied market object.
                         # Refresh this local reference before the real action.
                         base = self.market.curr_market
@@ -18002,6 +18113,15 @@ def main():
             "4 in T3; 0 disables audits)."
         ),
     )
+    v17.add_argument(
+        "--v16_store_cap",
+        type=int,
+        default=0,
+        help=(
+            "Persistent V17 branch-label ring capacity; 0 disables it and "
+            "production uses exactly 20000 rows."
+        ),
+    )
 
     v26r = parser.add_argument_group("v26r regime-switching market (all default off)")
     v26r.add_argument("--regime_market", action="store_true",
@@ -19075,6 +19195,7 @@ def main():
         v16_branch_horizon_days=args.v16_branch_horizon_days,
         v16_branch_design=args.v16_branch_design,
         v16_audit_every=args.v16_audit_every,
+        v16_store_cap=args.v16_store_cap,
         enable_driver_supply=not args.disable_driver_supply,
         use_osmnx=args.use_osmnx,
         osmnx_place=args.osmnx_place or None,
