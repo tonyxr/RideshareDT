@@ -1,0 +1,3 @@
+{"start_date": "2023-11-14",
+ "events": [{"kind": "holiday_wave", "start_day": 7, "end_day": 12, "intensity": 1.0, "announced": true,
+             "detail": {"name": "thanksgiving", "anchor_day": 9, "pre": 2, "post": 3}}]}

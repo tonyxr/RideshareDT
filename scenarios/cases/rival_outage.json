@@ -1,0 +1,2 @@
+{"start_date": "2023-03-06",
+ "events": [{"kind": "platform_outage", "start_day": 12, "end_day": 14, "intensity": 0.35, "announced": false, "firm": "Firm2"}]}

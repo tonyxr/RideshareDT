@@ -1,0 +1,12 @@
+{
+  "format": "ride-response-training-scenarios-v1",
+  "selection_basis": "Predeclared transition-rich curriculum: more shock/recovery boundaries and a forecasted storm, selected before revision-10 training.",
+  "cases": [
+    {"name": "natural_calibrated", "scenario": null},
+    {"name": "A1_shortage_severe", "scenario": "../../scenarios/cases/shortage_severe_late.json"},
+    {"name": "A2_storm_transit", "scenario": "../../scenarios/cases/storm_transit_late.json"},
+    {"name": "A5_rival_outage", "scenario": "../../scenarios/cases/rival_outage.json"},
+    {"name": "S1_promotion_bait", "scenario": "../../scenarios/cases/promotion_bait.json"},
+    {"name": "S2_own_outage_recovery", "scenario": "../../scenarios/cases/own_outage_late.json"}
+  ]
+}

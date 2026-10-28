@@ -1,0 +1,58 @@
+Revision 7: bounded demand repair, 2026-10-18
+
+Only the rider-choice price-response path and its calibration contracts change.
+PPOAgent.py, platform_mdp.py, driver_supply.py, pricing_models.py and the reward
+objective are byte-identical to the revision-6 source. Revision 6 is untouched.
+No existing policy is silently evaluated in a different demand environment.
+
+Joint contextual heterogeneous logit
+  anchor_i = existing contextual choice probability at the exogenous city-anchor
+             quote for this trip (not either firm's chosen posted quote)
+  h = city calibration median PriceThreshold / this rider's PriceThreshold
+  U_i = log(anchor_i) - beta * h * shock_sensitivity
+                        * (posted_fare_i - reference_trip_fare) / typical_city_fare
+  U_outside = log(anchor_outside)
+  P_i = softmax(U)_i across Firm1, Firm2 and NoRide
+
+This removes the posted-price min gate, threshold salience multiplier,
+fractional power of the gap, and context temperature from the marginal price
+response. Existing context, loyalty, waiting and reputation at the anchor
+remain explicit priors. When the first firm cannot serve, the available firm's
+utility is compared with the same outside utility, without resurrecting the
+old single-price acceptance gate. There is no tariff controller or policy
+fallback. Cached thresholds in this path are validated, not clipped.
+
+For a fixed rider opportunity at parity, the own-price elasticity is
+  -beta * h * (reference_trip_fare/typical_city_fare) * (1 - P_own).
+For a population it is weighted by P_own. The calibration computes beta
+analytically from this aggregate moment. No reward, supply outcome, tariff
+optimum, or RL policy enters that calculation.
+
+User-approved transferred-prior sensitivity arms: -0.9, -1.15, -1.4, all retained.
+Source: List, Muir, Pope and Sun (2023), Left-Digit Bias at Lyft, pp. 1-2:
+https://s3.amazonaws.com/fieldexperiments-papers2/papers/00771.pdf
+These are NOT city-specific estimates or confidence-interval endpoints. The
+midpoint is an illustrative central prior, not a fitted empirical estimate.
+
+Not identified/validated by this repair:
+  * Baseline participation, actual cross-platform diversion, or app-entry demand.
+  * The inverse-threshold heterogeneity assumption or conditional logit IIA.
+  * Shock elasticities or long-run supply equilibrium.
+  * Profit dominance or the economic value of dynamic pricing.
+Fitting an assumed moment successfully is not external validation. Held-out
+synthetic profiles test transfer within the simulator, not validity in a city.
+If the resulting demand changes supply or the best constant, capacity and warm
+starts must be remeasured. Old supply points are explicitly rejected because
+they were fitted under a different demand contract.
+
+New entrypoint: scripts/audit_joint_demand.py (no training or supply calibration).
+Use --demand_calibration_artifact with one of its saved city/arm JSON files to
+explicitly install the new model. Policy artifacts embed the exact parameters;
+reload and city operating-point reuse verify equality. No artifact means the
+legacy model for historical reproducibility, not an automatic runtime fallback.
+
+Testing: tests/test_joint_demand.py (equations and properties),
+tests/test_joint_demand_integration.py (actual city/cache/simulator/save-load paths),
+plus the existing regression and flags-off identity tests. Existing tests still
+protect retained behavior and are not removed just because their names refer
+to an earlier revision. No production retraining is authorized by this audit.

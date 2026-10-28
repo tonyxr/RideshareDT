@@ -1,0 +1,67 @@
+Revision 6 — isolated repair of the 12 issues supplied 2026-10-18
+
+Revision-5 source and all running processes are untouched. Reward stays at
+40% own profit + 60% own-minus-rival profit, with its existing normalization.
+No checkpoint substitution, minimum-driver floor or policy controller is added.
+
+Supply v2 explicitly separates posted-pay hourly participation from realized
+daily online earnings. On a day without online exposure, potential entrants
+respond to the posted earning opportunity; zero pay with positive exposure
+remains genuine zero income. Fleet realizations use unbiased stochastic
+rounding, not a minimum of one. This is a changed supply mechanism requiring
+new calibration, not an empirically validated labour-supply specification.
+
+Capacity must be fitted at the actual simulation volume, with 30 days including
+15 burn-in days. Revision-5 operating points are incompatible. Explicit CLI
+conflicts fail before rollouts; effective parameters are recorded.
+
+Rival telemetry uses online-hour earnings and the measured city reference.
+Daily EMA parameters are converted to block weights. Revenue initialization
+uses the same full-day statistic as its target. MPC compares with hold and
+includes move cost once, without an additional fixed improvement threshold.
+
+Actor quote-gap unit is 10% of city typical fare; critic supply count/earnings
+are relative and unsaturated. Epoch-wide PPO KL stopping belongs only to
+corrected learner revision >=4, never flags-off or earlier learners.
+
+Oracle coverage must include burn-in, forecast/recovery and compound labels;
+unknown labels remain explicit errors, never a silent calm-policy fallback.
+
+Preliminary verification: 306 component regressions passed; an earlier targeted
+run passed 136 tests including 39 city integration/rollback checks. These
+overlap and must not be added together as independent tests. Final-source
+regression, production integration and eight exact flags-off v26 identity
+checks are required before the approved experiment starts.
+
+Approved independent pipeline:
+  scripts/start_revision6_preflight.command
+  -> complete test suite (no skipped tests accepted)
+  -> scripts/start_revision6_smoke.command, only after all tests pass
+
+Smoke scope: NYC, Boston, Chicago sequentially, one training seed per city;
+30-day/15-burn-in capacity calibration at 50 requests; fixed-operating-point
+45-day checks at 50 and 300; validation-selected city warm starts; then 2,400
+training days per city (240 market / 260 static / 1,900 dynamic), final-policy
+standard benchmarks and saved policies/diagnostics/graphs. Standard evaluation
+is 120 four-hour blocks (20 days); its final quarter is only five days.
+
+Outputs:
+  ../artifacts/revision6_preflight_20261018
+  ../artifacts/revision6_smoke_20261018
+
+This is a finite one-shot Terminal pipeline, not a scheduled check. Any failure
+stops it and preserves logs; it never retries, replaces a policy, or promotes
+to full-budget training. Existing revision-4/5 experiments remain untouched.
+
+Still unverified: real three-city operating points, elasticity and learner
+performance. The choice model was not changed in this repair; extreme NYC
+own-price elasticity is not claimed fixed. The audit will measure it again.
+Calm calibration reports only single, rival-informed and hindsight-selected
+CONSTANT comparators; that hindsight result is not a global dynamic upper
+bound. Passing software tests does not establish empirical calibration,
+useful adaptation, critic convergence or profit dominance. One training seed
+per city is not independent training-seed replication.
+
+Existing regression tests were retained where they still exercise supported
+legacy or current paths. Assertions encoding superseded behavior were updated;
+no failing test or historical experiment artifact was removed to obtain a pass.

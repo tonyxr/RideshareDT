@@ -1,0 +1,26 @@
+{
+  "format": "revision15-tariff-structure-v1",
+  "structure": {
+    "base_fare": 1.8048722596988651,
+    "per_minute": 0.7219489038795461,
+    "per_mile": 0.6317052908946028,
+    "booking_fee": 1.082923355819319,
+    "airport_fee": 1.8048722596988651
+  },
+  "anchors": {
+    "base_fare": 2.4637304670750915,
+    "per_minute": 0.2574741973861594,
+    "per_mile": 0.9277811500605481,
+    "booking_fee": 2.258419594818834,
+    "airport_fee": 3.6591110964666314
+  },
+  "reference_level": 0.9,
+  "source": {
+    "revision": "15b",
+    "transfer_kind": "dimensionless R15b tariff shape, exposure-renormalized to city anchors",
+    "source_structure": "/Users/huali/Desktop/RideResponse/rideshare_v26r_revision15/runs/revision15b_direct_20261023_012422/structure/tariff_structure.json",
+    "source_sha256": "24420a2a645de2870d666621ed1352d950045bda61b9b9561fc58036942b1bbd",
+    "city": "chicago",
+    "pre_normalization_city_level": 1.179400788348437
+  }
+}

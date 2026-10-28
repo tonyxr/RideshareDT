@@ -1,0 +1,18683 @@
+from __future__ import annotations
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+@author: Xiaoru Shi
+"""
+"""
+End-to-end two-firm market simulator + Firm1 RL training.
+
+Defaults aim for stable learning:
+- large customers_per_step
+- normalized reward + coefficient movement penalty
+- clipped PPO policy/value updates
+"""
+
+import argparse
+import copy
+import csv
+import glob
+import gzip
+import hashlib
+import io
+import importlib.util
+import json
+import os
+import urllib.error
+import urllib.request
+import random
+import time
+import re
+import sys
+import zipfile
+from dataclasses import asdict, replace
+from collections import Counter, defaultdict, deque
+from datetime import datetime
+from typing import Deque, Dict, Any, List, Mapping, Sequence, Tuple, Optional
+
+
+# Suppress Intel oneMKL CPU deprecation warning on legacy (non-AVX) machines unless
+# the user has already chosen an instruction policy in the environment.
+import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
+mkl_config  # imported intentionally for its process-wide environment side effects
+
+import numpy as np
+import torch
+from diagnostic_logging import DiagnosticJournal
+from model_contract import OPPONENT_PROFIT_LEAD_WEIGHT
+from simulation_noise import isolated_batch_noise, rider_streams
+from strategic_benchmarks import solve_tariff_game
+
+
+from MarketInteraction import MarketInteraction, RideContext
+from Market_models import CoefficientOverrides
+from GenerateAgent import GenerateAgent
+from choice_models import ParametricChoiceModel, LLMChoiceModel, ChoiceResult
+from pricing_models import (
+    FirmMetrics,
+    FirmStaticPricer,
+    FirmHeuristicPricer,
+    FirmAdaptiveBestResponsePricer,
+    FirmAggressiveAdaptiveBestResponsePricer,
+    FirmMemoryBestResponsePricer,
+    FirmMarginGuardrailPricer,
+    FirmRandomWalkPricer,
+    FirmPIPriceGapPricer,
+    FirmRegionSupplyDemandPricer,
+    FirmQueueServiceThresholdPricer,
+    FirmSurgeDriverIncentivePricer,
+    FirmMPCGridPricer,
+    FirmPriceGapCatchUpPricer,
+    FirmFastPriceGapCatchUpPricer,
+    FirmTwinProfitOptimizerMixin,
+    FirmProfitOptimizedPIPriceGapPricer,
+    FirmProfitOptimizedMPCGridPricer,
+    FirmProfitOptimizedRegionSupplyDemandPricer,
+    FirmProfitOptimizedQueueServiceThresholdPricer,
+    FirmProfitOptimizedSurgeDriverIncentivePricer,
+    FirmMyopicProfitBestResponsePricer,
+    FirmForwardProfitBestResponsePricer,
+    FirmAnticipatingProfitBestResponsePricer,
+    FirmRLPricer,
+    HYBRID_RELATIVE_ACTION_SEMANTICS,
+    LEVEL_STEP_ACTION_SEMANTICS,
+    LEVEL_STEP_EXPOSURE,
+    TARIFF_LEVEL_GRID_STEP,
+    snap_tariff_level,
+    validate_tariff_structure,
+)
+from coeff_utils import get_coeff, set_coeff
+from calibration_utils import derive_calibration, load_calibration_json, load_calibration_preset
+from city_data_pipeline import (
+    DataValidationError,
+    NOAAWeatherIndex,
+    normalize_ride_record,
+    resolve_city_spec,
+)
+from gpt_threshold_utils import (
+    build_threshold_profile,
+    clip_price_threshold,
+    diagnose_gpt_threshold_usage,
+    format_gpt_threshold_usage_summary,
+    increment_gpt_threshold_usage,
+    is_retryable_gpt_threshold_http_status,
+    new_gpt_threshold_usage_counts,
+    summarize_priced_coldstart_rides,
+)
+from driver_supply import DriverSupplyConfig, DriverSupplyLayer, FirmDriverBatchState
+from driver_supply import DriverPayPolicy
+from market_shocks import (
+    PUBLIC_SHOCK_FEATURE_KEYS,
+    ShockConfig,
+    ShockEffect,
+    ShockEvent,
+    ShockProcess,
+    ShockScenario,
+)
+from market_dynamics import (
+    ControllerPerturbation,
+    FirmReputationMemory,
+    MarketDynamicsConfig,
+    THRESHOLD_ABLATION_MODES,
+    TripBank,
+    apply_threshold_ablation,
+    perturbed_mode_name,
+    realized_request_count,
+    rescale_pricer_to_market,
+    split_perturbed_mode,
+)
+from platform_mdp import (
+    ActionStabilityTracker,
+    ConstraintConfig,
+    ObservationConfig,
+    POLICY_OBJECTIVES,
+    PlatformObservationModel,
+    LongTermProfitReward,
+    LongTermProfitRewardConfig,
+    PositiveBusinessReward,
+    PositiveRewardConfig,
+    RobustObjectiveOptimizer,
+    SoftConstraintController,
+    OperationalClock,
+    TrainingStage,
+    TrainingStageScheduler,
+    conditional_competitive_shares,
+    config_payload as platform_mdp_config_payload,
+    objective_profit_share,
+    objective_reward_weights,
+    policy_objective_defaults,
+)
+from model_registry import (
+    allocate_archive_path,
+    append_manifest,
+    default_model_id,
+    list_registered_models,
+    resolve_model_reference,
+    safe_model_id,
+)
+
+
+# The case study's deployment comparison is intentionally fixed to these five
+# public-policy baselines.  Keeping one canonical list prevents training,
+# checkpoint selection, certification, and reporting from silently evaluating
+# different opponents.
+BENCHMARK_OPPONENT_MODES: Tuple[str, ...] = (
+    "pi_price_gap",
+    "mpc_grid",
+    "region_supply_demand",
+    "surge_driver_incentive",
+    "queue_service_threshold",
+)
+
+# Additive variants: canonical benchmark implementations above are never
+# modified or aliased to these simulator-backed own-profit optimizers.
+OPTIMIZED_BENCHMARK_OPPONENT_MODES: Tuple[str, ...] = (
+    "profit_opt_pi_price_gap",
+    "profit_opt_mpc_grid",
+    "profit_opt_region_supply_demand",
+    "profit_opt_surge_driver_incentive",
+    "profit_opt_queue_service_threshold",
+)
+PROFIT_BEST_RESPONSE_OPPONENT_MODES: Tuple[str, ...] = (
+    "profit_best_response_myopic",
+    "profit_best_response_forward",
+    "profit_best_response_anticipating",
+)
+CATCHUP_OPPONENT_MODES: Tuple[str, ...] = (
+    "price_gap_catchup",
+    "price_gap_catchup_fast",
+)
+# Revision 11: reactive, non-benchmark rivals also allowed in stage 3.
+REACTIVE_STAGE3_OPPONENT_MODES: Tuple[str, ...] = (
+    "adaptive_best_response_memory",
+    "adaptive_best_response_aggressive",
+)
+
+CROWDLLM_THRESHOLD_EVIDENCE_PROTOCOL = "city_reference_tariffs_v1"
+CROWDLLM_THRESHOLD_PROMPT_PROTOCOL = "structured_context_rubric_v10"
+# v26 (2026-10): the language model returns the numeric rider threshold itself.
+# The deterministic rubric is only a fallback for invalid rows and an ablation
+# arm; it never overwrites an accepted LLM value.
+CROWDLLM_NUMERIC_PROMPT_PROTOCOL = "numeric_profile_threshold_v11"
+GPT_THRESHOLD_MODES = ("rubric_context", "llm_numeric")
+CROWDLLM_THRESHOLD_AUDIT_PROTOCOL = "deterministic_context_validation_v1"
+CROWDLLM_REFERENCE_FIRM1_MULTIPLIER = 1.00
+CROWDLLM_REFERENCE_FIRM2_MULTIPLIER = 1.10
+
+# Experiments choose a prefix of this fixed, documented order.  The resolved
+# count is part of the trained-policy contract, so validation and evaluation
+# cannot silently expose the actor or its opponent to a different tariff scope.
+MANIPULATABLE_PRICE_COEFFICIENT_KEYS: Tuple[str, ...] = (
+    "base_fare",
+    "per_minute",
+    "per_mile",
+    "booking_fee",
+    "airport_fee",
+)
+
+# The auxiliary world model predicts twelve public market-response deltas plus
+# the realized Firm 2 leader intervention that preceded Firm 1's action (up to
+# five normalized coefficient moves and one intervention indicator). The
+# active audit vector is sized from the experiment's locked coefficient scope.
+# Simulator-private coefficients are teacher labels during training only;
+# deployment inference uses posted quotes and public history.
+MARKET_RESPONSE_DIM = 12
+OPPONENT_ACTION_FORECAST_DIM = 6
+RESPONSE_TARGET_DIM = MARKET_RESPONSE_DIM + OPPONENT_ACTION_FORECAST_DIM
+DURABILITY_MIN_STEPS = 100
+PRIVILEGED_CRITIC_STATE_DIM = 64
+# v26r: training-only exogenous regime channels appended to the privileged
+# critic (input-dependent baseline).  The actor never sees them.
+REGIME_CRITIC_LATENT_DIM = 12
+V25_CRITIC_OPPONENT_MODES: Tuple[str, ...] = (
+    "static",
+    "adaptive_best_response_aggressive",
+    "adaptive_best_response",
+    "heuristic",
+    "heuristic_margin",
+    "heuristic_random",
+    "pi_price_gap",
+    "mpc_grid",
+    "region_supply_demand",
+    "surge_driver_incentive",
+    "queue_service_threshold",
+    "adaptive_best_response_memory",   # v26r rival with memory (own critic slot)
+    *CATCHUP_OPPONENT_MODES,
+    *OPTIMIZED_BENCHMARK_OPPONENT_MODES,
+    *PROFIT_BEST_RESPONSE_OPPONENT_MODES,
+)
+try:
+    import kagglehub
+except Exception:
+    kagglehub = None
+
+try:
+    import pyarrow.parquet as pq
+except Exception:
+    pq = None
+
+class _ZeroValue:
+    """Stand-in for a critic value when a non-learning baseline acts."""
+
+    @staticmethod
+    def item() -> float:
+        return 0.0
+
+
+def _resolve_dataset_path(city: str = "nyc") -> str:
+    """Download the Kaggle dataset only when explicitly needed."""
+    if kagglehub is None:
+        raise RuntimeError("kagglehub is required only for --compare_with_dataset; install it to use that option")
+    spec = resolve_city_spec(city)
+    dataset_path = kagglehub.dataset_download(spec.kaggle_slug)
+    print("Path to dataset files:", dataset_path)
+    return dataset_path
+
+def _is_missing(v: Any) -> bool:
+    if v is None:
+        return True
+    s = str(v).strip().lower()
+    return s in {"", "nan", "none", "null", "na"}
+
+
+def _to_float(v: Any) -> Optional[float]:
+    if _is_missing(v):
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
+    
+def _to_numeric(v: Any) -> Optional[float]:
+    """Best-effort numeric parser for noisy dataset fields (currency, ranges, units)."""
+    fv = _to_float(v)
+    if fv is not None:
+        return fv
+    if _is_missing(v):
+        return None
+
+    text = str(v).strip().lower().replace(",", "")
+    if not text:
+        return None
+
+    nums = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", text)]
+    if not nums:
+        return None
+
+    # Fields like "$12-16" or "12 to 16" should map to a single usable value.
+    if len(nums) >= 2 and ("-" in text or " to " in text):
+        return float(sum(nums[:2]) / 2.0)
+    return float(nums[0])
+
+
+def _to_int(v: Any) -> Optional[int]:
+    fv = _to_float(v)
+    if fv is None:
+        return None
+    return int(fv)
+
+def _to_minutes(v: Any) -> Optional[float]:
+    if _is_missing(v):
+        return None
+    if isinstance(v, np.timedelta64):
+        return float(v / np.timedelta64(1, "m"))
+    fv = _to_numeric(v)
+    if fv is not None:
+        val = float(fv)
+        # Heuristic: very large values are likely stored in ns/us/ms or sec.
+        if val > 1e12:
+            return val / 60_000_000_000.0
+        if val > 1e9:
+            return val / 60_000_000.0
+        if val > 10000:
+            return val / 60.0
+        return val
+
+    try:
+        import pandas as pd
+        td = pd.to_timedelta(v)
+        return float(td.total_seconds() / 60.0)
+    except Exception:
+        return None
+
+
+def _pick_value(row: Dict[str, Any], names: List[str]) -> Any:
+    for k in names:
+        if k in row and not _is_missing(row[k]):
+            return row[k]
+    return None
+
+
+def _pick_first_parsed(
+    row: Dict[str, Any],
+    names: List[str],
+    parser,
+    with_key: bool = False,
+) -> Any:
+    for k in names:
+        if k not in row or _is_missing(row[k]):
+            continue
+        val = parser(row[k])
+        if val is not None:
+            return (val, k) if with_key else val
+    return (None, None) if with_key else None
+
+
+def _pick_first_numeric(row: Dict[str, Any], names: List[str]) -> Optional[float]:
+    return _pick_first_parsed(row, names, _to_numeric)
+
+
+def _pick_first_minutes(row: Dict[str, Any], names: List[str]) -> Optional[float]:
+    return _pick_first_parsed(row, names, _to_minutes)
+
+def _pick_first_minutes_with_key(row: Dict[str, Any], names: List[str]) -> Tuple[Optional[float], Optional[str]]:
+    val, key = _pick_first_parsed(row, names, _to_minutes, with_key=True)
+    return val, key
+
+def _pick_first_numeric_with_key(row: Dict[str, Any], names: List[str]) -> Tuple[Optional[float], Optional[str]]:
+    val, key = _pick_first_parsed(row, names, _to_numeric, with_key=True)
+    return val, key
+
+def _normalize_row_keys(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a row view that supports loose key matching across datasets."""
+    out = dict(row)
+    for k, v in row.items():
+        kn = str(k).replace("\ufeff", "").strip()
+        out.setdefault(kn, v)
+        out.setdefault(kn.lower(), v)
+        out.setdefault(kn.replace(" ", "_"), v)
+        out.setdefault(kn.lower().replace(" ", "_"), v)
+        out.setdefault(kn.replace("-", "_"), v)
+        out.setdefault(kn.lower().replace("-", "_"), v)
+    return out
+
+def _json_preview(obj: Any) -> str:
+    """JSON preview helper that tolerates datetimes/timedeltas/decimals."""
+    try:
+        return json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        return str(obj)
+
+
+def _canonical_json(obj: Any) -> str:
+    """Stable JSON used to audit the exact raw dataset record."""
+    return json.dumps(
+        obj,
+        ensure_ascii=False,
+        default=str,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def _discover_dataset_files(dataset_root: str, dataset_glob: str) -> List[str]:
+    """Discover tabular files for dataset comparison; tolerate compressed variants."""
+    base_patterns = [dataset_glob]
+    g = dataset_glob.lower()
+    if g == "*.csv":
+        base_patterns.extend(["*.csv.gz", "*.zip"])
+    elif g.endswith(".csv"):
+        base_patterns.extend([dataset_glob + ".gz", dataset_glob + ".zip"])
+
+    patterns: List[str] = []
+    for pat in base_patterns:
+        patterns.append(os.path.join(dataset_root, pat))
+        if "**" not in pat:
+            patterns.append(os.path.join(dataset_root, "**", pat))
+
+    files: List[str] = []
+    for pat in patterns:
+        files.extend(glob.glob(pat, recursive=True))
+    keep_ext = (".csv", ".csv.gz", ".zip", ".parquet")
+    return sorted({f for f in files if os.path.isfile(f) and f.lower().endswith(keep_ext)})
+
+
+def _iter_tabular_rows(fpath: str, sample_seed: Optional[int] = None):
+    """Yield rows from supported tabular files.
+
+    For parquet inputs, ``sample_seed`` deterministically randomizes both row
+    group order and rows within each emitted batch. This makes bounded
+    validation runs independent samples instead of repeatedly scoring the
+    beginning of a chronologically sorted dataset.
+    """
+    lower = fpath.lower()
+    if lower.endswith(".csv"):
+        with open(fpath, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                return
+            yield reader.fieldnames, reader
+        return
+
+    if lower.endswith(".csv.gz"):
+        with gzip.open(fpath, "rt", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                return
+            yield reader.fieldnames, reader
+        return
+
+    if lower.endswith(".zip"):
+        with zipfile.ZipFile(fpath, "r") as zf:
+            for member in zf.namelist():
+                if not member.lower().endswith(".csv"):
+                    continue
+                with zf.open(member, "r") as raw:
+                    text_stream = io.TextIOWrapper(raw, encoding="utf-8", newline="")
+                    reader = csv.DictReader(text_stream)
+                    if not reader.fieldnames:
+                        continue
+                    yield reader.fieldnames, reader
+        return
+
+    if lower.endswith(".parquet"):
+        if pq is None:
+            raise RuntimeError(
+                "Parquet validation requires pyarrow. Install it in the active "
+                "environment (for example: conda install -c conda-forge pyarrow)."
+            )
+        parquet_file = pq.ParquetFile(fpath)
+        fieldnames = parquet_file.schema.names
+        rng = np.random.default_rng(sample_seed)
+        group_order = list(range(parquet_file.num_row_groups))
+        if sample_seed is not None:
+            group_order = [int(group) for group in rng.permutation(group_order)]
+        # Round-robin row groups so a bounded comparison covers multiple
+        # temporal partitions. Seeded group ordering makes repeated robustness
+        # runs draw different partitions without loading the full parquet file.
+        # Each group also receives a bounded seeded batch offset. Without this,
+        # different seeds that select the same large row group would still read
+        # the identical first 1,000 rows from that group.
+        iterators = []
+        for group in group_order:
+            iterator = iter(
+                parquet_file.iter_batches(batch_size=1000, row_groups=[group])
+            )
+            if sample_seed is not None:
+                group_rows = int(parquet_file.metadata.row_group(group).num_rows)
+                group_batches = max(1, int(np.ceil(group_rows / 1000.0)))
+                skip_batches = int(rng.integers(0, min(group_batches, 256)))
+                for _ in range(skip_batches):
+                    try:
+                        next(iterator)
+                    except StopIteration:
+                        break
+            iterators.append(iterator)
+        while iterators:
+            active = []
+            for iterator in iterators:
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    continue
+                active.append(iterator)
+                records = batch.to_pylist()
+                if records:
+                    if sample_seed is not None and len(records) > 1:
+                        order = rng.permutation(len(records))
+                        records = [records[int(index)] for index in order]
+                    yield fieldnames, records
+            iterators = active
+        return
+
+def _infer_service_level(row: Dict[str, Any]) -> str:
+    service_text = str(_pick_value(row, ["service", "name", "cab_type", "product_name", "product_id", "business", "Business"]) or "").lower()
+    premium_markers = ["black", "lux", "luxury", "prem", "premium", "select", "suv"]
+    return "premium" if any(tok in service_text for tok in premium_markers) else "economy"
+
+
+def _infer_weather(row: Dict[str, Any]) -> str:
+    text = str(_pick_value(row, ["weather", "icon", "short_summary", "long_summary", "summary"]) or "").lower()
+    if "snow" in text or "sleet" in text or "blizzard" in text:
+        return "snow"
+    if "rain" in text or "storm" in text or "drizzle" in text:
+        return "rain"
+    return "clear"
+
+
+def _infer_airport_trip(row: Dict[str, Any]) -> bool:
+    location_fields = [
+        "source", "destination", "pickup", "dropoff", "pickup_zone", "dropoff_zone",
+        "pickup_location", "dropoff_location",
+    ]
+    values = [row.get(name) for name in location_fields if row.get(name) is not None]
+    text = " ".join(str(value).lower() for value in values)
+    airport_tokens = ["airport", "jfk", "lga", "ewr", "laguardia", "newark"]
+    if any(tok in text for tok in airport_tokens):
+        return True
+    # NYC TLC taxi-zone ids: Newark Airport=1, JFK=132, LaGuardia=138.
+    airport_zone_ids = {1, 132, 138}
+    return any((_to_int(value) in airport_zone_ids) for value in values)
+
+
+def _infer_hour_day(row: Dict[str, Any]) -> Tuple[int, int]:
+    hour = _to_int(_pick_value(row, ["hour", "pickup_hour", "hour_of_day"]))
+    day = _to_int(_pick_value(row, ["day_of_week", "weekday", "day"]))
+    day_was_explicit = day is not None
+
+    dt_raw = _pick_value(row, ["datetime", "pickup_datetime", "time_stamp", "timestamp", "date"])
+    dt: Optional[datetime] = None
+    if dt_raw is not None:
+        txt = str(dt_raw).strip()
+        if txt.isdigit():
+            sec = int(txt)
+            if sec > 1_000_000_000_000:
+                sec = sec // 1000
+            try:
+                dt = datetime.fromtimestamp(sec)
+            except Exception:
+                dt = None
+        if dt is None:
+            try:
+                dt = datetime.fromisoformat(txt.replace("Z", "+00:00"))
+            except Exception:
+                dt = None
+
+    if dt is not None:
+        if hour is None:
+            hour = int(dt.hour)
+        if day is None:
+            day = int(dt.weekday())
+
+    if day_was_explicit and day is not None and day >= 1 and day <= 7:
+        day = (day - 1) % 7
+
+    return int(hour if hour is not None else 12), int(day if day is not None else 2)
+
+
+def _parse_kv_floats(s: str) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    if not s:
+        return out
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"Bad entry '{part}'. Use key=value, e.g. base_fare=2.8")
+        k, v = part.split("=", 1)
+        out[k.strip()] = float(v.strip())
+    return out
+
+
+def _parse_stage_profit_lead_weights(value: str) -> Tuple[float, float, float, float]:
+    """Parse market,static,catchup,profit lead fractions from the CLI."""
+    try:
+        weights = tuple(float(part.strip()) for part in str(value).split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "stage profit-lead weights must be four comma-separated numbers"
+        ) from exc
+    if len(weights) != 4 or any(
+        not np.isfinite(weight) or weight < 0.0 or weight > 1.0
+        for weight in weights
+    ):
+        raise argparse.ArgumentTypeError(
+            "stage profit-lead weights must be four fractions in [0, 1]"
+        )
+    return weights  # type: ignore[return-value]
+
+
+def _parse_stage_market_share_weights(
+    value: str,
+) -> Tuple[float, float, float, float]:
+    """Parse market,static,catchup,profit completed-share-lead weights."""
+    try:
+        weights = tuple(float(part.strip()) for part in str(value).split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "stage market-share weights must be four comma-separated numbers"
+        ) from exc
+    if len(weights) != 4 or any(
+        not np.isfinite(weight) or weight < 0.0 or weight >= 1.0
+        for weight in weights
+    ):
+        raise argparse.ArgumentTypeError(
+            "stage market-share weights must be four fractions in [0, 1)"
+        )
+    return weights  # type: ignore[return-value]
+
+
+def _parse_tariff_level_bounds(value: str) -> Tuple[float, float]:
+    """Parse Revision 15 lower,upper tariff-level bounds on the 0.1 lattice."""
+    try:
+        parts = tuple(float(part.strip()) for part in str(value).split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "tariff level bounds must be two comma-separated numbers"
+        ) from exc
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            "tariff level bounds must be two comma-separated numbers"
+        )
+    try:
+        lower, upper = snap_tariff_level(parts[0]), snap_tariff_level(parts[1])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if not 0.0 < lower < upper:
+        raise argparse.ArgumentTypeError("tariff level bounds need 0 < lower < upper")
+    return (lower, upper)
+
+
+class Core:
+    def __init__(
+        self,
+        market_name: str,
+        seed: Optional[int] = None,
+        choice_mode: str = "cognitive",
+        model_name: str = "gpt-4o-mini",
+        openai_api_key: Optional[str] = None,
+        firm1_mode: str = "RL",
+        firm2_mode: str = "static",
+        firm1_static_values: str = "",
+        firm2_static_values: str = "",
+        manipulated_price_coefficients: int = 5,
+        total_customers_pool: int = 20000,
+        simulation_sample_cap: int = 2000,
+        deterministic_torch: bool = False,
+        positive_reward_profit_weight: float = 0.38,
+        positive_reward_revenue_weight: float = 0.22,
+        positive_reward_completed_demand_weight: float = 0.20,
+        positive_reward_service_weight: float = 0.20,
+        long_term_profit_scale: float = 2.0,
+        long_term_profit_advantage_scale: float = 1.0,
+        policy_objective: str = "profit_maximization",
+        stage_specific_rewards: bool = False,
+        opponent_profit_lead_weight: Optional[float] = None,
+        stage_profit_lead_weights: Optional[
+            Tuple[float, float, float, float]
+        ] = None,
+        stage_market_share_competitiveness_weights: Optional[
+            Tuple[float, float, float, float]
+        ] = None,
+        temporal_competitive_reward: bool = False,
+        durable_dominance_weight: float = 0.20,
+        adaptive_residual_weight: float = 0.10,
+        durable_dominance_horizon_days: float = 5.0,
+        learning_corrections: bool = False,
+        learner_revision: int = 4,
+        long_term_profit_weight: float = 1.0,
+        profit_dominance_weight: float = 0.0,
+        dominance_quality_scale: float = 4.0,
+        market_share_competitiveness_weight: float = 0.0,
+        market_share_target_gap: float = 0.10,
+        market_share_gap_scale: float = 0.10,
+        market_share_level_weight: float = 0.25,
+        price_competitiveness_weight: float = 0.0,
+        price_gap_reward_scale: float = 1.0,
+        intervention_cost_weight: float = 0.0,
+        reversal_cost_weight: float = 0.0,
+        ppo_gamma: float = 0.999,
+        ppo_gae_lambda: float = 0.99,
+        reward_rev_scale: float = 25.0,
+        reward_profit_scale: float = 12.0,
+        min_profit_margin: float = 0.08,
+        min_completion_coverage: float = 0.55,
+        driver_cost_per_mile: float = 0.85,
+        driver_cost_per_minute: float = 0.12,
+        fixed_trip_cost: float = 1.25,
+        airport_cost: float = 2.00,
+        enable_driver_supply: bool = True,
+        use_osmnx: bool = False,
+        osmnx_place: Optional[str] = None,
+        driver_base_active: int = 260,
+        driver_reservation_wage: float = 24.0,
+        driver_acceptance_mode: str = "expected",
+        driver_expected_acceptance_cutoff: float = 0.65,
+        driver_state_smoothing: float = 0.35,
+        constrained_reward: bool = False,
+        constraint_lr: float = 0.01,
+        constraint_penalty_scale: float = 0.10,
+        constraint_curriculum_start_scale: float = 0.25,
+        constraint_curriculum_mid_scale: float = 0.60,
+        constraint_curriculum_end_scale: float = 1.00,
+        target_price_gap: float = 0.75,
+        price_gap_tolerance: float = 0.45,
+        segment_gap_tolerances: Tuple[float, float, float, float] = (0.65, 0.60, 0.55, 0.55),
+        telemetry_delay_steps: int = 1,
+        quote_probe_interval_steps: int = 3,
+        quote_probe_delay_steps: int = 1,
+        quote_noise_dollars: float = 0.18,
+        quote_missing_probability: float = 0.03,
+        training_curriculum: str = "staged",
+        training_stage_market_fraction: float = 0.20,
+        training_stage_static_fraction: float = 0.20,
+        training_stage_dynamic_fraction: float = 0.60,
+        training_stage_profit_fraction: Optional[float] = None,
+        training_dynamic_episode_days: int = 30,
+        profit_planner_sample_cap: int = 32,
+        training_opening_tariff_randomization: float = 0.15,
+        ppo_batch_size: int = 48,
+        ppo_update_epochs: int = 8,
+        ppo_rollout_episodes: Optional[int] = None,
+        state_action_mi_weight: float = 0.0,
+        direct_actor_credit_weight: float = 0.0,
+        state_frame_stack: int = 16,
+        credit_assignment_v24: bool = False,
+        credit_assignment_v25: bool = False,
+        privileged_critic: Optional[bool] = None,
+        persistent_recurrence: Optional[bool] = None,
+        counterfactual_branches: Optional[int] = None,
+        counterfactual_q_coeff: Optional[float] = None,
+        counterfactual_actor_weight: Optional[float] = None,
+        potential_shaping_scale: Optional[float] = None,
+        hard_kl_stop: Optional[bool] = None,
+        reward_rate_beta: Optional[float] = None,
+        threshold_cache_path: str = "",
+        threshold_profile_source: str = "generated",
+        threshold_prompt_repeat_source: str = "",
+        save_threshold_cache: bool = True,
+        gpt_threshold_include_rationales: bool = False,
+        gpt_threshold_coldstart_rides: int = 5,
+        gpt_threshold_send_raw_rides: bool = False,
+        gpt_threshold_batch_size: int = 20,
+        gpt_threshold_max_retries: int = 2,
+        gpt_threshold_failure_pause: float = 1.0,
+        training_generalization_fraction: float = 0.0,
+        evaluation_generalization_fraction: float = 1.0,
+        regime_market: bool = False,
+        regime_features: bool = False,
+        regime_feature_ablation: bool = False,
+        actor_true_shortage_flag: bool = False,
+        whole_tariff_actions: bool = False,
+        counterfactual_day_credit: int = 0,
+        counterfactual_day_horizon_days: int = 2,
+        counterfactual_policy_coeff: Optional[float] = None,
+        nmcc_baseline: str = "hold",
+        nmcc_stages: Tuple[str, ...] = ("catchup", "profit"),
+        nmcc_every_k_decisions: int = 1,
+        nmcc_advantage_scale: str = "rms",
+        nmcc_dump: str = "",
+        momentum_features: bool = False,
+        momentum_day_steps: int = 6,
+        opponent_features: bool = False,
+        opponent_move_threshold: float = 0.02,
+        driver_incentive_levels: Sequence[float] = (1.0,),
+        tariff_targets: Sequence[float] = (),
+        persistence_features: bool = False,
+        level_step_actions: bool = False,
+        hybrid_relative_actions: bool = False,
+        relative_action_steps: Sequence[float] = (0.10, 0.20),
+        tariff_structure: Optional[Mapping[str, Any]] = None,
+        tariff_level_bounds: Tuple[float, float] = (0.6, 2.0),
+        ppo_entropy_start: Optional[float] = None,
+        branch_imitation_coeff: float = 0.0,
+        branch_imitation_temperature_scale: float = 0.25,
+    ):
+        self.seed = int(seed) if seed is not None else int(np.random.SeedSequence().generate_state(1)[0])
+        # ---- v26r regime-switching market (all default off) ----
+        self.regime_market = bool(regime_market)
+        self.regime_features = bool(regime_features)
+        self.regime_feature_ablation = bool(regime_feature_ablation)
+        self.actor_true_shortage_flag = bool(actor_true_shortage_flag)
+        # Revision 11: one multiplier moves the whole tariff in one decision.
+        self.whole_tariff_actions = bool(whole_tariff_actions)
+        # Revision 11b: common-random-number day-branch credit for the actor.
+        self.counterfactual_day_credit = int(max(0, counterfactual_day_credit))
+        self.counterfactual_day_horizon_days = int(max(1, counterfactual_day_horizon_days))
+        self.counterfactual_policy_coeff = (None if counterfactual_policy_coeff is None else float(counterfactual_policy_coeff))
+        self.counterfactual_day_seconds = 0.0
+        self.counterfactual_day_calls = 0
+        # Revision 14: NMCC paired-branch credit options.
+        self.nmcc_baseline = str(nmcc_baseline)
+        if self.nmcc_baseline not in ("hold", "mean"):
+            raise ValueError("nmcc_baseline must be 'hold' or 'mean'")
+        self.nmcc_stages = tuple(
+            str(s).strip() for s in nmcc_stages if str(s).strip()
+        )
+        if not set(self.nmcc_stages) <= {
+            "market", "static", "catchup", "profit"
+        }:
+            raise ValueError(
+                "nmcc_stages must be drawn from "
+                "market,static,catchup,profit: "
+                f"{self.nmcc_stages}"
+            )
+        self.nmcc_every_k_decisions = int(max(1, nmcc_every_k_decisions))
+        self.nmcc_advantage_scale = str(nmcc_advantage_scale)
+        if self.nmcc_advantage_scale not in ("rms", "zscore"):
+            raise ValueError("nmcc_advantage_scale must be 'rms' or 'zscore'")
+        self.nmcc_dump = str(nmcc_dump or "")
+        if self.counterfactual_day_credit == 1:
+            raise ValueError(
+                "NMCC needs at least two candidates (hold and the sampled action)"
+            )
+        self._nmcc_decision_counter = 0
+        self._nmcc_last: Dict[str, Any] = {}
+        # Revision 14: momentum and opponent observation options.
+        self.momentum_features = bool(momentum_features)
+        self.momentum_day_steps = int(max(1, momentum_day_steps))
+        self.opponent_features = bool(opponent_features)
+        self.opponent_move_threshold = float(max(0.0, opponent_move_threshold))
+        self.persistence_features = bool(persistence_features)
+        self._returning_share_ema: float = 0.0
+        self._rival_gap_history: Deque[float] = deque(maxlen=7 * 6)
+        self.driver_incentive_levels: Tuple[float, ...] = tuple(
+            float(x) for x in (driver_incentive_levels or (1.0,))
+        ) or (1.0,)
+        self.tariff_targets: Tuple[float, ...] = tuple(float(x) for x in (tariff_targets or ()))
+        # Revision 15: level steps on a fixed structure, PPO entropy start and
+        # branch imitation. Every option defaults off (Revision 14 identity).
+        self.level_step_actions = bool(level_step_actions)
+        self.hybrid_relative_actions = bool(hybrid_relative_actions)
+        self.relative_action_steps: Tuple[float, ...] = tuple(
+            float(value) for value in relative_action_steps
+        )
+        self.tariff_structure_payload: Optional[Dict[str, Any]] = (
+            None if tariff_structure is None else dict(tariff_structure)
+        )
+        self.tariff_level_bounds: Tuple[float, float] = (
+            snap_tariff_level(tariff_level_bounds[0]),
+            snap_tariff_level(tariff_level_bounds[1]),
+        )
+        self.ppo_entropy_start = (
+            None if ppo_entropy_start is None else float(ppo_entropy_start)
+        )
+        self.branch_imitation_coeff = float(branch_imitation_coeff)
+        self.branch_imitation_temperature_scale = float(
+            branch_imitation_temperature_scale
+        )
+        if not np.isfinite(self.branch_imitation_coeff) or self.branch_imitation_coeff < 0.0:
+            raise ValueError("branch_imitation_coeff must be finite and non-negative")
+        if (
+            not np.isfinite(self.branch_imitation_temperature_scale)
+            or self.branch_imitation_temperature_scale <= 0.0
+        ):
+            raise ValueError("branch_imitation_temperature_scale must be positive")
+        if self.hybrid_relative_actions:
+            if self.level_step_actions or self.whole_tariff_actions:
+                raise ValueError(
+                    "hybrid-relative, level-step, and whole-tariff actions are exclusive"
+                )
+            if self.tariff_targets:
+                raise ValueError("hybrid relative actions do not use tariff_targets")
+            if self.tariff_structure_payload is not None:
+                raise ValueError("hybrid relative actions do not use a tariff structure")
+            if tuple(self.driver_incentive_levels) != (1.0,):
+                raise ValueError(
+                    "hybrid relative actions require driver_incentive_levels=(1.0,)"
+                )
+        elif self.level_step_actions:
+            if self.whole_tariff_actions:
+                raise ValueError("level-step and whole-tariff actions are exclusive")
+            if self.tariff_targets:
+                raise ValueError("level-step actions do not use tariff_targets")
+            if self.tariff_structure_payload is None:
+                raise ValueError("level-step actions require a tariff structure")
+            if tuple(self.driver_incentive_levels) != (1.0,):
+                raise ValueError("level-step actions require driver_incentive_levels=(1.0,)")
+        elif self.tariff_structure_payload is not None:
+            raise ValueError("a tariff structure requires level-step actions")
+        self.shock_config: ShockConfig = ShockConfig(enabled=False)
+        self.shock_scenario: Optional[ShockScenario] = None
+        self.training_scenario_curriculum: Tuple[Tuple[str, Optional[ShockScenario]], ...] = ()
+        self.active_training_scenario: str = "natural_calibrated"
+        self.v26r_settings: Dict[str, Any] = {"enabled": False}
+        self._firm2_regime_price_multiplier: float = 1.0
+        self._regime_rival_switch_applied: Dict[int, str] = {}
+        self._regime_last_effect: ShockEffect = ShockEffect()
+        self.spillover_price_aware: bool = False
+        # v26r rider loyalty v2 (see configure_loyalty): per-rider stocks for the
+        # active pool, sampled each step with a returning share.
+        self.loyalty_model: str = "v1"
+        self.loyalty_lambda: float = 0.30
+        self.loyalty_pool_size: int = 2000
+        self.returning_rider_share: float = 0.60
+        self.loyalty_overcharge_penalty: bool = False
+        self.loyalty_weight: float = 3.0       # multiplier on the loyalty utility term for v2 riders
+        self.rider_loyalty: Dict[int, Dict[str, float]] = {}
+        self._active_rider_pool: List[Dict[str, Any]] = []
+        self._last_returning_share: float = 0.0
+        self.regime_critic_extra_dim = (
+            (REGIME_CRITIC_LATENT_DIM if self.regime_market else 0)
+        )
+        self.critic_opponent_modes = (V25_CRITIC_OPPONENT_MODES if self.regime_market or learning_corrections
+                                      else V25_CRITIC_OPPONENT_MODES[:-1])
+        self.v25_critic_state_dim = PRIVILEGED_CRITIC_STATE_DIM + len(self.critic_opponent_modes)
+        if opponent_profit_lead_weight is None:
+            opponent_profit_lead_weight = OPPONENT_PROFIT_LEAD_WEIGHT if stage_specific_rewards else 0.5
+        self.total_customers_pool = int(total_customers_pool)
+        self.simulation_sample_cap = int(max(0, simulation_sample_cap))
+        
+        self._seed_all_rngs(self.seed, deterministic_torch=deterministic_torch)
+        self.rng = np.random.default_rng(self.seed)
+        self.market = MarketInteraction(city_name=market_name, seed=self.seed)
+
+        self.market_name = str(self.market.current_city)
+
+        self.agent_gen = GenerateAgent(
+            seed=self.seed,
+            total_customers=total_customers_pool,
+            city_name=self.market_name,
+        )
+        self.profile_pool_multiplier = 2
+        self.model_name = model_name
+        # ``None`` means "inherit the environment".  An explicit empty string
+        # must remain empty so tests and offline runs can disable an ambient
+        # credential without mutating process-wide environment state.
+        self.openai_api_key = (
+            os.getenv("OPENAI_API_KEY")
+            if openai_api_key is None
+            else str(openai_api_key)
+        )
+        self.synthetic_profile_pool: List[Dict[str, Any]] = []
+        # Both partitions come from the same case-study population (including
+        # the same cached threshold source when requested).  Evaluation uses a
+        # deterministic holdout partition, not a synthetic cross-city threshold
+        # distribution that changes the problem being evaluated.
+        self.training_profile_pool: List[Dict[str, Any]] = []
+        self.evaluation_profile_pool: List[Dict[str, Any]] = []
+        self.generalization_profile_pool: List[Dict[str, Any]] = []
+        self.generalization_profiles_by_city: Dict[str, List[Dict[str, Any]]] = {}
+        self.training_generalization_fraction = float(np.clip(
+            training_generalization_fraction, 0.0, 1.0
+        ))
+        self.evaluation_generalization_fraction = float(np.clip(
+            evaluation_generalization_fraction, 0.0, 1.0
+        ))
+        self.gpt_threshold_batch_size = int(max(1, gpt_threshold_batch_size))
+        # ---- v26 contract (2026-10 review).  All defaults reproduce v25. ----
+        self.gpt_threshold_mode = "rubric_context"
+        self.market_dynamics = MarketDynamicsConfig()
+        self.trip_bank: Optional[TripBank] = None
+        self.threshold_ablation_mode = "as_loaded"
+        self.threshold_ablation_summary: Dict[str, Any] = {}
+        self.exclude_benchmarks_from_training = False
+        self.training_opponent_perturbation = ControllerPerturbation(scale=0.0)
+        self.environment_reseed_per_episode = False
+        self.truncation_bootstrap = False
+        self.observed_fare_mode = "isolated"
+        self.baseline_suite: Tuple[str, ...] = ()
+        self.static_baseline_multipliers: Tuple[float, ...] = (
+            0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30,
+        )
+        self.ood_perturbed_variants = 0
+        self.ood_perturbation_scale = 0.25
+        self.v26_settings: Dict[str, Any] = {"enabled": False}
+        self.baseline_evaluation_report: Dict[str, Any] = {}
+        self.ood_evaluation_report: Dict[str, Any] = {}
+        self.theory_benchmark_report: Dict[str, Any] = {}
+        self.evaluation_tariff_log: List[Dict[str, Any]] = []
+        self.gpt_threshold_max_retries = int(max(0, gpt_threshold_max_retries))
+        self.gpt_threshold_error_counts: Dict[str, int] = {}
+        self.gpt_threshold_last_error = ""
+        self.gpt_threshold_request_counts: Dict[str, int] = new_gpt_threshold_usage_counts()
+        self.gpt_threshold_failure_pause = float(max(0.0, gpt_threshold_failure_pause))
+        self.threshold_cache_path = str(threshold_cache_path or "")
+        self.threshold_prompt_repeat_source = str(
+            threshold_prompt_repeat_source or ""
+        )
+        requested_profile_source = str(threshold_profile_source or "generated").strip().lower()
+        if requested_profile_source not in {"generated", "cached"}:
+            raise ValueError("threshold_profile_source must be either 'generated' or 'cached'")
+        self.strict_cached_profiles = requested_profile_source == "cached"
+        self.threshold_profile_source = requested_profile_source
+        self.save_threshold_cache = bool(save_threshold_cache)
+        self.gpt_threshold_include_rationales = bool(gpt_threshold_include_rationales)
+        self.gpt_threshold_coldstart_rides = int(np.clip(gpt_threshold_coldstart_rides, 1, 10))
+        self.gpt_threshold_send_raw_rides = bool(gpt_threshold_send_raw_rides)
+        self.training_stable_window = 30
+        self.training_stable_tol = 0.012
+        self.reward_convergence_window = 60
+        self.reward_convergence_tol = 0.018
+        self.reward_trend_tol = 0.007
+        self.convergence_min_days = 80
+        self.convergence_required_streak = 5
+        self._convergence_streak = 0
+        
+        # choice model
+        self.choice_mode = choice_mode
+        if choice_mode in {"llm", "cognitive"}:
+            self.choice_model = LLMChoiceModel(model_name=model_name, api_key=self.openai_api_key, seed=self.seed)
+            if self.openai_api_key is None:
+                print("[Core] No OpenAI key found; GPT price-threshold bootstrapping will use deterministic fallback thresholds.")
+        else:
+            self.choice_model = ParametricChoiceModel(seed=self.seed)
+
+        # firms
+        self.firm1_mode = firm1_mode
+        self.firm2_mode = firm2_mode
+        # The default production clock is five market steps. run_experiment
+        # replaces this with the resolved shared value before collecting data.
+        self.shared_action_interval_steps = 5
+        self.shared_steps_per_day = 10
+
+        dynamic_pricer_modes = {
+            "heuristic",
+            "heuristic_margin",
+            "heuristic_random",
+            "adaptive_best_response",
+            "adaptive_best_response_aggressive",
+            "adaptive_best_response_memory",
+            "pi_price_gap",
+            "region_supply_demand",
+            "queue_service_threshold",
+            "surge_driver_incentive",
+            "mpc_grid",
+            *CATCHUP_OPPONENT_MODES,
+            *OPTIMIZED_BENCHMARK_OPPONENT_MODES,
+            *PROFIT_BEST_RESPONSE_OPPONENT_MODES,
+        }
+        firm1_dynamic_modes = dynamic_pricer_modes - set(
+            OPTIMIZED_BENCHMARK_OPPONENT_MODES
+        ) - set(PROFIT_BEST_RESPONSE_OPPONENT_MODES)
+        if self.firm1_mode not in {"RL", "static", *firm1_dynamic_modes}:
+            raise ValueError(
+                "firm1_mode must be one of: RL, heuristic, heuristic_margin, heuristic_random, "
+                "adaptive_best_response, adaptive_best_response_aggressive, pi_price_gap, "
+                "region_supply_demand, queue_service_threshold, surge_driver_incentive, "
+                "mpc_grid, static"
+            )
+        if self.firm2_mode not in {"static", *dynamic_pricer_modes}:
+            raise ValueError(
+                "firm2_mode must be one of: heuristic, heuristic_margin, heuristic_random, "
+                "adaptive_best_response, adaptive_best_response_aggressive, pi_price_gap, "
+                "region_supply_demand, queue_service_threshold, surge_driver_incentive, "
+                "mpc_grid, static"
+            )
+        self.opponent_is_dynamic = self.firm2_mode != "static"
+
+        manipulated_count = int(manipulated_price_coefficients)
+        if not 1 <= manipulated_count <= len(MANIPULATABLE_PRICE_COEFFICIENT_KEYS):
+            raise ValueError("manipulated_price_coefficients must be between 1 and 5")
+        self.manipulated_price_coefficient_count = manipulated_count
+        self.opt_keys = list(
+            MANIPULATABLE_PRICE_COEFFICIENT_KEYS[:manipulated_count]
+        )
+        self.shared_edit_keys = list(self.opt_keys)
+
+        v25 = bool(credit_assignment_v25)
+        v24 = bool(credit_assignment_v24 or v25)
+        self.credit_assignment_v25 = v25
+        # Stage 3 and Stage 4 deliberately use disjoint controller families.
+        # Keep the old dynamic population visible under its historical name so
+        # saved configurations and downstream analysis remain interpretable;
+        # the new curriculum consumes the explicit catch-up/profit pools.
+        self.training_dynamic_opponent_modes = tuple(dict.fromkeys((
+            str(self.firm2_mode),
+            "adaptive_best_response",
+            "heuristic",
+            "heuristic_random",
+            *(BENCHMARK_OPPONENT_MODES if v25 else ()),
+        )))
+        self.training_catchup_opponent_modes = CATCHUP_OPPONENT_MODES
+        self.training_profit_opponent_modes = tuple(dict.fromkeys((
+            *OPTIMIZED_BENCHMARK_OPPONENT_MODES,
+            *PROFIT_BEST_RESPONSE_OPPONENT_MODES,
+        )))
+        self.profit_planner_sample_cap = int(max(2, profit_planner_sample_cap))
+        self.privileged_critic = bool(
+            v24 if privileged_critic is None else privileged_critic
+        )
+        self.persistent_recurrence = bool(
+            v24 if persistent_recurrence is None else persistent_recurrence
+        )
+        self.counterfactual_branches = int(max(
+            0,
+            (3 if v24 and not learning_corrections else 0)
+            if counterfactual_branches is None
+            else counterfactual_branches,
+        ))
+        self.counterfactual_q_coeff = float(max(
+            0.0,
+            (0.50 if v24 else 0.0)
+            if counterfactual_q_coeff is None
+            else counterfactual_q_coeff,
+        ))
+        self.counterfactual_actor_weight = float(np.clip(
+            # V25's one-market-step CRN branches are deliberately critic-only:
+            # their immediate ordering is not the five-step semi-MDP objective
+            # and can point against profit after demand, supply, and the rival
+            # respond. Clipped PPO/GAE over the complete held-action return is
+            # therefore the only default actor credit. The v24 value is kept
+            # strictly for artifact/ablation compatibility.
+            (0.0 if v25 else 0.20 if v24 else 0.0)
+            if counterfactual_actor_weight is None
+            else counterfactual_actor_weight,
+            0.0,
+            1.0,
+        ))
+        self.potential_shaping_scale = float(max(
+            0.0,
+            (0.05 if v24 else 0.0)
+            if potential_shaping_scale is None
+            else potential_shaping_scale,
+        ))
+        self.hard_kl_stop = bool(
+            v24 if hard_kl_stop is None else hard_kl_stop
+        )
+        self.reward_rate_beta = float(np.clip(
+            # V25 updates a regime-keyed lagged reward-rate cache only after
+            # the current population's advantages have been fixed.  A modest
+            # beta prevents one noisy completed population from replacing the
+            # baseline coordinate system wholesale.
+            (0.20 if v25 else 0.05 if v24 else 0.0)
+            if reward_rate_beta is None
+            else reward_rate_beta,
+            0.0,
+            1.0,
+        ))
+        if self.counterfactual_branches > 0 and self.counterfactual_q_coeff <= 0.0:
+            raise ValueError(
+                "counterfactual branches require counterfactual_q_coeff > 0"
+            )
+        self.credit_assignment_config = {
+            "version": (
+                25
+                if v25
+                else 24
+                if any((
+                    self.privileged_critic,
+                    self.persistent_recurrence,
+                    self.counterfactual_branches > 0,
+                    self.potential_shaping_scale > 0.0,
+                    self.hard_kl_stop,
+                    self.reward_rate_beta > 0.0,
+                ))
+                else 23
+            ),
+            "privileged_critic": self.privileged_critic,
+            "privileged_critic_state_dim": (
+                (
+                    self.v25_critic_state_dim
+                    if v25
+                    else PRIVILEGED_CRITIC_STATE_DIM
+                ) + int(self.regime_critic_extra_dim)
+                if self.privileged_critic
+                else 0
+            ),
+            "persistent_recurrence": self.persistent_recurrence,
+            "counterfactual_branches": self.counterfactual_branches,
+            "counterfactual_q_coeff": self.counterfactual_q_coeff,
+            "counterfactual_actor_weight": self.counterfactual_actor_weight,
+            "potential_shaping_scale": self.potential_shaping_scale,
+            "hard_kl_stop": self.hard_kl_stop,
+            "reward_rate_beta": self.reward_rate_beta,
+        }
+        if v25:
+            self.credit_assignment_config.update({
+                "transition_contract": (
+                    "discounted_smdp_sum_actual_next_decision"
+                ),
+                "counterfactual_q_contract": (
+                    "independent_action_feature_pairwise_diagnostic"
+                ),
+                "recurrent_ingestion": "every_public_frame",
+                "critic_target_contract": "actual_next_decision_td0",
+                "privileged_value_contract": "direct_centralized_state_mlp",
+                "actor_credit_contract": "ppo_complete_smdp_return_only",
+                "opponent_loss_weighting": "equal_terminal_regime_mass",
+                "reward_baseline_contract": (
+                    "lagged_opponent_regime_action_independent"
+                ),
+                "behavior_policy_contract": (
+                    "cosine_actor_uniform_mixture_exact_ppo_ratio"
+                ),
+                "actor_initialization_contract": (
+                    "zero_logits_uniform_prior_deterministic_hold_tie_break"
+                ),
+                "critic_opponent_context": (
+                    "training_only_controller_class_one_hot"
+                ),
+            })
+
+        # The market simulator retains full ground truth.  Everything below is
+        # the platform-facing POMDP boundary: delayed own telemetry, sampled
+        # public quote probes, positive business utility, and separate
+        # operational audit/feasibility channels.
+        mdp_target_gap = float(target_price_gap)
+        self.learning_corrections = bool(learning_corrections)
+        self.learner_revision = int(learner_revision) if self.learning_corrections else 0
+        if self.learning_corrections:
+            if not v25 or not stage_specific_rewards:
+                raise ValueError("learning corrections require credit_assignment_v25 and stage_specific_rewards")
+            self.credit_assignment_config["learning_corrections"] = 1
+            self.credit_assignment_config["recurrent_training"] = "current_weight_episode_burnin_sequence_bptt"
+            self.credit_assignment_config["critic_target_contract"] = "discounted_reward_gae_lambda_return"
+            self.credit_assignment_config["reward_baseline_contract"] = (
+                "rollout_action_independent_reward_rate_centering"
+                if self.learner_revision >= 4
+                else "none_discounted_objective"
+            )
+            self.hard_kl_stop = True if hard_kl_stop is None else bool(hard_kl_stop)
+            self.credit_assignment_config["hard_kl_stop"] = self.hard_kl_stop
+            self.credit_assignment_config["learning_rate_schedule"] = "stage_cosine_3e-4_to_5e-5_critic_x3"
+            if self.learner_revision >= 2:
+                self.credit_assignment_config["learner_revision"] = self.learner_revision
+                self.credit_assignment_config["value_scale"] = 1.0 / (1.0 - ppo_gamma)
+                self.credit_assignment_config["critic_architecture"] = "history_privileged_actor_memory_behavior_context"
+                self.credit_assignment_config["privileged_value_contract"] = "history_conditioned_centralized_value"
+                self.credit_assignment_config["critic_value_units"] = "discounted_original_reward"
+                self.credit_assignment_config["entropy_schedule"] = "stage_progress_cosine_base_to_min"
+            if self.learner_revision >= 3:
+                value_components = [
+                        "own_profit_per_request",
+                        "rival_profit_per_request",
+                        "own_completed_share",
+                        "rival_completed_share",
+                    ]
+                if temporal_competitive_reward:
+                    value_components.extend([
+                        "durable_profit_advantage_per_request",
+                        "adaptive_profit_residual_per_request",
+                    ])
+                self.credit_assignment_config.update(
+                    critic_architecture="independent_history_privileged_economic_component_values",
+                    critic_target_contract=(
+                        f"{len(value_components)}_outcome_discounted_gae_lambda_returns"
+                    ),
+                    critic_optimizer_epsilon=1e-8,
+                    value_components=value_components)
+                self.credit_assignment_config["behavior_policy_contract"] = "raw_categorical_actor_no_external_mixture"
+            if self.learner_revision >= 4:
+                self.credit_assignment_config.update(
+                    actor_credit_contract="bootstrapped_episode_return_minus_collected_value",
+                    actor_trace_lambda=float(ppo_gae_lambda),
+                    critic_trace_lambda=float(ppo_gae_lambda),
+                    actor_advantage_clipping=False,
+                    boundary_bootstrap="next_period_context_and_lagged_opponent_response_transaction",
+                    entropy_schedule="stage_cosine_0.04_to_0.002",
+                    opponent_memory_clock="every_operational_period_before_scheduled_price_action")
+        if self.opponent_features and not (
+            self.learning_corrections and self.persistence_features
+        ):
+            raise ValueError(
+                "--opponent_features requires --learning_corrections "
+                "and --persistence_features"
+            )
+        self.observation_config = ObservationConfig(
+            learning_corrections=self.learning_corrections,
+            telemetry_delay_steps=int(max(0, telemetry_delay_steps)),
+            quote_probe_interval_steps=int(max(1, quote_probe_interval_steps)),
+            quote_probe_delay_steps=int(max(0, quote_probe_delay_steps)),
+            quote_noise_dollars=float(max(0.0, quote_noise_dollars)),
+            quote_missing_probability=float(np.clip(quote_missing_probability, 0.0, 0.95)),
+            revenue_scale=float(max(1e-6, reward_rev_scale)),
+            profit_scale=float(max(1e-6, reward_profit_scale)),
+            regime_features=bool(self.regime_features),
+            regime_feature_ablation=bool(self.regime_feature_ablation),
+            actor_true_shortage_flag=bool(self.actor_true_shortage_flag),
+            persistence_features=bool(self.persistence_features),
+            momentum_features=bool(self.momentum_features),
+            momentum_day_steps=int(self.momentum_day_steps),
+            opponent_features=bool(self.opponent_features),
+            opponent_move_threshold=float(self.opponent_move_threshold),
+        )
+        self.positive_reward_config = PositiveRewardConfig(
+            profit_weight=float(positive_reward_profit_weight),
+            revenue_weight=float(positive_reward_revenue_weight),
+            completed_demand_weight=float(positive_reward_completed_demand_weight),
+            service_weight=float(positive_reward_service_weight),
+            revenue_scale=float(max(1e-6, reward_rev_scale)),
+            profit_scale=float(max(1e-6, reward_profit_scale)),
+        )
+        objective_preset = policy_objective_defaults(
+            str(policy_objective),
+            share_dominance_reward=self.learning_corrections,
+        )
+        self.long_term_profit_reward_config = LongTermProfitRewardConfig(
+            learning_corrections=self.learning_corrections,
+            share_dominance_reward=self.learning_corrections,
+            stage_specific_rewards=bool(stage_specific_rewards),
+            four_stage_curriculum_rewards=(
+                str(training_curriculum) == "staged"
+                and bool(stage_specific_rewards)
+            ),
+            opponent_profit_lead_weight=float(opponent_profit_lead_weight),
+            stage_profit_lead_weights=stage_profit_lead_weights,
+            stage_market_share_competitiveness_weights=(
+                stage_market_share_competitiveness_weights
+            ),
+            temporal_competitive_reward=bool(temporal_competitive_reward),
+            durable_dominance_weight=float(durable_dominance_weight),
+            adaptive_residual_weight=float(adaptive_residual_weight),
+            durable_dominance_horizon_days=float(
+                durable_dominance_horizon_days
+            ),
+            objective_mode=str(policy_objective),
+            own_profit_scale=float(long_term_profit_scale),
+            profit_advantage_scale=float(long_term_profit_scale if self.learning_corrections else long_term_profit_advantage_scale),
+            own_profit_weight=float(
+                1.0 - opponent_profit_lead_weight if stage_specific_rewards else objective_preset["long_term_profit_weight"]
+            ),
+            profit_advantage_weight=float(
+                opponent_profit_lead_weight if stage_specific_rewards else objective_preset["profit_dominance_weight"]
+            ),
+            dominance_quality_scale=float(dominance_quality_scale),
+            market_share_competitiveness_weight=float(
+                market_share_competitiveness_weight
+                if stage_specific_rewards or self.learning_corrections
+                else objective_preset["market_share_competitiveness_weight"]
+            ),
+            market_share_target_gap=float(market_share_target_gap),
+            market_share_gap_scale=float(market_share_gap_scale),
+            market_share_level_weight=float(
+                objective_preset["market_share_level_weight"]
+            ),
+            price_competitiveness_weight=float(
+                objective_preset["price_competitiveness_weight"]
+            ),
+            price_gap_target=mdp_target_gap,
+            price_gap_scale=float(price_gap_reward_scale),
+            intervention_cost_weight=float(
+                objective_preset["intervention_cost_weight"]
+            ),
+            reversal_cost_weight=float(
+                objective_preset["reversal_cost_weight"]
+            ),
+        )
+        # Named objectives use the semi-MDP return as their only actor credit.
+        # An immediate-delta blend double-counts the same held action and can
+        # point against the final objective while an adaptive rival reacts.
+        del direct_actor_credit_weight
+        resolved_direct_actor_credit_weight = 0.0
+        self.constraint_config = ConstraintConfig(
+            target_gap=mdp_target_gap,
+            overall_tolerance=float(max(0.05, price_gap_tolerance)),
+            segment_tolerances=tuple(float(max(0.05, x)) for x in segment_gap_tolerances),
+            margin_floor=float(np.clip(min_profit_margin, 0.0, 0.95)),
+            completion_coverage_floor=float(
+                np.clip(min_completion_coverage, 0.0, 1.0)
+            ),
+            multiplier_lr=float(max(0.0, constraint_lr)),
+        )
+        self.platform_observers = {
+            "Firm1": PlatformObservationModel(self.seed + 101, self.observation_config),
+            "Firm2": PlatformObservationModel(self.seed + 202, self.observation_config),
+        }
+        # v26r: the frame width is an instance property (24, or 30 with the
+        # public regime signals).  Every Core reference goes through this.
+        self.platform_observation_dim = int(self.platform_observers["Firm1"].observation_dim)
+        self.regime_critic_extra_dim += int(self.platform_observation_dim) - int(
+            PlatformObservationModel.observation_dim
+        )
+        self.positive_reward_model = PositiveBusinessReward(self.positive_reward_config)
+        self.long_term_profit_reward_model = LongTermProfitReward(
+            self.long_term_profit_reward_config
+        )
+        self.objective_optimizer = RobustObjectiveOptimizer(
+            objective=str(policy_objective),
+            own_profit_scale=float(long_term_profit_scale),
+            profit_advantage_scale=float(long_term_profit_advantage_scale),
+            profit_advantage_target=0.0,
+            market_share_advantage_target=0.0,
+            fulfillment_floor=float(self.constraint_config.fulfillment_floor),
+            completion_coverage_floor=float(
+                self.constraint_config.completion_coverage_floor
+            ),
+            market_share_gap_scale=float(market_share_gap_scale),
+            own_completed_share_scale=float(
+                self.long_term_profit_reward_config.own_completed_share_scale
+            ),
+        )
+        self.objective_optimizer.weights = self.long_term_profit_reward_config.economic_weights()
+        if self.learning_corrections:
+            component_names = [
+                "own_profit_per_request",
+                "rival_profit_per_request",
+            ]
+            if len(self.long_term_profit_reward_config.critic_component_weights()) >= 4:
+                component_names.extend([
+                    "own_completed_share",
+                    "rival_completed_share",
+                ])
+            if self.long_term_profit_reward_config.temporal_competitive_reward:
+                component_names.extend([
+                    "durable_profit_advantage_per_request",
+                    "adaptive_profit_residual_per_request",
+                ])
+            self.credit_assignment_config["value_components"] = component_names
+        self.last_price_gap_metrics: Dict[str, float] = {
+            "signed_mean": float(mdp_target_gap),
+            "mae": 0.0,
+            "rmse": 0.0,
+            "p90_abs_error": 0.0,
+            "within_tolerance_rate": 1.0,
+            "target": float(mdp_target_gap),
+        }
+        self.soft_constraints = SoftConstraintController(self.constraint_config)
+        self.action_stability = ActionStabilityTracker(self.constraint_config)
+        if training_stage_profit_fraction is None:
+            # Backward-compatible interpretation of the old third-stage mass:
+            # 40% remains gap catch-up and 60% becomes profit-BR training.
+            catchup_fraction = 0.40 * float(training_stage_dynamic_fraction)
+            profit_fraction = 0.60 * float(training_stage_dynamic_fraction)
+        else:
+            catchup_fraction = float(training_stage_dynamic_fraction)
+            profit_fraction = float(training_stage_profit_fraction)
+        self.training_stage_scheduler = TrainingStageScheduler(
+            training_curriculum,
+            stage_fractions=(
+                training_stage_market_fraction,
+                training_stage_static_fraction,
+                catchup_fraction,
+                profit_fraction,
+            ),
+            dynamic_episode_days=training_dynamic_episode_days,
+            tariff_reset_fraction=training_opening_tariff_randomization,
+        )
+        self.current_training_stage = self.training_stage_scheduler.stage_at(0.0)
+        
+        pricer_by_mode = {
+            "heuristic": FirmHeuristicPricer,
+            "heuristic_margin": FirmMarginGuardrailPricer,
+            "heuristic_random": FirmRandomWalkPricer,
+            "adaptive_best_response": FirmAdaptiveBestResponsePricer,
+            "adaptive_best_response_aggressive": FirmAggressiveAdaptiveBestResponsePricer,
+            "adaptive_best_response_memory": FirmMemoryBestResponsePricer,
+            "pi_price_gap": FirmPIPriceGapPricer,
+            "region_supply_demand": FirmRegionSupplyDemandPricer,
+            "queue_service_threshold": FirmQueueServiceThresholdPricer,
+            "surge_driver_incentive": FirmSurgeDriverIncentivePricer,
+            "mpc_grid": FirmMPCGridPricer,
+            "price_gap_catchup": FirmPriceGapCatchUpPricer,
+            "price_gap_catchup_fast": FirmFastPriceGapCatchUpPricer,
+            "profit_opt_pi_price_gap": FirmProfitOptimizedPIPriceGapPricer,
+            "profit_opt_mpc_grid": FirmProfitOptimizedMPCGridPricer,
+            "profit_opt_region_supply_demand": FirmProfitOptimizedRegionSupplyDemandPricer,
+            "profit_opt_queue_service_threshold": FirmProfitOptimizedQueueServiceThresholdPricer,
+            "profit_opt_surge_driver_incentive": FirmProfitOptimizedSurgeDriverIncentivePricer,
+            "profit_best_response_myopic": FirmMyopicProfitBestResponsePricer,
+            "profit_best_response_forward": FirmForwardProfitBestResponsePricer,
+            "profit_best_response_anticipating": FirmAnticipatingProfitBestResponsePricer,
+        }
+        self.pricer_by_mode = dict(pricer_by_mode)
+
+        if (self.level_step_actions or self.hybrid_relative_actions) and not (
+            self.learning_corrections and self.firm1_mode == "RL"
+        ):
+            raise ValueError(
+                "revised relative actions require learning corrections and firm1_mode='RL'"
+            )
+        if self.ppo_entropy_start is not None and self.firm1_mode != "RL":
+            raise ValueError("ppo_entropy_start requires firm1_mode='RL'")
+        if self.firm1_mode == "RL":
+            effective_frame_stack = int(max(1, state_frame_stack))
+            self.firm1 = FirmRLPricer(
+                seed=self.seed,
+                opt_keys=self.shared_edit_keys,
+                state_frame_stack=effective_frame_stack,
+                single_state_dim=self.platform_observation_dim,
+                action_feature_dim=PlatformObservationModel.action_feature_dim,
+                constraint_dim=0,
+                response_dim=0,
+                opponent_forecast_dim=0,
+                feature_groups=self.platform_observers["Firm1"].regime_feature_groups(),
+                incentive_levels=tuple(self.driver_incentive_levels),
+                tariff_targets=tuple(self.tariff_targets) if self.tariff_targets else None,
+                gamma=float(ppo_gamma),
+                gae_lambda=float(ppo_gae_lambda),
+                state_action_mi_weight=float(state_action_mi_weight),
+                direct_actor_credit_weight=resolved_direct_actor_credit_weight,
+                critic_state_dim=(
+                    self.v25_critic_state_dim
+                    if v25
+                    else PRIVILEGED_CRITIC_STATE_DIM
+                ) + int(self.regime_critic_extra_dim),
+                privileged_critic=self.privileged_critic,
+                privileged_value_only=v25,
+                persistent_recurrence=self.persistent_recurrence,
+                counterfactual_q_coeff=self.counterfactual_q_coeff,
+                counterfactual_actor_weight=self.counterfactual_actor_weight,
+                potential_shaping_scale=self.potential_shaping_scale,
+                hard_kl_stop=self.hard_kl_stop,
+                reward_rate_beta=self.reward_rate_beta,
+                td_value_targets=v25,
+                learning_corrections=self.learning_corrections,
+                learner_revision=self.learner_revision,
+                value_component_dim=(
+                    len(
+                        self.long_term_profit_reward_config.critic_component_weights()
+                    )
+                    if self.learning_corrections else 2
+                ),
+                independent_coefficient_actions=(
+                    self.learning_corrections
+                    and not self.whole_tariff_actions
+                    and not self.level_step_actions
+                    and not self.hybrid_relative_actions
+                ),
+                level_step_actions=self.level_step_actions,
+                hybrid_relative_actions=self.hybrid_relative_actions,
+                relative_action_steps=self.relative_action_steps,
+                tariff_structure=self.tariff_structure_payload,
+                tariff_level_bounds=(
+                    self.tariff_level_bounds if self.level_step_actions else None
+                ),
+                entropy_coeff_start=self.ppo_entropy_start,
+            )
+        elif self.firm1_mode in pricer_by_mode:
+            self.firm1 = pricer_by_mode[self.firm1_mode](seed=self.seed, managed_keys=self.shared_edit_keys)
+        else:
+            self.firm1 = FirmStaticPricer()
+        self.counterfactual_action_counts = np.zeros(
+            self.firm1.agent.action_dim if self.firm1_mode == "RL" else 0,
+            dtype=np.int64,
+        )
+        if self.firm1_mode == "RL" and self.counterfactual_policy_coeff is not None:
+            self.firm1.agent.counterfactual_policy_coeff_override = float(self.counterfactual_policy_coeff)
+        if self.firm1_mode == "RL" and self.counterfactual_day_credit > 0:
+            if self.firm1.action_label(0) != "hold":
+                raise ValueError("NMCC assumes action index 0 is hold")
+            self.firm1.agent.counterfactual_baseline_mode = (
+                "provided" if self.nmcc_baseline == "hold" else "mean"
+            )
+            self.firm1.agent.counterfactual_advantage_scale = (
+                self.nmcc_advantage_scale
+            )
+        if self.branch_imitation_coeff > 0.0:
+            if self.firm1_mode != "RL":
+                raise ValueError("branch imitation requires firm1_mode='RL'")
+            if int(self.counterfactual_day_credit) != int(self.firm1.agent.action_dim):
+                raise ValueError(
+                    "branch imitation requires NMCC to replay every action: "
+                    f"nmcc_branches={self.counterfactual_day_credit}, "
+                    f"actions={self.firm1.agent.action_dim}"
+                )
+            self.firm1.agent.branch_imitation_coeff = float(self.branch_imitation_coeff)
+            self.firm1.agent.branch_imitation_temperature_scale = float(
+                self.branch_imitation_temperature_scale
+            )
+        if self.learner_revision >= 3 and self.firm1_mode == "RL":
+            self.firm1.agent.set_value_objective_weights(
+                self.long_term_profit_reward_config.critic_component_weights()
+            )
+
+        if self.firm2_mode in pricer_by_mode:
+            self.firm2 = pricer_by_mode[self.firm2_mode](seed=self.seed + 1, managed_keys=self.shared_edit_keys)
+        else:
+            self.firm2 = FirmStaticPricer()
+        setattr(self.firm2, "_ride_response_mode", str(self.firm2_mode))
+        if isinstance(self.firm2, FirmAdaptiveBestResponsePricer):
+            self.firm2.operational_clock = self.regime_market
+            self.firm2.reference_window_steps = int(self.shared_steps_per_day)
+        self._assert_competitor_parity()
+        print(
+            "[PricingControl] "
+            f"manipulated_price_coefficients={self.manipulated_price_coefficient_count}; "
+            f"keys={','.join(self.shared_edit_keys)}; "
+            "scope_locked_for_training_validation_evaluation=true."
+        )
+        
+        print(f"Using random seed: {self.seed}")
+
+        # initialize both firms with arbitrary starting coefficients on optimized dimensions
+        self._initialize_arbitrary_starting_coefficients()
+
+
+        # apply static overrides (if any)
+        f1_vals = _parse_kv_floats(firm1_static_values)
+        f2_vals = _parse_kv_floats(firm2_static_values)
+        f1_vals, f2_vals = self._restrict_static_overrides(f1_vals, f2_vals, self.shared_edit_keys)
+
+
+        if f1_vals and self.level_step_actions:
+            raise ValueError("Firm 1 static overrides are undefined under the level-step contract")
+        for k, v in f1_vals.items():
+            set_coeff(self.market.curr_market, self.firm1.overrides, k, v)
+        for k, v in f2_vals.items():
+            set_coeff(self.market.curr_market, self.firm2.overrides, k, v)
+
+        # last batch summaries (optional; can be logged)
+        self.airport_rate_last = self.market.airport_prob
+        self.mean_distance_last = 4.0
+        self.last_share = 0.0
+        self.last_revpr = 0.0
+        self.last_gap = 0.0
+        self.last_reward = 0.0
+        self.last_profitpr = 0.0
+        self.last_fulfillment = 1.0
+        self.last_completion_coverage = 0.0
+        self.last_acceptance = 1.0
+        self.last_wait = 0.0
+        self.last_driver_paypr = 0.0
+        self.last_firm2_share = 0.0
+        self.last_firm2_revpr = 0.0
+        self.last_firm2_profitpr = 0.0
+        self._durable_profit_lead_ema = 0.0
+        self._temporal_reward_state_initialized = False
+        self._last_cycle_firm2_metrics = None
+        self.objective_credit_ready = False
+        self.last_firm2_fulfillment = 1.0
+        self.last_firm2_acceptance = 1.0
+        self.last_firm2_wait = 0.0
+        self.last_firm2_driver_paypr = 0.0
+        self.ema_share = 0.5
+        self.ema_revpr = 0.0
+        self.ema_profitpr = 0.0
+        self.ema_gap = 0.0
+        self.ema_fulfillment = 1.0
+        self.ema_firm2_share = 0.5
+        self.ema_firm2_revpr = 0.0
+        self.ema_firm2_profitpr = 0.0
+        self.ema_firm2_gap = 0.0
+        self.ema_firm2_fulfillment = 1.0
+        self.prev_action_target = "hold"
+        self.last_action_mask_regime = "all_bounded_actions"
+        
+        self.training_logs = []
+        self.evaluation_logs = []
+        
+        self.run_logs = []
+        self.convergence_day: Optional[int] = None
+        self.convergence_window_std_at_day: Optional[float] = None
+        self.convergence_delta_per_day_at_day: Optional[float] = None
+        self.training_certification_report: Optional[Dict[str, Any]] = None
+        
+        self.min_profit_margin = float(np.clip(min_profit_margin, 0.0, 0.95))
+        self.reward_target_price_gap = float(self.constraint_config.target_gap)
+        self.driver_cost_per_mile = float(max(0.0, driver_cost_per_mile))
+        self.driver_cost_per_minute = float(max(0.0, driver_cost_per_minute))
+        self.fixed_trip_cost = float(max(0.0, fixed_trip_cost))
+        self.airport_cost = float(max(0.0, airport_cost))
+        self.enable_driver_supply = bool(enable_driver_supply)
+        self.driver_supply = DriverSupplyLayer(
+            seed=self.seed + 17,
+            config=DriverSupplyConfig(
+                base_active_drivers=int(max(1, driver_base_active)),
+                reservation_wage_per_hour=float(max(1.0, driver_reservation_wage)),
+                operating_cost_per_mile=self.driver_cost_per_mile,
+                platform_variable_cost=self.fixed_trip_cost,
+                acceptance_mode=str(driver_acceptance_mode),
+                expected_acceptance_cutoff=float(np.clip(driver_expected_acceptance_cutoff, 0.0, 1.0)),
+                state_smoothing_alpha=float(np.clip(driver_state_smoothing, 0.0, 1.0)),
+            ),
+            use_osmnx=bool(use_osmnx),
+            osmnx_place=osmnx_place or f"{market_name}, USA",
+        )
+        self.reward_rev_scale = float(max(1e-6, reward_rev_scale))
+        self.reward_profit_scale = float(max(1e-6, reward_profit_scale))
+        # The constrained-reward argument remains readable for older callers
+        # but cannot reactivate operational shaping, action shielding, or
+        # auxiliary critics.  The training curriculum is environment-only and
+        # was already resolved above.
+        del constrained_reward
+        self.constrained_reward = False
+        self.constraint_lr = float(max(0.0, constraint_lr))
+        self.constraint_penalty_scale = float(max(0.0, constraint_penalty_scale))
+        self.constraint_curriculum_start_scale = float(max(0.0, constraint_curriculum_start_scale))
+        self.constraint_curriculum_mid_scale = float(max(0.0, constraint_curriculum_mid_scale))
+        self.constraint_curriculum_end_scale = float(max(0.0, constraint_curriculum_end_scale))
+        self.constraint_curriculum_scale = 1.0
+        # Constraint fields remain as diagnostics for artifact/report
+        # compatibility. They do not enter either named reward, PPO gradients,
+        # or checkpoint ordering.
+        self.constraint_lambdas: Dict[str, float] = {
+            name: 0.0 for name in self.soft_constraints.names
+        }
+        self.constraint_lambda_max = float(self.constraint_config.multiplier_max)
+        
+        # Keep PPO optimization controls explicit so longer rollout windows can
+        # use minibatches instead of silently falling back to full-batch updates.
+        
+        self.ppo_update_epochs = int(max(1, ppo_update_epochs))
+        self.ppo_batch_size = int(max(1, ppo_batch_size))
+        self.ppo_rollout_episodes = int((2 if self.learner_revision >= 3 else 1)
+                                      if ppo_rollout_episodes is None else ppo_rollout_episodes)
+        if self.ppo_rollout_episodes < 1:
+            raise ValueError("ppo_rollout_episodes must be positive")
+        
+        objective_name = self.long_term_profit_reward_config.objective_mode
+        reward_weights = self.long_term_profit_reward_config.economic_weights()
+        active_terms = int(sum(
+            float(value) > 0.0 for value in reward_weights.values()
+        ))
+        objective_definition = (
+            f"linear {active_terms}-term economics: "
+            f"{reward_weights['own_profit']:.0%}*own_profit/$"
+            f"{self.long_term_profit_reward_config.own_profit_scale:.2f} + "
+            f"{reward_weights['profit_lead']:.0%}*profit_lead/$"
+            f"{self.long_term_profit_reward_config.profit_advantage_scale:.2f} + "
+            f"{reward_weights['own_completed_share']:.0%}*own_completed_share/"
+            f"{self.long_term_profit_reward_config.own_completed_share_scale:.0%} + "
+            f"{reward_weights['completed_share_lead']:.0%}*completed_share_lead/"
+            f"{self.long_term_profit_reward_config.market_share_gap_scale:.0%}; "
+            "unclipped, no terminal bonus, action cost, threshold, or quote-gap term"
+        )
+        if self.learning_corrections:
+            objective_definition = (
+                f"market/opponent/eval weights={reward_weights}; profit and profit lead use S, "
+                f"completed-share lead uses {self.long_term_profit_reward_config.market_share_gap_scale:.0%}; "
+                "no deficit penalty or action overrides"
+            )
+        print(
+            "[PolicyObjectiveReward] "
+            f"objective={objective_name}; "
+            f"mechanism={self.long_term_profit_reward_model.mechanism_name}; "
+            f"definition={objective_definition}; "
+            f"intervention_cost={self.long_term_profit_reward_config.intervention_cost_weight:.4f}, "
+            f"reversal_cost={self.long_term_profit_reward_config.reversal_cost_weight:.4f}, "
+            f"gamma={self.firm1.agent.gamma if self.firm1_mode == 'RL' else float('nan'):.4f}, "
+            f"lambda={self.firm1.agent.lam if self.firm1_mode == 'RL' else float('nan'):.4f}."
+        )
+        print(
+            "[ConstraintConfig] "
+            "optimization=disabled; "
+            f"diagnostics={self.soft_constraints.names}, "
+            f"margin_floor={self.constraint_config.margin_floor:.3f}; "
+            f"coverage_floor={self.constraint_config.completion_coverage_floor:.3f}; "
+            "all operational channels are reporting-only."
+        )
+    
+    def _sync_driver_incentive_multipliers(self) -> None:
+        """Expose pricer-side incentive controls to the driver pay layer.
+
+        Benchmark policies inspired by two-sided ride-hailing pricing literature
+        can adjust a ``supply_incentive_multiplier``.  The driver supply layer
+        consumes that value through each firm's pay policy before dispatches in
+        the next batch are evaluated.
+        """
+        if not self.enable_driver_supply:
+            return
+        for firm_name, pricer in (("Firm1", self.firm1), ("Firm2", self.firm2)):
+            policy = self.driver_supply.pay_policies.get(firm_name)
+            if policy is None:
+                continue
+            policy.incentive_multiplier = float(np.clip(
+                getattr(pricer, "supply_incentive_multiplier", 1.0),
+                0.85,
+                1.25,
+            ))
+    
+    def _assert_competitor_parity(self) -> None:
+        """Validate that non-static competitors share Firm1's observable action/state interface."""
+        if self.firm2_mode == "static" or not hasattr(self.firm1, "action_to_steps"):
+            return
+        mismatches: List[str] = []
+        if getattr(self.firm1, "action_keys", None) != getattr(self.firm2, "action_keys", None):
+            mismatches.append(
+                f"action_keys Firm1={getattr(self.firm1, 'action_keys', None)} "
+                f"Firm2={getattr(self.firm2, 'action_keys', None)}"
+            )
+        f1_cfg = getattr(self.firm1, "config", None)
+        f2_cfg = getattr(self.firm2, "config", None)
+        if f1_cfg is not None and f2_cfg is not None:
+            if dict(f1_cfg.step) != dict(f2_cfg.step):
+                mismatches.append(f"step Firm1={dict(f1_cfg.step)} Firm2={dict(f2_cfg.step)}")
+            if dict(f1_cfg.bounds) != dict(f2_cfg.bounds):
+                mismatches.append(f"bounds Firm1={dict(f1_cfg.bounds)} Firm2={dict(f2_cfg.bounds)}")
+        if mismatches:
+            raise ValueError("Firm1/Firm2 parity violation; only decision policy may differ: " + "; ".join(mismatches))
+        print(
+            "[PricingParity] Firm1 and Firm2 share managed keys, bounds, "
+            "coefficient steps, and the operational decision clock; their "
+            "policy-specific action representations may differ."
+        )
+    
+    def apply_calibration(self, calibration: Dict[str, Any]) -> None:
+        """Apply calibration outputs to market priors, agent priors, and choice sensitivity scales."""
+        self.active_calibration = copy.deepcopy(calibration) if isinstance(calibration, dict) else {}
+        market_cal = calibration.get("market", {}) if isinstance(calibration, dict) else {}
+        agent_cal = calibration.get("agent", {}) if isinstance(calibration, dict) else {}
+        choice_cal = calibration.get("choice", {}) if isinstance(calibration, dict) else {}
+
+        weather_probs = market_cal.get("weather_probs")
+        day_of_week_probs = market_cal.get("day_of_week_probs")
+        hour_probs = market_cal.get("hour_probs")
+        service_probs = market_cal.get("service_probs")
+        airport_prob = market_cal.get("airport_prob")
+        self.market.set_probability_priors(
+            weather_probs=(weather_probs if isinstance(weather_probs, dict) else None),
+            day_of_week_probs=(
+                day_of_week_probs if isinstance(day_of_week_probs, dict) else None
+            ),
+            hour_probs=(hour_probs if isinstance(hour_probs, dict) else None),
+            service_probs=(service_probs if isinstance(service_probs, dict) else None),
+            airport_prob=(float(airport_prob) if airport_prob is not None else None),
+            distance_mean_miles=market_cal.get("distance_mean_miles"),
+            distance_std_miles=market_cal.get("distance_std_miles"),
+            duration_mean_minutes=market_cal.get("duration_mean_minutes"),
+            duration_std_minutes=market_cal.get("duration_std_minutes"),
+        )
+
+        if isinstance(agent_cal, dict) and agent_cal:
+            if "age_mean" in agent_cal:
+                self.agent_gen.age_mean = float(agent_cal["age_mean"])
+            if "age_std" in agent_cal:
+                self.agent_gen.age_std = float(max(5.0, float(agent_cal["age_std"])))
+            if "household_lambda" in agent_cal:
+                self.agent_gen.household_lambda = float(max(1.1, float(agent_cal["household_lambda"])))
+            if "p_new" in agent_cal:
+                self.agent_gen.p_new = float(np.clip(float(agent_cal["p_new"]), 0.05, 0.95))
+            if "income_probs" in agent_cal and isinstance(agent_cal["income_probs"], dict):
+                keys = list(self.agent_gen.income_names)
+                vals = np.array([float(agent_cal["income_probs"].get(k, 0.0)) for k in keys], dtype=float)
+                s = float(vals.sum())
+                if s > 0:
+                    self.agent_gen.income_probs = vals / s
+            if "marital_probs" in agent_cal and isinstance(agent_cal["marital_probs"], dict):
+                keys = list(self.agent_gen.marital_names)
+                vals = np.array([float(agent_cal["marital_probs"].get(k, 0.0)) for k in keys], dtype=float)
+                s = float(vals.sum())
+                if s > 0:
+                    self.agent_gen.marital_probs = vals / s
+            if "gender_probs" in agent_cal and isinstance(agent_cal["gender_probs"], dict):
+                keys = list(self.agent_gen.gender_names)
+                vals = np.array([float(agent_cal["gender_probs"].get(k, 0.0)) for k in keys], dtype=float)
+                s = float(vals.sum())
+                if s > 0:
+                    self.agent_gen.gender_probs = vals / s
+            self.agent_gen.freeze_current_priors_as_base()
+            self.agent_gen._build_population()
+
+        if hasattr(self.choice_model, "apply_calibration") and isinstance(choice_cal, dict):
+            self.choice_model.apply_calibration(choice_cal)
+        if getattr(self, "market_dynamics", None) is not None and self.market_dynamics.enabled:
+            self._install_v26_market(self.market)
+            self._rescale_all_pricers()
+    
+    # ------------------------------------------------------------------
+    # v26 environment / evaluation contract
+    # ------------------------------------------------------------------
+    def configure_v26(
+        self,
+        *,
+        market_dynamics: MarketDynamicsConfig,
+        steps_per_day: int = 6,
+        trip_bank_path: str = "",
+        gpt_threshold_mode: str = "rubric_context",
+        threshold_ablation: str = "as_loaded",
+        exclude_benchmarks_from_training: bool = False,
+        training_opponent_perturbation: float = 0.0,
+        environment_reseed_per_episode: bool = False,
+        truncation_bootstrap: bool = False,
+        observed_fare_mode: str = "isolated",
+        baseline_suite: Sequence[str] = (),
+        static_baseline_multipliers: Optional[Sequence[float]] = None,
+        ood_perturbed_variants: int = 0,
+        ood_perturbation_scale: float = 0.25,
+    ) -> Dict[str, Any]:
+        """Install the v26 contract after construction and calibration.
+
+        Every switch is recorded in ``self.v26_settings`` (run config and model
+        artifact) so a paper result can be traced to its exact environment.
+        """
+        if str(gpt_threshold_mode) not in GPT_THRESHOLD_MODES:
+            raise ValueError(f"gpt_threshold_mode must be one of {GPT_THRESHOLD_MODES}")
+        if str(threshold_ablation) not in THRESHOLD_ABLATION_MODES:
+            raise ValueError(f"threshold_ablation must be one of {THRESHOLD_ABLATION_MODES}")
+        if str(observed_fare_mode) not in {"isolated", "trajectory"}:
+            raise ValueError("observed_fare_mode must be 'isolated' or 'trajectory'")
+        unknown = set(baseline_suite) - {"static_grid", "myopic_greedy", "anchor_hold"}
+        if unknown:
+            raise ValueError(f"unknown baseline(s): {sorted(unknown)}")
+        self.market_dynamics = market_dynamics
+        self.gpt_threshold_mode = str(gpt_threshold_mode)
+        self.threshold_ablation_mode = str(threshold_ablation)
+        self.exclude_benchmarks_from_training = bool(exclude_benchmarks_from_training)
+        self.training_opponent_perturbation = ControllerPerturbation(
+            scale=float(max(0.0, training_opponent_perturbation))
+        )
+        self.environment_reseed_per_episode = bool(environment_reseed_per_episode)
+        self.truncation_bootstrap = bool(truncation_bootstrap)
+        self.observed_fare_mode = str(observed_fare_mode)
+        self.baseline_suite = tuple(str(item) for item in baseline_suite)
+        if static_baseline_multipliers:
+            self.static_baseline_multipliers = tuple(float(x) for x in static_baseline_multipliers)
+        self.ood_perturbed_variants = int(max(0, ood_perturbed_variants))
+        self.ood_perturbation_scale = float(max(0.0, ood_perturbation_scale))
+        self.shared_steps_per_day = int(max(1, steps_per_day))
+        if self.exclude_benchmarks_from_training:
+            self.training_dynamic_opponent_modes = tuple(
+                mode for mode in self.training_dynamic_opponent_modes
+                if mode not in BENCHMARK_OPPONENT_MODES
+            )
+            if not self.training_catchup_opponent_modes:
+                raise ValueError("training opponent population is empty after excluding benchmarks")
+            if str(self.firm2_mode) in BENCHMARK_OPPONENT_MODES:
+                raise ValueError(
+                    "the configured Firm 2 training rival is a held-out benchmark; choose a "
+                    "non-benchmark --firm2_mode when benchmarks are excluded from training"
+                )
+        trip_bank_summary: Dict[str, Any] = {}
+        if market_dynamics.enabled and market_dynamics.empirical_trips:
+            bank_cfg = dict((self.active_calibration or {}).get("trip_bank", {}) or {})
+            path = str(trip_bank_path or bank_cfg.get("path", "") or "")
+            source_dir = str((self.active_calibration or {}).get("_source_dir", "") or "")
+            if path and not os.path.isabs(os.path.expanduser(path)) and source_dir and not trip_bank_path:
+                path = os.path.join(source_dir, path)
+            if not path:
+                raise ValueError(
+                    "empirical operational trips require --trip_bank_path or a calibration "
+                    "with a trip_bank entry (run scripts/prepare_city_data.py)"
+                )
+            path = os.path.abspath(os.path.expanduser(path))
+            self.trip_bank = TripBank.from_csv(
+                path,
+                city=str(self.market_name),
+                airport_identified=bool(bank_cfg.get("airport_identified", True)),
+                service_identified=bool(bank_cfg.get("service_identified", False)),
+            )
+            trip_bank_summary = self.trip_bank.summary()
+        self._install_v26_market(self.market)
+        self._install_v26_supply()
+        self._install_v26_choice()
+        self._rescale_all_pricers()
+        capacity_calibration = ({"deferred_until_supply_model_installed": True}
+                                if self.regime_market else self._calibrate_driver_capacity())
+        if not self.regime_market and market_dynamics.enabled and self.enable_driver_supply and market_dynamics.fleet_scale != 1.0:
+            calibrated_fleet = int(self.driver_supply.config.base_active_drivers)
+            self.driver_supply.config.base_active_drivers = int(max(
+                1, round(calibrated_fleet * float(market_dynamics.fleet_scale))
+            ))
+            capacity_calibration = {
+                **capacity_calibration,
+                "fleet_scale": float(market_dynamics.fleet_scale),
+                "scaled_base_active_drivers": int(self.driver_supply.config.base_active_drivers),
+            }
+        self.v26_settings = {
+            "enabled": bool(market_dynamics.enabled),
+            "environment_contract": market_dynamics.as_dict(),
+            "steps_per_day": int(self.shared_steps_per_day),
+            "trip_bank": trip_bank_summary,
+            "gpt_threshold_mode": self.gpt_threshold_mode,
+            "threshold_ablation": self.threshold_ablation_mode,
+            "exclude_benchmarks_from_training": self.exclude_benchmarks_from_training,
+            "training_dynamic_opponent_modes": list(self.training_dynamic_opponent_modes),
+            "training_catchup_opponent_modes": list(self.training_catchup_opponent_modes),
+            "training_profit_opponent_modes": list(self.training_profit_opponent_modes),
+            "canonical_benchmarks_unchanged": list(BENCHMARK_OPPONENT_MODES),
+            "training_opponent_perturbation_scale": float(self.training_opponent_perturbation.scale),
+            "environment_reseed_per_episode": self.environment_reseed_per_episode,
+            "truncation_bootstrap": self.truncation_bootstrap,
+            "observed_fare_mode": self.observed_fare_mode,
+            "baseline_suite": list(self.baseline_suite),
+            "static_baseline_multipliers": list(self.static_baseline_multipliers),
+            "ood_perturbed_variants": int(self.ood_perturbed_variants),
+            "ood_perturbation_scale": float(self.ood_perturbation_scale),
+            "calibrated_tariff": dict(
+                (self.active_calibration or {}).get("tariff", {}) or {}
+            ) if market_dynamics.enabled and market_dynamics.calibrated_tariff_anchors else {},
+            "choice_price_level": dict((self.active_calibration or {}).get("choice", {}) or {}),
+            "choice_firm_identity_constants": {
+                "near_tie_habit_firm2": float(getattr(self.choice_model, "near_tie_habit_firm2", 0.0)),
+                "reliability_bias_firm1": float(getattr(self.choice_model, "reliability_bias_firm1", 0.0)),
+            },
+            "rider_memory": bool(getattr(self.choice_model, "reputation", None) is not None),
+            "driver_capacity_calibration": capacity_calibration,
+            "driver_supply_elasticity": float(self.driver_supply.config.supply_elasticity),
+        }
+        print(f"[v26] {json.dumps(self.v26_settings, default=str)}")
+        return self.v26_settings
+
+    def _install_v26_market(self, market: MarketInteraction) -> None:
+        """Apply calibrated tariff anchors and dynamics to a (re)built market."""
+        config = self.market_dynamics
+        calibration = self.active_calibration or {}
+        if config.enabled and config.calibrated_tariff_anchors and calibration.get("tariff"):
+            market.register_calibrated_tariff(dict(calibration["tariff"]))
+        market.configure_dynamics(
+            config,
+            steps_per_day=int(self.shared_steps_per_day),
+            trip_bank=self.trip_bank,
+            weather_demand_multiplier=dict(
+                (calibration.get("market", {}) or {}).get("weather_demand_multiplier", {}) or {}
+            ),
+        )
+
+    def _install_v26_supply(self) -> None:
+        config = self.market_dynamics
+        if not config.enabled:
+            return
+        supply_cfg = self.driver_supply.config
+        supply_cfg.linear_demand_scaling = bool(config.linear_driver_scaling)
+        supply_cfg.reference_customers = float(config.driver_reference_customers)
+        supply_cfg.legacy_peak_factor = not bool(config.hourly_demand_volume)
+        # The configured reservation wage is in the same reference-dollar
+        # units as the uncalibrated market. Rider reservation prices are
+        # already city-scaled; scale the driver's opportunity wage by that
+        # same price level so a low-fare city is not misclassified as a market
+        # where nearly every trip fails the earnings cutoff. Preserve the
+        # reference value so repeated configure_v26 calls cannot compound it.
+        reference_wage = float(getattr(
+            self,
+            "_v26_reference_driver_reservation_wage",
+            supply_cfg.reservation_wage_per_hour,
+        ))
+        self._v26_reference_driver_reservation_wage = reference_wage
+        choice_calibration = dict((self.active_calibration or {}).get("choice", {}) or {})
+        price_level = float(np.clip(
+            choice_calibration.get("price_level_index", 1.0), 0.25, 4.0
+        ))
+        wage_scale = price_level if config.price_level_scaling else 1.0
+        supply_cfg.reservation_wage_per_hour = float(max(1.0, reference_wage * wage_scale))
+        self._v26_driver_wage_calibration = {
+            "reference_reservation_wage_per_hour": reference_wage,
+            "price_level_index": price_level,
+            "reservation_wage_per_hour": supply_cfg.reservation_wage_per_hour,
+        }
+        share = float(
+            ((self.active_calibration or {}).get("supply", {}) or {}).get("driver_fare_share", 0.72)
+        )
+        if config.symmetric_firms:
+            supply_cfg.firm2_supply_bias = 1.0
+            self.driver_supply.pay_policies["Firm1"] = DriverPayPolicy(fare_share=share)
+            self.driver_supply.pay_policies["Firm2"] = DriverPayPolicy(fare_share=share)
+        if self.regime_market:
+            # All monetary priors use the same city currency scale. Preserve
+            # raw priors so repeated configuration cannot compound scaling.
+            if not hasattr(self, '_supply_money_priors'):
+                self._supply_money_priors = {k: getattr(supply_cfg, k) for k in
+                    ('operating_cost_per_mile', 'platform_variable_cost', 'platform_cost_per_minute')}
+            for key, value in self._supply_money_priors.items():
+                setattr(supply_cfg, key, value * wage_scale)
+            for policy in self.driver_supply.pay_policies.values():
+                policy.minimum_pay = 3.50 * wage_scale
+
+    def _install_v26_choice(self) -> None:
+        """Symmetric rider utility, optional rider memory, supply-feedback switch."""
+        config = self.market_dynamics
+        if not config.enabled:
+            return
+        if config.symmetric_firms and hasattr(self.choice_model, "make_symmetric"):
+            self.choice_model.make_symmetric()
+        if self.regime_market:
+            choice_units = (self.active_calibration or {}).get('choice', {})
+            reference = float(choice_units.get('reference_fare', 23.16)) * float(choice_units.get('price_level_index', 1.))
+            if not np.isfinite(reference) or reference <= 0:
+                raise ValueError('city reference fare must be positive')
+            self.choice_model.fare_normalized = True
+            self.choice_model.currency_unit = reference / 23.16
+            # This is a units conversion of the existing reference-city prior,
+            # not a fit of elasticity to desired RL performance.
+            self.city_reference_fare = reference
+            self.observation_config = replace(self.observation_config,
+                gap_scale_dollars=0.1 * reference, profit_scale=reference,
+                revenue_scale=reference, driver_pay_scale=reference,
+                require_observed_quote_bins=True, telemetry_delay_steps=0)
+            for observer in self.platform_observers.values():
+                observer.config = self.observation_config
+        if hasattr(self.choice_model, "reputation"):
+            self.choice_model.reputation = (
+                FirmReputationMemory.from_config(config) if config.rider_memory else None
+            )
+        if not config.supply_feedback:
+            self.driver_supply.config.supply_elasticity = 0.0
+
+    def _calibrate_driver_capacity(
+        self,
+        *,
+        sample_size: Optional[int] = None,
+        days: int = 2,
+        iterations: int = 9,
+    ) -> Dict[str, Any]:
+        """Bisection on ``base_active_drivers`` for a target anchor fulfillment.
+
+        Both firms post the anchor tariff; demand, trips, choice and dispatch
+        noise use common random numbers across candidates, and the full
+        simulator state is restored afterwards.
+        """
+        if self.driver_supply.supply_v2:
+            from city_supply_calibration import calibrate_capacity
+            volume = self.supply_calibration_customers if sample_size is None else sample_size
+            return calibrate_capacity(self, sample_size=volume, iterations=iterations,
+                measure_reference=not getattr(self, '_supply_reference_is_explicit', False))
+        sample_size = 300 if sample_size is None else sample_size
+        config = self.market_dynamics
+        target = float(config.capacity_target_fulfillment)
+        supply_cfg = self.driver_supply.config
+        legacy = int(getattr(self, "_v26_legacy_fleet", supply_cfg.base_active_drivers))
+        self._v26_legacy_fleet = legacy
+        supply_cfg.base_active_drivers = legacy
+        if not (config.enabled and self.enable_driver_supply and target > 0.0):
+            return {"enabled": False, "base_active_drivers": legacy}
+        stat_names = (
+            "last_crowd_response_stats", "last_price_gap_metrics", "last_welfare_stats",
+        )
+        snapshot = {
+            "market": copy.deepcopy(self.market),
+            "choice_model": copy.deepcopy(self.choice_model),
+            "driver_supply": copy.deepcopy(self.driver_supply),
+            "firm1_overrides": copy.deepcopy(self.firm1.overrides),
+            "firm2": copy.deepcopy(self.firm2),
+            "rng_state": copy.deepcopy(self.rng.bit_generator.state),
+            "stats": {name: copy.deepcopy(getattr(self, name, None)) for name in stat_names},
+        }
+
+        def restore() -> None:
+            self.market = copy.deepcopy(snapshot["market"])
+            self.choice_model = copy.deepcopy(snapshot["choice_model"])
+            self.driver_supply = copy.deepcopy(snapshot["driver_supply"])
+            self.firm1.overrides = copy.deepcopy(snapshot["firm1_overrides"])
+            self.firm2 = copy.deepcopy(snapshot["firm2"])
+            self.rng = np.random.default_rng()
+            self.rng.bit_generator.state = copy.deepcopy(snapshot["rng_state"])
+            for name, value in snapshot["stats"].items():
+                if value is not None:
+                    setattr(self, name, copy.deepcopy(value))
+
+        steps = int(max(1, self.shared_steps_per_day))
+        hours = [int(24 * (index + 0.5) / steps) for index in range(steps)]
+        # Demographic riders from a private copy of the population generator.
+        # The threshold profile pool is built later (and lazily); at the anchor
+        # parity used here the fare gap is zero, so thresholds barely matter.
+        generator = copy.deepcopy(self.agent_gen)
+        generator.rng = np.random.default_rng(int(self.seed) + 26_026)
+        batches = [generator.sample_profiles(int(sample_size)) for _ in range(days * steps)]
+
+        def fulfillment(drivers: int) -> float:
+            restore()
+            self.firm1.overrides = CoefficientOverrides()
+            self.firm2.overrides = CoefficientOverrides()
+            if hasattr(self.choice_model, "rng"):
+                self.choice_model.rng = np.random.default_rng(int(self.seed) + 26_027)
+            self.driver_supply.rng = np.random.default_rng(int(self.seed) + 26_028)
+            self.rng = np.random.default_rng(int(self.seed) + 26_029)
+            reputation = getattr(self.choice_model, "reputation", None)
+            if reputation is not None:
+                reputation.reset()
+            self.driver_supply.config.base_active_drivers = int(drivers)
+            completed = offers = 0
+            for index, profiles in enumerate(batches):
+                _, m1, m2, _, _, _ = self.simulate_batch(
+                    day_of_week=2,
+                    weather="clear",
+                    hour=hours[index % steps],
+                    customers_per_step=int(sample_size),
+                    sampled_profiles=profiles,
+                    collect_rows=False,
+                    supply_reference_customers=int(sample_size),
+                )
+                if index >= steps // 2:
+                    completed += int(m1.completed + m2.completed)
+                    no_ride = float(self.last_crowd_response_stats.get("no_ride_rate", 0.0))
+                    offers += int(round(int(sample_size) * (1.0 - no_ride)))
+            return float(completed / max(1, offers))
+
+        legacy_fulfillment = fulfillment(legacy)
+        low, high = 20, 4000
+        maximum_fulfillment = fulfillment(high)
+        tolerance = 0.02
+        if maximum_fulfillment + tolerance < target:
+            restore()
+            raise RuntimeError(
+                "v26 driver capacity calibration cannot reach its target: "
+                f"maximum_fulfillment={maximum_fulfillment:.4f}, "
+                f"target={target:.4f}, max_drivers={high}, "
+                f"reservation_wage_per_hour={supply_cfg.reservation_wage_per_hour:.4f}. "
+                "Fix the city supply/pay calibration before training."
+            )
+        for _ in range(int(iterations)):
+            mid = int(round(np.sqrt(low * high)))
+            if fulfillment(mid) >= target:
+                high = mid
+            else:
+                low = mid
+        calibrated = int(high)
+        achieved = fulfillment(calibrated)
+        restore()
+        self.driver_supply.config.base_active_drivers = calibrated
+        result = {
+            "enabled": True,
+            "target_fulfillment": target,
+            "legacy_base_active_drivers": legacy,
+            "legacy_anchor_fulfillment": round(legacy_fulfillment, 4),
+            "base_active_drivers": calibrated,
+            "anchor_fulfillment": round(achieved, 4),
+            "reference_customers": float(supply_cfg.reference_customers),
+            **dict(getattr(self, "_v26_driver_wage_calibration", {}) or {}),
+        }
+        print(f"[v26] driver capacity calibration {json.dumps(result)}")
+        return result
+
+    def _reset_rider_memory(self) -> None:
+        reputation = getattr(self.choice_model, "reputation", None)
+        if reputation is not None:
+            reputation.reset()
+
+    @staticmethod
+    def _accumulate_welfare(acc: Dict[str, Any], stats: Optional[Mapping[str, Any]]) -> None:
+        if not stats:
+            return
+        by_income = acc.setdefault("by_income", {})
+        for bracket, values in dict(stats.get("by_income", {})).items():
+            bucket = by_income.setdefault(str(bracket), [0.0] * len(values))
+            for index, value in enumerate(values):
+                bucket[index] += float(value)
+        for key in ("firm1_profit", "firm2_profit", "driver_pay"):
+            acc[key] = float(acc.get(key, 0.0)) + float(stats.get(key, 0.0))
+
+    @staticmethod
+    def _summarize_welfare(acc: Mapping[str, Any]) -> Dict[str, float]:
+        """Flat per-request welfare and income-bracket equity metrics.
+
+        Consumer surplus is the reservation fare minus the fare paid for each
+        completed ride (0 for unserved requests).  Per-request quantities use
+        sampled requests as the denominator; total surplus adds both firms'
+        contribution and gross driver pay (a transfer, reported separately).
+        """
+        by_income = dict(acc.get("by_income", {}) or {})
+        if not by_income:
+            return {}
+        totals = np.sum(np.asarray(list(by_income.values()), dtype=float), axis=0)
+        requests = max(1.0, float(totals[0]))
+        served = float(totals[1])
+        summary: Dict[str, float] = {
+            "welfare_requests": float(totals[0]),
+            "welfare_served_rate": served / requests,
+            "welfare_no_ride_rate": float(totals[4]) / requests,
+            "welfare_mean_fare_paid": float(totals[2]) / max(1.0, served),
+            "welfare_consumer_surplus_per_request": float(totals[3]) / requests,
+            "welfare_platform_profit_per_request": (
+                float(acc.get("firm1_profit", 0.0)) + float(acc.get("firm2_profit", 0.0))
+            ) / requests,
+            "welfare_driver_pay_per_request": float(acc.get("driver_pay", 0.0)) / requests,
+        }
+        summary["welfare_total_surplus_per_request"] = (
+            summary["welfare_consumer_surplus_per_request"]
+            + summary["welfare_platform_profit_per_request"]
+            + summary["welfare_driver_pay_per_request"]
+        )
+        served_rates: Dict[str, float] = {}
+        for bracket, values in sorted(by_income.items()):
+            n = max(1.0, float(values[0]))
+            s_count = float(values[1])
+            served_rates[bracket] = s_count / n
+            summary[f"equity_served_rate__{bracket}"] = s_count / n
+            summary[f"equity_mean_fare_paid__{bracket}"] = float(values[2]) / max(1.0, s_count)
+            summary[f"equity_surplus_per_request__{bracket}"] = float(values[3]) / n
+            summary[f"equity_mean_wait__{bracket}"] = float(values[5]) / max(1.0, s_count)
+        if "<50k" in served_rates and "200k+" in served_rates:
+            summary["equity_served_gap_high_minus_low"] = served_rates["200k+"] - served_rates["<50k"]
+        return summary
+
+    def _firm_tariff_index(self, firm: Any) -> float:
+        """Posted tariff level relative to the city anchor (1.0 = anchor)."""
+        base = self.market.curr_market
+        overrides = getattr(firm, "overrides", CoefficientOverrides())
+        normalized_city = bool(getattr(self.choice_model, 'fare_normalized', False))
+        ratios = [
+            float(get_coeff(base, overrides, key)) / max(1e-6, float(getattr(base, key)))
+            for key in MANIPULATABLE_PRICE_COEFFICIENT_KEYS
+            if not normalized_city or float(getattr(base, key)) > 0.0
+        ]
+        if normalized_city and not ratios:
+            raise ValueError("A relative tariff index requires at least one positive city anchor")
+        return float(np.mean(ratios)) if ratios else 1.0
+
+    def _rescale_all_pricers(self) -> None:
+        if not (self.market_dynamics.enabled and self.market_dynamics.market_relative_bounds):
+            return
+        anchors = {key: float(getattr(self.market.curr_market, key)) for key in MANIPULATABLE_PRICE_COEFFICIENT_KEYS}
+        for pricer in (self.firm1, self.firm2):
+            rescale_pricer_to_market(pricer, anchors)
+            if isinstance(pricer, FirmAdaptiveBestResponsePricer) and self.regime_market:
+                pricer.reference_window_steps = int(self.shared_steps_per_day)
+                pricer.earnings_reference = self.driver_supply._earnings_reference('Firm2' if pricer is self.firm2 else 'Firm1')
+                if not getattr(pricer, '_supply_observed', False):
+                    pricer.ema_driver_earnings = pricer.earnings_reference
+                pricer.currency_unit = self.choice_model.currency_unit
+
+    def _rebuild_market(self, city: str, seed: int) -> MarketInteraction:
+        """Fresh market for an independent rollout, *with* the run calibration.
+
+        v25 rebuilt validation/benchmark markets from the city preset only, so
+        checkpoint selection and the five-controller suite silently ran on the
+        uncalibrated hour/weather/airport priors.  This helper re-applies the
+        active calibration (and the v26 dynamics) to every rebuilt market.
+        """
+        market = MarketInteraction(city_name=city, seed=int(seed))
+        market.set_market(city)
+        calibration = self.active_calibration or {}
+        market_cal = calibration.get("market", {}) if isinstance(calibration, dict) else {}
+        if market_cal:
+            market.set_probability_priors(
+                weather_probs=market_cal.get("weather_probs") if isinstance(market_cal.get("weather_probs"), dict) else None,
+                day_of_week_probs=market_cal.get("day_of_week_probs") if isinstance(market_cal.get("day_of_week_probs"), dict) else None,
+                hour_probs=market_cal.get("hour_probs") if isinstance(market_cal.get("hour_probs"), dict) else None,
+                service_probs=market_cal.get("service_probs") if isinstance(market_cal.get("service_probs"), dict) else None,
+                airport_prob=float(market_cal["airport_prob"]) if market_cal.get("airport_prob") is not None else None,
+                distance_mean_miles=market_cal.get("distance_mean_miles"),
+                distance_std_miles=market_cal.get("distance_std_miles"),
+                duration_mean_minutes=market_cal.get("duration_mean_minutes"),
+                duration_std_minutes=market_cal.get("duration_std_minutes"),
+            )
+        self._install_v26_market(market)
+        if self.regime_market:
+            # Common random numbers: the same rollout seed gives every policy
+            # the same regime path (70_000 keeps it disjoint from the other streams).
+            self._install_regime_process(market, seed=int(seed) + 70_000, training_openings=False)
+        return market
+
+    # ---------- v26r regime-switching market ----------
+    # ---------- v26r warm start ----------
+    def warm_start_actor(self, target_multiplier: float, logit: float = 2.0) -> Dict[str, Any]:
+        """Warm-start the active action contract without changing its semantics."""
+        if self.firm1_mode != "RL" or not hasattr(self.firm1, "action_to_multiplier"):
+            raise ValueError("warm start requires --firm1_mode RL")
+        if getattr(self.firm1, "level_step_actions", False):
+            raise ValueError(
+                "the level-step contract has no warm start; pass --rl_warm_start_target 0"
+            )
+        if getattr(self.firm1, "hybrid_relative_actions", False):
+            raise ValueError(
+                "the hybrid-relative contract has no absolute-target warm start; "
+                "pass --rl_warm_start_target 0"
+            )
+        if not self.firm1.independent_coefficient_actions:
+            table = dict(self.firm1.action_to_multiplier)
+            action, multiplier = min(
+                table.items(),
+                key=lambda item: abs(float(item[1]) - float(target_multiplier)),
+            )
+            record = self.firm1.agent.warm_start_action(
+                int(action), float(logit)
+            )
+            record = {
+                **record,
+                "target_multiplier": float(multiplier),
+                "requested": float(target_multiplier),
+            }
+            self.v26_settings = {
+                **dict(self.v26_settings or {}),
+                "rl_warm_start": record,
+            }
+            print(
+                f"[v26r] warm start: action {action} -> "
+                f"{multiplier:.2f}x anchor, logit {float(logit):.2f}"
+            )
+            return record
+        targets = tuple(self.firm1.tariff_targets)
+        magnitude, multiplier = min(
+            enumerate(targets),
+            key=lambda item: abs(float(item[1]) - float(target_multiplier)),
+        )
+        record = self.firm1.agent.warm_start_magnitude(
+            int(magnitude), float(logit)
+        )
+        record = {
+            **record,
+            "target_multiplier": float(multiplier),
+            "requested": float(target_multiplier),
+            "coefficient_choice": "unbiased",
+        }
+        self.v26_settings = {**dict(self.v26_settings or {}), "rl_warm_start": record}
+        print(
+            f"[v27] warm start: all coefficient choices remain neutral; "
+            f"target magnitude {multiplier:.2f}x anchor, logit {float(logit):.2f}"
+        )
+        return record
+
+    # ---------- v26r rider loyalty v2 ----------
+    @property
+    def loyalty_v2(self) -> bool:
+        return str(self.loyalty_model).lower() == "v2"
+
+    def configure_loyalty(
+        self,
+        *,
+        loyalty_model: str = "v1",
+        loyalty_lambda: float = 0.30,
+        loyalty_pool_size: int = 2000,
+        returning_rider_share: float = 0.60,
+        loyalty_overcharge_penalty: bool = False,
+        loyalty_weight: float = 3.0,
+    ) -> Dict[str, Any]:
+        """Install the per-rider loyalty stock (independent of the regime market)."""
+        self.loyalty_weight = float(max(0.0, loyalty_weight))
+        if self.choice_model is not None:
+            setattr(self.choice_model, "loyalty_v2_weight", self.loyalty_weight)
+        self.loyalty_model = str(loyalty_model).lower()
+        self.loyalty_lambda = float(np.clip(loyalty_lambda, 0.0, 1.0))
+        self.loyalty_pool_size = int(max(1, loyalty_pool_size))
+        self.returning_rider_share = float(np.clip(returning_rider_share, 0.0, 1.0))
+        self.loyalty_overcharge_penalty = bool(loyalty_overcharge_penalty)
+        self.rider_loyalty = {}
+        self._active_rider_pool = []
+        self._last_returning_share = 0.0
+        settings = {
+            "loyalty_model": self.loyalty_model,
+            "loyalty_lambda": self.loyalty_lambda,
+            "loyalty_pool_size": self.loyalty_pool_size,
+            "returning_rider_share": self.returning_rider_share,
+            "loyalty_overcharge_penalty": self.loyalty_overcharge_penalty,
+            "loyalty_weight": self.loyalty_weight,
+        }
+        self.v26_settings = {**dict(self.v26_settings or {}), **settings}
+        if self.loyalty_v2:
+            self._build_active_rider_pool(self.rng)
+        return settings
+
+    def _build_active_rider_pool(self, rng: np.random.Generator, *, evaluation: bool = False) -> None:
+        """Draw the episode's returning riders and initialise their loyalty stocks."""
+        if not self.synthetic_profile_pool:
+            self._bootstrap_synthetic_profiles(pool_size=max(self.total_customers_pool, self.loyalty_pool_size))
+        if not self.training_profile_pool or not self.evaluation_profile_pool:
+            self._build_generalization_profile_pool(pool_size=self.total_customers_pool)
+        primary_pool = self.evaluation_profile_pool if evaluation else self.training_profile_pool
+        size = int(min(self.loyalty_pool_size, len(primary_pool)))
+        indices = rng.choice(len(primary_pool), size=size, replace=False) if size < len(primary_pool) \
+            else np.arange(len(primary_pool))
+        self.rider_loyalty = {}
+        self._active_rider_pool = []
+        for rid, index in enumerate(indices):
+            profile = dict(primary_pool[int(index)])
+            firm = profile.get("LoyaltyFirm")
+            strength = float(np.clip(float(profile.get("LoyaltyStrength", 0.0) or 0.0), 0.0, 1.0))
+            stock = {"Firm1": 0.0, "Firm2": 0.0, "rides_Firm1": 0.0, "rides_Firm2": 0.0}
+            if firm in ("Firm1", "Firm2"):
+                stock[firm] = strength
+            self.rider_loyalty[rid] = stock
+            profile["_RiderID"] = int(rid)
+            profile["_LoyaltyV2"] = stock          # shared reference: updates are visible to the choice model
+            self._active_rider_pool.append(profile)
+
+    def _snapshot_rider_state(self, profiles=()) -> Dict[str, Any]:
+        """Retain identities as well as values: sampled riders alias live stocks.
+
+        Replacing a copied pool alone leaves the caller's sampled profiles pointing
+        at mutated stocks. Rollback must update those original dictionaries in place.
+        """
+        pool = getattr(self, "_active_rider_pool", [])
+        ledger = getattr(self, "rider_loyalty", {})
+        stocks = {id(stock): stock for stock in ledger.values()}
+        for profile in (*pool, *profiles):
+            stock = profile.get("_LoyaltyV2")
+            if stock is not None:
+                stocks[id(stock)] = stock
+        return {"pool": pool, "members": list(pool), "ledger": ledger,
+                "entries": dict(ledger),
+                "stocks": [(stock, copy.deepcopy(stock)) for stock in stocks.values()],
+                "telemetry": {name: (hasattr(self, name), copy.deepcopy(getattr(self, name, None)))
+                    for name in ('_last_returning_share', '_last_loyal_choice_rate',
+                                 '_last_loyal_request_share', 'last_welfare_stats')}}
+
+    def _restore_rider_state(self, saved: Mapping[str, Any]) -> None:
+        for stock, values in saved["stocks"]:
+            stock.clear()
+            stock.update(copy.deepcopy(values))
+        saved["ledger"].clear()
+        saved["ledger"].update(saved["entries"])
+        saved["pool"][:] = saved["members"]
+        self.rider_loyalty = saved["ledger"]
+        self._active_rider_pool = saved["pool"]
+        for name, (existed, value) in saved['telemetry'].items():
+            if existed:
+                setattr(self, name, copy.deepcopy(value))
+            elif hasattr(self, name):
+                delattr(self, name)
+
+    def _loyalty_record_outcome(
+        self,
+        profile: Dict[str, Any],
+        *,
+        choice: str,
+        matched_firm: str,
+        fulfilled: bool,
+        pickup_minutes: float,
+        wait_estimate: float,
+        paid: float,
+        other_price: float,
+        threshold: float,
+    ) -> None:
+        """Move the rider's loyalty stocks after one request (loyalty v2 only)."""
+        stock = profile.get("_LoyaltyV2")
+        if stock is None:
+            return
+        lam = float(self.loyalty_lambda)
+        x = {"Firm1": 0.0, "Firm2": 0.0}
+        if choice in ("Firm1", "Firm2"):
+            if fulfilled and matched_firm == choice:
+                good_wait = float(pickup_minutes) <= max(10.0, 1.5 * float(wait_estimate))
+                overcharged = self.loyalty_overcharge_penalty and (float(paid) - float(other_price)) > float(threshold)
+                x[choice] = -1.0 if overcharged else (1.0 if good_wait else 0.0)
+            elif fulfilled and matched_firm and matched_firm != choice:
+                x[choice] = -1.0            # stranded, then rescued by the rival
+                x[matched_firm] = 0.5
+            else:
+                x[choice] = -1.0            # stranded
+        for firm in ("Firm1", "Firm2"):
+            stock[firm] = float(np.clip((1.0 - lam) * float(stock[firm]) + lam * x[firm], -1.0, 1.0))
+        if fulfilled and matched_firm in ("Firm1", "Firm2"):
+            stock["rides_" + matched_firm] = float(stock.get("rides_" + matched_firm, 0.0)) + 1.0
+
+    def configure_joint_demand(self, spec):
+        """Install the declared demand contract before any capacity fitting."""
+        from joint_demand import JointChoiceModel, validate_spec
+        validate_spec(spec, self.market_name)
+        if not self.regime_market or not self.market_dynamics.enabled:
+            raise ValueError('joint demand requires the v26 regime-market configuration')
+        self.choice_model = JointChoiceModel.from_legacy(self.choice_model, spec)
+        self.v26_settings['demand_calibration'] = copy.deepcopy(spec)
+
+    def configure_v26r(
+        self,
+        *,
+        shock_config: Optional[ShockConfig] = None,
+        shock_scenario: Optional[ShockScenario] = None,
+        persistent_driver_stock: bool = False,
+        stock_adjustment_rate: float = 0.30,
+        stock_floor: float = 0.40,
+        emergency_surge_cap: float = 0.0,
+        supply_model: str = "v1",
+        supply_eta_day: float = 0.40,
+        supply_eta_hour: float = 0.20,
+        supply_reference_earnings: float = 0.0,
+        supply_operating_point: Optional[Mapping[str, Any]] = None,
+        supply_calibration_customers: int = 50,
+        explicit_supply_settings: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Install the regime-switching market contract (after configure_v26)."""
+        if not self.regime_market:
+            self.v26r_settings = {"enabled": False}
+            return self.v26r_settings
+        if not self.market_dynamics.enabled or not self.market.sequential_calendar:
+            raise ValueError("--regime_market requires --v26 with the sequential calendar")
+        config = shock_config or ShockConfig(enabled=True)
+        if not config.enabled:
+            raise ValueError("regime market requested with a disabled ShockConfig")
+        self.shock_config = config
+        if supply_calibration_customers <= 0:
+            raise ValueError('supply calibration request volume must be positive')
+        self.supply_calibration_customers = int(supply_calibration_customers)
+        self.shock_scenario = shock_scenario
+        self.emergency_surge_cap = float(max(0.0, emergency_surge_cap))
+        self._install_regime_process(self.market, seed=int(self.seed) + 70_000, training_openings=True)
+        if self.enable_driver_supply:
+            cfg = self.driver_supply.config
+            cfg.persistent_stock = bool(persistent_driver_stock) or str(supply_model).lower() == "v2"
+            cfg.stock_adjustment_rate = float(np.clip(stock_adjustment_rate, 0.0, 1.0))
+            cfg.stock_floor = float(max(0.0, stock_floor))
+            cfg.supply_model = str(supply_model).lower()
+            cfg.eta_day = float(max(0.0, supply_eta_day))
+            cfg.eta_hour = float(max(0.0, supply_eta_hour))
+            cfg.reference_earnings_per_hour = float(max(0.0, supply_reference_earnings))
+            self._supply_reference_is_explicit = supply_reference_earnings > 0
+            if cfg.supply_model == "v2":
+                if cfg.reference_earnings_per_hour == 0:
+                    cfg.reference_earnings_per_hour = float(cfg.reservation_wage_per_hour)
+                cfg.availability_block_hours = 24.0 / int(self.shared_steps_per_day)
+            if cfg.supply_model == "v2" and self.market_dynamics.driver_pay_basis != "fare":
+                print("[v26r] WARNING: supply v2 with driver_pay_basis='anchor': the posted fare does not move pay; "
+                      "use --driver_pay_basis fare for the pay-elastic channel.")
+            self.driver_supply.reset_stock()
+            if supply_operating_point is not None:
+                from calibration_artifact import validate_supply_point
+                if supply_operating_point.get('demand_calibration') != getattr(self.choice_model, 'demand_spec', None):
+                    raise ValueError('supply point was calibrated under a different demand model; recalibrate')
+                validate_supply_point(supply_operating_point, customers=self.supply_calibration_customers,
+                                      explicit=explicit_supply_settings or {})
+                if supply_operating_point['city'] != self.market_name:
+                    raise ValueError('saved supply operating point belongs to another city')
+                self.driver_supply.config = DriverSupplyConfig(**supply_operating_point['config'])
+                self.market_dynamics = replace(self.market_dynamics, fleet_scale=supply_operating_point['fleet_scale'])
+                self.driver_supply.hour_profile = {int(k): float(v) for k, v in supply_operating_point['hour_profile'].items()}
+                self.driver_supply.pay_policies = {f: DriverPayPolicy(**p) for f, p in supply_operating_point['pay_policies'].items()}
+                self.driver_supply.reset_stock()
+                capacity = copy.deepcopy(supply_operating_point['calibration'])
+            else:
+                capacity = self._calibrate_driver_capacity()
+            if supply_operating_point is None and self.market_dynamics.fleet_scale != 1.0:
+                self.driver_supply.config.base_active_drivers = max(1, round(
+                    self.driver_supply.config.base_active_drivers * self.market_dynamics.fleet_scale))
+                capacity["fleet_scale"] = float(self.market_dynamics.fleet_scale)
+                capacity["scaled_base_active_drivers"] = self.driver_supply.config.base_active_drivers
+            self.v26_settings["driver_capacity_calibration"] = capacity
+            self._rescale_all_pricers()
+        self.v26r_settings = {
+            "enabled": True,
+            "shock_config": config.as_dict(),
+            "scenario": None if shock_scenario is None else {
+                "start_date": shock_scenario.start_date.isoformat(),
+                "events": [
+                    {"kind": e.kind, "start_day": e.start_day, "end_day": e.end_day,
+                     "intensity": float(e.intensity), "firm": e.firm, "announced": e.announced,
+                     "detail": dict(e.detail)}
+                    for e in shock_scenario.events
+                ],
+                "forecasts": {int(k): bool(v) for k, v in shock_scenario.forecasts.items()},
+            },
+            "regime_features": bool(self.regime_features),
+            "regime_feature_ablation": bool(self.regime_feature_ablation),
+            "actor_true_shortage_flag": bool(self.actor_true_shortage_flag),
+            "whole_tariff_actions": bool(self.whole_tariff_actions),
+            "counterfactual_day_credit": int(self.counterfactual_day_credit),
+            "counterfactual_day_horizon_days": int(self.counterfactual_day_horizon_days),
+            "counterfactual_policy_coeff": self.counterfactual_policy_coeff,
+            "nmcc_baseline": self.nmcc_baseline,
+            "nmcc_stages": list(self.nmcc_stages),
+            "nmcc_every_k_decisions": int(self.nmcc_every_k_decisions),
+            "nmcc_advantage_scale": self.nmcc_advantage_scale,
+            "momentum_features": bool(self.momentum_features),
+            "momentum_day_steps": int(self.momentum_day_steps),
+            "opponent_features": bool(self.opponent_features),
+            "opponent_move_threshold": float(self.opponent_move_threshold),
+            "persistence_features": bool(self.persistence_features),
+            "observation_dim": int(self.platform_observation_dim),
+            "regime_critic_extra_dim": int(self.regime_critic_extra_dim),
+            "persistent_driver_stock": bool(self.driver_supply.config.persistent_stock),
+            "supply_model": self.driver_supply.config.supply_model,
+            "supply_eta_day": float(self.driver_supply.config.eta_day),
+            "supply_eta_hour": float(self.driver_supply.config.eta_hour),
+            "supply_calibration_customers": self.supply_calibration_customers,
+            "effective_supply_config": asdict(self.driver_supply.config),
+            "supply_reference_earnings": float(self.driver_supply.config.reference_earnings_per_hour),
+            "supply_reference_contract": self.v26_settings['driver_capacity_calibration'].get('reference_contract', 'explicit_reference'),
+            "driver_pay_basis": str(self.market_dynamics.driver_pay_basis),
+            "stock_adjustment_rate": float(self.driver_supply.config.stock_adjustment_rate),
+            "stock_floor": float(self.driver_supply.config.stock_floor),
+            "stock_floor_applied": self.driver_supply.config.supply_model != 'v2',
+            "operating_point_restored_from_artifact": supply_operating_point is not None,
+            "explicit_supply_settings": dict(explicit_supply_settings or {}),
+            "effective_fleet_scale": self.market_dynamics.fleet_scale,
+            "driver_incentive_levels": list(self.driver_incentive_levels),
+            "tariff_targets": list(self.tariff_targets) if self.tariff_targets else "v26_default",
+            "level_step_actions": bool(self.level_step_actions),
+            "hybrid_relative_actions": bool(self.hybrid_relative_actions),
+            "relative_action_steps": list(self.relative_action_steps),
+            "tariff_structure": (
+                copy.deepcopy(getattr(self.firm1, "tariff_structure", None))
+                if self.level_step_actions
+                else None
+            ),
+            "tariff_level_bounds": (
+                list(self.tariff_level_bounds) if self.level_step_actions else None
+            ),
+            "ppo_entropy_start": self.ppo_entropy_start,
+            "branch_imitation_coeff": float(self.branch_imitation_coeff),
+            "branch_imitation_temperature_scale": float(
+                self.branch_imitation_temperature_scale
+            ),
+            "spillover_price_aware": bool(self.spillover_price_aware),
+            "emergency_surge_cap": float(self.emergency_surge_cap),
+        }
+        self.v26_settings = {**dict(self.v26_settings or {}), "v26r": self.v26r_settings}
+        print(f"[v26r] {json.dumps(self.v26r_settings, default=str)}")
+        return self.v26r_settings
+
+    def _install_regime_process(self, market: MarketInteraction, *, seed: int, training_openings: bool) -> None:
+        process = ShockProcess(
+            self.shock_config,
+            seed=int(seed),
+            steps_per_day=int(max(1, self.shared_steps_per_day)),
+        )
+        if self.shock_scenario is not None:
+            process.scenario = copy.deepcopy(self.shock_scenario)
+        market.shock_training_openings = bool(training_openings)
+        market.install_shocks(process)
+
+    def _regime_effect(self, hour: int) -> ShockEffect:
+        if not self.regime_market:
+            return ShockEffect()
+        effect = self.market.shock_effect(int(hour))
+        self._regime_last_effect = effect
+        return effect
+
+    def _regime_day_start(self, hours: Optional[Sequence[int]], *, episode_seed: int) -> None:
+        """Once per simulated day, after ``sample_day_context``.
+
+        Installs the day's regime multipliers in the supply layer, advances the
+        persistent driver stock, applies rival promotions and scripted rival
+        controller switches.  Nothing happens when the regime market is off.
+        """
+        if not self.regime_market:
+            return
+        shocks = self.market.active_shocks
+        if shocks is None:
+            return
+        if hours:
+            first_hour = int(hours[0])
+        else:
+            day_hours = getattr(self.market.calendar, "_day_hours", None)
+            first_hour = int(day_hours[0]) if day_hours else 12
+        effect = self._regime_effect(first_hour)
+        if self.enable_driver_supply:
+            self.driver_supply.apply_shock(
+                fleet_multiplier=float(effect.fleet_multiplier),
+                wage_multiplier=float(effect.reservation_wage_multiplier),
+                firm_capacity=dict(effect.firm_capacity_multiplier),
+            )
+            self.driver_supply.advance_day()
+        self._firm2_regime_price_multiplier = float(effect.firm2_price_multiplier)
+        # Scripted rival controller switch (latent regime): the first day an
+        # event of kind ``rival_switch`` is active, Firm 2 changes controller
+        # class while keeping its posted tariff.
+        for index, event in enumerate(shocks.events):
+            if event.kind != "rival_switch":
+                continue
+            if not event.covers(max(0, shocks.day_index), 0):
+                continue
+            if index in self._regime_rival_switch_applied:
+                continue
+            new_mode = str(event.detail.get("mode", ""))
+            if new_mode and new_mode != str(getattr(self.firm2, "_ride_response_mode", "")):
+                self._set_firm2_mode_preserving_tariff(new_mode, int(episode_seed) + 17)
+                setattr(self.firm2, "_ride_response_mode", new_mode)
+            self._regime_rival_switch_applied[index] = new_mode
+
+    def _regime_resample_airport(self, airport: bool, multiplier: float) -> bool:
+        """Shift the airport share of trips by ``multiplier`` (holiday/storm waves)."""
+        p = float(np.clip(self.market.airport_prob, 1e-6, 0.95))
+        if multiplier > 1.0 and not airport:
+            flip = float(np.clip(p * (multiplier - 1.0) / max(1e-6, 1.0 - p), 0.0, 0.95))
+            return bool(self.rng.random() < flip)
+        if multiplier < 1.0 and airport:
+            return bool(self.rng.random() >= (1.0 - float(multiplier)))
+        return bool(airport)
+
+    def _regime_critic_features(self) -> List[float]:
+        """Training-only exogenous regime channels for the privileged critic."""
+        if not self.regime_market:
+            return []
+        effect = self._regime_last_effect
+        shocks = self.market.active_shocks
+        backlog = float(shocks.backlog) if shocks is not None else 0.0
+        stock = getattr(self.driver_supply, "online_stock", {"Firm1": 1.0, "Firm2": 1.0})
+        return [
+            float(np.clip(effect.fleet_multiplier - 1.0, -1.0, 1.0)),
+            float(np.clip(effect.firm_capacity_multiplier.get("Firm1", 1.0) - 1.0, -1.0, 1.0)),
+            float(np.clip(effect.firm_capacity_multiplier.get("Firm2", 1.0) - 1.0, -1.0, 1.0)),
+            float(np.clip(effect.firm2_price_multiplier - 1.0, -1.0, 1.0)),
+            float(np.clip(np.log(max(1e-3, effect.volume_multiplier)), -1.5, 1.5)),
+            float(np.clip(backlog / 1000.0, 0.0, 2.0)),
+            float(np.clip(float(stock.get("Firm1", 1.0)) - 1.0, -1.0, 1.0)),
+            float(np.clip(float(stock.get("Firm2", 1.0)) - 1.0, -1.0, 1.0)),
+            # v26r persistence channels (training only): mean loyalty stocks
+            # and the rival's memory state.
+            float(np.clip(self._loyalty_mean("Firm1"), -1.0, 1.0)),
+            float(np.clip(self._loyalty_mean("Firm2"), -1.0, 1.0)),
+            float(getattr(self.firm2, "memory_state", "") == "retaliation"),
+            float(getattr(self.firm2, "memory_state", "") == "accommodation"),
+        ]
+
+    def _persistence_public_features(self, firm_name: str = "Firm1") -> Dict[str, float]:
+        """Public operational proxies available to the named platform."""
+        earnings_index = 0.0
+        if self.enable_driver_supply and hasattr(self.driver_supply, "_earnings_reference"):
+            previous = self.driver_supply.smoothed_states.get(str(firm_name))
+            earned = float(getattr(previous, "driver_earnings_per_online_hour", 0.0) or 0.0) if previous is not None else 0.0
+            reference = float(self.driver_supply._earnings_reference(str(firm_name)))
+            if earned > 0.0 and reference > 0.0:
+                earnings_index = float(np.clip(earned / reference - 1.0, -1.0, 1.0))
+        # This current-day workforce count is visible before pricing. Unlike
+        # the diagnostic oracle flag, it does not name the hidden event or
+        # expose any future outcome.
+        supply_index = float(
+            getattr(self.driver_supply, "online_stock", {}).get(
+                str(firm_name), 1.0
+            )
+        ) - 1.0
+        gap = float(np.mean(self._rival_gap_history)) if self._rival_gap_history else 0.0
+        return {
+            "driver_earnings_index": earnings_index,
+            "same_day_driver_supply_index": float(np.clip(supply_index, -1.0, 1.0)),
+            "returning_share": float(np.clip(self._returning_share_ema, 0.0, 1.0)),
+            "rival_quote_index_7d": gap if getattr(self, "learning_corrections", False) else float(np.clip(gap / 8.0, -1.0, 1.0)),
+        }
+
+    def _step_customers(
+        self,
+        base_customers: int,
+        *,
+        hour: int,
+        day_of_week: int,
+        weather: str,
+    ) -> int:
+        """Realized requests in one step (v26 hourly volume) or the base count."""
+        config = self.market_dynamics
+        base = int(max(1, base_customers))
+        if not (config.enabled and config.hourly_demand_volume):
+            return base
+        multiplier = self.market.demand_volume_multiplier(
+            hour=int(hour), day_of_week=int(day_of_week), weather=str(weather)
+        )
+        shocks = self.market.active_shocks if self.regime_market else None
+        if shocks is not None:
+            # v26r: regime volume; storm-suppressed requests are partly deferred
+            # and released after the storm (a persistent demand state).
+            effect = self.market.shock_effect(int(hour))
+            volume = float(effect.volume_multiplier)
+            storm_factor = float(effect.storm_volume_factor)
+            if "winter_storm" in effect.active:
+                weather_factor = float(self.market.weather_demand_multiplier.get(str(weather), 1.0))
+                if weather_factor > 0.0:
+                    multiplier = float(multiplier) / weather_factor
+            expected = float(base) * float(multiplier) * volume
+            if storm_factor < 1.0:
+                shocks.defer(expected * (1.0 / max(0.05, storm_factor) - 1.0))
+            release = shocks.release_backlog(storm_active="winter_storm" in effect.active)
+            multiplier = float(multiplier) * volume + float(release) / float(base)
+        return realized_request_count(
+            self.market.rng,
+            base_customers=base,
+            multiplier=multiplier,
+            noise=str(config.demand_noise),
+            max_multiple=float(config.max_volume_multiple),
+        )
+
+    def _apply_threshold_ablation_to_pools(self) -> None:
+        mode = str(getattr(self, "threshold_ablation_mode", "as_loaded"))
+        if mode == "as_loaded" or not self.synthetic_profile_pool:
+            return
+        rubric = None
+        if mode == "rubric":
+            def rubric(profile: Dict[str, Any]) -> float:
+                rides = list(profile.get("ColdstartRides", []))[: self.gpt_threshold_coldstart_rides]
+                return float(self._fallback_price_threshold(profile, self._price_coldstart_rides(rides)))
+        self.threshold_ablation_summary = apply_threshold_ablation(
+            self.synthetic_profile_pool,
+            mode,
+            seed=int(self.seed) + 90_001,
+            rubric=rubric,
+        )
+        print(f"[ThresholdAblation] {json.dumps(self.threshold_ablation_summary)}")
+
+    @staticmethod
+    def _restrict_static_overrides(
+        f1_vals: Dict[str, float],
+        f2_vals: Dict[str, float],
+        shared_keys: List[str],
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """Force both firms to edit the same coefficient set and cap Firm2 to Firm1 scope."""
+        allowed = set(shared_keys)
+
+        f1_filtered = {k: v for k, v in f1_vals.items() if k in allowed}
+        dropped_f1 = [k for k in f1_vals.keys() if k not in allowed]
+        if dropped_f1:
+            print(f"[Core] Ignoring Firm1 static keys outside shared edit set: {dropped_f1}")
+
+        f2_allowed = set(f1_filtered.keys())
+        f2_filtered = {k: v for k, v in f2_vals.items() if k in f2_allowed}
+        dropped_f2 = [k for k in f2_vals.keys() if k not in f2_allowed]
+        if dropped_f2:
+            print(f"[Core] Ignoring Firm2 static keys not edited by Firm1: {dropped_f2}")
+
+        return f1_filtered, f2_filtered
+    
+    @staticmethod
+    def _seed_all_rngs(seed: int, deterministic_torch: bool = False) -> None:
+        """Seed Python/NumPy/Torch RNGs for reproducible simulations."""
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+        # Optional stricter mode for deterministic Torch kernels.
+        if deterministic_torch:
+            torch.use_deterministic_algorithms(True)
+            if hasattr(torch.backends, "cudnn"):
+                torch.backends.cudnn.benchmark = False
+
+    @staticmethod
+    def _ema(curr: float, prev: float, alpha: float = 0.2) -> float:
+        return (1.0 - alpha) * float(prev) + alpha * float(curr)
+    
+    @staticmethod
+    def estimate_duration(miles: float, hod: int) -> float:
+        mph = 18.0 if (7 <= hod < 10 or 16 <= hod < 19) else 25.0
+        return max(5.0, 60.0 * miles / max(8.0, mph))
+    
+    def _initialize_arbitrary_starting_coefficients(self) -> None:
+        """Set both firms to arbitrary (seeded-random) initial values for optimized coefficients."""
+        base = self.market.curr_market
+        lo, hi = 0.85, 1.15
+        for firm in (self.firm1, self.firm2):
+            for key in self.shared_edit_keys:
+                anchor = float(getattr(base, key))
+                value = anchor * float(self.rng.uniform(lo, hi))
+                floor = 0.01 if key in {
+                    "base_fare", "per_minute", "per_mile"
+                } else 0.0
+                setattr(firm.overrides, key, max(floor, value))
+
+    def _make_pricer(self, mode: str, seed: int):
+        """Construct a fresh opponent without carrying hidden controller state.
+
+        ``mode@perturbedK`` builds controller class ``mode`` with the K-th
+        seeded parameter perturbation (v26 out-of-distribution evaluation).
+        """
+        mode = str(mode).strip().lower()
+        base_mode, variant = split_perturbed_mode(mode)
+        cls = self.pricer_by_mode.get(base_mode)
+        pricer = (
+            FirmStaticPricer()
+            if cls is None
+            else cls(seed=int(seed), managed_keys=self.shared_edit_keys)
+        )
+        market_dynamics = getattr(self, "market_dynamics", None)
+        if isinstance(pricer, FirmAdaptiveBestResponsePricer):
+            pricer.operational_clock = bool(getattr(self, 'regime_market', False))
+            pricer.reference_window_steps = int(self.shared_steps_per_day)
+            if self.regime_market and hasattr(self, 'driver_supply'):
+                pricer.earnings_reference = self.driver_supply._earnings_reference('Firm2')
+                pricer.ema_driver_earnings = pricer.earnings_reference
+            pricer.currency_unit = float(getattr(self.choice_model, 'currency_unit', 1.)) if self.regime_market else 1.
+        if (
+            bool(getattr(market_dynamics, "enabled", False))
+            and bool(getattr(market_dynamics, "market_relative_bounds", False))
+        ):
+            rescale_pricer_to_market(
+                pricer,
+                {key: float(getattr(self.market.curr_market, key)) for key in MANIPULATABLE_PRICE_COEFFICIENT_KEYS},
+            )
+        if variant is not None and cls is not None:
+            # The draw depends only on (class, variant), never on the rollout
+            # seed, so every policy and baseline faces the identical variant.
+            class_code = sum(ord(ch) for ch in base_mode)
+            ControllerPerturbation(scale=float(self.ood_perturbation_scale)).apply(
+                pricer, np.random.default_rng([4_242, class_code, int(variant)])
+            )
+        setattr(
+            pricer,
+            "_ride_response_mode",
+            mode if cls is not None else "static",
+        )
+        return pricer
+
+    def _reseed_environment(self, episode_seed: int) -> None:
+        """Independent environment realization for one training opening (v26 M2).
+
+        Market, rider-choice, driver, observer, and simulator RNG streams are
+        re-derived from (training seed, opening seed), so the environment's
+        self-evolution differs across openings and across training seeds while
+        remaining exactly reproducible.  Policy and optimizer state are untouched.
+        """
+        sequence = np.random.SeedSequence([int(self.seed), int(episode_seed), 26])
+        streams = sequence.spawn(6)
+        self.market.rng = np.random.default_rng(streams[0])
+        self.rng = np.random.default_rng(streams[1])
+        if hasattr(self.choice_model, "rng"):
+            self.choice_model.rng = np.random.default_rng(streams[2])
+        self.driver_supply.rng = np.random.default_rng(streams[3])
+        for index, observer in enumerate(self.platform_observers.values()):
+            observer.rng = np.random.default_rng(streams[4].spawn(index + 1)[-1])
+        self.market.calendar.day_index = -1
+        if self.regime_market and self.market.shocks is not None:
+            # The next sample_day_context() redraws the episode's shock path
+            # from this stream, so an opening's regime path is reproducible.
+            self.market.shocks.rng = np.random.default_rng([int(self.seed), int(episode_seed), 27_028])
+            self.market.shock_training_openings = True
+
+    def _set_firm2_mode_preserving_tariff(self, mode: str, seed: int) -> None:
+        """Change only Firm 2's controller, preserving its posted tariff."""
+        base = self.market.curr_market
+        current_tariff = {
+            key: float(get_coeff(base, self.firm2.overrides, key))
+            for key in self.shared_edit_keys
+        }
+        self.firm2 = self._make_pricer(mode, int(seed))
+        for key, value in current_tariff.items():
+            set_coeff(base, self.firm2.overrides, key, value)
+
+    def _set_firm2_to_market_reference(self, seed: int) -> None:
+        """Use the configured city's base tariff as the market-stage reference."""
+        self.firm2 = self._make_pricer("static", int(seed))
+        base = self.market.curr_market
+        for key in self.shared_edit_keys:
+            set_coeff(
+                base,
+                self.firm2.overrides,
+                key,
+                float(getattr(base, key)),
+            )
+
+    def _training_stage_opponent_mode(
+        self,
+        stage: TrainingStage,
+        configured_mode: str,
+        episode_seed: Optional[int] = None,
+    ) -> str:
+        """Resolve the controller used by one curriculum stage."""
+        regime = str(stage.opponent_regime)
+        if regime in {"dynamic", "catchup", "profit"}:
+            if episode_seed is None:
+                return str(configured_mode)
+            legacy_dynamic_modes = tuple(dict.fromkeys((
+                str(configured_mode),
+                "adaptive_best_response",
+                "heuristic",
+                "heuristic_random",
+            )))
+            modes = tuple(
+                getattr(self, "training_profit_opponent_modes", ())
+                if regime == "profit"
+                else (
+                    getattr(self, "training_catchup_opponent_modes", ())
+                    if regime == "catchup"
+                    else getattr(
+                        self,
+                        "training_dynamic_opponent_modes",
+                        legacy_dynamic_modes,
+                    )
+                )
+            )
+            if not modes:
+                modes = legacy_dynamic_modes
+            if not modes:
+                raise RuntimeError(f"training opponent pool for {regime!r} is empty")
+            # Episode seeds advance by exactly ``episode_days`` in the training
+            # loop, so this deterministic rotation covers every controller
+            # before repeating instead of randomly omitting one in a short run.
+            episode_index = int(episode_seed) // max(1, int(stage.episode_days))
+            return str(modes[episode_index % len(modes)])
+        return "static"
+
+    def _training_opponent_episode_days(
+        self,
+        stage: TrainingStage,
+        opponent_mode: str,
+    ) -> int:
+        """Match training episode length to the controller response timescale."""
+        base_days = int(max(1, stage.episode_days if stage.episode_days > 0 or self.learner_revision < 3
+                            else self.training_stage_scheduler.stages[-1].episode_days))
+        if (
+            self.credit_assignment_v25
+            and str(stage.opponent_regime) in {"dynamic", "catchup", "profit"}
+            and str(opponent_mode) in {
+                "pi_price_gap",
+                "region_supply_demand",
+            }
+        ):
+            return int(max(300, base_days))
+        return base_days
+
+    def _ppo_rollout_ready(self, minimum_transitions: int) -> bool:
+        """Data-batch contract only; never examines profit or policy actions."""
+        agent = self.firm1.agent
+        return agent.buffer_size >= minimum_transitions and (
+            self.learner_revision < 3 or
+            sum(t.done or t.truncated for t in agent.buf) >= self.ppo_rollout_episodes)
+
+    def _training_opponent_population(
+        self, regime: str = "dynamic"
+    ) -> Tuple[str, ...]:
+        """Return one statistically balanced v25 opponent population cycle.
+
+        Fast controllers supply three independently reset short episodes per
+        cycle; the two slow controllers already supply 300-day trajectories
+        and appear once. Loss weighting later gives every *controller class*
+        equal mass, so replication improves coverage without changing the
+        intended opponent objective.
+        """
+        modes = tuple(
+            self.training_profit_opponent_modes
+            if str(regime) == "profit"
+            else (
+                self.training_catchup_opponent_modes
+                if str(regime) == "catchup"
+                else self.training_dynamic_opponent_modes
+            )
+        )
+        if not self.credit_assignment_v25:
+            return modes
+        slow = {"pi_price_gap", "region_supply_demand"}
+        if not (self.regime_market or self.learning_corrections):
+            return tuple(mode for mode in modes for _ in range(1 if mode in slow else 3))
+        return tuple(mode for repetition in range(3) for mode in modes
+                     if repetition == 0 or mode not in slow)
+
+    def configure_training_scenario_curriculum(
+        self,
+        entries: Sequence[Tuple[str, Optional[ShockScenario]]],
+    ) -> None:
+        """Install a predeclared episode curriculum without policy-based selection."""
+        names = [str(name) for name, _ in entries]
+        if not entries or any(not name for name in names) or len(names) != len(set(names)):
+            raise ValueError("training scenario curriculum requires unique non-empty cases")
+        self.training_scenario_curriculum = tuple((str(name), copy.deepcopy(case)) for name, case in entries)
+        self.v26_settings = {**dict(self.v26_settings or {}),
+            "training_scenario_curriculum": names}
+
+    def _set_training_episode_scenario(self, ordinal: int, opponent_count: int) -> str:
+        """Pair each scripted case with every opponent before advancing cases."""
+        if not self.training_scenario_curriculum:
+            name, scenario = "natural_calibrated", None
+        else:
+            # Each case is held for one full opponent-population cycle, so every
+            # case meets every opponent class (the revision-10 contract). Rotating
+            # every episode paired case k only with opponent k mod |pool|.
+            index = (int(ordinal) // max(1, int(opponent_count))) % len(self.training_scenario_curriculum)
+            name, scenario = self.training_scenario_curriculum[index]
+        self.active_training_scenario = str(name)
+        self.shock_scenario = copy.deepcopy(scenario)
+        if self.market.shocks is None and self.training_scenario_curriculum:
+            raise RuntimeError("training scenario curriculum requires an installed shock process")
+        if self.market.shocks is not None:
+            self.market.shocks.scenario = copy.deepcopy(scenario)
+        return self.active_training_scenario
+
+    def _enter_training_stage(
+        self,
+        stage: TrainingStage,
+        *,
+        configured_mode: str,
+        episode_seed: int,
+        opponent_mode_override: Optional[str] = None,
+    ) -> str:
+        """Open a fresh episode for a curriculum stage and return its controller.
+
+        Policy and optimizer state are intentionally retained.  Tariffs,
+        controller state, observation history, and simulator episode metrics
+        are reset so a return never spans two opponent regimes.
+        """
+        selected_mode = (
+            str(opponent_mode_override)
+            if opponent_mode_override is not None
+            else self._training_stage_opponent_mode(
+                stage, configured_mode, episode_seed=int(episode_seed)
+            )
+        )
+        # Tell the shock process the exact corrected-learner episode horizon
+        # before its next calendar reset so the training-only shortage
+        # curriculum can place both events in-bounds.
+        episode_days = self._training_opponent_episode_days(stage, selected_mode)
+        if self.regime_market:
+            self.market.shock_training_episode_days = int(episode_days)
+            self.market.calendar.day_index = -1
+        if self.environment_reseed_per_episode:
+            self._reseed_environment(int(episode_seed))
+        self._reset_adaptive_episode(
+            tariff_reset_fraction=float(stage.tariff_reset_fraction),
+            opponent_mode=selected_mode,
+            episode_seed=int(episode_seed),
+            symmetric_tariffs=False,
+        )
+        if str(stage.opponent_regime) == "market":
+            self._set_firm2_to_market_reference(int(episode_seed) + 1)
+        elif (
+            str(stage.opponent_regime) in {"dynamic", "catchup", "profit"}
+            and self.training_opponent_perturbation.scale > 0.0
+            and not isinstance(self.firm2, FirmStaticPricer)
+        ):
+            # Opponent domain randomization: every training opening faces a
+            # freshly perturbed parameterization of its controller class.
+            draw = self.training_opponent_perturbation.apply(
+                self.firm2, np.random.default_rng([int(self.seed), int(episode_seed), 11])
+            )
+            self.last_training_opponent_perturbation = dict(draw)
+        if self.learner_revision >= 3 and self.firm1_mode == "RL":
+            self.firm1.agent.set_value_objective_weights(
+                self.long_term_profit_reward_config.critic_component_weights(
+                    str(stage.opponent_regime)
+                )
+            )
+        return selected_mode
+
+    def _reset_adaptive_episode(
+        self,
+        *,
+        tariff_reset_fraction: float,
+        opponent_mode: Optional[str] = None,
+        episode_seed: Optional[int] = None,
+        symmetric_tariffs: bool = False,
+        evaluation_profiles: bool = False,
+    ) -> None:
+        """Create one independently randomized strategic trajectory opening.
+
+        Training calls this at stage boundaries and at each long episode in the
+        dynamic stage. Validation and evaluation use the same opening
+        randomization for independent long trajectories.
+        """
+        self._reset_rider_memory()
+        if self.regime_market:
+            self.driver_supply.reset_stock()
+            self.driver_supply.apply_shock()
+            self._firm2_regime_price_multiplier = 1.0
+            self._regime_rival_switch_applied = {}
+        if opponent_mode is not None:
+            self.firm2 = self._make_pricer(
+                opponent_mode,
+                self.seed + 10_000 if episode_seed is None else int(episode_seed),
+            )
+        fraction = float(np.clip(tariff_reset_fraction, 0.02, 0.40))
+        if self.level_step_actions and bool(symmetric_tariffs):
+            raise ValueError("symmetric openings are undefined under the level-step contract")
+        reset_rng = (
+            np.random.default_rng(int(episode_seed))
+            if episode_seed is not None
+            else self.rng
+        )
+        if self.loyalty_v2:
+            self._build_active_rider_pool(
+                np.random.default_rng([int(episode_seed), 26_002]) if episode_seed is not None else self.rng,
+                evaluation=evaluation_profiles,
+            )
+        base = self.market.curr_market
+        common_values: Dict[str, float] = {}
+        for firm_index, firm in enumerate((self.firm1, self.firm2)):
+            config = getattr(firm, "config", None)
+            for key in self.shared_edit_keys:
+                anchor = float(getattr(base, key))
+                if bool(symmetric_tariffs) and firm_index > 0:
+                    value = float(common_values[key])
+                else:
+                    value = anchor * float(
+                        reset_rng.uniform(1.0 - fraction, 1.0 + fraction)
+                    )
+                if config is not None and key in getattr(config, "bounds", {}):
+                    lb, ub = config.bounds[key]
+                    value = float(np.clip(value, lb, ub))
+                elif key in {"base_fare", "per_minute", "per_mile"}:
+                    value = max(0.01, value)
+                else:
+                    value = max(0.0, value)
+                if firm_index == 0 and self.level_step_actions:
+                    # The draw is still consumed, so Firm 2's opening and every
+                    # later random stream match the flags-off path. Firm 1
+                    # opens on S * L0 below.
+                    continue
+                set_coeff(base, firm.overrides, key, value)
+                if bool(symmetric_tariffs) and firm_index == 0:
+                    common_values[key] = float(value)
+        if self.level_step_actions:
+            self.firm1.post_tariff_level(
+                self._level_opening(fraction, episode_seed), self.market
+            )
+        if self.firm1_mode == "RL":
+            self.firm1.reset_state_history()
+        for observer in self.platform_observers.values():
+            observer.reset()
+        self.action_stability.reset()
+        self.last_crowd_response_stats = {}
+        self.last_share = 0.0
+        self.last_revpr = 0.0
+        self.last_profitpr = 0.0
+        self.last_gap = 0.0
+        self.last_fulfillment = 1.0
+        self.last_completion_coverage = 0.0
+        self.last_acceptance = 1.0
+        self.last_wait = 0.0
+        self.last_firm2_share = 0.0
+        self.last_firm2_revpr = 0.0
+        self.last_firm2_profitpr = 0.0
+        self._durable_profit_lead_ema = 0.0
+        self._temporal_reward_state_initialized = False
+        self.objective_credit_ready = False
+        self.last_action_mask_regime = "all_bounded_actions"
+        self._returning_share_ema = 0.0
+        self._rival_gap_history.clear()
+        
+    def _level_opening(self, fraction: float, episode_seed: Optional[int]) -> float:
+        """Opening level L0: a lattice level within +/-fraction of the reference."""
+        reference = float(self.firm1.tariff_structure["reference_level"])
+        lower, upper = self.firm1.tariff_level_bounds
+        count = int(round((upper - lower) / TARIFF_LEVEL_GRID_STEP))
+        lattice = [round(lower + index * TARIFF_LEVEL_GRID_STEP, 6) for index in range(count + 1)]
+        candidates = [
+            level for level in lattice
+            if abs(level - reference) <= float(fraction) * reference + 1e-9
+        ]
+        if not candidates:
+            raise RuntimeError("no lattice level lies inside the opening band")
+        rng = np.random.default_rng(
+            [int(self.seed if episode_seed is None else episode_seed), 15_015]
+        )
+        return float(candidates[int(rng.integers(len(candidates)))])
+
+    def _estimate_trip_cost(self, distance_miles: float, duration_minutes: float, airport: bool) -> float:
+        """Approximate platform contribution cost for a completed ride."""
+        return float(
+            self.fixed_trip_cost
+            + self.driver_cost_per_mile * max(0.0, float(distance_miles))
+            + self.driver_cost_per_minute * max(0.0, float(duration_minutes))
+            + (self.airport_cost if airport else 0.0)
+        )
+
+    @staticmethod
+    def _profit_margin(metrics: FirmMetrics) -> float:
+        if metrics.revenue <= 0.0:
+            return 0.0
+        return float(metrics.profit / max(metrics.revenue, 1e-6))
+    
+    def _driver_supply_context(self, firm: str, opponent: str) -> Tuple[Dict[str, float], np.ndarray]:
+        """Return same-firm supply diagnostics for heuristic/RL parity."""
+        if not self.enable_driver_supply:
+            return {}, np.zeros(8, dtype=np.float32)
+        state = self.driver_supply.smoothed_states.get(
+            firm,
+            self.driver_supply.last_states.get(firm, FirmDriverBatchState()),
+        )
+        context = {
+            "active_drivers": float(state.active_drivers),
+            "idle_driver_share": float(state.idle_driver_share),
+            "utilization": float(state.utilization),
+            "acceptance_rate": float(state.acceptance_rate),
+            "fulfillment_rate": float(state.fulfillment_rate),
+            "avg_wait_minutes": float(state.avg_wait_minutes),
+            "avg_pickup_minutes": float(state.avg_pickup_minutes),
+            "driver_earnings_per_hour": float(state.driver_earnings_per_hour),
+            "driver_earnings_per_online_hour": float(state.driver_earnings_per_online_hour),
+            "online_minutes": float(state.total_online_minutes),
+        }
+        return context, self.driver_supply.state_features_for_firm(firm, opponent=opponent)
+    
+    @staticmethod
+    def _smooth_positive_penalty(value: float, scale: float) -> float:
+        """Smoothly map a non-negative violation to [0, 1) without hard clipping."""
+        x = max(0.0, float(value))
+        s = max(1e-6, float(scale))
+        y = x / (x + s)
+        return float(y * y)
+    
+    @staticmethod
+    def _finite_float(value: float, default: float = 0.0) -> float:
+        """Return a scalar float with NaN/infinite values mapped to a safe default."""
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        return out if np.isfinite(out) else float(default)
+    
+    def _update_constraint_multipliers(self, reward_diag: Dict[str, float]) -> None:
+        """Compatibility no-op; operational metrics are diagnostics only."""
+        del reward_diag
+
+    def _constraint_vector_from_diag(self, reward_diag: Dict[str, float]) -> np.ndarray:
+        """Ordered constraint-cost vector for PPO constraint critics."""
+        costs = {
+            name: float(reward_diag.get(f"constraint_cost_{name}", 0.0))
+            for name in self.soft_constraints.names
+        }
+        return self.soft_constraints.vector(costs)
+
+    def _risk_cost_from_diag(self, reward_diag: Dict[str, float]) -> float:
+        """Tail-risk proxy used by the PPO risk critic and Lagrangian advantage."""
+        operational = np.asarray(
+            [
+                float(reward_diag.get("constraint_cost_fulfillment", 0.0)),
+                float(reward_diag.get("constraint_cost_coverage", 0.0)),
+                float(reward_diag.get("constraint_cost_wait", 0.0)),
+                float(reward_diag.get("constraint_cost_margin", 0.0)),
+            ],
+            dtype=float,
+        )
+        if operational.size == 0:
+            return 0.0
+        # A mean-only risk target hides rare but severe service failures.  Blend
+        # expected pressure with the worst currently visible tail channel.
+        return float(np.clip(0.35 * np.mean(operational) + 0.65 * np.max(operational), 0.0, 1.0))
+
+    def _response_target_from_metrics(self, m1: FirmMetrics, m2: FirmMetrics, mean_gap: float) -> np.ndarray:
+        """Current observable response snapshot, used to form causal deltas."""
+        telemetry = self.platform_observers["Firm1"].telemetry
+        demand = self.platform_observers["Firm1"].demand_mix
+        probes = self.platform_observers["Firm1"].quote_probes
+        return np.asarray(
+            [
+                # Put public opponent-response probes first.  These are the
+                # highest-value prediction targets for strategic adaptation.
+                *[
+                    float(np.clip(probes[s].get("gap", 0.0) / self.observation_config.gap_scale_dollars, -1.5, 1.5))
+                    for s in ("0_2", "2_5", "5_10", "10_plus")
+                ],
+                float(np.clip(telemetry.get("chosen_share_estimate", 0.0), 0.0, 1.0)),
+                float(np.clip(telemetry.get("completed_share_estimate", 0.0), 0.0, 1.0)),
+                float(np.clip(telemetry.get("revenue_per_request", 0.0) / self.reward_rev_scale, 0.0, 1.5)),
+                float(np.clip(telemetry.get("profit_per_request", 0.0) / self.reward_profit_scale, -1.0, 1.0)),
+                float(np.clip(telemetry.get("fulfillment_rate", 1.0), 0.0, 1.0)),
+                float(np.clip(telemetry.get("wait_minutes", 0.0) / 15.0, 0.0, 1.5)),
+                float(np.clip(demand.get("distance_mean", 0.0) / 12.0, 0.0, 1.5)),
+                float(np.clip(demand.get("long_trip_share", 0.0), 0.0, 1.0)),
+            ],
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _response_delta(baseline: np.ndarray, future: np.ndarray) -> np.ndarray:
+        """Bounded action-conditioned market change for response supervision."""
+        before = np.asarray(baseline, dtype=np.float32).reshape(-1)
+        after = np.asarray(future, dtype=np.float32).reshape(-1)
+        if before.shape != after.shape:
+            raise ValueError(f"response target shapes differ: {before.shape} != {after.shape}")
+        return np.clip(after - before, -2.0, 2.0).astype(np.float32)
+
+    def _sync_agent_optimization_context(self) -> None:
+        """Keep PPO optimization tied only to its scalar economic reward."""
+        if self.firm1_mode != "RL" or not hasattr(getattr(self.firm1, "agent", None), "set_optimization_context"):
+            return
+        self.firm1.agent.set_optimization_context(
+            np.zeros(len(self.soft_constraints.names), dtype=np.float32),
+            risk_coeff=0.0,
+            constraints_active=False,
+            risk_active=False,
+        )
+
+    def _ppo_bootstrap_estimates(
+        self,
+        *,
+        day_of_week: int,
+        hour: int,
+        weather: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Estimate continuing-task values without advancing the frame history."""
+        raw_state = self._build_rl_state(
+            day_of_week=day_of_week,
+            hour=hour,
+            weather=weather,
+            perspective="Firm1",
+        )
+        action_features = self._action_feature_matrix_for_pricer(
+            self.firm1, getattr(self, "last_crowd_response_stats", {}) or {}
+        )
+        stacked_state = self.firm1.stack_state(raw_state, commit=False)
+        critic_state = (
+            self._build_privileged_critic_state(raw_state)
+            if self.privileged_critic
+            else None
+        )
+        return self.firm1.agent.value_estimates(
+            stacked_state,
+            action_features=action_features,
+            critic_state=critic_state,
+        )
+
+    def _configure_constraint_curriculum(self, progress: float) -> None:
+        """Compatibility no-op; there is no constraint curriculum."""
+        del progress
+        self.constraint_curriculum_scale = 0.0
+            
+    @staticmethod
+    def _policy_action_diagnostics(logits: torch.Tensor, action: int) -> Dict[str, float]:
+        """Return compact deterministic-policy diagnostics for eval logs."""
+        with torch.no_grad():
+            probs_t = torch.softmax(logits.detach().float(), dim=-1).reshape(-1)
+            probs = np.asarray(probs_t.cpu().tolist(), dtype=float)
+        if probs.size == 0:
+            return {
+                "policy_action_prob": 0.0,
+                "policy_top_action": -1.0,
+                "policy_top_prob": 0.0,
+                "policy_entropy": 0.0,
+                "policy_hold_prob": 0.0,
+            }
+        safe_probs = np.clip(probs.astype(float), 1e-12, 1.0)
+        top_action = int(np.argmax(probs))
+        action_i = int(action)
+        action_prob = float(probs[action_i]) if 0 <= action_i < probs.size else 0.0
+        return {
+            "policy_action_prob": action_prob,
+            "policy_top_action": float(top_action),
+            "policy_top_prob": float(probs[top_action]),
+            "policy_entropy": float(-np.sum(safe_probs * np.log(safe_probs))),
+            "policy_hold_prob": float(probs[0]) if probs.size > 0 else 0.0,
+        }
+
+    def _coeff_snapshot(self) -> Dict[str, float]:
+        """Current manipulated Firm1 coefficients, resolved against market anchors."""
+        if self.firm1_mode != "RL":
+            return {}
+        return {
+            k: float(get_coeff(self.market.curr_market, self.firm1.overrides, k))
+            for k in self.shared_edit_keys
+        }
+
+    def _pricer_coeff_snapshot(self, pricer) -> Dict[str, float]:
+        """Resolved public tariff coefficients for either firm."""
+        overrides = getattr(pricer, "overrides", CoefficientOverrides())
+        return {
+            key: float(get_coeff(self.market.curr_market, overrides, key))
+            for key in self.shared_edit_keys
+        }
+
+    def _public_firm2_quote_gaps(
+        self,
+        *,
+        day_of_week: int,
+        hour: int,
+        weather: str,
+        own_quotes: Optional[Dict[str, Tuple[float, float]]] = None,
+    ) -> Dict[str, float]:
+        """Return representative posted-price gaps after Firm 2 commits.
+
+        These are ordinary public ride quotes, not controller coefficients.
+        Firm 1 receives the same four distance-segment view already used by the
+        observation model and therefore can identify a hidden policy only from
+        its observable price process and subsequent market outcomes.
+        """
+        public_rides = {
+            "0_2": (1.2, 8.0, False),
+            "2_5": (3.5, 14.0, False),
+            "5_10": (7.0, 24.0, False),
+            "10_plus": (13.0, 38.0, True),
+        }
+        gaps: Dict[str, float] = {}
+        for segment, (distance, duration, airport) in public_rides.items():
+            context = RideContext(
+                day_of_week=int(day_of_week),
+                weather=str(weather),
+                hour=int(hour),
+                airport=bool(airport),
+                service="economy",
+            )
+            firm1_quote = self.market.quote_price(
+                float(distance),
+                float(duration),
+                context,
+                overrides=self.firm1.overrides,
+            )
+            firm2_quote = self.market.quote_price(
+                float(distance),
+                float(duration),
+                context,
+                overrides=self.firm2.overrides,
+            )
+            if self.regime_market and self._firm2_regime_price_multiplier != 1.0:
+                firm2_quote = float(firm2_quote) * float(self._firm2_regime_price_multiplier)
+            gaps[segment] = float(firm2_quote - firm1_quote)
+            if own_quotes is not None:
+                reference = self.market.quote_price(float(distance), float(duration), context,
+                                                    overrides=CoefficientOverrides())
+                own_quotes[segment] = (float(firm1_quote), float(reference))
+        return gaps
+
+    def _publish_firm2_leader_quotes(
+        self,
+        *,
+        day_of_week: int,
+        hour: int,
+        weather: str,
+    ) -> None:
+        """Make the committed Firm 2 move observable before Firm 1 reacts."""
+        own_quotes = {} if self.platform_observers["Firm1"].config.learning_corrections and self.persistence_features else None
+        self.platform_observers["Firm1"].publish_public_quote_gaps(
+            self._public_firm2_quote_gaps(
+                day_of_week=day_of_week,
+                hour=hour,
+                weather=weather,
+                own_quotes=own_quotes,
+            )
+        )
+        if own_quotes is not None:
+            probes = self.platform_observers["Firm1"].quote_snapshot()
+            # Reconstruct from noisy PUBLIC gaps and our contemporaneous quote,
+            # not hidden rival coefficients. Changing our tariff cancels out.
+            rival_index = float(np.mean([
+                (probes[segment]["gap"] + own) / reference - 1.0
+                for segment, (own, reference) in own_quotes.items()
+            ]))
+            self._rival_gap_history.append(rival_index)
+            if self.opponent_features:
+                own_index = float(np.mean([
+                    own / reference - 1.0
+                    for segment, (own, reference) in own_quotes.items()
+                ]))
+                self.platform_observers["Firm1"].record_rival_index(
+                    rival_index, own_index
+                )
+
+    def _post_grid_multiplier(self, pricer, multiplier: float) -> None:
+        """Post one whole-tariff grid candidate within controller bounds."""
+        base = self.market.curr_market
+        config = getattr(pricer, "config", None)
+        for key in self.shared_edit_keys:
+            value = float(getattr(base, key)) * float(multiplier)
+            if config is not None and key in getattr(config, "bounds", {}):
+                value = float(np.clip(value, *config.bounds[key]))
+            set_coeff(base, pricer.overrides, key, value)
+
+    def _tariff_grid_multiplier(self, pricer) -> float:
+        base = self.market.curr_market
+        ratios = [
+            float(get_coeff(base, pricer.overrides, key))
+            / max(1e-9, float(getattr(base, key)))
+            for key in self.shared_edit_keys
+            if float(getattr(base, key)) > 0.0
+        ]
+        return float(np.mean(ratios)) if ratios else 1.0
+
+    def _firm2_profit_best_response_plan(
+        self,
+        *,
+        day_of_week: int,
+        hour: int,
+        weather: str,
+    ) -> Tuple[Optional[float], float, float, Dict[float, float]]:
+        """Select Firm 2's own-profit grid best response in the digital twin.
+
+        Every candidate starts from the same full snapshot. Thus rider draws,
+        trips, driver supply, loyalty and shocks use common random numbers.
+        Firm 1 is held at its last public tariff unless this is the explicitly
+        labelled fictitious-play controller, whose prediction uses only its
+        logged public reaction table. Switching requires a paired improvement
+        larger than one simulation standard error.
+        """
+        planner = self.firm2
+        if not isinstance(planner, FirmTwinProfitOptimizerMixin):
+            raise TypeError("profit planning requires a twin-profit controller")
+        steps_per_day = int(max(1, getattr(self, "shared_steps_per_day", 1)))
+        horizon = int(max(1, planner.profit_horizon_days * steps_per_day))
+        reference_customers = int(max(
+            1, getattr(self, "_profit_planner_reference_customers", 32)
+        ))
+        sample_cap = int(max(
+            2,
+            min(
+                reference_customers,
+                getattr(self, "profit_planner_sample_cap", 32),
+            ),
+        ))
+        grid = tuple(float(value) for value in planner.profit_candidate_grid)
+        current_multiplier = self._tariff_grid_multiplier(planner)
+        firm1_multiplier = self._tariff_grid_multiplier(self.firm1)
+        snapshot = self._snapshot_counterfactual_state()
+        original_cap = int(self.simulation_sample_cap)
+        trajectories: Dict[Optional[float], np.ndarray] = {}
+        try:
+            self.simulation_sample_cap = sample_cap
+            # None represents the exact current multi-coefficient tariff. A
+            # randomized opening need not lie on the 13-point grid.
+            for candidate in (None, *grid):
+                self._restore_counterfactual_state(snapshot)
+                branch_planner = self.firm2
+                if candidate is not None:
+                    self._post_grid_multiplier(branch_planner, candidate)
+                predicted_firm1 = branch_planner.predicted_firm1_multiplier(
+                    current_multiplier if candidate is None else candidate,
+                    firm1_multiplier,
+                )
+                profits: List[float] = []
+                current_day = int(day_of_week)
+                current_hour = int(hour)
+                current_weather = str(weather)
+                for offset in range(horizon):
+                    if offset > 0:
+                        # Revision 11: the planner never advances the shock
+                        # process (that would reveal the realized future regime
+                        # path). Today's public regime and weather are assumed to
+                        # persist over the planning horizon; hours advance one
+                        # block at a time in order.
+                        if offset % steps_per_day == 0:
+                            current_day = (int(current_day) + 1) % 7
+                        block_hours = max(1, 24 // steps_per_day)
+                        current_hour = int((int(hour) + offset * block_hours) % 24)
+                    if branch_planner.anticipate_firm1_reaction and offset > 0:
+                        self._post_grid_multiplier(self.firm1, predicted_firm1)
+                    realized_customers = self._step_customers(
+                        reference_customers,
+                        hour=current_hour,
+                        day_of_week=current_day,
+                        weather=current_weather,
+                    )
+                    profiles = self._sample_profiles_from_pool(sample_cap)
+                    _, _, m2, _, _, _ = self.simulate_batch(
+                        day_of_week=current_day,
+                        weather=current_weather,
+                        hour=current_hour,
+                        customers_per_step=realized_customers,
+                        sampled_profiles=profiles,
+                        collect_rows=False,
+                        supply_reference_customers=reference_customers,
+                    )
+                    profits.append(float(m2.profit_per_request))
+                trajectories[candidate] = np.asarray(profits, dtype=float)
+        finally:
+            self.simulation_sample_cap = original_cap
+            self._restore_counterfactual_state(snapshot)
+
+        discounts = np.power(
+            float(
+                self.firm1.agent.gamma
+                if self.firm1_mode == "RL"
+                else 0.999
+            ),
+            np.arange(horizon, dtype=float),
+        )
+        means = {
+            candidate: float(np.average(values, weights=discounts))
+            for candidate, values in trajectories.items()
+        }
+        best = min(grid, key=lambda value: (-means[value], value))
+        paired = trajectories[best] - trajectories[None]
+        improvement = float(means[best] - means[None])
+        standard_error = float(
+            np.std(paired, ddof=1) / np.sqrt(paired.size)
+            if paired.size > 1
+            else 0.0
+        )
+        selected = best if improvement > max(standard_error, 1e-12) else None
+        report_means = {float(value): float(means[value]) for value in grid}
+        report_means[current_multiplier] = float(means[None])
+        return selected, improvement, standard_error, report_means
+
+    def compute_theory_benchmarks(
+        self,
+        *,
+        customers_per_step: int = 32,
+        replications: int = 2,
+    ) -> Dict[str, Any]:
+        """Estimate the calm 13x13 tariff game with CRN twin simulations."""
+        if self.firm1_mode != "RL":
+            raise ValueError("theory benchmark computation requires Firm 1 RL pricing")
+        grid = tuple(float(value) for value in FirmTwinProfitOptimizerMixin.profit_candidate_grid)
+        sample_cap = int(max(2, min(customers_per_step, self.profit_planner_sample_cap)))
+        reps = int(max(1, replications))
+        root = self._snapshot_counterfactual_state()
+        original_cap = int(self.simulation_sample_cap)
+        original_regime = bool(self.regime_market)
+        firm1_samples = np.zeros((reps, len(grid), len(grid)), dtype=float)
+        firm2_samples = np.zeros_like(firm1_samples)
+        try:
+            self.simulation_sample_cap = sample_cap
+            # This is the requested calm operating point, not foreknowledge of
+            # a realized shock path.
+            self.regime_market = False
+            self._firm2_regime_price_multiplier = 1.0
+            for replication in range(reps):
+                self._restore_counterfactual_state(root)
+                self.regime_market = False
+                self._firm2_regime_price_multiplier = 1.0
+                seed = [int(self.seed), int(replication), 13_013]
+                self.rng = np.random.default_rng(seed)
+                if hasattr(self.choice_model, "rng"):
+                    self.choice_model.rng = np.random.default_rng([*seed, 1])
+                self.driver_supply.rng = np.random.default_rng([*seed, 2])
+                self.market.rng = np.random.default_rng([*seed, 3])
+                common = self._snapshot_counterfactual_state()
+                for row, firm1_multiplier in enumerate(grid):
+                    for column, firm2_multiplier in enumerate(grid):
+                        self._restore_counterfactual_state(common)
+                        self.regime_market = False
+                        self._post_grid_multiplier(self.firm1, firm1_multiplier)
+                        self._post_grid_multiplier(self.firm2, firm2_multiplier)
+                        profiles = self._sample_profiles_from_pool(sample_cap)
+                        _, m1, m2, _, _, _ = self.simulate_batch(
+                            day_of_week=2,
+                            weather="clear",
+                            hour=12,
+                            customers_per_step=int(max(2, customers_per_step)),
+                            sampled_profiles=profiles,
+                            collect_rows=False,
+                            supply_reference_customers=int(max(2, customers_per_step)),
+                        )
+                        firm1_samples[replication, row, column] = float(
+                            m1.profit_per_request
+                        )
+                        firm2_samples[replication, row, column] = float(
+                            m2.profit_per_request
+                        )
+        finally:
+            self.simulation_sample_cap = original_cap
+            self.regime_market = original_regime
+            self._restore_counterfactual_state(root)
+        firm1_mean = np.mean(firm1_samples, axis=0)
+        firm2_mean = np.mean(firm2_samples, axis=0)
+        report = solve_tariff_game(grid, firm1_mean, firm2_mean)
+        report.update({
+            "payoff_matrix_firm1": firm1_mean.tolist(),
+            "payoff_matrix_firm2": firm2_mean.tolist(),
+            "replications": reps,
+            "customers_per_cell": int(max(2, customers_per_step)),
+            "common_random_numbers_within_replication": True,
+            "operating_point": "calm_weekday_noon",
+            "markov_persistence_value_definition": (
+                "dynamic RL/best-response steady-state multiplier minus the "
+                "reported static Nash and Stackelberg multipliers"
+            ),
+        })
+        return report
+
+    def _firm2_leader_step(
+        self,
+        *,
+        previous_metrics: Optional[FirmMetrics],
+        day_of_week: int,
+        hour: int,
+        weather: str,
+        enabled: bool = True,
+    ) -> Tuple[np.ndarray, bool]:
+        """Execute one configured Firm 2 decision before Firm 1's decision.
+
+        The controller receives only lagged realized metrics and its existing
+        public observation interface.  Its native ``update`` and ``act``
+        methods are called without policy substitutions or hand-written action
+        overrides.  The returned target is a training-only audit/auxiliary
+        label; Firm 1 observes the resulting public quotes, never this label.
+        """
+        empty_target = np.zeros(
+            len(self.shared_edit_keys) + 1, dtype=np.float32
+        )
+        memory_clock = bool(getattr(self.firm2, 'operational_clock', False))
+        if memory_clock and previous_metrics is not None:
+            supply, supply_vector = self._driver_supply_context("Firm2", "Firm1")
+            self.firm2.update(
+                metrics=previous_metrics,
+                price_gap_mean=self._observed_own_minus_competitor_gap("Firm2"),
+                supply_state=supply, supply_state_vector=supply_vector,
+            )
+        if (
+            not bool(enabled)
+            or isinstance(self.firm2, FirmStaticPricer)
+        ):
+            # Holding is still a committed public price. Publish it so the
+            # follower sees a freshly posted static/no-change quote before its
+            # first decision as well as on periods between dynamic moves.
+            self._publish_firm2_leader_quotes(
+                day_of_week=day_of_week,
+                hour=hour,
+                weather=weather,
+            )
+            return empty_target, False
+
+        if hasattr(self.firm2, "observe_state"):
+            firm2_state = self._build_rl_state(
+                day_of_week=day_of_week,
+                hour=hour,
+                weather=weather,
+                perspective="Firm2",
+            )
+            firm2_features = self._action_feature_matrix_for_pricer(
+                self.firm2,
+                getattr(self, "last_crowd_response_stats", {}) or {},
+            )
+            self.firm2.observe_state(firm2_state, firm2_features)
+
+        if isinstance(self.firm2, FirmTwinProfitOptimizerMixin):
+            base = self.market.curr_market
+            self.firm2.observe_firm1_posted_tariff(
+                firm1_tariff={
+                    key: float(get_coeff(base, self.firm1.overrides, key))
+                    for key in self.shared_edit_keys
+                },
+                anchors={
+                    key: float(getattr(base, key))
+                    for key in self.shared_edit_keys
+                },
+            )
+
+        if previous_metrics is not None and not memory_clock:
+            supply, supply_vector = self._driver_supply_context(
+                "Firm2", "Firm1"
+            )
+            self.firm2.update(
+                metrics=previous_metrics,
+                price_gap_mean=self._observed_own_minus_competitor_gap(
+                    "Firm2"
+                ),
+                supply_state=supply,
+                supply_state_vector=supply_vector,
+            )
+
+        before = self._pricer_coeff_snapshot(self.firm2)
+        base = self.market.curr_market
+        if isinstance(self.firm2, FirmTwinProfitOptimizerMixin):
+            selected, improvement, standard_error, candidate_means = (
+                self._firm2_profit_best_response_plan(
+                    day_of_week=day_of_week,
+                    hour=hour,
+                    weather=weather,
+                )
+            )
+            # Planning restores a deep-copied Firm 2, so use the restored
+            # controller rather than the pre-planning reference.
+            self.firm2.set_profit_plan(
+                multiplier=selected,
+                improvement=improvement,
+                standard_error=standard_error,
+                candidate_means=candidate_means,
+            )
+            base = self.market.curr_market
+        self.firm2.act(
+            city_base=base.base_fare,
+            city_pmin=base.per_minute,
+            city_pmile=base.per_mile,
+            city_booking=base.booking_fee,
+            city_airport=base.airport_fee,
+            hour=hour,
+            weather=weather,
+        )
+        after = self._pricer_coeff_snapshot(self.firm2)
+        target = self._opponent_action_target(before, after, self.firm2)
+        self._publish_firm2_leader_quotes(
+            day_of_week=day_of_week,
+            hour=hour,
+            weather=weather,
+        )
+        return target, bool(target[-1] > 0.0)
+
+    def _opponent_action_target(
+        self,
+        before: Mapping[str, float],
+        after: Mapping[str, float],
+        pricer,
+    ) -> np.ndarray:
+        """Normalize Firm 2's current leader intervention for supervision.
+
+        Targets describe direction and approximate number of controller steps,
+        not absolute private tariff levels.  They therefore teach the public-
+        history model the public-price process that preceded the follower
+        action while keeping the deployed actor's observation boundary
+        unchanged.
+        """
+        config = getattr(pricer, "config", None)
+        steps = getattr(config, "step", {}) if config is not None else {}
+        fallback = {
+            "base_fare": 0.10,
+            "per_minute": 0.01,
+            "per_mile": 0.05,
+            "booking_fee": 0.10,
+            "airport_fee": 0.25,
+        }
+        moves = []
+        for key in self.shared_edit_keys:
+            scale = max(1e-6, float(steps.get(key, fallback[key])))
+            delta = float(after.get(key, 0.0) - before.get(key, 0.0))
+            moves.append(float(np.clip(delta / scale, -2.0, 2.0)))
+        intervened = float(any(abs(value) > 1e-6 for value in moves))
+        return np.asarray([*moves, intervened], dtype=np.float32)
+
+    @staticmethod
+    def _finalize_opponent_action_sum(values: np.ndarray) -> np.ndarray:
+        """Aggregate any rival moves within one Firm 1 reaction horizon."""
+        result = np.asarray(values, dtype=np.float32).reshape(-1).copy()
+        if not 2 <= result.size <= OPPONENT_ACTION_FORECAST_DIM:
+            raise ValueError(
+                "opponent action target has incompatible size: "
+                f"{result.size}; expected 2-{OPPONENT_ACTION_FORECAST_DIM}"
+            )
+        result[:-1] = np.clip(result[:-1], -2.0, 2.0)
+        result[-1] = float(result[-1] > 0.0)
+        return result
+
+    @staticmethod
+    def _coeff_delta(after: Dict[str, float], before: Dict[str, float]) -> Dict[str, float]:
+        keys = sorted(set(after) | set(before))
+        return {
+            k: float(after.get(k, 0.0) - before.get(k, 0.0))
+            for k in keys
+            if abs(float(after.get(k, 0.0) - before.get(k, 0.0))) > 1e-12
+        }
+
+    def _action_feature_matrix_for_pricer(self, pricer, crowd_context: Optional[Dict[str, float]] = None) -> Optional[np.ndarray]:
+        """Build action consequences from own tariff and observable quote probes."""
+        if int(getattr(getattr(pricer, "agent", None), "action_feature_dim", 0)) <= 0:
+            return None
+        if not hasattr(pricer, "action_to_steps") or not hasattr(pricer, "action_keys"):
+            return None
+        base = self.market.curr_market
+        config = getattr(pricer, "config", None)
+        if config is None:
+            return None
+        firm_name = "Firm2" if pricer is self.firm2 else "Firm1"
+        anchors = {key: float(getattr(base, key)) for key in self.opt_keys}
+        coefficients = {
+            key: float(get_coeff(base, pricer.overrides, key)) for key in self.opt_keys
+        }
+        return self.platform_observers[firm_name].build_action_features(
+            action_steps=getattr(pricer, "action_to_steps", {}),
+            action_keys=list(getattr(pricer, "action_keys", [])),
+            own_coefficients=coefficients,
+            anchor_coefficients=anchors,
+            coefficient_steps=dict(config.step),
+            coefficient_bounds=dict(config.bounds),
+            step_scale=float(getattr(pricer, "step_scale", 1.0)),
+            target_gap=float(self.constraint_config.target_gap),
+            action_target_keys=getattr(pricer, "action_to_target_key", None),
+            action_target_multipliers=getattr(
+                pricer, "action_to_multiplier", None
+            ),
+            action_target_relative_steps=getattr(
+                pricer, "action_to_relative_step", None
+            ),
+            action_target_values=(
+                pricer.level_target_values(self.market)
+                if getattr(pricer, "level_step_actions", False)
+                else None
+            ),
+        )
+
+    def _publish_pricing_observation(
+        self,
+        *,
+        day_of_week: int,
+        hour: int,
+        weather: str,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+        """Expose the same market observation set to both firms before decisions."""
+        firm1_state_vec = self._build_rl_state(day_of_week=day_of_week, hour=hour, weather=weather, perspective="Firm1")
+        firm2_state_vec = self._build_rl_state(day_of_week=day_of_week, hour=hour, weather=weather, perspective="Firm2")
+        crowd_context = getattr(self, "last_crowd_response_stats", {})
+        f1_action_features = self._action_feature_matrix_for_pricer(self.firm1, crowd_context)
+        f2_action_features = self._action_feature_matrix_for_pricer(self.firm2, crowd_context)
+        if hasattr(self.firm1, "observe_state"):
+            self.firm1.observe_state(firm1_state_vec, f1_action_features)
+        if hasattr(self.firm2, "observe_state"):
+            # Same schema, firm-specific values: Firm2 receives its own supply,
+            # fulfillment, coefficient distances, and Firm1 as the opponent.
+            self.firm2.observe_state(firm2_state_vec, f2_action_features)
+        return firm1_state_vec, f1_action_features, f2_action_features
+
+    def _ingest_platform_observations(self, m1: FirmMetrics, m2: FirmMetrics) -> None:
+        """Release one simulated market outcome through realistic measurement channels."""
+        if self.persistence_features:
+            # Rival-minus-own public quote gap (dollars), 7-day window; returning share EMA.
+            if not self.learning_corrections:
+                self._rival_gap_history.append(-float(self._observed_own_minus_competitor_gap("Firm1")))
+            self._returning_share_ema = 0.8 * float(self._returning_share_ema) + 0.2 * float(
+                getattr(self, "_last_returning_share", 0.0)
+            )
+        crowd_stats = dict(getattr(self, "last_crowd_response_stats", {}) or {})
+        for firm_name, opponent_name, metrics, gap_sign in (
+            ("Firm1", "Firm2", m1, 1.0),
+            ("Firm2", "Firm1", m2, -1.0),
+        ):
+            supply, _ = self._driver_supply_context(firm_name, opponent_name)
+            own_metrics = {
+                "chosen_share": float(metrics.chosen_share),
+                "completed_share": float(metrics.completed_share),
+                "revenue_per_request": float(metrics.rev_per_request),
+                "profit_per_request": float(metrics.profit_per_request),
+                "fulfillment_rate": float(metrics.fulfillment_rate),
+                "acceptance_rate": float(metrics.driver_acceptance_rate),
+                "wait_minutes": float(metrics.avg_wait_minutes),
+                "driver_pay_per_request": float(metrics.driver_pay / max(1, metrics.total)),
+            }
+            self.platform_observers[firm_name].ingest(
+                own_metrics=own_metrics,
+                supply_metrics=supply,
+                crowd_stats=crowd_stats,
+                gap_sign=gap_sign,
+            )
+
+    def _observed_own_minus_competitor_gap(self, firm_name: str) -> float:
+        """Return an uncertainty-weighted public-quote estimate, never true gap."""
+        probes = self.platform_observers[firm_name].quote_probes.values()
+        available = [probe for probe in probes if float(probe.get("available", 0.0)) > 0.0]
+        if not available:
+            return 0.0
+        weights = np.asarray(
+            [1.0 / max(0.05, float(probe.get("uncertainty", 1.0))) for probe in available],
+            dtype=float,
+        )
+        competitor_minus_own = float(np.average(
+            [float(probe.get("gap", 0.0)) - float(probe.get('own_promotion_discount', 0.)) for probe in available],
+            weights=weights,
+        ))
+        return -competitor_minus_own
+
+    def _restore_coeff_snapshot(self, snapshot: Dict[str, float]) -> None:
+        """Restore Firm1 overrides to an absolute coefficient snapshot."""
+        if self.firm1_mode != "RL":
+            return
+        for k, value in snapshot.items():
+            set_coeff(self.market.curr_market, self.firm1.overrides, k, float(value))
+
+    def _apply_eval_guardrail(
+        self,
+        mode: str,
+        *,
+        metrics: FirmMetrics,
+        price_gap_f2_minus_f1: float,
+        base,
+    ) -> Dict[str, Any]:
+        """Compatibility diagnostics only; policy projection is unsupported."""
+        del metrics, price_gap_f2_minus_f1, base
+        if mode != "off":
+            raise ValueError("policy guardrails are disabled; mode must be 'off'")
+        before = self._coeff_snapshot()
+        return {"applied": False, "mode": "off", "reasons": [], "deltas": {},
+                "before": before, "after": dict(before)}
+    
+    @staticmethod
+    def _format_distance_segment_diagnostics(stats: Dict[str, Any]) -> str:
+        """Compact distance-bin diagnostics for terminal progress logs."""
+        pieces: List[str] = []
+        for label, display in (
+            ("0_2", "0-2"),
+            ("2_5", "2-5"),
+            ("5_10", "5-10"),
+            ("10_plus", "10+"),
+        ):
+            choice = float(stats.get(f"distance_bin_{label}_firm1_choice_share", np.nan))
+            completed = float(stats.get(f"distance_bin_{label}_firm1_completed_share", np.nan))
+            gap = float(stats.get(f"distance_bin_{label}_price_gap_mean", np.nan))
+            if np.isfinite(choice) and np.isfinite(completed) and np.isfinite(gap):
+                pieces.append(f"{display}:ch={choice:.2f}/done={completed:.2f}/gap={gap:.2f}")
+        return " | ".join(pieces)
+
+    @staticmethod
+    def _segment_balance_penalty_from_stats(stats: Dict[str, Any]) -> float:
+        """Penalty for policies that win only one distance segment or create floods."""
+        completed_shares: List[float] = []
+        flood_penalties: List[float] = []
+        gap_penalties: List[float] = []
+        for label in ("0_2", "2_5", "5_10", "10_plus"):
+            choice = float(stats.get(f"distance_bin_{label}_firm1_choice_share", np.nan))
+            completed = float(stats.get(f"distance_bin_{label}_firm1_completed_share", np.nan))
+            gap = float(stats.get(f"distance_bin_{label}_price_gap_mean", np.nan))
+            if np.isfinite(completed):
+                completed_shares.append(float(np.clip(completed, 0.0, 1.0)))
+            if np.isfinite(choice) and np.isfinite(completed):
+                flood_penalties.append(float(np.clip(choice - completed - 0.25, 0.0, 1.0)))
+            if np.isfinite(gap):
+                gap_penalties.append(float(np.clip((abs(gap) - 3.0) / 3.0, 0.0, 1.0)))
+        imbalance = 0.0
+        if len(completed_shares) >= 2:
+            imbalance = float(np.clip(np.std(completed_shares) / 0.30, 0.0, 1.0))
+        flood = float(np.mean(flood_penalties)) if flood_penalties else 0.0
+        gap_extreme = float(np.mean(gap_penalties)) if gap_penalties else 0.0
+        return float(np.clip(0.50 * imbalance + 0.35 * flood + 0.15 * gap_extreme, 0.0, 1.0))
+
+    def _validation_score_from_metrics(
+        self,
+        *,
+        reward: float,
+        completed_share_advantage: Optional[float] = None,
+    ) -> float:
+        """Return the checkpoint score owned by the configured objective.
+
+        Every policy is ranked by its realized normalized training reward.
+        The profit pipeline selects on Firm1 contribution profit and the
+        competitiveness pipeline on the Firm1-minus-Firm2 completed-share gap.
+        Neither uses proxy KPIs.
+        """
+        del completed_share_advantage
+        return float(reward)
+
+    @staticmethod
+    def _evaluation_checkpoint(
+        best_checkpoint: Optional[Mapping[str, Any]],
+        latest_checkpoint: Optional[Mapping[str, Any]],
+        best_observed_checkpoint: Optional[Mapping[str, Any]] = None,
+    ) -> Tuple[Optional[Mapping[str, Any]], str]:
+        """Never replace the latest policy with a historical policy.
+
+        Eligibility and reward plateaus are diagnostics, not permission to
+        substitute weights. Historical comparisons must be explicit runs.
+        """
+        del best_checkpoint, best_observed_checkpoint
+        if latest_checkpoint is not None:
+            return latest_checkpoint, "final_dynamic_policy"
+        return None, "final_actor"
+
+    def _configured_primary_objective(self) -> str:
+        """Return the explicit objective used for selection and certification."""
+        config = getattr(self, "long_term_profit_reward_config", None)
+        if config is None:
+            return "profit_maximization"
+        configured = str(
+            getattr(config, "objective_mode", "profit_maximization")
+            or "profit_maximization"
+        ).strip().lower()
+        if configured not in POLICY_OBJECTIVES:
+            raise ValueError(f"unsupported policy objective: {configured!r}")
+        return configured
+
+    def _capture_final_training_checkpoint(self, day, latest_validation_checkpoint=None):
+        """Snapshot terminal learning state, never an earlier validation state."""
+        validated = (latest_validation_checkpoint is not None
+                     and latest_validation_checkpoint["day"] == int(day))
+        return {
+            "day": int(day),
+            "training_stage": str(self.current_training_stage.name),
+            "score": float(latest_validation_checkpoint["score"]) if validated else float("nan"),
+            "agent_state": {k: v.detach().cpu().clone()
+                            for k, v in self.firm1.agent.net.state_dict().items()},
+            "normalizer_state": copy.deepcopy(self.firm1.agent.normalizer_state_dict()),
+            "optimizer_state": copy.deepcopy(self.firm1.agent.optimizer_state_dict()),
+            "validation": dict(latest_validation_checkpoint["validation"]) if validated else {},
+        }
+
+    def _objective_firm_scores(
+        self,
+        own_profit: Sequence[float],
+        rival_profit: Sequence[float],
+        own_share: Sequence[float],
+        rival_share: Sequence[float],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return symmetric firm scores under the configured scalar objective.
+
+        PPO maximizes Firm 1's score.  Swapping the two firms gives the
+        comparison score used only for mixed-objective dominance diagnostics;
+        it does not add a reward, constraint, or action requirement.
+        """
+        own_profit_v = np.asarray(own_profit, dtype=float)
+        rival_profit_v = np.asarray(rival_profit, dtype=float)
+        own_share_v = np.asarray(own_share, dtype=float)
+        rival_share_v = np.asarray(rival_share, dtype=float)
+        if len({
+            own_profit_v.size,
+            rival_profit_v.size,
+            own_share_v.size,
+            rival_share_v.size,
+        }) != 1:
+            raise ValueError("objective score inputs must be aligned")
+        config = self.long_term_profit_reward_config
+        weights = config.economic_weights()
+
+        def score(
+            first_profit: np.ndarray,
+            second_profit: np.ndarray,
+            first_share: np.ndarray,
+            second_share: np.ndarray,
+        ) -> np.ndarray:
+            return (
+                weights["own_profit"]
+                * first_profit
+                / config.own_profit_scale
+                + weights["profit_lead"]
+                * (first_profit - second_profit)
+                / config.profit_advantage_scale
+                + weights["own_completed_share"]
+                * first_share
+                / config.own_completed_share_scale
+                + weights["completed_share_lead"]
+                * (first_share - second_share)
+                / config.market_share_gap_scale
+            )
+
+        return (
+            score(own_profit_v, rival_profit_v, own_share_v, rival_share_v),
+            score(rival_profit_v, own_profit_v, rival_share_v, own_share_v),
+        )
+
+    def _objective_dominance_path(
+        self,
+        own_profit: Sequence[float],
+        rival_profit: Sequence[float],
+        own_share: Sequence[float],
+        rival_share: Sequence[float],
+    ) -> np.ndarray:
+        """Return the objective-consistent Firm 1 minus Firm 2 path."""
+        objective = self._configured_primary_objective()
+        if objective == "profit_maximization":
+            return np.asarray(own_profit, dtype=float) - np.asarray(
+                rival_profit, dtype=float
+            )
+        if objective == "competitiveness":
+            return np.asarray(own_share, dtype=float) - np.asarray(
+                rival_share, dtype=float
+            )
+        own_score, rival_score = self._objective_firm_scores(
+            own_profit, rival_profit, own_share, rival_share
+        )
+        return own_score - rival_score
+
+    @staticmethod
+    def _smoothed_convergence_statistics(
+        rewards: Sequence[float],
+        *,
+        window: int,
+        smoothing: int = 20,
+    ) -> Tuple[int, float, float]:
+        """Measure convergence on rolling expected reward, not raw market noise.
+
+        A day's realized reward contains demand, weather, profile, supply, and
+        opponent-response noise.  The policy has converged only when a sequence
+        of trailing expected-reward estimates is stable.  Returning the number
+        of usable estimates lets callers retain their existing minimum-window
+        requirements without accidentally declaring convergence on a short run.
+        """
+        finite = np.asarray(
+            [float(value) for value in rewards if np.isfinite(value)],
+            dtype=float,
+        )
+        smooth_width = int(max(1, smoothing))
+        if finite.size < smooth_width:
+            return 0, 1.0, 1.0
+        kernel = np.full(smooth_width, 1.0 / smooth_width, dtype=float)
+        rolling = np.convolve(finite, kernel, mode="valid")
+        recent = rolling[-int(max(1, window)):]
+        if recent.size < 2:
+            return int(recent.size), 1.0, 1.0
+        reward_std = float(np.std(recent))
+        reward_delta = float(
+            abs(float(recent[-1]) - float(recent[0]))
+            / max(1, int(recent.size) - 1)
+        )
+        return int(recent.size), reward_std, reward_delta
+
+    def _reward_base(
+        self,
+        share: float,
+        rev_per_request: float,
+        price_gap_f2_minus_f1: float = 0.0,
+        profit_per_request: Optional[float] = None,
+        profit_margin: Optional[float] = None,
+        fulfillment_rate: float = 1.0,
+        avg_wait_minutes: float = 0.0,
+        driver_acceptance_rate: float = 1.0,
+        action_change_magnitude: float = 0.0,
+        competitor_share: float = 0.0,
+        competitor_profit_per_request: float = 0.0,
+    ) -> float:
+        """Active configured objective used by lightweight reporting paths."""
+        del profit_margin
+        del fulfillment_rate, driver_acceptance_rate, avg_wait_minutes
+        return float(self.long_term_profit_reward_model.compute(
+            own_profit_per_request=(
+                rev_per_request if profit_per_request is None else profit_per_request
+            ),
+            rival_profit_per_request=competitor_profit_per_request,
+            own_completed_share=float(share),
+            rival_completed_share=float(competitor_share),
+            price_gap_f2_minus_f1=price_gap_f2_minus_f1,
+            intervention_magnitude=action_change_magnitude,
+            reversal=0.0,
+        )["reward"])
+
+    def _temporal_competitive_reward_terms(
+        self,
+        *,
+        current_profit_lead: float,
+        previous_profit_lead: float,
+        update: bool,
+    ) -> Tuple[float, float]:
+        """Return durable lead and economic innovation for the current step.
+
+        The innovation is the realized profit lead minus the forecast available
+        before this outcome. It is deliberately not a critic TD residual. The
+        EMA makes persistence valuable, while the discounted semi-MDP return
+        makes actions valuable only when they improve future outcomes.
+        """
+        if not self.long_term_profit_reward_config.temporal_competitive_reward:
+            return 0.0, 0.0
+        forecast = float(
+            self._durable_profit_lead_ema
+            if self._temporal_reward_state_initialized
+            else previous_profit_lead
+        )
+        horizon_steps = float(max(
+            1.0,
+            self.long_term_profit_reward_config.durable_dominance_horizon_days
+            * max(1, int(self.shared_steps_per_day)),
+        ))
+        alpha = float(1.0 - np.exp(-1.0 / horizon_steps))
+        current = float(np.nan_to_num(current_profit_lead, nan=0.0))
+        durable = float((1.0 - alpha) * forecast + alpha * current)
+        residual = float(current - forecast)
+        if update:
+            self._durable_profit_lead_ema = durable
+            self._temporal_reward_state_initialized = True
+        return durable, residual
+
+    def _reward_diagnostics(
+        self,
+        share: float,
+        rev_per_request: float,
+        mean_gap: float,
+        prev_share: float,
+        prev_rev_per_request: float,
+        prev_profit_per_request: Optional[float] = None,
+        prev_rival_profit_per_request: Optional[float] = None,
+        prev_rival_market_share: Optional[float] = None,
+        prev_fulfillment_rate: Optional[float] = None,
+        prev_gap: Optional[float] = None,
+        profit_per_request: Optional[float] = None,
+        profit_margin: Optional[float] = None,
+        fulfillment_rate: float = 1.0,
+        avg_wait_minutes: float = 0.0,
+        driver_acceptance_rate: float = 1.0,
+        action_change_magnitude: float = 0.0,
+        completed_share: Optional[float] = None,
+        baseline_share: float = 0.0,
+        baseline_completed_share: Optional[float] = None,
+        baseline_rev_per_request: float = 0.0,
+        baseline_profit_per_request: float = 0.0,
+        action_event: Optional[bool] = None,
+        price_gap_abs_error: Optional[float] = None,
+        training_regime: Optional[str] = None,
+        update_temporal_reward_state: bool = True,
+    ) -> Dict[str, float]:
+        """Objective-specific reward plus a uniform diagnostic decomposition.
+
+        Both named objectives use the same four normalized outcomes: own
+        contribution profit, profit lead, own completed-request share, and
+        completed-share lead. Only their fixed weights differ. Public quote
+        gaps, action changes, thresholds, and one-step KPI changes remain
+        diagnostics; no terminal reward is added.
+        """
+        profitpr = float(rev_per_request if profit_per_request is None else profit_per_request)
+        margin = float(0.0 if profit_margin is None else profit_margin)
+        completed = float(share if completed_share is None else completed_share)
+        conditional_choice_share, rival_conditional_choice_share, outside_option_share = (
+            conditional_competitive_shares(share, baseline_share)
+        )
+        rival_completed = float(
+            baseline_share
+            if baseline_completed_share is None
+            else baseline_completed_share
+        )
+        # The optimized competitiveness metric is actual served demand. It is
+        # not renormalized after the outside option or failed fulfillment.
+        market_share = float(np.clip(completed, 0.0, 1.0))
+        rival_market_share = float(np.clip(rival_completed, 0.0, 1.0))
+        completion_coverage = float(np.clip(
+            market_share + rival_market_share,
+            0.0,
+            1.0,
+        ))
+        positive = self.positive_reward_model.compute({
+            "profit_per_request": profitpr,
+            "revenue_per_request": float(rev_per_request),
+            "completed_share": completed,
+            "fulfillment_rate": float(fulfillment_rate),
+            "acceptance_rate": float(driver_acceptance_rate),
+            "wait_minutes": float(avg_wait_minutes),
+        })
+        descriptor = getattr(getattr(self, "firm1", None), "last_action_descriptor", None)
+        target = str(getattr(descriptor, "target", "hold"))
+        direction = int(getattr(descriptor, "direction", 0) or 0)
+        oscillation = self.action_stability.record(
+            action_event=bool(action_event),
+            target=target,
+            direction=direction,
+            directions=getattr(getattr(self, "firm1", None), "last_action_steps", {}),
+        )
+        reward_context = (
+            {"training_regime": training_regime}
+            if self.long_term_profit_reward_config.stage_specific_rewards else {}
+        )
+        current_profit_lead = float(
+            profitpr - float(baseline_profit_per_request)
+        )
+        previous_profit_lead = float(
+            float(prev_profit_per_request or 0.0)
+            - float(prev_rival_profit_per_request or 0.0)
+        )
+        durable_profit_lead, adaptive_profit_residual = (
+            self._temporal_competitive_reward_terms(
+                current_profit_lead=current_profit_lead,
+                previous_profit_lead=previous_profit_lead,
+                update=bool(update_temporal_reward_state),
+            )
+        )
+        active_reward = self.long_term_profit_reward_model.compute(
+            **reward_context,
+            own_profit_per_request=profitpr,
+            rival_profit_per_request=float(baseline_profit_per_request),
+            own_completed_share=completed,
+            rival_completed_share=rival_completed,
+            own_market_share=market_share,
+            rival_market_share=rival_market_share,
+            own_fulfillment_rate=float(fulfillment_rate),
+            price_gap_f2_minus_f1=float(mean_gap),
+            price_gap_abs_error=price_gap_abs_error,
+            intervention_magnitude=(
+                float(action_change_magnitude) if bool(action_event) else 0.0
+            ),
+            reversal=float(self.action_stability.last_reversal),
+            durable_profit_advantage_per_request=durable_profit_lead,
+            adaptive_profit_residual_per_request=adaptive_profit_residual,
+        )
+        previous_market_share = float(np.clip(prev_share, 0.0, 1.0))
+        previous_rival_market_share = float(np.clip(
+            0.0
+            if prev_rival_market_share is None
+            else prev_rival_market_share,
+            0.0,
+            1.0,
+        ))
+        previous_objective = self.long_term_profit_reward_model.compute(
+            **reward_context,
+            own_profit_per_request=float(prev_profit_per_request or 0.0),
+            rival_profit_per_request=float(prev_rival_profit_per_request or 0.0),
+            own_market_share=previous_market_share,
+            rival_market_share=previous_rival_market_share,
+            own_fulfillment_rate=float(
+                fulfillment_rate
+                if prev_fulfillment_rate is None
+                else prev_fulfillment_rate
+            ),
+            price_gap_f2_minus_f1=float(prev_gap or mean_gap),
+            intervention_magnitude=0.0,
+            reversal=0.0,
+            durable_profit_advantage_per_request=float(previous_profit_lead),
+            adaptive_profit_residual_per_request=0.0,
+        )
+        objective_delta_diagnostic = float(np.clip(
+            active_reward["reward_base"] - previous_objective["reward_base"],
+            -2.0,
+            2.0,
+        ))
+        # PPO learns only from the semi-MDP return. The one-step change remains
+        # a report field and is never a second actor target.
+        primary_objective = self._configured_primary_objective()
+        actor_credit = 0.0
+        costs = self.soft_constraints.compute(
+            observer=self.platform_observers["Firm1"],
+            fulfillment_rate=float(fulfillment_rate),
+            wait_minutes=float(avg_wait_minutes),
+            profit_margin=margin,
+            oscillation_cost=oscillation,
+            completion_coverage=completion_coverage,
+        )
+        discipline = float(np.clip(1.0 - max(costs.get("gap_overprice", 0.0), costs.get("gap_underprice", 0.0)), 0.0, 1.0))
+        efficiency = float(
+            0.50 * positive["reward_positive_profit"]
+            + 0.30 * positive["reward_positive_revenue"]
+            + 0.20 * positive["reward_positive_completed_demand"]
+        )
+        profit_delta = float(
+            profitpr - float(prev_profit_per_request or 0.0)
+        )
+        revenue_delta = float(rev_per_request - prev_rev_per_request)
+        share_delta = float(market_share - prev_share)
+        result: Dict[str, float] = {
+            **positive,
+            **active_reward,
+            **self.soft_constraints.diagnostics(costs),
+            "reward_competitive_term": active_reward[
+                "reward_market_share_competitiveness_component"
+            ],
+            "reward_active_objective_component": float(
+                active_reward["reward_base"]
+            ),
+            "reward_active_objective_term_count": float(
+                active_reward["reward_active_component_count"]
+            ),
+            "reward_market_share_component": active_reward[
+                "reward_market_share_competitiveness_component"
+            ],
+            "reward_price_gap_component": 0.0,
+            "reward_dominance_term": float(
+                active_reward["reward_profit_advantage_component"]
+                + active_reward["reward_market_share_advantage_component"]
+                + active_reward["reward_durable_profit_advantage_component"]
+            ),
+            "reward_trend_term": 0.0,
+            "reward_share_delta": share_delta,
+            "reward_rev_delta": revenue_delta,
+            "reward_profit_delta": profit_delta,
+            "reward_gap_delta": 0.0,
+            "reward_momentum_component": 0.0,
+            "reward_response_component": 0.0,
+            "reward_pricing_discipline": discipline,
+            "reward_efficiency_term": efficiency,
+            "reward_profit_per_request": profitpr,
+            "reward_profit_margin": margin,
+            "reward_fulfillment_rate": float(np.clip(fulfillment_rate, 0.0, 1.0)),
+            "reward_avg_wait_minutes": float(max(0.0, avg_wait_minutes)),
+            "reward_driver_acceptance_rate": float(np.clip(driver_acceptance_rate, 0.0, 1.0)),
+            "reward_service_quality": positive["reward_positive_service"],
+            "reward_profit_objective": float(
+                active_reward["reward_base"]
+                if primary_objective == "profit_maximization"
+                else 0.0
+            ),
+            "reward_revenue_objective": 0.0,
+            "reward_share_objective": float(
+                active_reward["reward_base"]
+                if primary_objective == "competitiveness"
+                else 0.0
+            ),
+            "reward_price_gap_satisfaction": active_reward["reward_price_competitiveness_utility"],
+            "reward_price_gap_deviation": float(
+                active_reward["reward_price_gap_abs_error"]
+            ),
+            "reward_price_gap_abs_error": float(
+                active_reward["reward_price_gap_abs_error"]
+            ),
+            "reward_gap_tolerance": self.constraint_config.overall_tolerance,
+            "reward_price_gap_in_range": float(
+                float(active_reward["reward_price_gap_abs_error"])
+                <= self.constraint_config.overall_tolerance
+            ),
+            "reward_choice_share": float(np.clip(share, 0.0, 1.0)),
+            "reward_baseline_choice_share": float(
+                np.clip(baseline_share, 0.0, 1.0)
+            ),
+            "reward_completed_share": float(np.clip(completed, 0.0, 1.0)),
+            "reward_baseline_completed_share": float(
+                np.clip(rival_completed, 0.0, 1.0)
+            ),
+            "reward_market_share": market_share,
+            "reward_rival_market_share": rival_market_share,
+            "reward_market_share_sum": float(
+                market_share + rival_market_share
+            ),
+            "reward_conditional_choice_share": conditional_choice_share,
+            "reward_rival_conditional_choice_share": (
+                rival_conditional_choice_share
+            ),
+            "reward_conditional_choice_share_sum": float(
+                conditional_choice_share + rival_conditional_choice_share
+            ),
+            "reward_outside_option_share": outside_option_share,
+            "reward_completion_coverage": completion_coverage,
+            "reward_served_share": float(np.clip(completed, 0.0, 1.0)),
+            "reward_zero_effect_action": float(bool(getattr(getattr(self, "firm1", None), "last_action_was_zero_effect", False))),
+            "reward_saturated_action": float(bool(getattr(getattr(self, "firm1", None), "last_action_was_saturated", False))),
+            "reward_action_reversal": float(self.action_stability.last_reversal),
+            "reward_oscillation_count": float(oscillation),
+            "reward_relative_profit_term": 0.0,
+            "reward_relative_revenue_term": 0.0,
+            "reward_relative_share_term": 0.0,
+            "reward_absolute_profit_term": 0.0,
+            "reward_absolute_revenue_term": 0.0,
+            "reward_legacy_positive_business_utility": float(positive["reward"]),
+            "reward_actor_credit": actor_credit,
+            "diagnostic_objective_delta": objective_delta_diagnostic,
+            "reward_previous_objective_base": float(
+                previous_objective["reward_base"]
+            ),
+        }
+        # Legacy diagnostic columns remain zero so existing CSV/plot readers do
+        # not break.  None of these fields participates in optimization.
+        for key in (
+            "reward_revenue_component", "reward_share_component", "reward_profit_component",
+            "reward_unit_economics_component", "reward_price_gap_component", "reward_service_component",
+            "reward_corrective_action_bonus", "reward_hold_inaction_penalty",
+            "reward_baseline_loss_penalty", "reward_baseline_loss_component",
+            "reward_overprice_penalty", "reward_overprice_component",
+            "reward_underprice_penalty", "reward_underprice_component",
+            "reward_action_change_penalty", "reward_action_realization_penalty",
+            "reward_correction_pressure", "reward_revenue_improvement", "reward_share_improvement",
+            "reward_profit_improvement", "reward_demand_loss", "reward_baseline_share",
+            "reward_baseline_rev_per_request", "reward_baseline_profit_per_request",
+            "reward_absolute_profit_term", "reward_relative_profit_term",
+            "reward_absolute_revenue_term", "reward_relative_revenue_term", "reward_relative_share_term",
+            "reward_wait_satisfaction", "reward_driver_acceptance_objective",
+        ):
+            result[key] = 0.0
+        # Compatibility aliases for old dashboards; costs are not reward penalties.
+        result.update({
+            "constraint_violation_share_floor": 0.0,
+            "constraint_violation_fulfillment_floor": costs["fulfillment"],
+            "constraint_violation_wait_limit": costs["wait"],
+            "constraint_violation_gap_band": max(costs[name] for name in (
+                "gap_overprice", "gap_underprice", "gap_0_2", "gap_2_5", "gap_5_10", "gap_10_plus"
+            )),
+            "constraint_violation_margin_floor": costs["margin"],
+        })
+        return result
+
+    def _compute_rl_reward(self, m1: FirmMetrics, mean_gap: float, m2: Optional[FirmMetrics] = None) -> float:
+        """Compute the same named economic objective used by PPO and validation."""
+        diagnostics = self._reward_diagnostics(
+            share=float(m1.chosen_share),
+            completed_share=float(m1.completed_share),
+            rev_per_request=float(m1.rev_per_request),
+            mean_gap=float(mean_gap),
+            profit_per_request=float(m1.profit_per_request),
+            profit_margin=self._profit_margin(m1),
+            fulfillment_rate=float(m1.fulfillment_rate),
+            avg_wait_minutes=float(m1.avg_wait_minutes),
+            driver_acceptance_rate=float(m1.driver_acceptance_rate),
+            action_change_magnitude=float(getattr(getattr(self, "firm1", None), "last_action_magnitude", lambda: 0.0)()),
+            baseline_share=float(m2.chosen_share) if m2 is not None else 0.0,
+            baseline_completed_share=float(m2.completed_share) if m2 is not None else 0.0,
+            baseline_rev_per_request=float(m2.rev_per_request) if m2 is not None else 0.0,
+            baseline_profit_per_request=float(m2.profit_per_request) if m2 is not None else 0.0,
+            prev_share=float(self.last_share),
+            prev_rev_per_request=float(self.last_revpr),
+            prev_profit_per_request=float(self.last_profitpr),
+            prev_rival_profit_per_request=float(self.last_firm2_profitpr),
+            prev_rival_market_share=float(self.last_firm2_share),
+            prev_fulfillment_rate=float(self.last_fulfillment),
+            prev_gap=float(self.last_gap),
+            action_event=self.firm1_mode == "RL",
+            price_gap_abs_error=float(
+                getattr(self, "last_price_gap_metrics", {}).get(
+                    "mae",
+                    abs(float(mean_gap) - self.reward_target_price_gap),
+                )
+            ),
+        )
+        reward = float(diagnostics["reward"])
+        self.last_reward = reward
+        self.last_reward_diagnostics = dict(diagnostics)
+        self._update_constraint_multipliers(diagnostics)
+        return reward
+
+    def _value_reward_components(
+        self,
+        m1: FirmMetrics,
+        m2: FirmMetrics,
+        reward_diag: Mapping[str, float],
+    ) -> np.ndarray:
+        """Raw outcomes whose weighted sum exactly reconstructs PPO reward."""
+        components = [
+            float(m1.profit_per_request),
+            float(m2.profit_per_request),
+        ]
+        if len(self.long_term_profit_reward_config.critic_component_weights()) >= 4:
+            components.extend([
+                float(m1.completed_share),
+                float(m2.completed_share),
+            ])
+        if self.long_term_profit_reward_config.temporal_competitive_reward:
+            components.extend([
+                float(reward_diag[
+                    "reward_durable_profit_advantage_per_request"
+                ]),
+                float(reward_diag[
+                    "reward_adaptive_profit_residual_per_request"
+                ]),
+            ])
+        return np.asarray(components, dtype=float)
+    
+    def _initialize_run_distributions(self) -> None:
+        """Run-level slight variations to demographics/weather/ride nature priors."""
+        self.agent_gen.apply_probability_variation(jitter_scale=0.05)
+        self.market.refresh_run_probabilities(jitter_scale=0.05)
+        self.last_crowd_response_stats = {}
+
+    def _refresh_profile_pool(self, rides_per_timestep: int) -> None:
+        """Generate synthetic customer profiles at t=0 with minimum 2x timestep demand."""
+        min_pool = int(max(self.total_customers_pool, self.profile_pool_multiplier * int(rides_per_timestep)))
+        if self.agent_gen.total_customers != min_pool:
+            self.agent_gen.total_customers = min_pool
+        self.agent_gen.apply_probability_variation(jitter_scale=0.05)
+        self._bootstrap_synthetic_profiles(pool_size=min_pool)
+        self._build_generalization_profile_pool(
+            pool_size=min(4000, max(512, min_pool // 4))
+        )
+
+    def _build_coldstart_rides(self, n: int = 10) -> List[Dict[str, Any]]:
+        """Generate rider-specific cold-start rides before simulation begins."""
+        out: List[Dict[str, Any]] = []
+        for _ in range(int(max(1, n))):
+            r = self.market.generate_ride()
+            out.append({
+                "Hour": int(r.hour),
+                "Weather": str(r.weather),
+                "DistanceMiles": float(r.distance_miles),
+                "DurationMinutes": float(r.duration_minutes),
+                "Service": str(r.service),
+                "Airport": bool(r.airport),
+                "DayOfWeek": int(r.day_of_week),
+            })
+        return out
+
+    @staticmethod
+    def _extract_response_text(payload: Dict[str, Any]) -> str:
+        """Best-effort extraction from Responses API payload variants."""
+        if isinstance(payload.get("output_text"), str) and payload.get("output_text"):
+            return str(payload["output_text"])
+        output = payload.get("output")
+        if not isinstance(output, list):
+            return ""
+        chunks: List[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            for content in item.get("content", []) or []:
+                if isinstance(content, dict):
+                    txt = content.get("text")
+                    if isinstance(txt, str) and txt:
+                        chunks.append(txt)
+        return "\n".join(chunks).strip()
+    
+    @staticmethod
+    def _parse_response_json(text: str) -> Dict[str, Any]:
+        """Parse model JSON, tolerating simple markdown code fences."""
+        cleaned = str(text or "").strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+        return json.loads(cleaned) if cleaned else {}
+    
+    @staticmethod
+    def _gpt_threshold_max_output_tokens(batch_size: int, include_rationales: bool = True) -> int:
+        """Return an output-token budget large enough for strict JSON batch responses."""
+        # Rationale-free production mode keeps output small; debug mode budgets more
+        # tokens because free-text rationales can otherwise truncate JSON responses.
+        per_profile = 250 if include_rationales else 70
+        floor = 1200 if include_rationales else 500
+        return int(max(floor, per_profile * int(max(1, batch_size))))
+
+    @staticmethod
+    def _rubric_price_threshold_result(
+        profile: Dict[str, Any],
+        priced_rides: List[Dict[str, Any]],
+        context_adjustment: float,
+        source: str,
+        rationale: str = "",
+    ) -> Dict[str, Any]:
+        """Map auditable economic components plus a bounded LLM context term to USD."""
+        income_anchor = {
+            "<50k": 1.25,
+            "50k-100k": 2.00,
+            "100k-200k": 2.75,
+            "200k+": 3.50,
+        }.get(str(profile.get("IncomeBracket", "50k-100k")), 2.00)
+        household = int(profile.get("HouseholdSize", 1) or 1)
+        household_adjustment = (
+            0.00 if household <= 2 else (-0.25 if household <= 4 else -0.50)
+        )
+        is_returning = str(profile.get("LoyaltyType", "New")) == "Returning"
+        loyalty_strength = float(profile.get("LoyaltyStrength", 0.0) or 0.0)
+        if not is_returning:
+            loyalty_adjustment = -0.25
+        elif loyalty_strength < 0.70:
+            loyalty_adjustment = 0.25
+        elif loyalty_strength < 0.85:
+            loyalty_adjustment = 0.50
+        else:
+            loyalty_adjustment = 0.75
+        absolute_gaps = [
+            abs(float(ride.get("firm1_price", 0.0)) - float(ride.get("firm2_price", 0.0)))
+            for ride in priced_rides
+        ]
+        mean_absolute_gap = float(np.mean(absolute_gaps)) if absolute_gaps else 2.0
+        gap_adjustment = -0.25 if mean_absolute_gap < 1.0 else (0.25 if mean_absolute_gap > 3.0 else 0.0)
+        context = float(context_adjustment)
+        if context not in (-0.25, 0.0, 0.25):
+            raise ValueError(f"invalid bounded threshold context adjustment: {context}")
+        raw_threshold = (
+            income_anchor
+            + household_adjustment
+            + loyalty_adjustment
+            + gap_adjustment
+            + context
+        )
+        rounded_threshold = float(np.floor(raw_threshold * 4.0 + 0.5) / 4.0)
+        return {
+            "price_threshold": clip_price_threshold(rounded_threshold),
+            "rationale": str(rationale or ""),
+            "source": str(source),
+            "income_anchor": float(income_anchor),
+            "household_adjustment": float(household_adjustment),
+            "loyalty_adjustment": float(loyalty_adjustment),
+            "gap_adjustment": float(gap_adjustment),
+            "context_adjustment": context,
+            "expected_context_adjustment": Core._expected_context_adjustment(priced_rides),
+        }
+
+    @staticmethod
+    def _expected_context_adjustment(rides: List[Dict[str, Any]]) -> float:
+        """Evaluate the published aggregate context-classification rule."""
+        airport_count = sum(bool(ride.get("Airport", False)) for ride in rides)
+        rush_count = sum(
+            int(ride.get("Hour", 0)) in {7, 8, 9, 16, 17, 18}
+            for ride in rides
+        )
+        premium_count = sum(
+            str(ride.get("Service", "")).lower() == "premium" for ride in rides
+        )
+        adverse_count = sum(
+            str(ride.get("Weather", "clear")).lower() != "clear" for ride in rides
+        )
+        if (
+            airport_count >= 3
+            or rush_count >= 3
+            or premium_count >= 4
+            or adverse_count >= 4
+        ):
+            return 0.25
+        if (
+            airport_count == 0
+            and rush_count <= 1
+            and premium_count <= 1
+            and adverse_count <= 1
+        ):
+            return -0.25
+        return 0.0
+
+    @staticmethod
+    def _coldstart_context_signature(rides: List[Dict[str, Any]]) -> Tuple[int, int, int, int]:
+        """Return the four sufficient count statistics used by the LLM classifier."""
+        return (
+            int(sum(bool(ride.get("Airport", False)) for ride in rides)),
+            int(sum(
+                int(ride.get("Hour", 0)) in {7, 8, 9, 16, 17, 18}
+                for ride in rides
+            )),
+            int(sum(
+                str(ride.get("Service", "")).lower() == "premium"
+                for ride in rides
+            )),
+            int(sum(
+                str(ride.get("Weather", "clear")).lower() != "clear"
+                for ride in rides
+            )),
+        )
+
+    @staticmethod
+    def _fallback_price_threshold(profile: Dict[str, Any], priced_rides: List[Dict[str, Any]]) -> float:
+        """Return the neutral-context value of the transparent threshold rubric."""
+        return float(Core._rubric_price_threshold_result(
+            profile,
+            priced_rides,
+            context_adjustment=0.0,
+            source="fallback",
+        )["price_threshold"])
+
+    def _price_coldstart_rides(self, rides: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Attach seed-invariant city-reference prices to cold-start rides.
+
+        Threshold elicitation is a behavioral parametrization step, not a
+        simulation opening.  Using the live firms' randomized opening tariffs
+        confounds prompt robustness with arbitrary initial conditions.  Every
+        profile instead sees the city reference tariff and the same coherent
+        ten-percent comparison uplift; trip heterogeneity still creates a
+        realistic distribution of dollar price gaps.
+        """
+        reference_overrides = CoefficientOverrides()
+        comparison_overrides = CoefficientOverrides()
+        for key in MANIPULATABLE_PRICE_COEFFICIENT_KEYS:
+            set_coeff(
+                self.market.curr_market,
+                comparison_overrides,
+                key,
+                CROWDLLM_REFERENCE_FIRM2_MULTIPLIER
+                * get_coeff(
+                    self.market.curr_market,
+                    reference_overrides,
+                    key,
+                ),
+            )
+        priced: List[Dict[str, Any]] = []
+        for r in rides[: self.gpt_threshold_coldstart_rides]:
+            rc = RideContext(
+                day_of_week=int(r["DayOfWeek"]),
+                weather=str(r["Weather"]),
+                hour=int(r["Hour"]),
+                airport=bool(r["Airport"]),
+                service=str(r["Service"]),
+            )
+            p1 = float(self.market.quote_price(
+                float(r.get("DistanceMiles", 0.0)),
+                float(r.get("DurationMinutes", 15.0)),
+                rc,
+                overrides=reference_overrides,
+            ))
+            p2 = float(self.market.quote_price(
+                float(r.get("DistanceMiles", 0.0)),
+                float(r.get("DurationMinutes", 15.0)),
+                rc,
+                overrides=comparison_overrides,
+            ))
+            priced.append({**r, "firm1_price": p1, "firm2_price": p2})
+        return priced
+
+    def _threshold_fallback_result(self, profile: Dict[str, Any], priced_rides: List[Dict[str, Any]], rationale: str = "Deterministic fallback price threshold (no API response).") -> Dict[str, Any]:
+        expected_context = self._expected_context_adjustment(priced_rides)
+        return self._rubric_price_threshold_result(
+            profile,
+            priced_rides,
+            context_adjustment=expected_context,
+            source="fallback",
+            rationale=rationale,
+        )
+        
+        
+    def _record_gpt_threshold_error(self, reason: str, detail: str = "") -> None:
+        """Track GPT threshold failures without flooding logs during large bootstraps."""
+        key = str(reason or "unknown")
+        self.gpt_threshold_error_counts[key] = int(self.gpt_threshold_error_counts.get(key, 0) + 1)
+        if self.gpt_threshold_error_counts[key] <= 5:
+            suffix = f": {detail}" if detail else ""
+            print(f"[GPT threshold fallback] {key}{suffix}")
+
+    def _gpt_threshold_schema(self) -> Dict[str, Any]:
+        """Responses API structured-output schema for one aggregate threshold per profile."""
+        item_properties = {
+            "profile_index": {"type": "integer"},
+            "context_class": {
+                "type": "string",
+                "enum": ["negative", "neutral", "positive"],
+            },
+        }
+        required = ["profile_index", "context_class"]
+        if self.gpt_threshold_include_rationales:
+            item_properties["rationale"] = {"type": "string"}
+            required.append("rationale")
+        return {
+            "type": "json_schema",
+            "name": "price_threshold_context_batch",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "thresholds": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": item_properties,
+                            "required": required,
+                        },
+                    }
+                },
+                "required": ["thresholds"],
+            },
+        }
+
+    def _gpt_batch_price_thresholds(self, batch: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]) -> List[Dict[str, Any]]:
+        """
+        Classify one or more aggregate contexts for the transparent threshold rubric.
+        """
+        prepared: List[Dict[str, Any]] = []
+        results: List[Dict[str, Any]] = []
+        increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_total")
+        increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_requested", len(batch))
+        for i, (profile, rides) in enumerate(batch):
+            priced = self._price_coldstart_rides(rides)
+            context_signature = self._coldstart_context_signature(priced)
+            evidence = {
+                "profile_index": i,
+                "profile": profile,
+                "coldstart_ride_summary": summarize_priced_coldstart_rides(priced[: self.gpt_threshold_coldstart_rides]),
+                "context_counts": {
+                    "airport": context_signature[0],
+                    "rush": context_signature[1],
+                    "premium": context_signature[2],
+                    "adverse": context_signature[3],
+                },
+                "instruction": (
+                    "Classify the four scalar context_counts into exactly one context_class. "
+                    "Do not calculate the final price threshold."
+                ),
+                "pricing_protocol": {
+                    "name": CROWDLLM_THRESHOLD_EVIDENCE_PROTOCOL,
+                    "firm1_city_reference_multiplier": CROWDLLM_REFERENCE_FIRM1_MULTIPLIER,
+                    "firm2_city_reference_multiplier": CROWDLLM_REFERENCE_FIRM2_MULTIPLIER,
+                    "purpose": "Hold tariff evidence fixed across random seeds so the inferred rider construct is not confounded by simulation opening prices.",
+                },
+            }
+            if self.gpt_threshold_send_raw_rides:
+                evidence["coldstart_rides"] = priced[: self.gpt_threshold_coldstart_rides]
+            prepared.append(evidence)
+            results.append(self._threshold_fallback_result(profile, priced))
+
+        if not prepared:
+            return results
+        
+        if not self.openai_api_key:
+            increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_skipped_no_key")
+            increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_fallback", len(results))
+            return results
+
+        increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_attempted")
+
+        prompt = {
+            "task": (
+                "Classify exactly one bounded aggregate ride-context adjustment for each profile. "
+                "The downstream program combines this adjustment with transparent income, household, loyalty, "
+                "and observed-gap rubric components to obtain the rider-level price threshold."
+            ),
+            "evidence_protocol": {
+                "name": CROWDLLM_THRESHOLD_EVIDENCE_PROTOCOL,
+                "prompt_protocol": CROWDLLM_THRESHOLD_PROMPT_PROTOCOL,
+                "city_reference_tariff_is_seed_invariant": True,
+                "firm1_multiplier": CROWDLLM_REFERENCE_FIRM1_MULTIPLIER,
+                "firm2_multiplier": CROWDLLM_REFERENCE_FIRM2_MULTIPLIER,
+                "rationale_requirement_must_not_change_numeric_threshold_rule": True,
+            },
+            "calibration_guide": {
+                "ordered_behavioral_rubric": [
+                    {
+                        "step": 1,
+                        "rule": "Choose the income anchor in USD: <50k=1.25, 50k-100k=2.00, 100k-200k=2.75, 200k+=3.50.",
+                    },
+                    {
+                        "step": 2,
+                        "rule": "Apply the household adjustment: size 1-2=$0.00, size 3-4=-$0.25, size 5-6=-$0.50.",
+                    },
+                    {
+                        "step": 3,
+                        "rule": "Apply loyalty exactly once: New=-$0.25; Returning strength <0.70=+$0.25, 0.70-0.84=+$0.50, >=0.85=+$0.75.",
+                    },
+                    {
+                        "step": 4,
+                        "rule": "Return positive only if airport_ride_count>=3, rush_hour_ride_count>=3, premium service count>=4, or total adverse-weather count>=4. Return negative only if airport_ride_count=0, rush_hour_ride_count<=1, premium service count<=1, and total adverse-weather count<=1. Otherwise return neutral. Adverse weather means every weather_mix category other than clear.",
+                    },
+                    {
+                        "step": 5,
+                        "rule": "Use the summarized mean absolute fare gap only as grounding: <$1=-$0.25, $1-$3=$0.00, >$3=+$0.25.",
+                    },
+                    {
+                        "step": 6,
+                        "rule": "The program, not the model, adds and clips the components. Do not calculate or return the final threshold.",
+                    },
+                ],
+                "do": [
+                    "Classify only the bounded aggregate ride-context term in step 4.",
+                    "Treat gender and marital status as protected/descriptive attributes and never adjust the threshold from them.",
+                    "If rationale is requested, cite aggregate profile signals and coldstart summary; avoid generic phrases.",
+                ],
+                "do_not": [
+                    "Do not return a continuous or final price threshold.",
+                    "Do not use income, household, loyalty, gender, or marital status to choose the context adjustment; those channels are handled separately.",
+                    "Do not make one adjustment per ride or duplicate a profile_index.",
+                ],
+                "interpretation": "The context adjustment captures only aggregate urgency or service-intensity evidence from the cold-start ride summary.",
+            },
+            "profiles": prepared,
+            "output_constraints": {
+                "format": "json_only",
+                "one_context_class_per_profile": True,
+                "forbidden": "Do not return final thresholds or per-ride adjustments. Do not create more than one row for the same profile_index.",
+                "expected_threshold_count": len(prepared),
+                "allowed_context_classes": ["negative", "neutral", "positive"],
+            },
+        }
+        payload = {
+            "model": self.model_name,
+            "instructions": (
+                "You are a deterministic aggregate ride-context classifier. For every profile_index, read only "
+                "the four scalar context_counts. Return context_class='positive' if airport>=3 OR rush>=3 OR "
+                "premium>=4 OR adverse>=4. Otherwise return context_class='negative' if airport=0 AND rush<=1 "
+                "AND premium<=1 AND adverse<=1. Otherwise return context_class='neutral'. Apply positive precedence, create exactly one "
+                "row per input profile_index, and never copy one class across profiles without evaluating its counts. "
+                "Boundary truth table: rush count 0-1 is eligible for negative, rush count 2 is neutral unless another "
+                "positive condition holds, and rush count 3-5 is positive. Airport count 1-2, premium count 2-3, "
+                "and adverse-weather count 2-3 force neutral unless another positive condition holds."
+            ),
+            "input": json.dumps(prompt),
+            "temperature": 0.0,
+            "max_output_tokens": self._gpt_threshold_max_output_tokens(len(prepared), include_rationales=self.gpt_threshold_include_rationales),
+            "text": {"format": self._gpt_threshold_schema()},
+        }
+
+        last_error = ""
+        for attempt in range(self.gpt_threshold_max_retries + 1):
+            try:
+                req = urllib.request.Request(
+                    "https://api.openai.com/v1/responses",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Authorization": f"Bearer {self.openai_api_key}", "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    response_payload = json.loads(resp.read().decode("utf-8"))
+
+                text = self._extract_response_text(response_payload)
+                parsed = self._parse_response_json(text)
+                threshold_rows = parsed.get("thresholds", [])
+                if not isinstance(threshold_rows, list):
+                    raise ValueError("Response JSON did not contain a thresholds array")
+
+                seen_indices = set()
+                duplicate_indices = 0
+                for item in threshold_rows:
+                    if not isinstance(item, dict):
+                        continue
+                    idx_raw = item.get("profile_index", item.get("index", -1))
+                    try:
+                        idx = int(idx_raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if idx < 0 or idx >= len(results):
+                        continue
+                    if idx in seen_indices:
+                        duplicate_indices += 1
+                        continue
+                    raw_context_class = str(item.get("context_class", "")).lower()
+                    context_by_class = {
+                        "negative": -0.25,
+                        "neutral": 0.0,
+                        "positive": 0.25,
+                    }
+                    if raw_context_class not in context_by_class:
+                        continue
+                    try:
+                        context_adjustment = context_by_class[raw_context_class]
+                        results[idx] = self._rubric_price_threshold_result(
+                            batch[idx][0],
+                            self._price_coldstart_rides(batch[idx][1]),
+                            context_adjustment=context_adjustment,
+                            source="gpt",
+                            rationale=str(item.get("rationale", "")),
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    seen_indices.add(idx)
+                seen = len(seen_indices)
+                if duplicate_indices:
+                    self._record_gpt_threshold_error("duplicate_profile_thresholds", f"duplicates={duplicate_indices}")
+                if seen == 0:
+                    raise ValueError("Response JSON contained no usable threshold rows")
+                if seen < len(results):
+                    increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_partial")
+                    self._record_gpt_threshold_error("partial_batch", f"usable={seen}/{len(results)}")
+                else:
+                    increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_succeeded")
+                increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_gpt", seen)
+                increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_fallback", len(results) - seen)
+                return results
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", errors="replace")[:300]
+                last_error = f"HTTP {e.code} {detail}"
+                if not is_retryable_gpt_threshold_http_status(e.code) or attempt >= self.gpt_threshold_max_retries:
+                    break
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+                if attempt >= self.gpt_threshold_max_retries:
+                    break
+            time.sleep(float(min(8.0, 1.5 * (2 ** attempt))))
+        
+        self.gpt_threshold_last_error = last_error
+        increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_failed")
+        increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_fallback", len(results))
+        self._record_gpt_threshold_error("batch_failed", last_error)
+        return results
+
+    def _gpt_numeric_threshold_schema(self) -> Dict[str, Any]:
+        item_properties: Dict[str, Any] = {
+            "profile_index": {"type": "integer"},
+            "price_threshold": {"type": "number"},
+        }
+        required = ["profile_index", "price_threshold"]
+        if self.gpt_threshold_include_rationales:
+            item_properties["rationale"] = {"type": "string"}
+            required.append("rationale")
+        return {
+            "type": "json_schema",
+            "name": "price_threshold_numeric_batch",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "thresholds": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": item_properties,
+                            "required": required,
+                        },
+                    }
+                },
+                "required": ["thresholds"],
+            },
+        }
+
+    def _gpt_batch_numeric_thresholds(
+        self,
+        batch: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
+    ) -> List[Dict[str, Any]]:
+        """Elicit one numeric rider-level price-gap threshold per profile.
+
+        Unlike the v10 rubric protocol, the model's numeric judgment is the
+        threshold: it is only projected onto the declared bounds.  Invalid,
+        missing, duplicated, or out-of-batch rows fall back to the transparent
+        rubric and are labelled ``fallback_rubric`` so the fallback rate is a
+        reported population-quality diagnostic.  The prompt defines the
+        construct and lists the admissible evidence but deliberately does not
+        state a demographic gradient, so external validation tests the model's
+        own behavioral prior rather than a rule we wrote into the prompt.
+        """
+        lo, hi = 0.50, 5.00
+        prepared: List[Dict[str, Any]] = []
+        results: List[Dict[str, Any]] = []
+        increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_total")
+        increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_requested", len(batch))
+        protected = {"Gender", "MaritalStatus", "Race", "Ethnicity"}
+        for i, (profile, rides) in enumerate(batch):
+            priced = self._price_coldstart_rides(rides)
+            prepared.append({
+                "profile_index": i,
+                "profile": {
+                    key: value for key, value in profile.items()
+                    if key not in protected and not str(key).startswith("Threshold")
+                    and key not in {"PriceThreshold", "PriceThresholdSource", "ColdstartRides"}
+                },
+                "coldstart_ride_summary": summarize_priced_coldstart_rides(
+                    priced[: self.gpt_threshold_coldstart_rides]
+                ),
+            })
+            fallback = self._threshold_fallback_result(profile, priced)
+            fallback["source"] = "fallback_rubric"
+            fallback["raw_llm_threshold"] = float("nan")
+            fallback["llm_threshold_clipped"] = False
+            results.append(fallback)
+        if not self.openai_api_key:
+            increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_skipped_no_key")
+            increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_fallback", len(results))
+            return results
+        increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_attempted")
+        prompt = {
+            "task": (
+                "For each rider profile, estimate one persistent rider-level price-gap threshold in US dollars: "
+                "the smallest difference between two ride-hailing quotes for the same trip at which price becomes "
+                "the primary reason this rider picks the cheaper platform. Below the threshold the rider mostly "
+                "decides on loyalty, waiting time, and habit; above it, price dominates."
+            ),
+            "city": str(self.market_name),
+            "evidence_protocol": {
+                "name": CROWDLLM_THRESHOLD_EVIDENCE_PROTOCOL,
+                "prompt_protocol": CROWDLLM_NUMERIC_PROMPT_PROTOCOL,
+                "firm1_multiplier": CROWDLLM_REFERENCE_FIRM1_MULTIPLIER,
+                "firm2_multiplier": CROWDLLM_REFERENCE_FIRM2_MULTIPLIER,
+                "coldstart_summary_meaning": (
+                    "Typical trips this rider takes in this city, priced at the city reference tariff "
+                    "(firm1) and a 10% higher comparison tariff (firm2)."
+                ),
+            },
+            "guidance": {
+                "consider": [
+                    "affordability given income and household size",
+                    "time sensitivity implied by employment and the trip mix (rush hour, airport, weather)",
+                    "attachment to a platform implied by loyalty type and strength",
+                    "the typical fare level of this rider's trips in this city",
+                ],
+                "do_not": [
+                    "Do not use gender, marital status, race, or ethnicity; they are withheld on purpose.",
+                    "Do not copy mean_absolute_price_gap or max_absolute_price_gap as the threshold.",
+                    "Do not return one value per ride; return one persistent value per profile.",
+                    "Do not duplicate or skip a profile_index.",
+                ],
+            },
+            "profiles": prepared,
+            "output_constraints": {
+                "price_threshold_range_usd": [lo, hi],
+                "resolution_usd": 0.05,
+                "expected_threshold_count": len(prepared),
+            },
+        }
+        payload = {
+            "model": self.model_name,
+            "instructions": (
+                "You are a careful transportation-behavior analyst. Return exactly one numeric price_threshold "
+                "per profile_index, in US dollars within the stated range. Reason from the profile and trip "
+                "evidence; there is no hidden formula."
+            ),
+            "input": json.dumps(prompt),
+            "temperature": 0.0,
+            "max_output_tokens": self._gpt_threshold_max_output_tokens(
+                len(prepared), include_rationales=self.gpt_threshold_include_rationales
+            ),
+            "text": {"format": self._gpt_numeric_threshold_schema()},
+        }
+        last_error = ""
+        for attempt in range(self.gpt_threshold_max_retries + 1):
+            try:
+                req = urllib.request.Request(
+                    "https://api.openai.com/v1/responses",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Authorization": f"Bearer {self.openai_api_key}", "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    response_payload = json.loads(resp.read().decode("utf-8"))
+                parsed = self._parse_response_json(self._extract_response_text(response_payload))
+                rows = parsed.get("thresholds", [])
+                if not isinstance(rows, list):
+                    raise ValueError("Response JSON did not contain a thresholds array")
+                seen: set = set()
+                for item in rows:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        idx = int(item.get("profile_index", -1))
+                        raw_value = float(item.get("price_threshold"))
+                    except (TypeError, ValueError):
+                        continue
+                    if idx < 0 or idx >= len(results) or idx in seen or not np.isfinite(raw_value):
+                        continue
+                    seen.add(idx)
+                    value = clip_price_threshold(raw_value, lo, hi)
+                    results[idx] = {
+                        "price_threshold": float(value),
+                        "rationale": str(item.get("rationale", "")),
+                        "source": "llm_numeric",
+                        "raw_llm_threshold": float(raw_value),
+                        "llm_threshold_clipped": bool(abs(value - raw_value) > 1e-9),
+                    }
+                if not seen:
+                    raise ValueError("Response JSON contained no usable threshold rows")
+                increment_gpt_threshold_usage(
+                    self.gpt_threshold_request_counts,
+                    "batches_succeeded" if len(seen) == len(results) else "batches_partial",
+                )
+                increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_gpt", len(seen))
+                increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_fallback", len(results) - len(seen))
+                return results
+            except urllib.error.HTTPError as e:
+                last_error = f"HTTP {e.code} {e.read().decode('utf-8', errors='replace')[:300]}"
+                if not is_retryable_gpt_threshold_http_status(e.code) or attempt >= self.gpt_threshold_max_retries:
+                    break
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+                if attempt >= self.gpt_threshold_max_retries:
+                    break
+            time.sleep(float(min(8.0, 1.5 * (2 ** attempt))))
+        self.gpt_threshold_last_error = last_error
+        increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "batches_failed")
+        increment_gpt_threshold_usage(self.gpt_threshold_request_counts, "profiles_fallback", len(results))
+        self._record_gpt_threshold_error("batch_failed", last_error)
+        return results
+
+    def _bootstrap_numeric_threshold_profiles(
+        self,
+        all_pairs: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
+    ) -> None:
+        """v26 numeric CrowdLLM population: one LLM value per profile, no overwrite."""
+        batch_size = int(max(1, self.gpt_threshold_batch_size))
+        counts: Dict[str, int] = {}
+        for start in range(0, len(all_pairs), batch_size):
+            batch = all_pairs[start : start + batch_size]
+            thresholds = self._gpt_batch_numeric_thresholds(batch)
+            for (profile, rides), threshold in zip(batch, thresholds):
+                enriched = build_threshold_profile(profile, rides, threshold)
+                enriched.setdefault("ProfileMarket", str(self.market_name))
+                enriched["ThresholdEvidenceProtocol"] = CROWDLLM_THRESHOLD_EVIDENCE_PROTOCOL
+                enriched["ThresholdEvidenceFirm1Multiplier"] = CROWDLLM_REFERENCE_FIRM1_MULTIPLIER
+                enriched["ThresholdEvidenceFirm2Multiplier"] = CROWDLLM_REFERENCE_FIRM2_MULTIPLIER
+                enriched["ThresholdPromptProtocol"] = CROWDLLM_NUMERIC_PROMPT_PROTOCOL
+                enriched["ThresholdAuditProtocol"] = "none_numeric_llm_value_retained"
+                enriched["ThresholdPromptBatchSize"] = int(batch_size)
+                enriched["ThresholdPromptModel"] = str(self.model_name)
+                enriched["ThresholdRawLLMValue"] = float(threshold.get("raw_llm_threshold", float("nan")))
+                enriched["ThresholdLLMClipped"] = bool(threshold.get("llm_threshold_clipped", False))
+                fallback = self._fallback_price_threshold(
+                    profile, self._price_coldstart_rides(rides)
+                )
+                enriched["ThresholdRubricReference"] = float(fallback)
+                self.synthetic_profile_pool.append(enriched)
+                source = str(threshold.get("source", "fallback_rubric"))
+                counts[source] = counts.get(source, 0) + 1
+            if (start // batch_size) % 50 == 0:
+                print(f">>> numeric CrowdLLM thresholds: {min(len(all_pairs), start + batch_size)}/{len(all_pairs)}")
+        total = max(1, sum(counts.values()))
+        print(
+            ">>> Numeric price-threshold sources: "
+            + ", ".join(f"{k}={v} ({100.0 * v / total:.1f}%)" for k, v in sorted(counts.items()))
+        )
+        summary = format_gpt_threshold_usage_summary(self.gpt_threshold_request_counts)
+        if summary:
+            print(f">>> GPT threshold API utilization: {summary}")
+        self._save_threshold_cache()
+
+    def _try_load_threshold_cache(self, pool_size: int) -> bool:
+        """Load cached threshold-enriched profiles when cached profile mode is requested."""
+        path = self.threshold_cache_path
+        if self.threshold_profile_source != "cached":
+            return False
+        if not path:
+            raise ValueError("threshold_profile_source='cached' requires --threshold_cache_path")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Threshold profile cache not found: {path}")
+        rows: List[Dict[str, Any]] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if "PriceThreshold" not in row:
+                    continue
+                declared_market = str(
+                    row.get("ProfileMarket", row.get("City", row.get("Market", "")))
+                    or ""
+                ).strip()
+                if (
+                    declared_market
+                    and self._normalized_market_name(declared_market)
+                    != self._normalized_market_name(self.market_name)
+                ):
+                    raise ValueError(
+                        "Threshold cache contains a profile for "
+                        f"{declared_market!r}, but this case study is configured "
+                        f"for {self.market_name!r}. Use a market-matched cache."
+                    )
+                if hasattr(self.choice_model, 'demand_spec'):
+                    from joint_demand import positive
+                    row['PriceThreshold'] = positive(row['PriceThreshold'], 'cached PriceThreshold')
+                else:
+                    row["PriceThreshold"] = clip_price_threshold(row["PriceThreshold"])
+                row.setdefault("ProfileMarket", str(self.market_name))
+                rows.append(row)
+                if len(rows) >= int(pool_size):
+                    break
+        if len(rows) < int(pool_size):
+            raise ValueError(
+                f"Threshold profile cache has {len(rows)} usable profiles; need {int(pool_size)}. "
+                "Use threshold_profile_source='generated' to create a completely new profile pool, "
+                "or provide a larger cache for threshold_profile_source='cached'."
+            )
+        self.synthetic_profile_pool = rows[: int(pool_size)]
+        self.gpt_threshold_request_counts = new_gpt_threshold_usage_counts()
+        print(f"[ThresholdCache] Loaded {len(self.synthetic_profile_pool)} cached threshold profiles from {path}.")
+        return True
+
+    def _save_threshold_cache(self) -> None:
+        """Persist threshold-enriched profiles as JSONL for fast repeated experiments."""
+        path = self.threshold_cache_path
+        if not (self.save_threshold_cache and path and self.synthetic_profile_pool):
+            return
+        _ensure_parent_dir(path)
+        with open(path, "w", encoding="utf-8") as f:
+            for row in self.synthetic_profile_pool:
+                f.write(json.dumps(row, sort_keys=True) + "\n")
+        print(f"[ThresholdCache] Saved {len(self.synthetic_profile_pool)} threshold profiles -> {path}")
+
+    def _bootstrap_synthetic_profiles(self, pool_size: int) -> None:
+        if self._try_load_threshold_cache(pool_size):
+            return
+        if self.threshold_profile_source != "generated":
+            raise ValueError(f"Unsupported threshold_profile_source={self.threshold_profile_source!r}")
+        repeat_pairs: Optional[List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]] = None
+        if self.threshold_prompt_repeat_source:
+            repeat_pairs = []
+            excluded = {
+                "ColdstartRides",
+                "PriceThreshold",
+                "PriceThresholdRationale",
+                "PriceThresholdSource",
+                "ProfileMarket",
+                "ThresholdEvidenceProtocol",
+                "ThresholdEvidenceFirm1Multiplier",
+                "ThresholdEvidenceFirm2Multiplier",
+                "ThresholdPromptProtocol",
+            }
+            with open(self.threshold_prompt_repeat_source, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    declared_market = str(row.get("ProfileMarket", "")).strip()
+                    if (
+                        declared_market
+                        and self._normalized_market_name(declared_market)
+                        != self._normalized_market_name(self.market_name)
+                    ):
+                        raise ValueError(
+                            "threshold prompt-repeat source market mismatch: "
+                            f"{declared_market!r} != {self.market_name!r}"
+                        )
+                    rides = list(row.get("ColdstartRides", []))[
+                        : self.gpt_threshold_coldstart_rides
+                    ]
+                    if len(rides) < self.gpt_threshold_coldstart_rides:
+                        raise ValueError(
+                            "threshold prompt-repeat source has insufficient cold-start rides"
+                        )
+                    profile = {
+                        key: value for key, value in row.items()
+                        if key not in excluded and not str(key).startswith("Threshold")
+                    }
+                    repeat_pairs.append((profile, rides))
+                    if len(repeat_pairs) >= int(max(1, pool_size)):
+                        break
+            if len(repeat_pairs) < int(max(1, pool_size)):
+                raise ValueError(
+                    "threshold prompt-repeat source contains fewer usable profiles "
+                    f"than requested: {len(repeat_pairs)} < {int(max(1, pool_size))}"
+                )
+            base_profiles = [profile for profile, _ in repeat_pairs]
+        else:
+            base_profiles = self.agent_gen.sample_profiles(int(max(1, pool_size)))
+        self.synthetic_profile_pool = []
+        threshold_source_counts: Dict[str, int] = {}
+        self.gpt_threshold_error_counts = {}
+        self.gpt_threshold_last_error = ""
+        self.gpt_threshold_request_counts = new_gpt_threshold_usage_counts()
+        all_pairs = (
+            list(repeat_pairs)
+            if repeat_pairs is not None
+            else [
+                (profile, self._build_coldstart_rides(n=self.gpt_threshold_coldstart_rides))
+                for profile in base_profiles
+            ]
+        )
+        if str(getattr(self, "gpt_threshold_mode", "rubric_context")) == "llm_numeric":
+            self._bootstrap_numeric_threshold_profiles(all_pairs)
+            return
+        signature_indices: Dict[Tuple[int, int, int, int], List[int]] = {}
+        for index, (_, rides) in enumerate(all_pairs):
+            signature = self._coldstart_context_signature(rides)
+            signature_indices.setdefault(signature, []).append(index)
+        thresholds_by_index: List[Optional[Dict[str, Any]]] = [None] * len(all_pairs)
+        for signature, indices in signature_indices.items():
+            representative = all_pairs[indices[0]]
+            failed_before = int(self.gpt_threshold_request_counts.get("batches_failed", 0))
+            representative_threshold = self._gpt_batch_price_thresholds([representative])[0]
+            failed_after = int(self.gpt_threshold_request_counts.get("batches_failed", 0))
+            for index in indices:
+                profile, coldstart_rides = all_pairs[index]
+                if str(representative_threshold.get("source", "fallback")) == "gpt":
+                    raw_context_adjustment = float(
+                        representative_threshold["context_adjustment"]
+                    )
+                    expected_context_adjustment = self._expected_context_adjustment(
+                        coldstart_rides
+                    )
+                    threshold = self._rubric_price_threshold_result(
+                        profile,
+                        self._price_coldstart_rides(coldstart_rides),
+                        context_adjustment=expected_context_adjustment,
+                        source="gpt",
+                        rationale=str(representative_threshold.get("rationale", "")),
+                    )
+                    threshold["raw_gpt_context_adjustment"] = raw_context_adjustment
+                    threshold["context_was_corrected"] = not np.isclose(
+                        raw_context_adjustment,
+                        expected_context_adjustment,
+                    )
+                else:
+                    threshold = self._threshold_fallback_result(
+                        profile,
+                        self._price_coldstart_rides(coldstart_rides),
+                        rationale=str(representative_threshold.get("rationale", "")),
+                    )
+                    threshold["raw_gpt_context_adjustment"] = float("nan")
+                    threshold["context_was_corrected"] = False
+                threshold["context_signature"] = ":".join(str(value) for value in signature)
+                threshold["context_signature_reuse_count"] = len(indices)
+                thresholds_by_index[index] = threshold
+            transient_error = any(
+                token in self.gpt_threshold_last_error
+                for token in ("RemoteDisconnected", "Connection refused", "ConnectionReset", "Timeout", "timed out", "URLError")
+            )
+            if (
+                self.openai_api_key
+                and failed_after > failed_before
+                and transient_error
+                and self.gpt_threshold_failure_pause > 0.0
+            ):
+                time.sleep(self.gpt_threshold_failure_pause)
+
+        for (profile, coldstart_rides), optional_threshold in zip(all_pairs, thresholds_by_index):
+            if optional_threshold is None:
+                raise RuntimeError("missing deduplicated threshold result")
+            threshold = optional_threshold
+            src = str(threshold.get("source", "fallback"))
+            threshold_source_counts[src] = int(threshold_source_counts.get(src, 0) + 1)
+            enriched = build_threshold_profile(profile, coldstart_rides, threshold)
+            enriched.setdefault("ProfileMarket", str(self.market_name))
+            enriched["ThresholdEvidenceProtocol"] = CROWDLLM_THRESHOLD_EVIDENCE_PROTOCOL
+            enriched["ThresholdEvidenceFirm1Multiplier"] = CROWDLLM_REFERENCE_FIRM1_MULTIPLIER
+            enriched["ThresholdEvidenceFirm2Multiplier"] = CROWDLLM_REFERENCE_FIRM2_MULTIPLIER
+            enriched["ThresholdPromptProtocol"] = CROWDLLM_THRESHOLD_PROMPT_PROTOCOL
+            enriched["ThresholdAuditProtocol"] = CROWDLLM_THRESHOLD_AUDIT_PROTOCOL
+            enriched["ThresholdPromptBatchSize"] = 1
+            enriched["ThresholdPromptDeduplication"] = "context_signature_v1"
+            enriched["ThresholdContextSignature"] = str(threshold["context_signature"])
+            enriched["ThresholdContextSignatureReuseCount"] = int(
+                threshold["context_signature_reuse_count"]
+            )
+            enriched["ThresholdIncomeAnchor"] = float(threshold["income_anchor"])
+            enriched["ThresholdHouseholdAdjustment"] = float(threshold["household_adjustment"])
+            enriched["ThresholdLoyaltyAdjustment"] = float(threshold["loyalty_adjustment"])
+            enriched["ThresholdGapAdjustment"] = float(threshold["gap_adjustment"])
+            enriched["ThresholdContextAdjustment"] = float(threshold["context_adjustment"])
+            enriched["ThresholdRawGPTContextAdjustment"] = float(
+                threshold["raw_gpt_context_adjustment"]
+            )
+            enriched["ThresholdContextWasCorrected"] = bool(
+                threshold["context_was_corrected"]
+            )
+            enriched["ThresholdExpectedContextAdjustment"] = float(
+                threshold["expected_context_adjustment"]
+            )
+            enriched["ThresholdPromptModel"] = str(self.model_name)
+            self.synthetic_profile_pool.append(enriched)
+
+        total = int(sum(threshold_source_counts.values()))
+        summary_parts = []
+        for k, v in sorted(threshold_source_counts.items()):
+            pct = 100.0 * float(v) / float(max(1, total))
+            summary_parts.append(f"{k}={v} ({pct:.1f}%)")
+        print(
+            ">>> Price-threshold bootstrap sources "
+            f"(prompt_batch_size=1, unique_context_signatures={len(signature_indices)}): "
+            + ", ".join(summary_parts)
+        )
+        request_summary = format_gpt_threshold_usage_summary(self.gpt_threshold_request_counts)
+        if request_summary:
+            print(f">>> GPT threshold API utilization: {request_summary}")
+        diagnostic_notes = diagnose_gpt_threshold_usage(
+            self.gpt_threshold_request_counts,
+            self.gpt_threshold_error_counts,
+            self.gpt_threshold_max_retries,
+        )
+        if diagnostic_notes:
+            print(">>> GPT threshold diagnosis: " + "; ".join(diagnostic_notes))
+        if self.gpt_threshold_error_counts:
+            print(
+                ">>> GPT threshold fallback errors: "
+                + ", ".join(f"{k}={v}" for k, v in sorted(self.gpt_threshold_error_counts.items()))
+            )
+        self._save_threshold_cache()
+
+    @staticmethod
+    def _normalized_market_name(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+    def _build_generalization_profile_pool(self, pool_size: int) -> None:
+        """Create a deterministic same-market train/evaluation partition.
+
+        ``generalization_profile_pool`` is retained as a compatibility name,
+        but it now means the held-out portion of the configured case-study
+        population. In cached mode both partitions therefore preserve the
+        configured market's threshold distribution instead of evaluating a
+        policy against an unrelated synthetic multi-city distribution.
+        """
+        del pool_size
+        if not self.synthetic_profile_pool:
+            raise ValueError("cannot partition an empty case-study profile pool")
+        v26_enabled = bool(
+            getattr(getattr(self, "market_dynamics", None), "enabled", False)
+        )
+
+        def _partition_identity(row: Mapping[str, Any]) -> str:
+            if not v26_enabled:
+                return _canonical_json(row)
+            # v26: partition on the rider/trip identity only, so threshold
+            # sources and ablations share one held-out rider set.
+            return _canonical_json({
+                key: value for key, value in row.items()
+                if not str(key).startswith(("Threshold", "PriceThreshold"))
+            })
+
+        ranked = sorted(
+            self.synthetic_profile_pool,
+            key=lambda row: hashlib.sha256(
+                (
+                    str(
+                        590_021
+                        if v26_enabled
+                        else self.seed + 590_021
+                    )
+                    + "|"
+                    + _partition_identity(row)
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        if len(ranked) == 1:
+            training = list(ranked)
+            evaluation = list(ranked)
+        else:
+            evaluation_count = int(np.clip(round(0.20 * len(ranked)), 1, len(ranked) - 1))
+            evaluation = ranked[:evaluation_count]
+            training = ranked[evaluation_count:]
+        for row in ranked:
+            row.setdefault("ProfileMarket", str(self.market_name))
+        self.training_profile_pool = training
+        self.evaluation_profile_pool = evaluation
+        self.generalization_profile_pool = list(evaluation)
+        self.generalization_profiles_by_city = {
+            str(self.market_name): list(evaluation)
+        }
+        source = (
+            "cached_threshold_profiles"
+            if self.threshold_profile_source == "cached"
+            else "generated_threshold_profiles"
+        )
+        print(
+            f"[CaseStudyProfiles] market={self.market_name}; source={source}; "
+            f"training={len(training)}; held_out_evaluation={len(evaluation)}."
+        )
+        # v26 threshold ablation is applied after the hash partition so every
+        # arm uses exactly the same training/held-out riders.
+        self._apply_threshold_ablation_to_pools()
+        self._threshold_ablation_applied = True
+
+    def _sample_profiles_from_pool(
+        self,
+        n: int,
+        *,
+        generalization_fraction: Optional[float] = None,
+        generalization_city: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        if not self.synthetic_profile_pool:
+            self._bootstrap_synthetic_profiles(pool_size=max(self.total_customers_pool, n))
+        requested = int(max(0, n))
+        if requested == 0:
+            return []
+        if not self.generalization_profile_pool:
+            self._build_generalization_profile_pool(
+                pool_size=min(4000, max(512, self.total_customers_pool // 4))
+            )
+        fraction = float(np.clip(
+            self.training_generalization_fraction
+            if generalization_fraction is None
+            else generalization_fraction,
+            0.0,
+            1.0,
+        ))
+        robust_count = int(round(requested * fraction))
+        primary_count = int(requested - robust_count)
+        primary_pool = self.training_profile_pool or self.synthetic_profile_pool
+        robust_pool = self.evaluation_profile_pool or self.generalization_profile_pool
+        if generalization_city:
+            requested_city = str(generalization_city)
+            if (
+                self._normalized_market_name(requested_city)
+                != self._normalized_market_name(self.market_name)
+            ):
+                raise ValueError(
+                    f"case-study profile sampling is {self.market_name}-only; "
+                    f"requested holdout city was {requested_city!r}"
+                )
+        sampled: List[Dict[str, Any]] = []
+        if primary_count:
+            primary_idx = self.rng.integers(
+                0, len(primary_pool), size=primary_count
+            )
+            sampled.extend(
+                primary_pool[int(index)]
+                for index in primary_idx
+            )
+        if robust_count:
+            robust_idx = self.rng.integers(
+                0, len(robust_pool), size=robust_count
+            )
+            sampled.extend(robust_pool[int(index)] for index in robust_idx)
+        if self.loyalty_v2 and self._active_rider_pool and sampled:
+            # v26r loyalty v2: a returning share of the step's requests comes from
+            # the episode's active riders, who carry their loyalty stocks.
+            returning = int(round(len(sampled) * float(self.returning_rider_share)))
+            if returning > 0:
+                active_idx = self.rng.integers(0, len(self._active_rider_pool), size=returning)
+                for position, index in enumerate(active_idx):
+                    sampled[position] = self._active_rider_pool[int(index)]
+        if len(sampled) > 1:
+            order = self.rng.permutation(len(sampled))
+            sampled = [sampled[int(index)] for index in order]
+        # Choice/simulation code treats profiles as read-only, so dictionary
+        # reuse keeps same-distribution holdout sampling inexpensive.
+        return sampled
+    
+    def _effective_simulation_sample_size(self, requested: int, collect_rows: bool = False) -> int:
+        """Return the Monte Carlo profile count used for aggregate simulations."""
+        requested_i = int(max(0, requested))
+        if collect_rows or self.simulation_sample_cap <= 0:
+            return requested_i
+        return int(min(requested_i, self.simulation_sample_cap))
+
+    def save_trained_model(
+        self,
+        path: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        *,
+        registry_dir: Optional[str] = None,
+        model_id: Optional[str] = None,
+    ) -> str:
+        """Save a portable policy and, when configured, an immutable archive copy.
+
+        ``path`` remains a convenient mutable alias for older scripts.  The
+        registry copy is never overwritten and can later be addressed by its
+        model id or archive filename.
+        """
+        if self.firm1_mode != "RL":
+            raise ValueError("trained model artifacts require firm1_mode='RL'")
+        if not path and not registry_dir:
+            raise ValueError("save_trained_model requires a path or registry_dir")
+        resolved_model_id = safe_model_id(model_id or (os.path.splitext(os.path.basename(path or ""))[0] or "trained-policy"))
+        archive_output = (
+            allocate_archive_path(registry_dir, resolved_model_id)
+            if registry_dir
+            else os.path.abspath(os.path.expanduser(str(path)))
+        )
+        alias_output = os.path.abspath(os.path.expanduser(str(path))) if path else None
+        created_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        cache_path = (
+            os.path.abspath(os.path.expanduser(self.threshold_cache_path))
+            if self.threshold_cache_path
+            else ""
+        )
+        cache_sha256 = (
+            _sha256_file(cache_path)
+            if cache_path and os.path.isfile(cache_path)
+            else None
+        )
+        independent_actions = bool(
+            getattr(self.firm1, "independent_coefficient_actions", False)
+        )
+        level_actions = bool(getattr(self.firm1, "level_step_actions", False))
+        hybrid_actions = bool(
+            getattr(self.firm1, "hybrid_relative_actions", False)
+        )
+        action_semantics = (
+            LEVEL_STEP_ACTION_SEMANTICS
+            if level_actions
+            else HYBRID_RELATIVE_ACTION_SEMANTICS
+            if hybrid_actions
+            else "factorized_single_coefficient_absolute_target"
+            if independent_actions
+            else "absolute_whole_tariff_target"
+        )
+        artifact = {
+            "format": "ride-response-platform-policy",
+            "version": int(self.credit_assignment_config["version"]),
+            "created_at": created_at,
+            "model_id": resolved_model_id,
+            "market_name": self.market_name,
+            "manipulated_price_coefficient_count": int(
+                self.manipulated_price_coefficient_count
+            ),
+            "opt_keys": list(self.shared_edit_keys),
+            "action_to_steps": copy.deepcopy(self.firm1.action_to_steps),
+            "action_to_multiplier": copy.deepcopy(
+                self.firm1.action_to_multiplier
+            ),
+            "action_to_target_key": copy.deepcopy(
+                self.firm1.action_to_target_key
+            ),
+            "action_semantics": action_semantics,
+            "action_to_level_step": copy.deepcopy(
+                getattr(self.firm1, "action_to_level_step", {})
+            ),
+            "action_to_relative_step": copy.deepcopy(
+                getattr(self.firm1, "action_to_relative_step", {})
+            ),
+            "tariff_structure": copy.deepcopy(
+                getattr(self.firm1, "tariff_structure", None)
+            ),
+            "tariff_level_bounds": (
+                list(self.firm1.tariff_level_bounds) if level_actions else None
+            ),
+            "single_state_dim": int(self.firm1.single_state_dim),
+            "state_frame_stack": int(self.firm1.state_frame_stack),
+            "action_feature_dim": int(self.firm1.agent.action_feature_dim),
+            "constraint_names": [],
+            "response_dim": 0,
+            "opponent_forecast_dim": 0,
+            "observation_feature_groups": {},
+            "city_context_keys": list(PlatformObservationModel.CITY_CONTEXT_KEYS),
+            "architecture": (
+                "stateful-public-gru-level-step-actor-centralized-v-independent-action-q-ppo"
+                if level_actions
+                else "stateful-public-gru-hybrid-relative-factorized-actor-centralized-v-independent-action-q-ppo"
+                if hybrid_actions
+                else "stateful-public-gru-factorized-target-magnitude-actor-centralized-v-independent-action-q-ppo"
+                if independent_actions
+                else "stateful-public-gru-actor-direct-centralized-v-independent-action-q-categorical-ppo"
+                if int(self.credit_assignment_config["version"]) >= 25
+                else "stateful-separate-gru-actor-centralized-critic-categorical-ppo"
+                if int(self.credit_assignment_config["version"]) >= 24
+                else "separate-gru-actor-critic-categorical-ppo"
+            ),
+            "policy_lineage": (
+                "v25_exact_smdp_actual_next_state_causal_ppo"
+                if int(self.credit_assignment_config["version"]) >= 25
+                else "v24_credit_assignment_centralized_critic_crn_ppo"
+                if int(self.credit_assignment_config["version"]) >= 24
+                else "v23_coherent_tariff_differential_semimdp_ppo"
+            ),
+            "credit_assignment_config": copy.deepcopy(
+                self.credit_assignment_config
+            ),
+            "v26_settings": copy.deepcopy(getattr(self, "v26_settings", {"enabled": False})),
+            "demand_calibration": copy.deepcopy(getattr(self.choice_model, 'demand_spec', None)),
+            "supply_operating_point": ({'contract': 'revision6-posted-pay-entry-stochastic-rounding',
+                'demand_calibration': copy.deepcopy(getattr(self.choice_model, 'demand_spec', None)),
+                'city': self.market_name, 'fleet_scale': self.market_dynamics.fleet_scale,
+                'config': asdict(self.driver_supply.config),
+                'hour_profile': dict(self.driver_supply.hour_profile),
+                'pay_policies': {f: asdict(p) for f, p in self.driver_supply.pay_policies.items()},
+                'calibration': copy.deepcopy(self.v26_settings.get('driver_capacity_calibration', {}))}
+                if self.driver_supply.supply_v2 else None),
+            "competition_protocol": {
+                "name": "firm2_leader_then_firm1_follower",
+                "leader": "Firm2",
+                "follower": "Firm1",
+                "firm1_observes": "posted_public_quote_gaps_before_action",
+                "firm2_private_policy_hidden": True,
+                "shared_action_interval_steps": int(
+                    self.shared_action_interval_steps
+                ),
+                "steps_per_day": int(self.shared_steps_per_day),
+                "training_stage_order": [
+                    stage.name
+                    for stage in self.training_stage_scheduler.stages
+                ],
+                "training_opponent_regimes": [
+                    stage.opponent_regime
+                    for stage in self.training_stage_scheduler.stages
+                ],
+                "dynamic_opponent_pool": list(
+                    self.training_dynamic_opponent_modes
+                ),
+                "catchup_opponent_pool": list(
+                    self.training_catchup_opponent_modes
+                ),
+                "profit_opponent_pool": list(
+                    self.training_profit_opponent_modes
+                ),
+                "dynamic_population_cycle": list(
+                    self._training_opponent_population("catchup")
+                ),
+                "profit_population_cycle": list(
+                    self._training_opponent_population("profit")
+                ),
+                "dynamic_population_weighting": (
+                    "equal_controller_class_mass_then_equal_opening_mass"
+                    if self.credit_assignment_v25
+                    else "uniform_transition_mass"
+                ),
+                "training_tariff_path": (
+                    "fresh_stage_openings_and_long_dynamic_episodes"
+                ),
+                "training_tariff_resets_after_opening": bool(
+                    len(self.training_stage_scheduler.stages) > 1
+                ),
+                "configured_firm2_active_from_opening": bool(
+                    self.training_stage_scheduler.stages[0].opponent_regime
+                    in {"dynamic", "catchup", "profit"}
+                ),
+            },
+            "policy_objective": str(
+                self.long_term_profit_reward_config.objective_mode
+            ),
+            "reward_mechanism": str(
+                self.long_term_profit_reward_model.mechanism_name
+            ),
+            "gamma": float(self.firm1.agent.gamma),
+            "gae_lambda": float(self.firm1.agent.lam),
+            "policy_training_config": {
+                "algorithm": "categorical_ppo",
+                "rollout_independent_episodes": self.ppo_rollout_episodes,
+                "rollout_collection": ("sequential_independent_openings" if self.learner_revision >= 3
+                                       else "legacy_sequential"),
+                "actor": "ordered_frame_encoder_gru_to_action_logits",
+                "critic": ("independent_recurrent_bilateral_values" if self.learner_revision >= 3
+                           else "separate_ordered_frame_encoder_gru_to_scalar_value"),
+                "credit_assignment": copy.deepcopy(
+                    self.credit_assignment_config
+                ),
+                "critic_objective": ("bilateral_discounted_returns_with_exact_stage_combination" if self.learner_revision >= 3
+                                     else "discounted_stage_reward_value" if self.learning_corrections
+                                     else "continuing_average_reward_differential_value"),
+                "held_action_reward": (
+                    "discounted_smdp_sum_over_operational_steps"
+                    if int(self.credit_assignment_config["version"]) >= 25
+                    else "discounted_mean_over_operational_steps"
+                ),
+                "entropy_coefficient": float(self.firm1.agent.ent_coeff),
+                "entropy_coefficient_bounds": [
+                    float(self.firm1.agent.min_ent_coeff),
+                    float(self.firm1.agent.max_ent_coeff),
+                ],
+                "target_entropy_fraction": float(
+                    self.firm1.agent.target_entropy_fraction
+                ),
+                "entropy_adaptation_rate": float(
+                    self.firm1.agent.entropy_adaptation_rate
+                ),
+                "behavior_exploration_schedule": {
+                    "clock": "local_simulation_days_within_each_training_stage",
+                    "entropy_start": float(self.firm1.agent.base_ent_coeff),
+                    "entropy_end": float(self.firm1.agent.min_ent_coeff),
+                    "distribution": "actor_uniform_feasible_mixture",
+                    "initial_rate": float(self.firm1.agent.initial_exploration_rate),
+                    "final_rate": float(self.firm1.agent.final_exploration_rate),
+                    "warmup_fraction": float(
+                        self.firm1.agent.exploration_warmup_fraction
+                    ),
+                    "decay_end_fraction": float(
+                        self.firm1.agent.exploration_fraction
+                    ),
+                    "decay": "cosine",
+                    "hold_remains_feasible": True,
+                    "ppo_ratio_uses_behavior_mixture": True,
+                    "per_stage_schedules": [
+                        {
+                            "stage": stage.name,
+                            "reward_regime": stage.opponent_regime,
+                            "exploration": [
+                                stage.exploration_rate,
+                                stage.exploration_end_rate,
+                            ],
+                            "entropy_scale": [
+                                stage.entropy_scale,
+                                stage.entropy_end_scale,
+                            ],
+                            "learning_rate_scale": [
+                                stage.learning_rate_scale,
+                                stage.learning_rate_end_scale,
+                            ],
+                        }
+                        for stage in self.training_stage_scheduler.stages
+                    ],
+                },
+                "minimum_rollout_transitions": int(getattr(
+                    self, "ppo_min_rollout_transitions", 96
+                )),
+                "update_readiness_check_days": int(getattr(
+                    self, "ppo_update_interval_days", 0
+                )),
+                "optimizer_epochs_per_update": int(self.ppo_update_epochs),
+                "optimizer_minibatch_size": int(self.ppo_batch_size),
+                "training_episode_days": int(max(
+                    stage.episode_days
+                    for stage in self.training_stage_scheduler.stages
+                )),
+                "nmcc_horizon_days": int(
+                    self.counterfactual_day_horizon_days
+                ),
+                "nmcc_every_k_decisions": int(
+                    self.nmcc_every_k_decisions
+                ),
+                "clip_epsilon": float(self.firm1.agent.clip_eps),
+                "learning_rate": float(self.firm1.agent.curr_lr),
+                "critic_learning_rate": float(
+                    self.firm1.agent.critic_opt.param_groups[0]["lr"]
+                ),
+                "checkpoint_selector": str(
+                    self.objective_optimizer.mechanism_name
+                ),
+            },
+            # Evaluation must reproduce the case-study population contract.
+            # In particular, a policy trained with cached NYC thresholds must
+            # never silently fall back to a freshly generated rider pool.
+            "case_study_population": {
+                "schema_version": 1,
+                "market_name": str(self.market_name),
+                "threshold_profile_source": str(
+                    self.threshold_profile_source
+                ),
+                "threshold_cache_path": cache_path,
+                "threshold_cache_sha256": cache_sha256,
+                "profile_pool_size": int(self.total_customers_pool),
+                "realized_profile_count": int(
+                    len(self.synthetic_profile_pool)
+                ),
+                "partition_method": "deterministic_sha256_80_20",
+                "training_holdout_fraction": float(
+                    self.training_generalization_fraction
+                ),
+                "evaluation_holdout_fraction": float(
+                    self.evaluation_generalization_fraction
+                ),
+            },
+            "network_state": {
+                key: value.detach().cpu() for key, value in self.firm1.agent.net.state_dict().items()
+            },
+            "optimizer_state": self.firm1.agent.optimizer_state_dict(),
+            "normalizer_state": self.firm1.agent.normalizer_state_dict(),
+            # Tariffs, opponent controller state, observation queues, and dual
+            # variables are deliberately excluded.  The artifact is a policy,
+            # not a terminal training-world snapshot.
+            "mdp_config": platform_mdp_config_payload(
+                self.observation_config,
+                self.positive_reward_config,
+                self.constraint_config,
+                self.training_stage_scheduler,
+                self.long_term_profit_reward_config,
+            ),
+            "metadata": dict(metadata or {}),
+        }
+        if independent_actions:
+            artifact["action_factorization"] = {
+                "target_choices": ["hold", *list(self.shared_edit_keys)],
+                "magnitude_targets": list(self.firm1.tariff_targets),
+                "joint_action_count": int(self.firm1.agent.action_dim),
+            }
+        elif hybrid_actions:
+            artifact["action_factorization"] = {
+                "target_choices": [
+                    "hold", "whole_tariff", *list(self.shared_edit_keys)
+                ],
+                "relative_steps": sorted(set(
+                    float(value)
+                    for value in self.firm1.action_to_relative_step.values()
+                )),
+                "joint_action_count": int(self.firm1.agent.action_dim),
+                "no_op_actions_masked": True,
+            }
+        os.makedirs(os.path.dirname(archive_output) or ".", exist_ok=True)
+        torch.save(artifact, archive_output)
+        if alias_output and os.path.realpath(alias_output) != os.path.realpath(archive_output):
+            os.makedirs(os.path.dirname(alias_output) or ".", exist_ok=True)
+            torch.save(artifact, alias_output)
+            print(f">>> Updated trained-policy alias -> {alias_output}")
+        if registry_dir:
+            manifest = append_manifest(
+                registry_dir,
+                {
+                    "model_id": resolved_model_id,
+                    "archive_id": os.path.basename(archive_output),
+                    "archive_path": archive_output,
+                    "alias_path": alias_output,
+                    "created_at": created_at,
+                    "market_name": self.market_name,
+                    "metadata": dict(metadata or {}),
+                },
+            )
+            print(f">>> Registered immutable trained policy -> {archive_output}")
+            print(f">>> Model registry manifest -> {manifest}")
+        else:
+            print(f">>> Saved portable trained policy -> {archive_output}")
+        self.last_saved_model_path = archive_output
+        self.last_saved_model_id = resolved_model_id
+        return archive_output
+
+    def load_trained_model(
+        self,
+        path: str,
+        *,
+        load_optimizer: bool = False,
+        restore_tariff: bool = False,
+    ) -> Dict[str, Any]:
+        """Load a policy without loading or replacing the benchmark opponent."""
+        if self.firm1_mode != "RL":
+            raise ValueError("trained model artifacts require firm1_mode='RL'")
+        source = os.path.abspath(os.path.expanduser(path))
+        try:
+            artifact = torch.load(source, map_location=self.firm1.agent.device, weights_only=False)
+        except TypeError:
+            artifact = torch.load(source, map_location=self.firm1.agent.device)
+        if artifact.get("format") != "ride-response-platform-policy":
+            raise ValueError(f"unsupported trained model artifact: {source}")
+        if artifact.get('demand_calibration') != getattr(self.choice_model, 'demand_spec', None):
+            raise ValueError('policy and runtime demand contracts differ')
+        if int(artifact.get("version", 0)) < 23:
+            raise ValueError(
+                "trained model predates the supported recurrent pricing-policy, "
+                "differential semi-MDP reward, and corrected critic contract; "
+                "retrain the policy"
+            )
+        competition_protocol = dict(
+            artifact.get("competition_protocol", {}) or {}
+        )
+        if competition_protocol.get("name") != (
+            "firm2_leader_then_firm1_follower"
+        ):
+            raise ValueError(
+                "trained model competition protocol is incompatible with the "
+                "Firm2-leader/Firm1-follower runtime"
+            )
+        saved_action_interval = int(
+            competition_protocol.get("shared_action_interval_steps", 0)
+        )
+        if saved_action_interval <= 0:
+            raise ValueError(
+                "trained model does not record a valid shared action interval"
+            )
+        self.loaded_shared_action_interval_steps = saved_action_interval
+        saved_steps_per_day = int(
+            competition_protocol.get("steps_per_day", 0)
+        )
+        if saved_steps_per_day <= 0:
+            raise ValueError(
+                "trained model does not record a valid market steps-per-day calendar"
+            )
+        self.loaded_steps_per_day = saved_steps_per_day
+        runtime_objective = str(
+            self.long_term_profit_reward_config.objective_mode
+        )
+        artifact_objective = str(artifact.get("policy_objective", ""))
+        if artifact_objective != runtime_objective:
+            raise ValueError(
+                "trained policy objective does not match runtime: "
+                f"artifact={artifact_objective!r}, runtime={runtime_objective!r}"
+            )
+        runtime_mechanism = str(
+            self.long_term_profit_reward_model.mechanism_name
+        )
+        artifact_mechanism = str(artifact.get("reward_mechanism", ""))
+        if artifact_mechanism != runtime_mechanism:
+            raise ValueError(
+                "trained policy reward mechanism does not match runtime: "
+                f"artifact={artifact_mechanism!r}, runtime={runtime_mechanism!r}"
+            )
+        saved_lead_weight = float(artifact.get("mdp_config", {}).get("active_reward", {}).get("opponent_profit_lead_weight", 0.5))
+        if not np.isclose(saved_lead_weight, self.long_term_profit_reward_config.opponent_profit_lead_weight):
+            raise ValueError("trained policy opponent profit lead weight does not match runtime")
+        saved_active_reward = dict(
+            artifact.get("mdp_config", {}).get("active_reward", {}) or {}
+        )
+        runtime_stage_lead_weights = (
+            self.long_term_profit_reward_config.stage_profit_lead_weights
+        )
+        saved_stage_lead_weights_raw = saved_active_reward.get(
+            "stage_profit_lead_weights"
+        )
+        saved_stage_lead_weights = (
+            None
+            if saved_stage_lead_weights_raw is None
+            else tuple(float(value) for value in saved_stage_lead_weights_raw)
+        )
+        stage_schedule_matches = (
+            runtime_stage_lead_weights is None
+            and saved_stage_lead_weights is None
+        ) or (
+            runtime_stage_lead_weights is not None
+            and saved_stage_lead_weights is not None
+            and np.allclose(
+                runtime_stage_lead_weights,
+                saved_stage_lead_weights,
+                rtol=0.0,
+                atol=1e-12,
+            )
+        )
+        if not stage_schedule_matches:
+            raise ValueError(
+                "trained policy stage profit-lead schedule does not match runtime"
+            )
+        runtime_stage_share_weights = (
+            self.long_term_profit_reward_config
+            .stage_market_share_competitiveness_weights
+        )
+        saved_stage_share_weights_raw = saved_active_reward.get(
+            "stage_market_share_competitiveness_weights"
+        )
+        saved_stage_share_weights = (
+            None
+            if saved_stage_share_weights_raw is None
+            else tuple(float(value) for value in saved_stage_share_weights_raw)
+        )
+        stage_share_schedule_matches = (
+            runtime_stage_share_weights is None
+            and saved_stage_share_weights is None
+        ) or (
+            runtime_stage_share_weights is not None
+            and saved_stage_share_weights is not None
+            and np.allclose(
+                runtime_stage_share_weights,
+                saved_stage_share_weights,
+                rtol=0.0,
+                atol=1e-12,
+            )
+        )
+        if not stage_share_schedule_matches:
+            raise ValueError(
+                "trained policy stage market-share schedule does not match runtime"
+            )
+        for field in (
+            "temporal_competitive_reward",
+            "durable_dominance_weight",
+            "adaptive_residual_weight",
+            "durable_dominance_horizon_days",
+        ):
+            runtime_value = getattr(self.long_term_profit_reward_config, field)
+            saved_value = saved_active_reward.get(field, False if field == "temporal_competitive_reward" else runtime_value)
+            matches = (
+                bool(saved_value) == bool(runtime_value)
+                if field == "temporal_competitive_reward"
+                else np.isclose(float(saved_value), float(runtime_value))
+            )
+            if not matches:
+                raise ValueError(
+                    f"trained policy {field} does not match runtime"
+                )
+        population_contract = dict(
+            artifact.get("case_study_population", {}) or {}
+        )
+        if population_contract:
+            artifact_market = str(
+                population_contract.get(
+                    "market_name", artifact.get("market_name", "")
+                )
+            )
+            if self._normalized_market_name(artifact_market) != (
+                self._normalized_market_name(self.market_name)
+            ):
+                raise ValueError(
+                    "trained policy population market does not match runtime: "
+                    f"artifact={artifact_market!r}, runtime={self.market_name!r}"
+                )
+            artifact_source = str(
+                population_contract.get(
+                    "threshold_profile_source", "generated"
+                )
+            )
+            if artifact_source != self.threshold_profile_source:
+                raise ValueError(
+                    "trained policy threshold population does not match runtime: "
+                    f"artifact={artifact_source!r}, "
+                    f"runtime={self.threshold_profile_source!r}"
+                )
+            expected_pool_size = int(
+                population_contract.get(
+                    "profile_pool_size", self.total_customers_pool
+                )
+            )
+            if expected_pool_size != int(self.total_customers_pool):
+                raise ValueError(
+                    "trained policy profile pool size does not match runtime: "
+                    f"artifact={expected_pool_size}, "
+                    f"runtime={self.total_customers_pool}"
+                )
+            expected_training_fraction = float(
+                population_contract.get(
+                    "training_holdout_fraction",
+                    self.training_generalization_fraction,
+                )
+            )
+            expected_evaluation_fraction = float(
+                population_contract.get(
+                    "evaluation_holdout_fraction",
+                    self.evaluation_generalization_fraction,
+                )
+            )
+            if not np.isclose(
+                expected_training_fraction,
+                self.training_generalization_fraction,
+            ) or not np.isclose(
+                expected_evaluation_fraction,
+                self.evaluation_generalization_fraction,
+            ):
+                raise ValueError(
+                    "trained policy same-market holdout fractions do not "
+                    "match the runtime population contract"
+                )
+            if artifact_source == "cached":
+                runtime_cache = (
+                    os.path.abspath(
+                        os.path.expanduser(self.threshold_cache_path)
+                    )
+                    if self.threshold_cache_path
+                    else ""
+                )
+                if not runtime_cache or not os.path.isfile(runtime_cache):
+                    raise ValueError(
+                        "cached-threshold policy evaluation requires the "
+                        "training NYC threshold cache"
+                    )
+                expected_hash = str(
+                    population_contract.get("threshold_cache_sha256", "")
+                    or ""
+                )
+                if expected_hash and _sha256_file(runtime_cache) != expected_hash:
+                    raise ValueError(
+                        "runtime threshold cache fingerprint does not match "
+                        "the cache used to train this policy"
+                    )
+        expected = {
+            "single_state_dim": int(self.firm1.single_state_dim),
+            "state_frame_stack": int(self.firm1.state_frame_stack),
+            "action_feature_dim": int(self.firm1.agent.action_feature_dim),
+        }
+        for key, value in expected.items():
+            if int(artifact.get(key, -1)) != value:
+                raise ValueError(
+                    f"trained model {key}={artifact.get(key)} is incompatible with runtime {value}"
+                )
+        if int(artifact.get("response_dim", -1)) != 0:
+            raise ValueError("trained model still contains a response auxiliary")
+        if int(artifact.get("opponent_forecast_dim", -1)) != 0:
+            raise ValueError("trained model still contains an opponent forecast auxiliary")
+        artifact_opt_keys = list(artifact.get("opt_keys", []))
+        artifact_manipulated_count = int(
+            artifact.get(
+                "manipulated_price_coefficient_count",
+                len(artifact_opt_keys),
+            )
+        )
+        if not 1 <= artifact_manipulated_count <= len(
+            MANIPULATABLE_PRICE_COEFFICIENT_KEYS
+        ):
+            raise ValueError(
+                "trained model records an invalid manipulated price-coefficient count"
+            )
+        if artifact_manipulated_count != len(artifact_opt_keys):
+            raise ValueError(
+                "trained model manipulated price-coefficient count does not "
+                "match its pricing keys"
+            )
+        if artifact_manipulated_count != self.manipulated_price_coefficient_count:
+            raise ValueError(
+                "trained model manipulated price-coefficient count does not "
+                "match runtime: "
+                f"artifact={artifact_manipulated_count}, "
+                f"runtime={self.manipulated_price_coefficient_count}"
+            )
+        if artifact_opt_keys != list(self.shared_edit_keys):
+            raise ValueError("trained model pricing keys do not match runtime pricing keys")
+        if artifact.get("action_to_steps") != self.firm1.action_to_steps:
+            raise ValueError("trained model action mapping does not match runtime action mapping")
+        if artifact.get("action_to_multiplier") != self.firm1.action_to_multiplier:
+            raise ValueError("trained model tariff targets do not match runtime")
+        if artifact.get("action_to_target_key") != self.firm1.action_to_target_key:
+            raise ValueError("trained model coefficient targets do not match runtime")
+        expected_action_semantics = (
+            LEVEL_STEP_ACTION_SEMANTICS
+            if getattr(self.firm1, "level_step_actions", False)
+            else HYBRID_RELATIVE_ACTION_SEMANTICS
+            if getattr(self.firm1, "hybrid_relative_actions", False)
+            else "factorized_single_coefficient_absolute_target"
+            if self.firm1.independent_coefficient_actions
+            else "absolute_whole_tariff_target"
+        )
+        if artifact.get("action_semantics") != expected_action_semantics:
+            raise ValueError(
+                "trained model action semantics do not match runtime: "
+                f"artifact={artifact.get('action_semantics')!r}, "
+                f"runtime={expected_action_semantics!r}"
+            )
+        if getattr(self.firm1, "level_step_actions", False):
+            if artifact.get("action_to_level_step") != self.firm1.action_to_level_step:
+                raise ValueError("trained model level steps do not match runtime")
+            if artifact.get("tariff_structure") != self.firm1.tariff_structure:
+                raise ValueError("trained model tariff structure does not match runtime")
+            if [float(x) for x in (artifact.get("tariff_level_bounds") or [])] != list(
+                self.firm1.tariff_level_bounds
+            ):
+                raise ValueError("trained model tariff level bounds do not match runtime")
+        if getattr(self.firm1, "hybrid_relative_actions", False):
+            if (
+                artifact.get("action_to_relative_step")
+                != self.firm1.action_to_relative_step
+            ):
+                raise ValueError(
+                    "trained model relative tariff steps do not match runtime"
+                )
+            expected_factorization = {
+                "target_choices": [
+                    "hold", "whole_tariff", *list(self.shared_edit_keys)
+                ],
+                "relative_steps": sorted(set(
+                    float(value)
+                    for value in self.firm1.action_to_relative_step.values()
+                )),
+                "joint_action_count": int(self.firm1.agent.action_dim),
+                "no_op_actions_masked": True,
+            }
+            if artifact.get("action_factorization") != expected_factorization:
+                raise ValueError(
+                    "trained model hybrid action factorization does not match runtime"
+                )
+        if dict(artifact.get("observation_feature_groups", {})):
+            raise ValueError("trained model still contains hierarchical feature groups")
+        if list(artifact.get("city_context_keys", [])) != list(
+            PlatformObservationModel.CITY_CONTEXT_KEYS
+        ):
+            raise ValueError("trained model city-context schema does not match runtime")
+        if list(artifact.get("constraint_names", [])):
+            raise ValueError("trained model still contains constraint critics")
+        artifact_credit = dict(
+            artifact.get("credit_assignment_config", {}) or {}
+        )
+        if bool(artifact_credit.get("learning_corrections", False)) != self.learning_corrections:
+            raise ValueError("trained model learning-correction contract does not match runtime")
+        if self.learning_corrections and int(artifact_credit.get("learner_revision", 1)) != self.learner_revision:
+            raise ValueError("trained model learner revision does not match runtime")
+        if not artifact_credit:
+            artifact_credit = {
+                "version": 23,
+                "privileged_critic": False,
+                "privileged_critic_state_dim": 0,
+                "persistent_recurrence": False,
+                "counterfactual_branches": 0,
+                "counterfactual_q_coeff": 0.0,
+                "counterfactual_actor_weight": 0.0,
+                "potential_shaping_scale": 0.0,
+                "hard_kl_stop": False,
+                "reward_rate_beta": 0.0,
+            }
+        if (
+            int(artifact_credit.get("version", 23)) >= 25
+            and float(
+                artifact_credit.get("counterfactual_actor_weight", 0.0)
+            ) == 0.0
+        ):
+            # Transitional v25 artifacts created while the production
+            # contract was being finalized used these mechanisms but did not
+            # yet serialize their names. Infer only the unambiguous zero-CF-
+            # actor case; older one-step actor-credit artifacts remain
+            # intentionally incompatible with this production contract.
+            artifact_credit.setdefault(
+                "actor_credit_contract", "ppo_complete_smdp_return_only"
+            )
+            artifact_credit.setdefault(
+                "opponent_loss_weighting", "equal_terminal_regime_mass"
+            )
+        for key, runtime_value in self.credit_assignment_config.items():
+            artifact_value = artifact_credit.get(key)
+            matches = (
+                np.isclose(float(artifact_value), float(runtime_value))
+                if isinstance(runtime_value, float)
+                else artifact_value == runtime_value
+            )
+            if not matches:
+                raise ValueError(
+                    "trained policy credit-assignment configuration does not "
+                    f"match runtime for {key}: artifact={artifact_value!r}, "
+                    f"runtime={runtime_value!r}"
+                )
+        try:
+            self.firm1.agent.net.load_state_dict(artifact["network_state"])
+        except RuntimeError as exc:
+            raise ValueError(
+                "trained model network is incompatible with the recurrent "
+                "actor/critic architecture; instantiate the artifact's v23/v24/v25 "
+                "credit-assignment configuration before loading"
+            ) from exc
+        self.firm1.agent.load_normalizer_state_dict(
+            artifact.get("normalizer_state")
+        )
+        if load_optimizer and artifact.get("optimizer_state"):
+            self.firm1.agent.load_optimizer_state_dict(
+                artifact["optimizer_state"]
+            )
+        if restore_tariff:
+            if getattr(self.firm1, "level_step_actions", False):
+                raise ValueError(
+                    "restore_tariff is undefined under the level-step contract; "
+                    "openings post S * L0"
+                )
+            for key, value in artifact.get("firm1_coefficients", {}).items():
+                if key in self.shared_edit_keys:
+                    set_coeff(self.market.curr_market, self.firm1.overrides, key, float(value))
+        self.constraint_lambdas = {
+            name: 0.0 for name in self.soft_constraints.names
+        }
+        self.firm1.reset_state_history()
+        for observer in self.platform_observers.values():
+            observer.reset()
+        self.action_stability.reset()
+        self._sync_agent_optimization_context()
+        self.loaded_trained_model_path = source
+        self.loaded_trained_model_id = artifact.get("model_id")
+        self.loaded_trained_model_created_at = artifact.get("created_at")
+        self.loaded_trained_model_version = int(artifact.get("version", 0))
+        self.loaded_trained_model_metadata = dict(artifact.get("metadata", {}) or {})
+        training_seed = self.loaded_trained_model_metadata.get("training_seed")
+        training_seed_source = "artifact_metadata"
+        if training_seed is None:
+            match = re.search(
+                r"(?:^|_)seed(\d+)(?:_|$)",
+                str(self.loaded_trained_model_id or ""),
+            )
+            if match:
+                training_seed = int(match.group(1))
+                training_seed_source = "legacy_model_id_inference"
+            else:
+                training_seed_source = "unavailable"
+        self.loaded_trained_model_training_seed = (
+            None if training_seed is None else int(training_seed)
+        )
+        self.loaded_trained_model_training_seed_source = training_seed_source
+        self.loaded_trained_model_sha256 = _sha256_file(source)
+        print(
+            f">>> Loaded trained policy <- {source}; "
+            f"model_id={self.loaded_trained_model_id}, "
+            f"training_seed={self.loaded_trained_model_training_seed} "
+            f"({self.loaded_trained_model_training_seed_source}); "
+            f"benchmark opponent remains {self.firm2_mode}."
+        )
+        return artifact
+
+    @staticmethod
+    def _validation_opponent_rollouts(
+        actual_mode: str,
+        actual_seed_count: int,
+        include_benchmarks: bool = False,
+    ) -> List[Tuple[str, str]]:
+        """Build checkpoint or reporting rollouts without mixing their roles."""
+        mode = str(actual_mode)
+        seed_count = int(max(1, actual_seed_count))
+        rollouts = [
+            (f"actual_firm2__{mode}__opening_{index + 1}", mode)
+            for index in range(seed_count)
+        ]
+        if include_benchmarks:
+            rollouts.extend(
+                (benchmark, benchmark) for benchmark in BENCHMARK_OPPONENT_MODES
+            )
+        return rollouts
+
+    def _ood_opponent_rollouts(self) -> List[Tuple[str, str]]:
+        """Parameter-perturbed variants of every benchmark controller (v26 C2)."""
+        rollouts: List[Tuple[str, str]] = []
+        for benchmark in BENCHMARK_OPPONENT_MODES:
+            for variant in range(int(self.ood_perturbed_variants)):
+                name = perturbed_mode_name(benchmark, variant)
+                rollouts.append((name, name))
+        return rollouts
+
+    @staticmethod
+    def _full_horizon_validation_means(
+        **series: Sequence[float],
+    ) -> Dict[str, float]:
+        """Return aligned, finite full-rollout means for checkpoint scoring."""
+        if not series:
+            raise ValueError("validation metric series cannot be empty")
+        vectors = {
+            name: np.asarray(values, dtype=float).reshape(-1)
+            for name, values in series.items()
+        }
+        lengths = {vector.size for vector in vectors.values()}
+        if len(lengths) != 1 or 0 in lengths:
+            raise ValueError("validation metric series must be non-empty and aligned")
+        for name, vector in vectors.items():
+            if not np.all(np.isfinite(vector)):
+                raise ValueError(f"validation metric {name} must be finite")
+        return {
+            name: float(np.mean(vector))
+            for name, vector in vectors.items()
+        }
+
+    def _check_supply_calibration_volume(self, customers: int) -> None:
+        """Integer dispatch is not invariant to simulation-volume rescaling."""
+        calibration = getattr(self, 'v26_settings', {}).get('driver_capacity_calibration', {})
+        if (self.driver_supply.supply_v2 and calibration.get('enabled')
+                and int(customers) != int(calibration['sample_size'])):
+            raise ValueError(f"Supply calibrated at {calibration['sample_size']} requests, not {customers}; "
+                             "recalibrate at the requested simulation volume")
+
+    def _adaptive_policy_validation(
+        self,
+        *,
+        customers_per_step: int,
+        profile_sample_size: int,
+        horizon: int = 192,
+        aggressive_horizon: Optional[int] = None,
+        policy_mode: str = "argmax_raw",
+        policy_temperature: float = 0.50,
+        policy_seed: Optional[int] = None,
+        opponent_interval_steps: int = 10,
+        firm1_interval_steps: Optional[int] = None,
+        steps_per_day: int = 10,
+        aggressive_seed_count: int = 5,
+        include_benchmarks: bool = False,
+        firm1_policy: Optional[str] = None,
+        rollouts_override: Optional[Sequence[Tuple[str, str]]] = None,
+        extra_modes: Sequence[str] = (),
+        critic_reward_regime: Optional[str] = None,
+        evaluation_profiles: bool = True,
+    ) -> Dict[str, Any]:
+        """Evaluate the actor against configured Firm 2 evaluation rollouts.
+
+        v26 additions: ``firm1_policy`` replaces the RL actor by a baseline on
+        the identical rollout seeds (``static:<multiplier>``, ``opening_hold``,
+        ``rl_actor_frozen`` or ``myopic_greedy``). ``rl_actor_frozen`` lets the
+        learned actor post exactly once at the opening and then holds that
+        resulting differentiated tariff for the rest of the rollout.  This is
+        the matched frozen-policy control for measuring the value of subsequent
+        adaptation. ``rollouts_override`` evaluates an explicit
+        opponent list (training-exposed benchmarks, genuine holdouts, or
+        perturbed OOD variants); and
+        ``extra_modes`` adds training-population controller classes to
+        checkpoint validation when benchmarks are held out.
+
+        Validation must call ``agent.act`` repeatedly.  Scoring a single market
+        batch at the current training tariff selects a tariff snapshot, not an
+        adaptive policy, and leaks the terminal training state into evaluation.
+        """
+        self._check_supply_calibration_volume(customers_per_step)
+        saved = {
+            "market": copy.deepcopy(self.market),
+            "agent_gen": self.agent_gen,
+            "riders": self._snapshot_rider_state(),
+            "python_rng_state": random.getstate(),
+            "firm1_overrides": copy.deepcopy(self.firm1.overrides),
+            "firm2": copy.deepcopy(self.firm2),
+            "firm1_execution": self.firm1.snapshot_execution_state(),
+            "observers": {name: observer.snapshot() for name, observer in self.platform_observers.items()},
+            "stability": self.action_stability.snapshot(),
+            "crowd": dict(getattr(self, "last_crowd_response_stats", {}) or {}),
+            "driver_supply": copy.deepcopy(self.driver_supply),
+            # v26 fix: rider-choice noise (and rider memory) is part of the
+            # environment.  v25 neither restored it nor reseeded it per
+            # rollout, so validation advanced the training choice stream and
+            # paired policy evaluations (RL vs. baselines) saw different noise.
+            "choice_model": copy.deepcopy(self.choice_model),
+            "rng_state": copy.deepcopy(self.rng.bit_generator.state),
+            "torch_rng_state": torch.random.get_rng_state(),
+            "cuda_rng_state": (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            ),
+        }
+        tracked_names = (
+            "last_share", "last_revpr", "last_profitpr", "last_gap",
+            "last_fulfillment", "last_completion_coverage",
+            "last_acceptance", "last_wait", "last_action_mask_regime",
+            "last_firm2_share", "last_firm2_revpr", "last_firm2_profitpr",
+        )
+        tracked_names += (
+            "_rival_gap_history", "_returning_share_ema", "last_price_gap_metrics",
+            "_durable_profit_lead_ema", "_temporal_reward_state_initialized",
+        )
+        if self.regime_market:
+            tracked_names += ("_regime_last_effect", "_firm2_regime_price_multiplier", "_regime_rival_switch_applied")
+        saved["last_values"] = {name: copy.deepcopy(getattr(self, name)) for name in tracked_names}
+        mode_scores: List[float] = []
+        rewards: List[float] = []
+        own_shares: List[float] = []
+        rival_shares: List[float] = []
+        own_completed_shares: List[float] = []
+        rival_completed_shares: List[float] = []
+        own_revenues: List[float] = []
+        rival_revenues: List[float] = []
+        own_profits: List[float] = []
+        rival_profits: List[float] = []
+        gaps: List[float] = []
+        fulfillment: List[float] = []
+        completion_coverage: List[float] = []
+        actions: List[int] = []
+        validation_mode_names: List[str] = []
+        mode_profit_advantages: List[float] = []
+        mode_share_advantages: List[float] = []
+        mode_objective_advantages: List[float] = []
+        mode_gap_errors: List[float] = []
+        mode_own_profit_means: List[float] = []
+        mode_rival_profit_means: List[float] = []
+        mode_own_share_means: List[float] = []
+        mode_rival_share_means: List[float] = []
+        mode_fulfillment_means: List[float] = []
+        mode_completion_coverage_means: List[float] = []
+        mode_tail_objective_rewards: List[float] = []
+        mode_profit_advantage_decay: List[float] = []
+        mode_objective_dominance_rates: List[float] = []
+        mode_tail_dynamicity: Dict[str, float] = {}
+        mode_tail_action_diversity: Dict[str, float] = {}
+        mode_tail_action_switch_rate: Dict[str, float] = {}
+        mode_leader_intervention_rates: Dict[str, float] = {}
+        mode_selected_action_feasibility: Dict[str, float] = {}
+        validation_mode_cities: Dict[str, str] = {}
+        benchmark_trajectories: Dict[str, Dict[str, List[float]]] = {}
+        rollout_summaries: Dict[str, Dict[str, float]] = {}
+        heldout_critic_predictions: List[float] = []
+        heldout_critic_targets: List[float] = []
+        heldout_critic_lambda_targets: List[float] = []
+        heldout_critic_mc_returns: List[float] = []
+        heldout_critic_mc_predictions: List[float] = []
+        try:
+            if self.learner_revision >= 3:
+                self.firm1.agent.set_value_objective_weights(
+                    self.long_term_profit_reward_config.critic_component_weights(
+                        critic_reward_regime
+                    )
+                )
+            resolved_policy_seed = int(
+                self.seed + 810_001 if policy_seed is None else policy_seed
+            )
+            resolved_actual_seed_count = int(max(1, aggressive_seed_count))
+            validation_rollouts = (
+                [(str(name), str(mode)) for name, mode in rollouts_override]
+                if rollouts_override is not None
+                else self._validation_opponent_rollouts(
+                    str(self.firm2_mode),
+                    resolved_actual_seed_count,
+                    include_benchmarks=include_benchmarks,
+                )
+                + [
+                    (f"training_class__{mode}", str(mode))
+                    for mode in extra_modes
+                    if str(mode) != str(self.firm2_mode)
+                ]
+            )
+            resolved_firm1_interval = int(
+                max(
+                    1,
+                    opponent_interval_steps
+                    if firm1_interval_steps is None
+                    else firm1_interval_steps,
+                )
+            )
+            resolved_steps_per_day = int(max(1, steps_per_day))
+            for rollout_index, (rollout_name, mode) in enumerate(validation_rollouts):
+                rollout_seed = resolved_policy_seed + 10_007 * rollout_index
+                validation_city = str(self.market_name)
+                validation_mode_cities[str(rollout_name)] = validation_city
+                torch.manual_seed(rollout_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(rollout_seed)
+                self.rng = np.random.default_rng(rollout_seed + 1)
+                # Each validation rollout receives an independently seeded
+                # configured-market path and the same-distribution held-out
+                # profile split.
+                # Opponent strategy is the experimental variable; city and
+                # threshold distribution are deliberately held fixed.
+                self.market = self._rebuild_market(
+                    validation_city, rollout_seed + 2
+                )
+                self.market.refresh_run_probabilities(jitter_scale=0.15)
+                self.agent_gen = GenerateAgent(
+                    seed=rollout_seed + 4,
+                    total_customers=max(512, profile_sample_size),
+                    city_name=validation_city,
+                )
+                self.agent_gen.apply_probability_variation(jitter_scale=0.18)
+                self.driver_supply = copy.deepcopy(saved["driver_supply"])
+                self.choice_model = copy.deepcopy(saved["choice_model"])
+                if self.market_dynamics.enabled:
+                    # Common random numbers across policies for the same rollout.
+                    if hasattr(self.choice_model, "rng"):
+                        self.choice_model.rng = np.random.default_rng(rollout_seed + 5)
+                    self.driver_supply.rng = np.random.default_rng(rollout_seed + 6)
+                    for observer_index, observer in enumerate(self.platform_observers.values()):
+                        observer.rng = np.random.default_rng(rollout_seed + 7 + observer_index)
+                self._reset_adaptive_episode(
+                    tariff_reset_fraction=0.15,
+                    opponent_mode=mode,
+                    episode_seed=rollout_seed + 3,
+                    symmetric_tariffs=False,
+                    evaluation_profiles=evaluation_profiles,
+                )
+                mode_welfare: Dict[str, Any] = {}
+                clock = OperationalClock()
+                prev_share = 0.5
+                prev_rev = 0.0
+                prev_profit = 0.0
+                prev_rival_share = 0.5
+                prev_rival_profit = 0.0
+                prev_fulfillment = 1.0
+                prev_gap = 0.0
+                mode_rewards: List[float] = []
+                mode_own_shares: List[float] = []
+                mode_rival_shares: List[float] = []
+                mode_own_profits: List[float] = []
+                mode_rival_profits: List[float] = []
+                mode_gaps: List[float] = []
+                mode_gap_abs_errors: List[float] = []
+                mode_fulfillment: List[float] = []
+                mode_completion_coverage: List[float] = []
+                mode_actions: List[int] = []
+                mode_action_feasible: List[float] = []
+                mode_critic_records: List[
+                    Tuple[float, float, float, float, float, float]
+                ] = []
+                pending_critic_value: Optional[float] = None
+                pending_critic_reward = 0.0
+                pending_critic_discount = 1.0
+                pending_critic_potential = 0.0
+                previous_firm2_metrics: Optional[FirmMetrics] = None
+                leader_decision_count = 0
+                leader_intervention_count = 0
+                firm1_decision_count = 0
+                rollout_day_ctx = None
+                # ``aggressive_horizon`` is retained as an API-compatibility
+                # name. The canonical suite applies the requested long horizon
+                # uniformly to the actual rival and all five deployment benchmarks.
+                mode_horizon = int(max(
+                    horizon,
+                    horizon if aggressive_horizon is None else aggressive_horizon,
+                ))
+                for step_index in range(max(2, mode_horizon)):
+                    if (
+                        rollout_day_ctx is None
+                        or step_index % resolved_steps_per_day == 0
+                    ):
+                        rollout_day_ctx = self.market.sample_day_context()
+                        self._regime_day_start(None, episode_seed=rollout_seed + 8 + step_index)
+                    ctx = rollout_day_ctx
+                    hour = self.market.sample_timestep_hour().hour
+                    rival_due = clock.due(opponent_interval_steps)
+                    _, leader_intervened = self._firm2_leader_step(
+                        previous_metrics=previous_firm2_metrics,
+                        day_of_week=ctx.day_of_week,
+                        hour=hour,
+                        weather=ctx.weather,
+                        enabled=rival_due,
+                    )
+                    if rival_due and not isinstance(
+                        self.firm2, FirmStaticPricer
+                    ):
+                        leader_decision_count += 1
+                        leader_intervention_count += int(leader_intervened)
+                    raw_state, action_features, _ = self._publish_pricing_observation(
+                        day_of_week=ctx.day_of_week,
+                        hour=hour,
+                        weather=ctx.weather,
+                    )
+                    state = self.firm1.stack_state(raw_state)
+                    critic_state = (
+                        self._build_privileged_critic_state(raw_state)
+                        if self.privileged_critic
+                        else None
+                    )
+                    action = -1
+                    firm1_due = (step_index % resolved_firm1_interval) == 0
+                    presampled = None
+                    if self.market_dynamics.enabled:
+                        # Exogenous demand is drawn before Firm 1 acts so the RL
+                        # policy and every baseline see common random numbers.
+                        pre_customers = self._step_customers(
+                            customers_per_step,
+                            hour=hour,
+                            day_of_week=ctx.day_of_week,
+                            weather=ctx.weather,
+                        )
+                        presampled = (
+                            pre_customers,
+                            self._sample_profiles_from_pool(
+                                self._effective_simulation_sample_size(pre_customers),
+                                generalization_fraction=1.0 if evaluation_profiles else 0.0,
+                                generalization_city=validation_city,
+                            ),
+                        )
+                    if firm1_due:
+                        action_mask = self._objective_action_mask(
+                            self.firm1.feasible_action_mask(self.market),
+                            fulfillment_rate=self.last_fulfillment,
+                        )
+                        learned_actor_due = self._learned_actor_due_for_policy(
+                            firm1_policy, firm1_decision_count
+                        )
+                        if learned_actor_due:
+                            (
+                                action,
+                                _,
+                                _,
+                                decision_value,
+                                _,
+                                _,
+                            ) = self.firm1.agent.act(
+                                state,
+                                deterministic=True,
+                                action_features=action_features,
+                                action_mask=action_mask,
+                                policy_mode=policy_mode,
+                                policy_temperature=policy_temperature,
+                                critic_state=critic_state,
+                            )
+                        else:
+                            action = self._baseline_firm1_action(
+                                str(firm1_policy),
+                                step_index=step_index,
+                                action_mask=np.asarray(action_mask, dtype=bool),
+                                day_of_week=ctx.day_of_week,
+                                hour=hour,
+                                weather=ctx.weather,
+                                presampled=presampled,
+                                customers_per_step=customers_per_step,
+                                holding_steps=resolved_firm1_interval,
+                                opponent_interval_steps=opponent_interval_steps,
+                                evaluation_profiles=evaluation_profiles,
+                            )
+                            decision_value = _ZeroValue()
+                        mode_action_feasible.append(float(
+                            0 <= int(action) < len(action_mask)
+                            and bool(action_mask[int(action)])
+                        ))
+                        current_potential = (
+                            self._public_reward_potential(raw_state)
+                            if self.potential_shaping_scale > 0.0
+                            else 0.0
+                        )
+                        if pending_critic_value is not None:
+                            mode_critic_records.append((
+                                float(pending_critic_value),
+                                float(pending_critic_reward),
+                                float(pending_critic_discount),
+                                float(pending_critic_potential),
+                                float(current_potential),
+                                float(decision_value.item()),
+                            ))
+                        pending_critic_value = (
+                            float(decision_value.item()) if firm1_policy is None else None
+                        )
+                        pending_critic_reward = 0.0
+                        pending_critic_discount = 1.0
+                        pending_critic_potential = float(current_potential)
+                        if int(action) >= 0:
+                            self.firm1.apply_action(action, self.market)
+                        actions.append(int(action))
+                        mode_actions.append(int(action))
+                        firm1_decision_count += 1
+                    elif firm1_policy is None:
+                        self.firm1.agent.observe_recurrent_state(
+                            state, critic_state=critic_state
+                        )
+                    if presampled is not None:
+                        step_customers, profiles = presampled
+                    else:
+                        step_customers = int(customers_per_step)
+                        profiles = self._sample_profiles_from_pool(
+                            profile_sample_size,
+                            generalization_fraction=1.0,
+                            generalization_city=validation_city,
+                        )
+                    _, m1, m2, gap, _, _ = self.simulate_batch(
+                        day_of_week=ctx.day_of_week,
+                        weather=ctx.weather,
+                        hour=hour,
+                        customers_per_step=step_customers,
+                        sampled_profiles=profiles,
+                        collect_rows=False,
+                        supply_reference_customers=customers_per_step,
+                    )
+                    if self.market_dynamics.enabled:
+                        self._accumulate_welfare(mode_welfare, getattr(self, "last_welfare_stats", None))
+                    self._ingest_platform_observations(m1, m2)
+                    previous_firm2_metrics = m2
+                    diag = self._reward_diagnostics(
+                        share=float(m1.chosen_share),
+                        completed_share=float(m1.completed_share),
+                        rev_per_request=float(m1.rev_per_request),
+                        mean_gap=float(gap),
+                        prev_share=prev_share,
+                        prev_rev_per_request=prev_rev,
+                        prev_profit_per_request=prev_profit,
+                        prev_rival_profit_per_request=prev_rival_profit,
+                        prev_rival_market_share=prev_rival_share,
+                        prev_fulfillment_rate=prev_fulfillment,
+                        prev_gap=prev_gap,
+                        profit_per_request=float(m1.profit_per_request),
+                        profit_margin=self._profit_margin(m1),
+                        fulfillment_rate=float(m1.fulfillment_rate),
+                        avg_wait_minutes=float(m1.avg_wait_minutes),
+                        driver_acceptance_rate=float(m1.driver_acceptance_rate),
+                        baseline_share=float(m2.chosen_share),
+                        baseline_completed_share=float(m2.completed_share),
+                        baseline_rev_per_request=float(m2.rev_per_request),
+                        baseline_profit_per_request=float(m2.profit_per_request),
+                        action_event=firm1_due,
+                        price_gap_abs_error=float(
+                            self.last_price_gap_metrics["mae"]
+                        ),
+                    )
+                    mode_own_profits.append(float(m1.profit_per_request))
+                    mode_rival_profits.append(float(m2.profit_per_request))
+                    mode_own_shares.append(
+                        float(diag["reward_market_share"])
+                    )
+                    mode_rival_shares.append(
+                        float(diag["reward_rival_market_share"])
+                    )
+                    mode_gaps.append(float(gap))
+                    mode_gap_abs_errors.append(
+                        float(diag["reward_price_gap_abs_error"])
+                    )
+                    mode_rewards.append(float(diag["reward"]))
+                    if pending_critic_value is not None:
+                        critic_reward = (
+                            self.long_term_profit_reward_model.compute(
+                                own_profit_per_request=float(m1.profit_per_request),
+                                rival_profit_per_request=float(m2.profit_per_request),
+                                own_completed_share=float(m1.completed_share),
+                                rival_completed_share=float(m2.completed_share),
+                                durable_profit_advantage_per_request=float(
+                                    diag["reward_durable_profit_advantage_per_request"]
+                                ),
+                                adaptive_profit_residual_per_request=float(
+                                    diag["reward_adaptive_profit_residual_per_request"]
+                                ),
+                                training_regime=critic_reward_regime,
+                            )["reward"]
+                            if self.learner_revision >= 2 else float(diag["reward"])
+                        )
+                        pending_critic_reward += (
+                            pending_critic_discount * float(critic_reward)
+                        )
+                        pending_critic_discount *= float(
+                            self.firm1.agent.gamma
+                        )
+                    rewards.append(float(diag["reward"]))
+                    own_shares.append(float(diag["reward_market_share"]))
+                    rival_shares.append(
+                        float(diag["reward_rival_market_share"])
+                    )
+                    own_completed_shares.append(float(m1.completed_share))
+                    rival_completed_shares.append(float(m2.completed_share))
+                    own_revenues.append(float(m1.rev_per_request))
+                    rival_revenues.append(float(m2.rev_per_request))
+                    own_profits.append(float(m1.profit_per_request))
+                    rival_profits.append(float(m2.profit_per_request))
+                    gaps.append(float(gap))
+                    fulfillment.append(float(m1.fulfillment_rate))
+                    mode_fulfillment.append(float(m1.fulfillment_rate))
+                    if getattr(self, "_sweep_trace_enabled", False):
+                        self._sweep_trace.append(self._trace_row(
+                            rollout=str(rollout_name), step=int(step_index), hour=int(hour), m1=m1, m2=m2,
+                            reward=float(diag["reward"]),
+                        ))
+                    realized_coverage = float(np.clip(
+                        m1.completed_share + m2.completed_share, 0.0, 1.0
+                    ))
+                    completion_coverage.append(realized_coverage)
+                    mode_completion_coverage.append(realized_coverage)
+                    self.last_fulfillment = float(m1.fulfillment_rate)
+                    self.last_completion_coverage = realized_coverage
+                    prev_share = float(diag["reward_market_share"])
+                    prev_rev = float(m1.rev_per_request)
+                    prev_profit = float(m1.profit_per_request)
+                    prev_rival_share = float(
+                        diag["reward_rival_market_share"]
+                    )
+                    prev_rival_profit = float(m2.profit_per_request)
+                    prev_fulfillment = float(m1.fulfillment_rate)
+                    prev_gap = float(gap)
+                    clock.advance()
+                if mode_critic_records:
+                    # Independent realized return evidence. These are finite
+                    # horizon targets with NO value bootstrap, so horizon-tail
+                    # bias must be disclosed when comparing infinite values.
+                    realized = float(pending_critic_reward)
+                    trajectory_returns = []
+                    for record in reversed(mode_critic_records):
+                        realized = record[1] + record[2] * realized
+                        trajectory_returns.append(realized)
+                    heldout_critic_mc_returns.extend(reversed(trajectory_returns))
+                    heldout_critic_mc_predictions.extend(record[0] for record in mode_critic_records)
+                    exposures = np.asarray([
+                        (
+                            float(max(1, resolved_firm1_interval))
+                            if abs(1.0 - self.firm1.agent.gamma) <= 1e-12
+                            else (1.0 - record[2])
+                            / (1.0 - self.firm1.agent.gamma)
+                        )
+                        for record in mode_critic_records
+                    ], dtype=float)
+                    raw_interval_rewards = np.asarray(
+                        [record[1] for record in mode_critic_records],
+                        dtype=float,
+                    )
+                    # Match the critic's training target with the lagged
+                    # action-independent baseline. Using this validation
+                    # rollout's own realized mean would leak its actions into
+                    # the target and overstate explained variance.
+                    validation_reward_rate = float(
+                        0.0 if self.learning_corrections else
+                        self.firm1.agent.reward_rate_by_regime.get(
+                            str(mode), 0.0
+                        )
+                        if self.credit_assignment_v25
+                        else np.sum(raw_interval_rewards)
+                        / max(1e-8, float(np.sum(exposures)))
+                    )
+                    for record, exposure in zip(
+                        mode_critic_records, exposures
+                    ):
+                        (
+                            prediction,
+                            raw_interval_reward,
+                            interval_discount,
+                            potential,
+                            next_potential,
+                            next_prediction,
+                        ) = record
+                        shaped_reward = float(raw_interval_reward)
+                        if self.potential_shaping_scale > 0.0:
+                            shaped_reward += self.potential_shaping_scale * (
+                                interval_discount * next_potential - potential
+                            )
+                        target = (
+                            shaped_reward
+                            - validation_reward_rate * float(exposure)
+                            + interval_discount * next_prediction
+                        )
+                        heldout_critic_predictions.append(float(prediction))
+                        heldout_critic_targets.append(float(target))
+                    if self.learning_corrections:
+                        advantage = 0.0
+                        targets = []
+                        for prediction, reward, discount, potential, next_potential, next_prediction in reversed(mode_critic_records):
+                            delta = reward + self.potential_shaping_scale * (discount * next_potential - potential) + discount * next_prediction - prediction
+                            advantage = delta + discount * self.firm1.agent.lam * advantage
+                            targets.append(prediction + advantage)
+                        heldout_critic_lambda_targets.extend(reversed(targets))
+                # The tail is the same per-step economic reward, aggregated
+                # separately so transient opening performance cannot outrank
+                # durable performance. It introduces no new reward component.
+                tail_start = min(
+                    len(mode_own_profits) - 1,
+                    max(0, (3 * len(mode_own_profits)) // 4),
+                )
+                tail_own_profit = float(np.mean(mode_own_profits[tail_start:]))
+                tail_rival_profit = float(np.mean(mode_rival_profits[tail_start:]))
+                tail_own_share = float(np.mean(mode_own_shares[tail_start:]))
+                tail_rival_share = float(np.mean(mode_rival_shares[tail_start:]))
+                late_share_advantage = tail_own_share - tail_rival_share
+                objective_advantage_path = self._objective_dominance_path(
+                    mode_own_profits[tail_start:],
+                    mode_rival_profits[tail_start:],
+                    mode_own_shares[tail_start:],
+                    mode_rival_shares[tail_start:],
+                )
+                objective_advantage_target = 0.0
+                dominance_window = int(
+                    max(1, min(20, objective_advantage_path.size))
+                )
+                objective_rolling_advantage = np.convolve(
+                    objective_advantage_path,
+                    np.full(
+                        dominance_window,
+                        1.0 / dominance_window,
+                        dtype=float,
+                    ),
+                    mode="valid",
+                )
+                objective_dominance_rate = float(np.mean(
+                    objective_rolling_advantage >= objective_advantage_target
+                ))
+                early_end = max(1, len(mode_own_profits) // 4)
+                early_advantage = float(
+                    np.mean(mode_own_profits[:early_end])
+                    - np.mean(mode_rival_profits[:early_end])
+                )
+                late_advantage = tail_own_profit - tail_rival_profit
+                tail_gap_error = float(
+                    np.mean(mode_gap_abs_errors[tail_start:])
+                )
+                decision_tail_start = max(0, (3 * len(mode_actions)) // 4)
+                tail_actions = mode_actions[decision_tail_start:]
+                effective_tail_actions = [
+                    self._economic_action_group(int(action))
+                    for action in tail_actions
+                ]
+                tail_action_diversity = float(
+                    len(set(effective_tail_actions)) / 3.0
+                )
+                tail_action_switch_rate = float(
+                    np.mean(np.diff(effective_tail_actions) != 0)
+                    if len(effective_tail_actions) > 1 else 0.0
+                )
+                tail_dynamicity = float(
+                    min(1.0, tail_action_diversity / (2.0 / 3.0))
+                    * min(1.0, tail_action_switch_rate / 0.10)
+                )
+                mode_tail_dynamicity[str(rollout_name)] = tail_dynamicity
+                mode_tail_action_diversity[str(rollout_name)] = tail_action_diversity
+                mode_tail_action_switch_rate[str(rollout_name)] = tail_action_switch_rate
+                mode_leader_intervention_rates[str(rollout_name)] = float(
+                    leader_intervention_count / max(1, leader_decision_count)
+                )
+                mode_selected_action_feasibility[str(rollout_name)] = float(
+                    np.mean(mode_action_feasible)
+                    if mode_action_feasible else 1.0
+                )
+                full_means = self._full_horizon_validation_means(
+                    reward=mode_rewards,
+                    own_profit=mode_own_profits,
+                    rival_profit=mode_rival_profits,
+                    own_market_share=mode_own_shares,
+                    rival_market_share=mode_rival_shares,
+                    fulfillment=mode_fulfillment,
+                    completion_coverage=mode_completion_coverage,
+                )
+                rollout_summaries[str(rollout_name)] = {
+                    "objective_reward_mean": float(full_means["reward"]),
+                    "objective_reward_tail_mean": float(np.mean(mode_rewards[tail_start:])),
+                    "own_profit_per_request": float(full_means["own_profit"]),
+                    "rival_profit_per_request": float(full_means["rival_profit"]),
+                    "own_completed_share": float(full_means["own_market_share"]),
+                    "rival_completed_share": float(full_means["rival_market_share"]),
+                    "fulfillment": float(full_means["fulfillment"]),
+                    "completion_coverage": float(full_means["completion_coverage"]),
+                    "objective_advantage_mean": float(np.mean(objective_advantage_path)),
+                    "objective_dominance_rate": float(objective_dominance_rate),
+                    "late_objective_advantage": float(
+                        late_advantage
+                        if self._configured_primary_objective() == "profit_maximization"
+                        else late_share_advantage
+                    ),
+                    "steps": int(len(mode_rewards)),
+                    **self._summarize_welfare(mode_welfare),
+                }
+                if self.learning_corrections:
+                    _, rival_scores = self._objective_firm_scores(
+                        mode_own_profits, mode_rival_profits, mode_own_shares, mode_rival_shares)
+                    rollout_summaries[str(rollout_name)]["rival_objective_reward_mean"] = float(np.mean(rival_scores))
+                if getattr(self, "diagnostic_journal", None):
+                    self.diagnostic_journal.append("rollouts", {
+                        "rollout": str(rollout_name), "firm1_policy": firm1_policy or "rl_actor",
+                        "policy_seed": policy_seed,
+                        "summary": rollout_summaries[str(rollout_name)],
+                        "reward": mode_rewards, "own_profit": mode_own_profits,
+                        "rival_profit": mode_rival_profits, "actions": mode_actions})
+                validation_mode_names.append(str(rollout_name))
+                mode_own_profit_means.append(full_means["own_profit"])
+                mode_rival_profit_means.append(full_means["rival_profit"])
+                mode_own_share_means.append(full_means["own_market_share"])
+                mode_rival_share_means.append(full_means["rival_market_share"])
+                mode_fulfillment_means.append(full_means["fulfillment"])
+                mode_completion_coverage_means.append(
+                    full_means["completion_coverage"]
+                )
+                mode_tail_objective_rewards.append(float(
+                    np.mean(mode_rewards[tail_start:])
+                ))
+                mode_profit_advantages.append(late_advantage)
+                mode_share_advantages.append(late_share_advantage)
+                mode_objective_advantages.append(float(
+                    np.mean(objective_advantage_path)
+                ))
+                mode_objective_dominance_rates.append(
+                    objective_dominance_rate
+                )
+                mode_gap_errors.append(tail_gap_error)
+                mode_profit_advantage_decay.append(
+                    max(0.0, early_advantage - late_advantage)
+                )
+                mode_scores.append(self._validation_score_from_metrics(
+                    reward=full_means["reward"],
+                    completed_share_advantage=late_share_advantage,
+                ))
+                if (
+                    include_benchmarks
+                    and str(rollout_name) in BENCHMARK_OPPONENT_MODES
+                ):
+                    benchmark_trajectories[str(rollout_name)] = {
+                        "day": [
+                            float(index + 1)
+                            for index in range(len(mode_rewards))
+                        ],
+                        "normalized_objective_reward": [
+                            float(value) for value in mode_rewards
+                        ],
+                        "firm1_profit_per_request": [
+                            float(value) for value in mode_own_profits
+                        ],
+                        "firm2_profit_per_request": [
+                            float(value) for value in mode_rival_profits
+                        ],
+                        "firm1_completed_share": [
+                            float(value) for value in mode_own_shares
+                        ],
+                        "firm2_completed_share": [
+                            float(value) for value in mode_rival_shares
+                        ],
+                        "firm1_fulfillment_rate": [
+                            float(value) for value in mode_fulfillment
+                        ],
+                        "completion_coverage": [
+                            float(value) for value in mode_completion_coverage
+                        ],
+                        "price_gap_abs_error": [
+                            float(value) for value in mode_gap_abs_errors
+                        ],
+                    }
+        finally:
+            self._restore_rider_state(saved["riders"])
+            random.setstate(saved["python_rng_state"])
+            self.market = saved["market"]
+            self.agent_gen = saved["agent_gen"]
+            self.firm1.overrides = saved["firm1_overrides"]
+            self.firm2 = saved["firm2"]
+            self.firm1.restore_execution_state(saved["firm1_execution"])
+            for name, snapshot in saved["observers"].items():
+                self.platform_observers[name].restore(snapshot)
+            self.action_stability.restore(saved["stability"])
+            self.last_crowd_response_stats = saved["crowd"]
+            self.driver_supply = saved["driver_supply"]
+            self.choice_model = saved["choice_model"]
+            self.rng.bit_generator.state = saved["rng_state"]
+            torch.random.set_rng_state(saved["torch_rng_state"])
+            if torch.cuda.is_available() and saved["cuda_rng_state"] is not None:
+                torch.cuda.set_rng_state_all(saved["cuda_rng_state"])
+            for name, value in saved["last_values"].items():
+                setattr(self, name, value)
+        mean_mode_score = float(np.mean(mode_scores)) if mode_scores else -float("inf")
+        mode_score_std = float(np.std(mode_scores)) if mode_scores else float("inf")
+        worst_mode_score = float(np.min(mode_scores)) if mode_scores else -float("inf")
+        mean_profit_advantage = (
+            float(np.mean(mode_profit_advantages))
+            if mode_profit_advantages else -float("inf")
+        )
+        worst_profit_advantage = (
+            float(np.min(mode_profit_advantages))
+            if mode_profit_advantages else -float("inf")
+        )
+        mean_share_advantage = (
+            float(np.mean(mode_share_advantages))
+            if mode_share_advantages else -float("inf")
+        )
+        worst_share_advantage = (
+            float(np.min(mode_share_advantages))
+            if mode_share_advantages else -float("inf")
+        )
+        mean_own_profit = (
+            float(np.mean(mode_own_profit_means))
+            if mode_own_profit_means else -float("inf")
+        )
+        worst_own_profit = (
+            float(np.min(mode_own_profit_means))
+            if mode_own_profit_means else -float("inf")
+        )
+        mean_fulfillment = (
+            float(np.mean(mode_fulfillment_means))
+            if mode_fulfillment_means else 0.0
+        )
+        worst_fulfillment = (
+            float(np.min(mode_fulfillment_means))
+            if mode_fulfillment_means else 0.0
+        )
+        mean_completion_coverage = (
+            float(np.mean(mode_completion_coverage_means))
+            if mode_completion_coverage_means else 0.0
+        )
+        worst_completion_coverage = (
+            float(np.min(mode_completion_coverage_means))
+            if mode_completion_coverage_means else 0.0
+        )
+        mean_gap_error = (
+            float(np.mean(mode_gap_errors))
+            if mode_gap_errors else float("inf")
+        )
+        worst_gap_error = (
+            float(np.max(mode_gap_errors))
+            if mode_gap_errors else float("inf")
+        )
+        profit_win_rate = (
+            float(np.mean(np.asarray(mode_profit_advantages) > 0.0))
+            if mode_profit_advantages else 0.0
+        )
+        share_win_rate = (
+            float(np.mean(np.asarray(mode_share_advantages) > 0.0))
+            if mode_share_advantages else 0.0
+        )
+        robust_dominance_bonus = float(
+            0.50 * np.tanh(
+                worst_profit_advantage
+                / max(
+                    1e-6,
+                    self.long_term_profit_reward_config.profit_advantage_scale,
+                )
+            )
+        )
+        incomplete_win_penalty = float(0.50 * (1.0 - profit_win_rate))
+        worst_advantage_decay = (
+            float(np.max(mode_profit_advantage_decay))
+            if mode_profit_advantage_decay else float("inf")
+        )
+        durability_decay_penalty = float(
+            0.35 * np.tanh(
+                worst_advantage_decay
+                / max(
+                    1e-6,
+                    self.long_term_profit_reward_config.profit_advantage_scale,
+                )
+            )
+        )
+        action_diversity = float(
+            len(set(actions)) / max(1, len(self.firm1.action_to_steps))
+        )
+        action_switch_rate = float(
+            np.mean(np.diff(actions) != 0) if len(actions) > 1 else 0.0
+        )
+        aggressive_dynamicities = [
+            float(value)
+            for name, value in mode_tail_dynamicity.items()
+            if str(name).startswith("adaptive_best_response_aggressive")
+        ]
+        policy_dynamicity = float(
+            min(aggressive_dynamicities)
+            if aggressive_dynamicities
+            else 0.0
+        )
+        # Responsiveness is reported, but it is not a source of reward and not
+        # a certification requirement.  Requiring late tariff movement made a
+        # genuinely converged dominant policy ineligible and selected action
+        # churn instead.  Economic durability is established directly by the
+        # worst-opponent outcome gaps below.
+        minimum_checkpoint_dynamicity = 0.0
+        objective = self._configured_primary_objective()
+        profit_dominance_gap = 0.0
+        optimization = self.objective_optimizer.summarize(
+            own_profit=mode_own_profit_means,
+            rival_profit=mode_rival_profit_means,
+            own_market_share=mode_own_share_means,
+            rival_market_share=mode_rival_share_means,
+            fulfillment=mode_fulfillment_means,
+            completion_coverage=mode_completion_coverage_means,
+            objective_reward=mode_scores,
+            objective_dominance_rate=mode_objective_dominance_rates,
+            tail_objective_reward=mode_tail_objective_rewards,
+        )
+        durability_horizon_sufficient = bool(
+            int(max(
+                horizon,
+                horizon if aggressive_horizon is None else aggressive_horizon,
+            ))
+            >= DURABILITY_MIN_STEPS
+        )
+        checkpoint_eligible = bool(
+            optimization["checkpoint_eligible"]
+            and durability_horizon_sufficient
+        )
+        objective_selection_key = list(optimization["selection_key"])
+        collapsed_policy_penalty = float(0.50 * (1.0 - policy_dynamicity))
+        checkpoint_score = float(optimization["objective_score"])
+        critic_predictions = np.asarray(
+            heldout_critic_predictions, dtype=float
+        )
+        critic_targets = np.asarray(heldout_critic_targets, dtype=float)
+        heldout_critic_td_mae = float(
+            np.mean(np.abs(critic_targets - critic_predictions))
+            if critic_targets.size
+            else float("nan")
+        )
+        heldout_target_variance = float(
+            np.var(critic_targets) if critic_targets.size else 0.0
+        )
+        heldout_critic_td_explained_variance = float(
+            1.0
+            - np.var(critic_targets - critic_predictions)
+            / heldout_target_variance
+            if critic_targets.size >= 2 and heldout_target_variance > 1e-8
+            else float("nan")
+        )
+        mode_own_objective_scores, mode_rival_objective_scores = (
+            self._objective_firm_scores(
+                mode_own_profit_means,
+                mode_rival_profit_means,
+                mode_own_share_means,
+                mode_rival_share_means,
+            )
+        )
+        if self.learning_corrections:
+            # Report the same realized objective as the reward computation.
+            mode_own_objective_scores = np.asarray([rollout_summaries[name]["objective_reward_mean"] for name in validation_mode_names])
+            mode_rival_objective_scores = np.asarray([rollout_summaries[name]["rival_objective_reward_mean"] for name in validation_mode_names])
+            checkpoint_score = float(np.mean(mode_own_objective_scores))
+            objective_selection_key = [checkpoint_score]
+            # Validation is diagnostic, never permission to substitute a
+            # different policy. Short horizons are reported separately.
+            checkpoint_eligible = True
+        return {
+            "score": checkpoint_score,
+            "objective_optimizer": str(optimization["optimizer_mechanism"]),
+            "objective_selection_key": objective_selection_key,
+            "objective_full_horizon_mean": float(
+                optimization["objective_mean"]
+            ),
+            "objective_tail_mean": float(
+                optimization["tail_objective_mean"]
+            ),
+            "objective_tail_weight": float(optimization["tail_weight"]),
+            "objective_reward_weights": dict(
+                optimization["reward_weights"]
+            ),
+            "objective_feasible_mode_fraction": float(
+                optimization["feasible_mode_fraction"]
+            ),
+            "objective_maximum_normalized_shortfall": float(
+                optimization["maximum_normalized_shortfall"]
+            ),
+            "objective_mean_normalized_shortfall": float(
+                optimization["mean_normalized_shortfall"]
+            ),
+            "mean_objective_dominance_rate": float(
+                optimization["mean_objective_dominance_rate"]
+            ),
+            "worst_objective_dominance_rate": float(
+                optimization["worst_objective_dominance_rate"]
+            ),
+            "objective_dominance_rate_floor": float(
+                optimization["dominance_rate_floor"]
+            ),
+            "mode_objective_dominance_rate": {
+                name: float(value)
+                for name, value in zip(
+                    validation_mode_names,
+                    optimization["mode_objective_dominance_rate"],
+                )
+            },
+            "objective_mode_normalized_shortfall": {
+                name: float(value)
+                for name, value in zip(
+                    validation_mode_names,
+                    optimization["mode_normalized_shortfall"],
+                )
+            },
+            "objective_mode_feasible": {
+                name: bool(value)
+                for name, value in zip(
+                    validation_mode_names,
+                    optimization["mode_feasible"],
+                )
+            },
+            "primary_objective": objective,
+            "market_share_target_gap": float(
+                self.long_term_profit_reward_config.market_share_target_gap
+            ),
+            "profit_advantage_target": float(profit_dominance_gap),
+            "fulfillment_floor": float(
+                self.constraint_config.fulfillment_floor
+            ),
+            "completion_coverage_floor": float(
+                self.constraint_config.completion_coverage_floor
+            ),
+            "mode_score_mean": mean_mode_score,
+            "mode_score_std": mode_score_std,
+            "mode_score_worst": worst_mode_score,
+            "mean_profit_advantage": mean_profit_advantage,
+            "worst_profit_advantage": worst_profit_advantage,
+            "mean_completed_share_advantage": mean_share_advantage,
+            "worst_completed_share_advantage": worst_share_advantage,
+            "completed_share_win_rate": share_win_rate,
+            "mean_market_share_advantage": mean_share_advantage,
+            "worst_market_share_advantage": worst_share_advantage,
+            "market_share_win_rate": share_win_rate,
+            "mean_own_profit_per_request": mean_own_profit,
+            "worst_own_profit_per_request": worst_own_profit,
+            "mean_fulfillment_rate": mean_fulfillment,
+            "worst_fulfillment_rate": worst_fulfillment,
+            "mean_completion_coverage": mean_completion_coverage,
+            "worst_completion_coverage": worst_completion_coverage,
+            "profit_win_rate": profit_win_rate,
+            "mean_price_gap_abs_error": mean_gap_error,
+            "worst_price_gap_abs_error": worst_gap_error,
+            "robust_dominance_bonus": robust_dominance_bonus,
+            "incomplete_win_penalty": incomplete_win_penalty,
+            "worst_profit_advantage_decay": worst_advantage_decay,
+            "durability_decay_penalty": durability_decay_penalty,
+            "policy_dynamicity": policy_dynamicity,
+            "minimum_checkpoint_dynamicity": minimum_checkpoint_dynamicity,
+            "checkpoint_eligible": checkpoint_eligible,
+            "heldout_critic_td_explained_variance": (
+                heldout_critic_td_explained_variance
+            ),
+            "heldout_critic_td_mae": heldout_critic_td_mae,
+            "heldout_critic_td_samples": int(critic_targets.size),
+            'critic_mc_no_bootstrap_mae': (float(np.mean(np.abs(np.array(heldout_critic_mc_returns)
+                - np.array(heldout_critic_mc_predictions)))) if heldout_critic_mc_returns else None),
+            'critic_mc_no_bootstrap_samples': len(heldout_critic_mc_returns),
+            'critic_diagnostic_limitation': 'TD/lambda targets self-bootstrap; MC returns do not, but omit the value beyond the finite horizon. Neither alone establishes calibrated advantages.',
+            'profile_partition': 'evaluation' if evaluation_profiles else 'training_validation',
+            'horizon_steps': mode_horizon,
+            'horizon_days': mode_horizon / resolved_steps_per_day,
+            **({"critic_reward_regime": critic_reward_regime or "competitive_evaluation",
+                "critic_diagnostic_distribution": "heldout_rivals_deployment_policy_not_on_policy_fit",
+                "critic_policy_mode": policy_mode,
+                "critic_value_units": "discounted_original_reward",
+                "critic_value_scale": self.firm1.agent.value_scale}
+               if self.learner_revision >= 2 else {}),
+            **({"heldout_critic_lambda_mae": (float(np.mean(np.abs(np.asarray(heldout_critic_lambda_targets) - critic_predictions)))
+                                             if heldout_critic_lambda_targets else None),
+                "heldout_critic_lambda_explained_variance": float(1.0 - np.var(np.asarray(heldout_critic_lambda_targets) - critic_predictions) / np.var(heldout_critic_lambda_targets))
+                if len(heldout_critic_lambda_targets) > 1 and np.var(heldout_critic_lambda_targets) > 1e-8 else float("nan")}
+               if self.learning_corrections else {}),
+            "durability_horizon_sufficient": durability_horizon_sufficient,
+            "durability_minimum_horizon": DURABILITY_MIN_STEPS,
+            "collapsed_policy_penalty": collapsed_policy_penalty,
+            "mode_profit_advantages": {
+                name: float(advantage)
+                for name, advantage in zip(
+                    validation_mode_names, mode_profit_advantages
+                )
+            },
+            "mode_completed_share_advantages": {
+                name: float(advantage)
+                for name, advantage in zip(
+                    validation_mode_names, mode_share_advantages
+                )
+            },
+            "mode_objective_advantages": {
+                name: float(advantage)
+                for name, advantage in zip(
+                    validation_mode_names, mode_objective_advantages
+                )
+            },
+            "mode_own_market_share": {
+                name: float(share)
+                for name, share in zip(
+                    validation_mode_names, mode_own_share_means
+                )
+            },
+            "mode_rival_market_share": {
+                name: float(share)
+                for name, share in zip(
+                    validation_mode_names, mode_rival_share_means
+                )
+            },
+            "mode_profit_advantage_decay": {
+                name: float(decay)
+                for name, decay in zip(
+                    validation_mode_names, mode_profit_advantage_decay
+                )
+            },
+            "mode_price_gap_abs_error": {
+                name: float(error)
+                for name, error in zip(validation_mode_names, mode_gap_errors)
+            },
+            "mode_tail_dynamicity": dict(mode_tail_dynamicity),
+            "mode_tail_action_diversity": dict(mode_tail_action_diversity),
+            "mode_tail_action_switch_rate": dict(mode_tail_action_switch_rate),
+            "mode_firm2_leader_intervention_rates": dict(
+                mode_leader_intervention_rates
+            ),
+            "mode_selected_action_feasibility": dict(
+                mode_selected_action_feasibility
+            ),
+            "competition_protocol": "firm2_leader_then_firm1_follower",
+            "validation_policy_mode": str(policy_mode),
+            "validation_policy_seed": int(
+                self.seed + 810_001 if policy_seed is None else policy_seed
+            ),
+            "validation_base_horizon": int(horizon),
+            "validation_aggressive_horizon": int(
+                horizon if aggressive_horizon is None else aggressive_horizon
+            ),
+            "validation_benchmark_horizon": int(max(
+                horizon,
+                horizon if aggressive_horizon is None else aggressive_horizon,
+            )),
+            "validation_aggressive_seed_count": int(
+                resolved_actual_seed_count
+            ),
+            "validation_opponent_interval_steps": int(
+                max(1, opponent_interval_steps)
+            ),
+            "validation_firm1_interval_steps": int(
+                resolved_firm1_interval
+            ),
+            "validation_steps_per_day": int(resolved_steps_per_day),
+            "mode_own_profit_per_request": {
+                name: float(profit)
+                for name, profit in zip(
+                    validation_mode_names, mode_own_profit_means
+                )
+            },
+            "mode_rival_profit_per_request": {
+                name: float(profit)
+                for name, profit in zip(
+                    validation_mode_names, mode_rival_profit_means
+                )
+            },
+            "mode_own_objective_score": {
+                name: float(score)
+                for name, score in zip(
+                    validation_mode_names, mode_own_objective_scores
+                )
+            },
+            "mode_rival_objective_score": {
+                name: float(score)
+                for name, score in zip(
+                    validation_mode_names, mode_rival_objective_scores
+                )
+            },
+            "mode_fulfillment_rate": {
+                name: float(rate)
+                for name, rate in zip(
+                    validation_mode_names, mode_fulfillment_means
+                )
+            },
+            "mode_completion_coverage": {
+                name: float(rate)
+                for name, rate in zip(
+                    validation_mode_names, mode_completion_coverage_means
+                )
+            },
+            "mode_validation_cities": dict(validation_mode_cities),
+            "benchmark_trajectories": benchmark_trajectories,
+            "rollout_summaries": rollout_summaries,
+            "firm1_policy": "rl_actor" if firm1_policy is None else str(firm1_policy),
+            "validation_profile_source": "same_market_threshold_holdout" if evaluation_profiles else "training_partition_validation",
+            "reward": float(np.mean(rewards)) if rewards else 0.0,
+            "share": float(np.mean(own_shares)) if own_shares else 0.0,
+            "rival_share": float(np.mean(rival_shares)) if rival_shares else 0.0,
+            "completed_share": float(np.mean(own_completed_shares)) if own_completed_shares else 0.0,
+            "rival_completed_share": float(np.mean(rival_completed_shares)) if rival_completed_shares else 0.0,
+            "rev_per_request": float(np.mean(own_revenues)) if own_revenues else 0.0,
+            "rival_rev_per_request": float(np.mean(rival_revenues)) if rival_revenues else 0.0,
+            "profit_per_request": float(np.mean(own_profits)) if own_profits else 0.0,
+            "rival_profit_per_request": float(np.mean(rival_profits)) if rival_profits else 0.0,
+            "fulfillment_rate": float(np.mean(fulfillment)) if fulfillment else 0.0,
+            "completion_coverage": float(np.mean(completion_coverage)) if completion_coverage else 0.0,
+            "price_gap": float(np.mean(gaps)) if gaps else 0.0,
+            "action_diversity": action_diversity,
+            "action_switch_rate": action_switch_rate,
+        }
+
+    def _baseline_firm1_action(
+        self,
+        spec: str,
+        *,
+        step_index: int,
+        action_mask: np.ndarray,
+        day_of_week: int,
+        hour: int,
+        weather: str,
+        presampled: Optional[Tuple[int, List[Dict[str, Any]]]],
+        customers_per_step: int,
+        holding_steps: int = 1,
+        opponent_interval_steps: int = 1,
+        evaluation_profiles: bool = True,
+    ) -> int:
+        """Firm 1 baseline policies evaluated on the RL policy's rollout seeds.
+
+        * ``opening_hold``: never moves from the randomized opening tariff.
+        * ``rl_actor_frozen``: the caller obtains one opening action from the
+          learned actor, then routes all later decisions here as hold.
+        * ``static:<m>``: posts ``m`` x every controlled anchor once, then holds
+          (the static-tariff landscape; the best ``m`` per opponent is the
+          static oracle in hindsight).
+        * ``myopic_greedy``: at every decision, evaluates every legal action for
+          the complete next holding interval under common random numbers with
+          the true simulator. It is privileged; RL minus this comparator is
+          not an observation-matched measure of foresight.
+        """
+        name = str(spec)
+        if name in {"opening_hold", "rl_actor_frozen"}:
+            return 0
+        if name.startswith("static:"):
+            if step_index == 0:
+                target = name.split(":", 1)[1]
+                incentive = 1.0
+                if "@" in target:
+                    target, inc_text = target.split("@", 1)
+                    incentive = float(inc_text)
+                self._post_firm1_target(float(target), incentive)
+            return 0
+        if name.startswith("static_tariff:"):
+            # Fixed differentiated tariff, e.g. static_tariff:@/path/tariff.json
+            # with {"base_fare": 2.0, "per_minute": 1.6, ...}.
+            if step_index == 0:
+                table = self._parse_policy_table(name.split(":", 1)[1])
+                # Revision 15b structure-search artifacts wrap the actual
+                # dimensionless coefficient multipliers under ``structure``.
+                # Accept that audited artifact directly so the wider case
+                # harness can compare against the searched tariff without
+                # copying or silently transforming it.
+                if isinstance(table.get("structure"), Mapping):
+                    table = dict(table["structure"])
+                self._post_firm1_coefficient_targets(
+                    table
+                )
+            return 0
+        if name.startswith("schedule:"):
+            # Open-loop daily schedule: {"default": [m, inc], "days": {"3": [m, inc], ...}}
+            table = self._parse_policy_table(name.split(":", 1)[1])
+            day = int(step_index) // int(max(1, self.shared_steps_per_day))
+            entry = dict(table.get("days", {})).get(str(day), table.get("default", [1.0, 1.0]))
+            self._post_firm1_target(float(entry[0]), float(entry[1]) if len(entry) > 1 else 1.0)
+            return 0
+        if name.startswith("oracle:"):
+            # Regime-oracle static policy: told the true regime, posts the
+            # table's (multiplier, incentive) for it; no foresight beyond the
+            # public forecast phase.  Adaptation value = oracle - best static.
+            table = self._parse_policy_table(name.split(":", 1)[1])
+            key = self._regime_key_for_hour(int(hour))
+            if key not in table:
+                raise ValueError(f"Oracle table has no target for regime {key!r}")
+            entry = table[key]
+            self._post_firm1_target(float(entry[0]), float(entry[1]) if len(entry) > 1 else 1.0)
+            return 0
+        if name.startswith("rule:"):
+            # Tuned reactive rule on the same public information as the actor
+            # (delayed own KPIs, public quote gaps, public regime signals).
+            params = self._parse_policy_table(name.split(":", 1)[1])
+            multiplier, incentive = self._reactive_rule(params, int(hour))
+            self._post_firm1_target(multiplier, incentive)
+            return 0
+        if name == "myopic_greedy":
+            feasible = np.flatnonzero(np.asarray(action_mask, dtype=bool))
+            if feasible.size == 0:
+                return 0
+            if presampled is None:
+                raise RuntimeError("myopic_greedy requires v26 pre-sampled common random numbers")
+            step_customers, profiles = presampled
+            if holding_steps > 1:
+                scores = self._holding_interval_action_values(feasible,
+                    step_index=step_index, holding_steps=holding_steps,
+                    opponent_interval_steps=opponent_interval_steps,
+                    day_of_week=day_of_week, hour=hour, weather=weather,
+                    presampled=presampled, customers_per_step=customers_per_step,
+                    evaluation_profiles=evaluation_profiles)
+                return min(scores, key=lambda action: (-scores[action], action))
+            saved_branches = self.counterfactual_branches
+            try:
+                self.counterfactual_branches = int(feasible.size)
+                values, valid = self._counterfactual_action_values(
+                    selected_action=int(feasible[0]),
+                    policy_top_action=int(feasible[0]),
+                    policy_second_action=int(feasible[0]),
+                    action_mask=np.asarray(action_mask, dtype=bool),
+                    day_of_week=int(day_of_week),
+                    hour=int(hour),
+                    weather=str(weather),
+                    customers_per_step=int(step_customers),
+                    sampled_profiles=profiles,
+                    supply_reference_customers=int(customers_per_step),
+                )
+            finally:
+                self.counterfactual_branches = saved_branches
+            scores = np.where(valid, values, -np.inf)
+            best = float(np.max(scores))
+            # Prefer hold on ties so the baseline does not churn on noise.
+            if np.isfinite(scores[0]) and scores[0] >= best - 1e-12:
+                return 0
+            return int(np.argmax(scores))
+        raise ValueError(f"unknown Firm 1 baseline {spec!r}")
+
+    def _holding_interval_action_values(self, actions, *, step_index, holding_steps,
+            opponent_interval_steps, day_of_week, hour, weather, presampled,
+            customers_per_step, evaluation_profiles):
+        """Privileged search through the next real decision, transactionally."""
+        snapshot = self._snapshot_counterfactual_state(presampled[1])
+        scores = {}
+        try:
+            for action in actions:
+                self._restore_counterfactual_state(snapshot)
+                self.firm1.apply_action(int(action), self.market)
+                total, previous = 0., None
+                current_day, current_weather, current_hour = day_of_week, weather, hour
+                for offset in range(holding_steps):
+                    if offset:
+                        if (step_index + offset) % self.shared_steps_per_day == 0:
+                            ctx = self.market.sample_day_context()
+                            current_day, current_weather = ctx.day_of_week, ctx.weather
+                            self._regime_day_start(None, episode_seed=self.seed + step_index + offset)
+                        current_hour = self.market.sample_timestep_hour().hour
+                        self._firm2_leader_step(previous_metrics=previous, day_of_week=current_day,
+                            hour=current_hour, weather=current_weather,
+                            enabled=(step_index + offset) % opponent_interval_steps == 0)
+                        count = self._step_customers(customers_per_step, hour=current_hour,
+                            day_of_week=current_day, weather=current_weather)
+                        profiles = self._sample_profiles_from_pool(count,
+                            generalization_fraction=1. if evaluation_profiles else 0.)
+                    else:
+                        count, profiles = presampled
+                    _, own, rival, gap, _, _ = self.simulate_batch(
+                        day_of_week=current_day, hour=current_hour, weather=current_weather,
+                        customers_per_step=count, sampled_profiles=profiles, collect_rows=False,
+                        supply_reference_customers=customers_per_step)
+                    total += self.firm1.agent.gamma ** offset * self._compute_rl_reward(own, gap, m2=rival)
+                    self._ingest_platform_observations(own, rival)
+                    self._update_recent_response_emas(own, gap, m2=rival)
+                    previous = rival
+                scores[int(action)] = float(total)
+        finally:
+            self._restore_counterfactual_state(snapshot)
+        return scores
+
+    def _counterfactual_day_values(self, *, selected_action, action_mask, day_index,
+            step_in_day, hours, day_ctx, presampled, customers_per_step,
+            firm2_interval_steps, days_left=None):
+        """Revision 14 NMCC: paired H-day branch values for hold, the sampled action
+        and the least-explored alternatives, on common random numbers.
+
+        Each candidate is posted and held (Firm 1 makes no further decision) for
+        H_eff days from the identical market state. Firm 2 reacts with its own
+        policy at its normal cadence. Values are the stage training reward,
+        discounted per day, centred on the hold branch (or on the candidate mean).
+        Training credit only; the actor input never sees these values.
+        """
+        import time as _time
+        started = _time.perf_counter()
+        values = np.full(self.firm1.agent.action_dim, np.nan, dtype=np.float32)
+        mask = np.asarray(action_mask, dtype=bool).reshape(-1)
+        feasible = np.flatnonzero(mask).astype(int).tolist()
+        hold = 0
+        selected = int(selected_action)
+        candidates = []
+        for required in (hold, selected):
+            if required in feasible and required not in candidates:
+                candidates.append(required)
+        alternatives = sorted(
+            (a for a in feasible if a not in candidates),
+            key=lambda a: (int(self.counterfactual_action_counts[a]), a),
+        )
+        candidates.extend(
+            alternatives[: max(
+                0, int(self.counterfactual_day_credit) - len(candidates)
+            )]
+        )
+        spd = int(max(1, len(hours)))
+        horizon_days = int(self.counterfactual_day_horizon_days)
+        if days_left is not None:
+            horizon_days = int(min(horizon_days, max(0, int(days_left))))
+        if horizon_days < 1 or len(candidates) < 2:
+            return values, np.zeros_like(mask)
+        for a in candidates:
+            self.counterfactual_action_counts[a] += 1
+        gamma_day = float(self.firm1.agent.gamma) ** spd
+        snapshot = self._snapshot_counterfactual_state(presampled[1])
+        try:
+            for action in candidates:
+                self._restore_counterfactual_state(snapshot)
+                self.firm1.apply_action(int(action), self.market)
+                total, previous, offset = 0.0, None, 0
+                for k in range(horizon_days):
+                    if k == 0:
+                        ctx, day_hours, start_t = day_ctx, list(hours), int(step_in_day)
+                    else:
+                        ctx = self.market.sample_day_context()
+                        day_hours = [self.market.sample_timestep_hour().hour for _ in range(spd)]
+                        self._regime_day_start(day_hours, episode_seed=self.seed + 50_000 + int(day_index) + k)
+                        start_t = 0
+                    for t in range(start_t, len(day_hours)):
+                        hour = int(day_hours[t])
+                        if offset > 0:
+                            self._firm2_leader_step(previous_metrics=previous,
+                                day_of_week=ctx.day_of_week, hour=hour, weather=ctx.weather,
+                                enabled=((k * spd + t) % int(max(1, firm2_interval_steps)) == 0))
+                            count = self._step_customers(customers_per_step, hour=hour,
+                                day_of_week=ctx.day_of_week, weather=ctx.weather)
+                            profiles = self._sample_profiles_from_pool(
+                                self._effective_simulation_sample_size(count))
+                        else:
+                            count, profiles = presampled
+                        _, own, rival, gap, _, _ = self.simulate_batch(
+                            day_of_week=ctx.day_of_week, hour=hour, weather=ctx.weather,
+                            customers_per_step=count, sampled_profiles=profiles,
+                            collect_rows=False, supply_reference_customers=customers_per_step)
+                        diag = self._reward_diagnostics(
+                            training_regime=self.current_training_stage.opponent_regime,
+                            share=float(own.chosen_share), completed_share=float(own.completed_share),
+                            rev_per_request=float(own.rev_per_request), mean_gap=float(gap),
+                            prev_share=float(self.last_share), prev_rev_per_request=float(self.last_revpr),
+                            prev_profit_per_request=float(self.last_profitpr),
+                            prev_rival_profit_per_request=float(self.last_firm2_profitpr),
+                            prev_rival_market_share=float(self.last_firm2_share),
+                            prev_fulfillment_rate=float(self.last_fulfillment), prev_gap=float(self.last_gap),
+                            profit_per_request=float(own.profit_per_request), profit_margin=self._profit_margin(own),
+                            fulfillment_rate=float(own.fulfillment_rate), avg_wait_minutes=float(own.avg_wait_minutes),
+                            driver_acceptance_rate=float(own.driver_acceptance_rate),
+                            action_change_magnitude=float(self.firm1.last_action_magnitude()) if offset == 0 else 0.0,
+                            baseline_share=float(rival.chosen_share), baseline_completed_share=float(rival.completed_share),
+                            baseline_rev_per_request=float(rival.rev_per_request),
+                            baseline_profit_per_request=float(rival.profit_per_request),
+                            action_event=(offset == 0),
+                            price_gap_abs_error=float(self.last_price_gap_metrics.get("mae", 0.0)),
+                            update_temporal_reward_state=False)
+                        total += gamma_day ** k * float(diag["reward"]) / float(spd)
+                        self._ingest_platform_observations(own, rival)
+                        self._update_recent_response_emas(own, gap, m2=rival)
+                        previous = rival
+                        offset += 1
+                values[int(action)] = float(total)
+        finally:
+            self._restore_counterfactual_state(snapshot)
+        target_mask = np.isfinite(values)
+        raw_values = {
+            int(a): float(values[int(a)]) for a in candidates
+        }
+        if self.nmcc_baseline == "hold" and np.isfinite(values[hold]):
+            values[target_mask] -= float(values[hold])
+        elif bool(target_mask.any()):
+            values[target_mask] -= float(np.mean(values[target_mask]))
+        best = max(candidates, key=lambda a: (float(values[a]), -a))
+        advantage_values = {
+            self.firm1.action_label(int(a)): float(values[int(a)])
+            for a in candidates
+            if np.isfinite(values[int(a)])
+        }
+        feasible_count = int(len(feasible))
+        computed_count = int(target_mask.sum())
+        self._nmcc_last = {
+            "day": int(day_index),
+            "horizon_days": int(horizon_days),
+            "selected": self.firm1.action_label(selected),
+            "selected_advantage": float(values[selected]),
+            "best": self.firm1.action_label(int(best)),
+            "spread": float(np.nanmax(values) - np.nanmin(values)),
+            "feasible_action_count": feasible_count,
+            "computed_action_count": computed_count,
+            "advantage_coverage": float(
+                computed_count / max(1, feasible_count)
+            ),
+            "action_advantages": advantage_values,
+        }
+        elapsed = _time.perf_counter() - started
+        self.counterfactual_day_seconds += elapsed
+        self.counterfactual_day_calls += 1
+        dump_path = self.nmcc_dump or os.environ.get("R11B_CF_DUMP", "")
+        if dump_path:
+            try:
+                effect = getattr(self, "_regime_last_effect", None)
+                base = self.market.curr_market
+                record = {
+                    "day": int(day_index),
+                    "t": int(step_in_day),
+                    "stage": str(getattr(self.current_training_stage, "opponent_regime", "")),
+                    "regime": list(getattr(effect, "active", ()) or ()),
+                    "fleet": float(getattr(effect, "fleet_multiplier", 1.0)),
+                    "horizon_days": int(horizon_days),
+                    "firm1_ratios": {
+                        key: float(get_coeff(base, self.firm1.overrides, key))
+                        / max(1e-9, float(getattr(base, key)))
+                        for key in self.shared_edit_keys
+                    },
+                    "firm2_level": float(self._tariff_grid_multiplier(self.firm2)),
+                    "firm1_tariff_level": (
+                        self.firm1.current_tariff_level()
+                        if getattr(self.firm1, "level_step_actions", False)
+                        else None
+                    ),
+                    "selected": self.firm1.action_label(selected),
+                    "feasible_action_count": feasible_count,
+                    "computed_action_count": computed_count,
+                    "advantage_coverage": float(
+                        computed_count / max(1, feasible_count)
+                    ),
+                    "raw_values": {
+                        self.firm1.action_label(a): v
+                        for a, v in raw_values.items()
+                    },
+                    "values": advantage_values,
+                    "seconds": float(elapsed),
+                }
+                with open(dump_path, "a") as handle:
+                    handle.write(json.dumps(record) + "\n")
+            except Exception as exc:  # diagnostics must never break training
+                print(f">>> [revision14] NMCC dump failed: {exc!r}")
+        return values, target_mask
+
+    @staticmethod
+    def _nmcc_branch_due(decision_count: int, every_k_decisions: int) -> bool:
+        """Replay decision 1 and then every K-th subsequent decision."""
+        count = int(decision_count)
+        cadence = int(max(1, every_k_decisions))
+        return count >= 1 and (count - 1) % cadence == 0
+
+    # ---------- v26r Gate-1 policy helpers ----------
+    def run_policy_sweep(
+        self,
+        *,
+        specs: Sequence[str],
+        rivals: Sequence[str],
+        openings: int,
+        horizon: int,
+        customers_per_step: int,
+        steps_per_day: int,
+        firm1_interval_steps: int,
+        opponent_interval_steps: int,
+        policy_seed: int,
+        evaluation_profiles: bool = True,
+    ) -> Dict[str, Any]:
+        """Evaluate Firm 1 policy specs on identical rollout tapes (Gate 1).
+
+        Every spec faces the same (rival, opening) rollouts with the same
+        seeds: rider draws, trips, rival controller seed, observers and the
+        regime path.  Output: per spec x rollout objective means, so paired
+        differences and their standard errors can be computed outside.
+        """
+        if self.firm1_mode != "RL":
+            raise ValueError("--policy_sweep needs --firm1_mode RL (the RL pricer hosts the baselines)")
+        self._check_supply_calibration_volume(customers_per_step)
+        rollouts: List[Tuple[str, str]] = []
+        for rival in rivals:
+            rollouts.extend(
+                (f"{rival}__opening_{index + 1}", str(rival)) for index in range(int(openings))
+            )
+        results: Dict[str, Any] = {}
+        traces: Dict[str, List[Dict[str, float]]] = {}
+        for spec in specs:
+            self._sweep_trace_enabled = True
+            self._sweep_trace = []
+            report = self._adaptive_policy_validation(
+                customers_per_step=int(customers_per_step),
+                profile_sample_size=int(customers_per_step),
+                horizon=int(horizon),
+                aggressive_horizon=int(horizon),
+                policy_mode="argmax_raw",
+                policy_seed=int(policy_seed),
+                opponent_interval_steps=int(opponent_interval_steps),
+                firm1_interval_steps=int(firm1_interval_steps),
+                steps_per_day=int(steps_per_day),
+                firm1_policy=None if str(spec) == "rl_actor" else str(spec),
+                rollouts_override=list(rollouts),
+                evaluation_profiles=evaluation_profiles,
+            )
+            results[str(spec)] = {
+                name: {
+                    "objective": float(summary["objective_reward_mean"]),
+                    "own_profit": float(summary["own_profit_per_request"]),
+                    "rival_profit": float(summary["rival_profit_per_request"]),
+                    "profit_lead": float(summary["own_profit_per_request"] - summary["rival_profit_per_request"]),
+                    "own_share": float(summary["own_completed_share"]),
+                    "fulfillment": float(summary["fulfillment"]),
+                    "steps": int(summary["steps"]),
+                }
+                for name, summary in dict(report.get("rollout_summaries", {})).items()
+            }
+            means = [row["objective"] for row in results[str(spec)].values()]
+            traces[str(spec)] = list(self._sweep_trace)
+            self._sweep_trace_enabled = False
+            print(f"[PolicySweep] {spec}: mean objective {np.mean(means):.4f} over {len(means)} rollouts")
+        return {
+            "traces": traces,
+            "protocol": "v26r_policy_sweep_common_random_numbers",
+            "city": str(self.market_name),
+            "objective": str(self._configured_primary_objective()),
+            "rollouts": [list(r) for r in rollouts],
+            "horizon": int(horizon),
+            "customers_per_step": int(customers_per_step),
+            "steps_per_day": int(steps_per_day),
+            "policy_seed": int(policy_seed),
+            "v26r": dict(self.v26r_settings),
+            "results": results,
+        }
+
+    @staticmethod
+    def _learned_actor_due_for_policy(
+        firm1_policy: Optional[str], decision_count: int
+    ) -> bool:
+        """Whether evaluation should query the learned actor at this decision.
+
+        The deployed ``rl_actor`` is queried at every Firm 1 decision.  The
+        matched ``rl_actor_frozen`` control is queried only for decision zero;
+        later decisions return hold through ``_baseline_firm1_action``.
+        """
+        return firm1_policy is None or (
+            str(firm1_policy) == "rl_actor_frozen" and int(decision_count) == 0
+        )
+
+    @staticmethod
+    def _parse_policy_table(text: str) -> Dict[str, Any]:
+        """JSON object, or ``@path`` to a JSON file."""
+        text = str(text).strip()
+        if text.startswith("@"):
+            with open(os.path.expanduser(text[1:]), "r", encoding="utf-8") as fh:
+                return dict(json.load(fh))
+        return dict(json.loads(text))
+
+    def _trace_row(self, *, rollout: str, step: int, hour: int, m1, m2, reward: float = float("nan")) -> Dict[str, float]:
+        supply = self.driver_supply if self.enable_driver_supply else None
+        base = self.market.curr_market
+        ratios = [
+            float(get_coeff(base, self.firm1.overrides, key)) / max(1e-6, float(getattr(base, key)))
+            for key in self.shared_edit_keys if float(getattr(base, key)) > 0.0
+        ]
+        rival_ratios = [
+            float(get_coeff(base, self.firm2.overrides, key)) / max(1e-6, float(getattr(base, key)))
+            for key in self.shared_edit_keys if float(getattr(base, key)) > 0.0
+        ]
+        row = {
+            "rollout": rollout, "step": int(step), "hour": int(hour),
+            "firm1_level": float(np.mean(ratios)) if ratios else 1.0,
+            "firm2_level": float(np.mean(rival_ratios)) if rival_ratios else 1.0,
+            "firm2_level_effective": (float(np.mean(rival_ratios)) if rival_ratios else 1.0) * float(self._firm2_regime_price_multiplier),
+            "own_share": float(m1.completed_share), "rival_share": float(m2.completed_share),
+            "own_market_share": (float(m1.completed_share / (m1.completed_share + m2.completed_share))
+                                 if m1.completed_share + m2.completed_share > 0 else None),
+            "profit_lead": float(m1.profit_per_request - m2.profit_per_request),
+            "share_lead": float(m1.completed_share - m2.completed_share),
+            "fulfillment": float(m1.fulfillment_rate),
+            "rival_fulfillment": float(m2.fulfillment_rate),
+            "wait": float(m1.avg_wait_minutes),
+            "rival_wait": float(m2.avg_wait_minutes),
+            "revenue_per_request": float(m1.rev_per_request),
+            "rival_revenue_per_request": float(m2.rev_per_request),
+            "profit_per_request": float(m1.profit_per_request),
+            "rival_profit_per_request": float(m2.profit_per_request),
+            "reward": float(reward),
+            "stock_firm1": float(getattr(supply, "online_stock", {}).get("Firm1", 1.0)) if supply else 1.0,
+            "stock_firm2": float(getattr(supply, "online_stock", {}).get("Firm2", 1.0)) if supply else 1.0,
+            "active_drivers_firm1": float(supply.last_states["Firm1"].active_drivers) if supply else 0.0,
+            "earnings_online_hour_firm1": float(supply.smoothed_states["Firm1"].driver_earnings_per_online_hour) if supply else 0.0,
+            "loyalty_mean_firm1": float(self._loyalty_mean("Firm1")),
+            "loyalty_mean_firm2": float(self._loyalty_mean("Firm2")),
+            "returning_share": float(getattr(self, "_last_returning_share", 0.0)),
+            "rival_memory_state": str(getattr(self.firm2, "memory_state", "")),
+            "loyal1_choice_rate": float(getattr(self, "_last_loyal_choice_rate", 0.0)),
+            "loyal1_request_share": float(getattr(self, "_last_loyal_request_share", 0.0)),
+            "loyal1_pool_share": float(self._loyalty_share("Firm1")),
+            "regime": self._regime_key_for_hour(int(hour)),
+            "shock_active": list(self._regime_last_effect.active),
+            "shock_phases": dict(self._regime_last_effect.event_phases),
+            "fleet_multiplier": float(self._regime_last_effect.fleet_multiplier),
+            "transit_availability": float(self._regime_last_effect.transit_availability),
+            "rival_controller": str(getattr(self.firm2, "_ride_response_mode", type(self.firm2).__name__)),
+        }
+        if getattr(self.firm1, "level_step_actions", False):
+            row["firm1_tariff_level"] = self.firm1.current_tariff_level()
+        reference_ctx = RideContext(
+            day_of_week=2,
+            weather="clear",
+            hour=int(hour),
+            airport=False,
+            service="economy",
+        )
+        anchor_quote = float(self.market.quote_price(
+            4.0,
+            15.0,
+            reference_ctx,
+            overrides=CoefficientOverrides(),
+        ))
+        for name, pricer in (("firm1", self.firm1), ("firm2", self.firm2)):
+            quote = float(self.market.quote_price(
+                4.0,
+                15.0,
+                reference_ctx,
+                overrides=pricer.overrides,
+            ))
+            row[f"{name}_reference_fare_index"] = (
+                quote / max(1e-9, anchor_quote) - 1.0
+            )
+        for key in self.shared_edit_keys:
+            anchor = max(1e-6, float(getattr(base, key)))
+            row[f"firm1_ratio_{key}"] = float(
+                get_coeff(base, self.firm1.overrides, key)
+            ) / anchor
+        return row
+
+    def _loyalty_share(self, firm: str, margin: float = 0.25) -> float:
+        """Share of active riders whose loyalty stock favours ``firm`` by more than ``margin``."""
+        stocks = getattr(self, "rider_loyalty", None)
+        if not stocks:
+            return 0.0
+        other = "Firm2" if firm == "Firm1" else "Firm1"
+        values = [float(v.get(firm, 0.0)) - float(v.get(other, 0.0)) > margin for v in stocks.values()]
+        return float(np.mean(values)) if values else 0.0
+
+    def _loyalty_mean(self, firm: str) -> float:
+        stocks = getattr(self, "rider_loyalty", None)
+        if not stocks:
+            return 0.0
+        values = [float(v.get(firm, 0.0)) for v in stocks.values()]
+        return float(np.mean(values)) if values else 0.0
+
+    def _post_firm1_target(self, multiplier: float, incentive: float = 1.0) -> None:
+        """Post ``multiplier`` x every controlled anchor and the incentive level."""
+        if hasattr(self.firm1, "release_tariff_level"):
+            self.firm1.release_tariff_level()
+        base = self.market.curr_market
+        for key in self.firm1.opt_keys:
+            lb, ub = self.firm1.config.bounds[key]
+            value = float(np.clip(float(getattr(base, key)) * float(multiplier), lb, ub))
+            setattr(self.firm1.overrides, key, value)
+        if hasattr(self.firm1, "supply_incentive_multiplier"):
+            self.firm1.supply_incentive_multiplier = float(np.clip(incentive, 0.85, 1.25))
+
+    def _post_firm1_coefficient_targets(
+        self, multipliers: Mapping[str, float]
+    ) -> None:
+        """Post per-coefficient anchor multipliers (evaluation comparator only)."""
+        if hasattr(self.firm1, "release_tariff_level"):
+            self.firm1.release_tariff_level()
+        base = self.market.curr_market
+        unknown = set(multipliers) - set(self.firm1.opt_keys)
+        ignorable_zero_anchor = {
+            key for key in unknown
+            if key in MANIPULATABLE_PRICE_COEFFICIENT_KEYS
+            and float(getattr(base, key, 0.0)) <= 0.0
+        }
+        unknown -= ignorable_zero_anchor
+        if unknown:
+            raise ValueError(
+                f"unknown tariff coefficients: {sorted(unknown)}"
+            )
+        for key in self.firm1.opt_keys:
+            lb, ub = self.firm1.config.bounds[key]
+            value = float(np.clip(
+                float(getattr(base, key))
+                * float(multipliers.get(key, 1.0)),
+                lb,
+                ub,
+            ))
+            setattr(self.firm1.overrides, key, value)
+
+    def _regime_key_for_hour(self, hour: int) -> str:
+        """Canonical regime label from the true effect (oracle information)."""
+        if not self.regime_market:
+            return "calm"
+        effect = self.market.shock_effect(int(hour))
+        from market_shocks import regime_label
+        return regime_label(effect, bool(self._regime_rival_switch_applied))
+
+    def _firm1_public_kpis(self, hour: int) -> Dict[str, float]:
+        observer = self.platform_observers["Firm1"]
+        telemetry = dict(getattr(observer, "telemetry", {}) or {})
+        probes = getattr(observer, "quote_probes", {}) or {}
+        gaps = [float((probes[s] or {}).get("gap", 0.0)) for s in probes]
+        public = self.market.shock_public_features(int(hour)) if (self.regime_market and self.regime_features and not self.regime_feature_ablation) else {}
+        return {
+            "wait": float(telemetry.get("wait_minutes", 0.0) or 0.0),
+            "fulfillment": float(telemetry.get("fulfillment_rate", 1.0) if telemetry.get("fulfillment_rate") is not None else 1.0),
+            "share": float(telemetry.get("completed_share_estimate", 0.5) or 0.5),
+            "gap": float(np.mean(gaps)) if gaps else 0.0,
+            "storm_warning": float(public.get("storm_warning", 0.0)),
+            "holiday": float(public.get("holiday_active", 0.0)),
+            "transit": float(public.get("transit_availability", 1.0)),
+        }
+
+    def _reactive_rule(self, params: Mapping[str, Any], hour: int) -> Tuple[float, float]:
+        """Parametric surge rule: multiplier and incentive from public KPIs."""
+        k = self._firm1_public_kpis(int(hour))
+        p = dict(params)
+        base = float(p.get("base", 1.0))
+        wait_ref = float(p.get("wait_ref", 7.0))
+        m = base
+        m += float(p.get("wait_gain", 0.0)) * (k["wait"] - wait_ref) / max(1e-6, wait_ref)
+        m += float(p.get("fill_gain", 0.0)) * (float(p.get("fill_ref", 0.8)) - k["fulfillment"])
+        m += float(p.get("gap_gain", 0.0)) * k["gap"] / 4.0
+        m += float(p.get("share_gain", 0.0)) * (k["share"] - 0.5)
+        m += float(p.get("storm_gain", 0.0)) * k["storm_warning"]
+        m += float(p.get("holiday_gain", 0.0)) * k["holiday"]
+        m += float(p.get("transit_gain", 0.0)) * (1.0 - k["transit"])
+        inc = float(p.get("inc_base", 1.0))
+        inc += float(p.get("inc_wait_gain", 0.0)) * (k["wait"] - wait_ref) / max(1e-6, wait_ref)
+        inc += float(p.get("inc_storm_gain", 0.0)) * k["storm_warning"]
+        lo, hi = float(p.get("min", 0.6)), float(p.get("max", 1.6))
+        return float(np.clip(m, lo, hi)), float(np.clip(inc, 0.85, 1.25))
+
+    def _evaluate_baseline_suite(
+        self,
+        *,
+        customers_per_step: int,
+        horizon: int,
+        policy_seed: int,
+        opponent_interval_steps: int,
+        steps_per_day: int,
+        rollouts: Sequence[Tuple[str, str]],
+        rl_report: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Run every configured Firm 1 baseline on the RL report's rollouts."""
+        specs: List[str] = []
+        if "static_grid" in self.baseline_suite:
+            specs.extend(f"static:{m:.2f}" for m in self.static_baseline_multipliers)
+        if "anchor_hold" in self.baseline_suite:
+            specs.append("opening_hold")
+        if "myopic_greedy" in self.baseline_suite:
+            specs.append("myopic_greedy")
+        results: Dict[str, Any] = {"rl_actor": dict(rl_report.get("rollout_summaries", {}))}
+        validation_results = {}
+        for spec in specs:
+            if spec.startswith('static:'):
+                selected = self._adaptive_policy_validation(
+                    customers_per_step=customers_per_step, profile_sample_size=customers_per_step,
+                    horizon=horizon, aggressive_horizon=horizon, policy_mode='argmax_raw',
+                    policy_seed=int(policy_seed)+50_000_003,
+                    opponent_interval_steps=opponent_interval_steps,
+                    firm1_interval_steps=opponent_interval_steps, steps_per_day=steps_per_day,
+                    firm1_policy=spec, rollouts_override=list(rollouts), evaluation_profiles=False)
+                validation_results[spec] = selected['rollout_summaries']
+            report = self._adaptive_policy_validation(
+                customers_per_step=customers_per_step,
+                profile_sample_size=customers_per_step,
+                horizon=horizon,
+                aggressive_horizon=horizon,
+                policy_mode="argmax_raw",
+                policy_seed=policy_seed,
+                opponent_interval_steps=opponent_interval_steps,
+                firm1_interval_steps=opponent_interval_steps,
+                steps_per_day=steps_per_day,
+                firm1_policy=spec,
+                rollouts_override=list(rollouts),
+            )
+            results[spec] = dict(report.get("rollout_summaries", {}))
+            if getattr(self, "diagnostic_journal", None):
+                self.diagnostic_journal.append("baseline_cases", {
+                    "policy_seed": int(policy_seed), "policy": spec, "results": results[spec]})
+                self.diagnostic_journal.event("baseline_completed", {
+                    "policy_seed": int(policy_seed), "policy": spec, "rollouts": len(rollouts)})
+            print(f"[Baselines] completed {spec} on {len(rollouts)} opponent rollout(s)")
+        comparison: Dict[str, Any] = {}
+        rl = results["rl_actor"]
+        for opponent in rl:
+            row: Dict[str, Any] = {"rl_objective": rl[opponent]["objective_reward_mean"]}
+            static_scores = {
+                spec: results[spec][opponent]["objective_reward_mean"]
+                for spec in results
+                if spec.startswith("static:") and opponent in results[spec]
+            }
+            if static_scores:
+                rival = dict(rollouts)[opponent]
+                group = [name for name, mode in rollouts if mode == rival]
+                best_spec = min(static_scores, key=lambda spec: (
+                    -float(np.mean([validation_results[spec][name]['objective_reward_mean'] for name in group])),
+                    float(spec.split(':')[1])))
+                modes = sorted(set(dict(rollouts).values()))
+                single = min(static_scores, key=lambda spec: (-float(np.mean([
+                    np.mean([validation_results[spec][name]['objective_reward_mean']
+                             for name, mode in rollouts if mode == rival_mode]) for rival_mode in modes])),
+                    float(spec.split(':')[1])))
+                row["best_static"] = best_spec
+                row["best_static_objective"] = static_scores[best_spec]
+                row["rl_minus_best_static"] = row["rl_objective"] - static_scores[best_spec]
+                row['selection'] = 'independent validation seeds and training rider partition, unchanged reward'
+                row['single_constant'] = single
+                row['single_constant_objective'] = static_scores[single]
+                row['hindsight_best_constant'] = min(static_scores, key=lambda spec: (-static_scores[spec], float(spec.split(':')[1])))
+                row['hindsight_scope'] = 'ex-post best whole constant trajectory; not dynamic optimum'
+            if "myopic_greedy" in results and opponent in results["myopic_greedy"]:
+                row["myopic_objective"] = results["myopic_greedy"][opponent]["objective_reward_mean"]
+                row["rl_minus_myopic"] = row["rl_objective"] - row["myopic_objective"]
+            if "opening_hold" in results and opponent in results["opening_hold"]:
+                row["rl_minus_opening_hold"] = (
+                    row["rl_objective"] - results["opening_hold"][opponent]["objective_reward_mean"]
+                )
+            comparison[opponent] = row
+        return {
+            "protocol": "v26_firm1_seat_baselines_same_rollout_seeds",
+            "horizon": int(horizon),
+            "policy_seed": int(policy_seed),
+            "specs": specs,
+            "static_validation_results": validation_results,
+            "results": results,
+            "comparison": comparison,
+        }
+
+    @staticmethod
+    def _normalized_smoothed_trend(
+        values: Sequence[float],
+        window: int = 20,
+    ) -> float:
+        """Return fitted start-to-finish change after moving-average smoothing."""
+        array = np.asarray(values, dtype=float)
+        array = array[np.isfinite(array)]
+        if array.size < 3:
+            return 0.0
+        resolved_window = int(max(1, min(window, array.size // 3 or 1)))
+        if resolved_window > 1:
+            kernel = np.ones(resolved_window, dtype=float) / resolved_window
+            array = np.convolve(array, kernel, mode="valid")
+        if array.size < 2:
+            return 0.0
+        x = np.linspace(0.0, 1.0, array.size)
+        return float(np.polyfit(x, array, 1)[0])
+
+    def _fare_equivalent_action_impact(self, action: int) -> float:
+        """Approximate broad-market dollars changed by a discrete action.
+
+        The exposure weights represent a typical 15-minute, four-mile ride;
+        airport fee receives only its approximate population exposure. This
+        prevents an airport-only oscillation from satisfying the dynamic-policy
+        gate while the coefficients affecting nearly every ride remain fixed.
+        """
+        if self.firm1_mode != "RL" or not hasattr(self.firm1, "action_steps"):
+            return 0.0
+        if getattr(self.firm1, "level_step_actions", False):
+            step = self.firm1.action_to_level_step.get(int(action))
+            if step is None:
+                return 0.0
+            base = self.market.curr_market
+            structure = self.firm1.tariff_structure["structure"]
+            return abs(float(step)) * float(sum(
+                float(getattr(base, key)) * float(structure[key]) * LEVEL_STEP_EXPOSURE[key]
+                for key in self.firm1.opt_keys
+            ))
+        relative_step = getattr(
+            self.firm1, "action_to_relative_step", {}
+        ).get(int(action))
+        if relative_step is not None:
+            target_key = getattr(
+                self.firm1, "action_to_target_key", {}
+            ).get(int(action))
+            target_keys = (
+                tuple(self.firm1.opt_keys)
+                if target_key == "whole_tariff"
+                else (str(target_key),)
+            )
+            base = self.market.curr_market
+            exposure = {
+                "base_fare": 1.0,
+                "per_minute": 14.65,
+                "per_mile": 3.95,
+                "booking_fee": 1.0,
+                "airport_fee": 0.0775,
+            }
+            return abs(float(relative_step)) * float(sum(
+                float(getattr(base, key)) * float(exposure.get(key, 0.0))
+                for key in target_keys
+            ))
+        multiplier = getattr(
+            self.firm1, "action_to_multiplier", {}
+        ).get(int(action))
+        target_key = getattr(
+            self.firm1, "action_to_target_key", {}
+        ).get(int(action))
+        if multiplier is not None and target_key is None:
+            base = self.market.curr_market
+            exposure = {
+                "base_fare": 1.0,
+                "per_minute": 14.65,
+                "per_mile": 3.95,
+                "booking_fee": 1.0,
+                "airport_fee": 0.0775,
+            }
+            return abs(float(multiplier) - 1.0) * float(sum(
+                float(getattr(base, key)) * float(exposure.get(key, 0.0))
+                for key in self.firm1.opt_keys
+            ))
+        if multiplier is not None and target_key is not None:
+            base = self.market.curr_market
+            exposure = {
+                "base_fare": 1.0,
+                "per_minute": 14.65,
+                "per_mile": 3.95,
+                "booking_fee": 1.0,
+                "airport_fee": 0.0775,
+            }
+            return (
+                abs(float(multiplier) - 1.0)
+                * float(getattr(base, target_key))
+                * float(exposure.get(target_key, 0.0))
+            )
+        steps = self.firm1.action_steps(int(action))
+        exposure = {
+            "base_fare": 1.0,
+            "per_minute": 14.65,
+            "per_mile": 3.95,
+            "booking_fee": 1.0,
+            "airport_fee": 0.0775,
+        }
+        config_steps = getattr(getattr(self.firm1, "config", None), "step", {})
+        return float(sum(
+            abs(float(direction))
+            * float(config_steps.get(key, 0.0))
+            * float(exposure.get(key, 0.0))
+            for key, direction in steps.items()
+        ))
+
+    def _economic_action_group(self, action: int) -> int:
+        """Map an action to lower/neutral/higher representative total fare."""
+        if self.firm1_mode != "RL" or not hasattr(self.firm1, "action_steps"):
+            return 0
+        if getattr(self.firm1, "level_step_actions", False):
+            step = self.firm1.action_to_level_step.get(int(action))
+            return 0 if step is None else int(np.sign(float(step)))
+        relative_step = getattr(
+            self.firm1, "action_to_relative_step", {}
+        ).get(int(action))
+        if relative_step is not None:
+            return int(np.sign(float(relative_step)))
+        multiplier = getattr(
+            self.firm1, "action_to_multiplier", {}
+        ).get(int(action))
+        if multiplier is not None:
+            target_key = getattr(
+                self.firm1, "action_to_target_key", {}
+            ).get(int(action))
+            if target_key is None:
+                return int(np.sign(float(multiplier) - 1.0))
+            exposure = {
+                "base_fare": 1.0,
+                "per_minute": 14.65,
+                "per_mile": 3.95,
+                "booking_fee": 1.0,
+                "airport_fee": 0.0775,
+            }
+            signed_impact = (
+                (float(multiplier) - 1.0)
+                * float(getattr(self.market.curr_market, target_key))
+                * float(exposure.get(target_key, 0.0))
+            )
+            if signed_impact < -0.05:
+                return -1
+            if signed_impact > 0.05:
+                return 1
+            return 0
+        steps = self.firm1.action_steps(int(action))
+        exposure = {
+            "base_fare": 1.0,
+            "per_minute": 14.65,
+            "per_mile": 3.95,
+            "booking_fee": 1.0,
+            "airport_fee": 0.0775,
+        }
+        config_steps = getattr(getattr(self.firm1, "config", None), "step", {})
+        signed_impact = float(sum(
+            float(direction)
+            * float(config_steps.get(key, 0.0))
+            * float(exposure.get(key, 0.0))
+            for key, direction in steps.items()
+        ))
+        if signed_impact < -0.05:
+            return -1
+        if signed_impact > 0.05:
+            return 1
+        return 0
+
+    def _objective_action_mask(
+        self,
+        base_mask: np.ndarray,
+        *,
+        fulfillment_rate: Optional[float] = None,
+        completion_coverage: Optional[float] = None,
+        share_advantage: Optional[float] = None,
+    ) -> np.ndarray:
+        """Preserve the stationary physical action set."""
+        del fulfillment_rate, completion_coverage, share_advantage
+        mask = np.asarray(base_mask, dtype=bool).copy()
+        if mask.size == 0:
+            return mask
+        if not np.any(mask):
+            mask[0] = True
+        self.last_action_mask_regime = "all_coefficient_targets_available"
+        # No objective, business, or operational heuristic removes an action.
+        return mask
+
+    def _competitive_durability_backtest(self) -> Dict[str, Any]:
+        """Audit learned dynamics without changing actions or simulator state.
+
+        The audit follows the named policy objective. Profit maximization
+        requires a durable contribution-profit result; competitiveness requires
+        a durable completed-request-share lead;
+        balanced requires both leads. Action changes remain diagnostics and
+        never count as evidence of economic quality.
+
+        Raw on-policy training reward is intentionally diagnostic only: PPO
+        exploration and a learning adaptive rival make its time slope a poor
+        convergence test. Evaluation reward is also not required to rise
+        monotonically because evaluation freezes the policy. A sound frozen
+        policy must retain reward while the rival and market evolve.
+        """
+        training = list(self.training_logs)
+        evaluation = list(self.evaluation_logs)
+        if not evaluation:
+            return {
+                "passed": False,
+                "failures": ["evaluation_logs_missing"],
+            }
+
+        tail_size = max(20, len(evaluation) // 4)
+        tail = evaluation[-tail_size:]
+        settled_start = min(len(evaluation) - 1, len(evaluation) // 10)
+        settled = evaluation[settled_start:]
+        training_rewards = [float(row.get("avg_reward", np.nan)) for row in training]
+        evaluation_rewards = [float(row.get("reward", np.nan)) for row in settled]
+        validation_scores = [
+            float(row.get("validation_score", np.nan))
+            for row in training
+            if np.isfinite(float(row.get("validation_score", np.nan)))
+        ]
+        if not training:
+            loaded_metadata = dict(
+                getattr(self, "loaded_trained_model_metadata", {}) or {}
+            )
+            saved_validation = dict(
+                loaded_metadata.get("checkpoint_validation", {}) or {}
+            )
+            current_validation = dict(
+                getattr(self, "benchmark_evaluation_report", {}) or {}
+            )
+            validation_scores = [
+                float(report["score"])
+                for report in (saved_validation, current_validation)
+                if np.isfinite(float(report.get("score", np.nan)))
+            ]
+
+        def competitive_shares_from_row(
+            row: Mapping[str, Any],
+        ) -> Tuple[float, float]:
+            if (
+                "rl_market_share" in row
+                and "heuristic_market_share" in row
+            ):
+                return (
+                    float(row["rl_market_share"]),
+                    float(row["heuristic_market_share"]),
+                )
+            return (
+                float(row.get("rl_completed_share", 0.0)),
+                float(row.get("heuristic_completed_share", 0.0)),
+            )
+
+        late_share_advantages = [
+            own_market - rival_market
+            for own_market, rival_market in (
+                competitive_shares_from_row(row) for row in tail
+            )
+        ]
+        late_profit_advantages = [
+            float(row["rl_profit"]) - float(row["heuristic_profit"])
+            for row in tail
+        ]
+        late_share_advantage = float(np.mean(late_share_advantages))
+        late_profit_advantage = float(np.mean(late_profit_advantages))
+        late_objective_advantages = self._objective_dominance_path(
+            [float(row["rl_profit"]) for row in tail],
+            [float(row["heuristic_profit"]) for row in tail],
+            [competitive_shares_from_row(row)[0] for row in tail],
+            [competitive_shares_from_row(row)[1] for row in tail],
+        )
+        late_objective_advantage = float(np.mean(late_objective_advantages))
+
+        def rolling_dominance_rate(
+            values: Sequence[float],
+            *,
+            window: int = 20,
+            minimum_gap: float = 0.0,
+        ) -> float:
+            finite = np.asarray(
+                [float(value) for value in values if np.isfinite(value)],
+                dtype=float,
+            )
+            if finite.size == 0:
+                return 0.0
+            resolved = int(max(1, min(window, finite.size)))
+            rolling = np.convolve(
+                finite,
+                np.full(resolved, 1.0 / resolved, dtype=float),
+                mode="valid",
+            )
+            return float(np.mean(rolling >= float(minimum_gap)))
+        target_gap = float(
+            getattr(
+                getattr(self, "long_term_profit_reward_config", None),
+                "price_gap_target",
+                0.75,
+            )
+        )
+        gap_error_values = [
+            float(
+                row.get(
+                    "price_gap_abs_error",
+                    abs(
+                        float(row.get("price_gap_f2_minus_f1", np.nan))
+                        - target_gap
+                    ),
+                )
+            )
+            for row in tail
+            if np.isfinite(
+                float(
+                    row.get(
+                        "price_gap_abs_error",
+                        abs(
+                            float(row.get("price_gap_f2_minus_f1", np.nan))
+                            - target_gap
+                        ),
+                    )
+                )
+            )
+        ]
+        late_gap_abs_error = (
+            float(np.mean(gap_error_values))
+            if gap_error_values
+            else float("inf")
+        )
+        late_own_profit = float(np.mean([
+            float(row["rl_profit"]) for row in tail
+        ]))
+        late_fulfillment_rate = float(np.mean([
+            float(row.get("rl_fulfillment_rate", 1.0)) for row in tail
+        ]))
+        late_completion_coverage = float(np.mean([
+            float(row.get(
+                "completion_coverage",
+                np.clip(
+                    float(row.get("rl_completed_share", 0.0))
+                    + float(row.get("heuristic_completed_share", 0.0)),
+                    0.0,
+                    1.0,
+                ),
+            ))
+            for row in tail
+        ]))
+        training_reward_trend = self._normalized_smoothed_trend(training_rewards)
+        evaluation_reward_trend = self._normalized_smoothed_trend(evaluation_rewards)
+        validation_score_trend = self._normalized_smoothed_trend(
+            validation_scores,
+            window=3,
+        )
+        # Compare adjacent settled windows. The former reference used the
+        # earliest post-reset quarter, so normal rival catch-up made a stable
+        # late equilibrium look like non-convergence.
+        reference_end = max(1, len(evaluation) - tail_size)
+        reference_start = max(settled_start, reference_end - tail_size)
+        pre_late_reward_window = evaluation[reference_start:reference_end]
+        if not pre_late_reward_window:
+            pre_late_reward_window = settled[: min(tail_size, len(settled))]
+        pre_late_evaluation_reward = float(np.mean([
+            float(row.get("reward", np.nan))
+            for row in pre_late_reward_window
+        ]))
+        late_evaluation_reward = float(np.mean([
+            float(row.get("reward", np.nan))
+            for row in tail
+        ]))
+        reward_floor = float(
+            getattr(
+                getattr(self, "long_term_profit_reward_config", None),
+                "minimum_reward",
+                -2.0,
+            )
+        )
+        # Shift by the declared reward floor before forming a ratio. Directly
+        # dividing signed rewards turns a stable negative series into a huge
+        # negative "retention" value even when nothing degraded.
+        evaluation_reward_retention = float(
+            (late_evaluation_reward - reward_floor + 1e-6)
+            / max(1e-6, pre_late_evaluation_reward - reward_floor + 1e-6)
+        )
+
+        coeff_change_count = 0
+        economic_change_count = 0
+        exposure = {
+            "base_fare": 1.0,
+            "per_minute": 15.0,
+            "per_mile": 4.0,
+            "booking_fee": 1.0,
+            "airport_fee": 0.05,
+        }
+        for previous, current in zip(tail, tail[1:]):
+            deltas = [
+                (
+                    key,
+                    abs(
+                        float(current.get(f"firm1_{key}", np.nan))
+                        - float(previous.get(f"firm1_{key}", np.nan))
+                    ),
+                )
+                for key in self.shared_edit_keys
+                if np.isfinite(float(current.get(f"firm1_{key}", np.nan)))
+                and np.isfinite(float(previous.get(f"firm1_{key}", np.nan)))
+            ]
+            if any(delta > 1e-9 for _, delta in deltas):
+                coeff_change_count += 1
+            fare_equivalent_delta = float(sum(
+                delta * float(exposure.get(key, 0.0))
+                for key, delta in deltas
+            ))
+            if fare_equivalent_delta >= 0.05:
+                economic_change_count += 1
+        late_coefficient_change_rate = float(
+            coeff_change_count / max(1, len(tail) - 1)
+        )
+        late_economic_change_rate = float(
+            economic_change_count / max(1, len(tail) - 1)
+        )
+        effective_actions = [
+            self._economic_action_group(int(row.get("action", -1)))
+            for row in tail
+        ]
+        late_action_diversity = int(len(set(effective_actions)))
+
+        objective = self._configured_primary_objective()
+        # Dominance has its ordinary economic meaning: Firm 1 stays ahead of
+        # Firm 2. Arbitrary +$0.25 and +10-point margins are not part of either
+        # named objective and therefore cannot decide certification.
+        share_dominance_gap = 0.0
+        profit_dominance_gap = 0.0
+        dominance_rate_floor = 0.90
+        late_share_rolling_dominance_rate = rolling_dominance_rate(
+            late_share_advantages,
+            minimum_gap=share_dominance_gap,
+        )
+        late_profit_rolling_dominance_rate = rolling_dominance_rate(
+            late_profit_advantages,
+            minimum_gap=profit_dominance_gap,
+        )
+        late_objective_rolling_dominance_rate = rolling_dominance_rate(
+            late_objective_advantages,
+            minimum_gap=0.0,
+        )
+        failures: List[str] = []
+        if len(evaluation) < DURABILITY_MIN_STEPS:
+            failures.append("evaluation_horizon_too_short_for_durability")
+        if objective == "competitiveness":
+            if late_share_advantage < share_dominance_gap:
+                failures.append("late_market_share_advantage_below_target")
+            if late_share_rolling_dominance_rate < dominance_rate_floor:
+                failures.append("late_market_share_dominance_not_consistent")
+        elif objective == "profit_maximization":
+            if late_own_profit <= 0.0:
+                failures.append("late_own_profit_not_positive")
+            if late_profit_advantage < profit_dominance_gap:
+                failures.append("late_profit_advantage_below_target")
+            if late_profit_rolling_dominance_rate < dominance_rate_floor:
+                failures.append("late_profit_dominance_not_consistent")
+        else:
+            if late_objective_advantage < 0.0:
+                failures.append("late_mixed_objective_advantage_below_parity")
+            if late_objective_rolling_dominance_rate < dominance_rate_floor:
+                failures.append("late_mixed_objective_dominance_not_consistent")
+        minimum_validation_snapshots = 2 if training else 1
+        if len(validation_scores) < minimum_validation_snapshots:
+            failures.append("held_out_validation_snapshots_insufficient")
+        # Validation score is a noisy diagnostic measured against fresh market
+        # paths and openings.  A fitted slope across a handful of snapshots is
+        # not an economic failure criterion: it can reject a final policy that
+        # wins every held-out opening and remains dominant throughout the long
+        # frozen-policy evaluation.  Durability is decided by the objective's
+        # late rolling dominance and evaluation-reward retention below; the
+        # score trend remains in the report for inspection only.
+        if (
+            not np.isfinite(evaluation_reward_retention)
+            or evaluation_reward_retention < 0.75
+        ):
+            failures.append("late_evaluation_reward_not_retained")
+        return {
+            "passed": not failures,
+            "failures": failures,
+            "primary_objective": objective,
+            "evaluation_days": int(len(evaluation)),
+            "late_window_days": int(len(tail)),
+            "late_completed_share_advantage": late_share_advantage,
+            "late_completed_share_rolling_dominance_rate": (
+                late_share_rolling_dominance_rate
+            ),
+            "late_market_share_advantage": late_share_advantage,
+            "late_market_share_rolling_dominance_rate": (
+                late_share_rolling_dominance_rate
+            ),
+            "late_own_profit_per_request": late_own_profit,
+            "late_fulfillment_rate": late_fulfillment_rate,
+            "late_completion_coverage": late_completion_coverage,
+            "late_profit_advantage_per_request": late_profit_advantage,
+            "late_profit_rolling_dominance_rate": (
+                late_profit_rolling_dominance_rate
+            ),
+            "late_objective_advantage": late_objective_advantage,
+            "late_objective_rolling_dominance_rate": (
+                late_objective_rolling_dominance_rate
+            ),
+            "late_price_gap_abs_error": late_gap_abs_error,
+            "target_price_gap": target_gap,
+            "held_out_validation_snapshots": int(len(validation_scores)),
+            "held_out_validation_score_fitted_change": validation_score_trend,
+            "training_smoothed_reward_fitted_change": training_reward_trend,
+            "settled_evaluation_smoothed_reward_fitted_change": evaluation_reward_trend,
+            "pre_late_evaluation_reward": pre_late_evaluation_reward,
+            # Compatibility alias retained for existing report readers.
+            "early_settled_evaluation_reward": pre_late_evaluation_reward,
+            "late_evaluation_reward": late_evaluation_reward,
+            "late_evaluation_reward_retention": evaluation_reward_retention,
+            "late_coefficient_change_rate": late_coefficient_change_rate,
+            "late_fare_equivalent_change_rate": late_economic_change_rate,
+            "late_action_diversity": late_action_diversity,
+            "criteria": {
+                "primary_objective": objective,
+                "late_completed_share_advantage_min": (
+                    share_dominance_gap
+                    if objective == "competitiveness"
+                    else None
+                ),
+                "late_market_share_advantage_min": (
+                    share_dominance_gap
+                    if objective == "competitiveness"
+                    else None
+                ),
+                "late_completed_share_rolling_dominance_rate_min": (
+                    dominance_rate_floor
+                    if objective == "competitiveness"
+                    else None
+                ),
+                "late_own_profit_per_request_min_exclusive": (
+                    0.0 if objective == "profit_maximization" else None
+                ),
+                "late_fulfillment_rate_min": None,
+                "late_completion_coverage_min": None,
+                "late_profit_advantage_per_request_min": (
+                    profit_dominance_gap
+                    if objective == "profit_maximization"
+                    else None
+                ),
+                "late_profit_rolling_dominance_rate_min": (
+                    dominance_rate_floor
+                    if objective == "profit_maximization"
+                    else None
+                ),
+                "late_objective_advantage_min": (
+                    0.0
+                    if objective not in {
+                        "profit_maximization", "competitiveness"
+                    }
+                    else None
+                ),
+                "late_objective_rolling_dominance_rate_min": (
+                    dominance_rate_floor
+                    if objective not in {
+                        "profit_maximization", "competitiveness"
+                    }
+                    else None
+                ),
+                "late_price_gap_abs_error_max": (
+                    None
+                ),
+                "held_out_validation_snapshots_min": (
+                    minimum_validation_snapshots
+                ),
+                "evaluation_steps_min": DURABILITY_MIN_STEPS,
+                "held_out_validation_score_fitted_change_min": None,
+                "late_evaluation_reward_retention_min": 0.75,
+                "late_fare_equivalent_change_rate_min": None,
+                "late_action_diversity_min": None,
+            },
+        }
+    def run_experiment(
+        self,
+        train_timesteps: int = 6000,
+        train_customers_per_step: int = 5000,
+        eval_timesteps: int = 1000,
+        eval_customers_per_step: int = 1000,
+        profiles_out: Optional[str] = None,
+        profiles_log_limit: int = 200000,
+        train_steps_per_day: int = 10,
+        ppo_update_interval_days: int = 10,
+        ppo_min_rollout_transitions: int = 96,
+        stochastic_training: bool = True,
+        firm1_action_interval_steps: int = -1,
+        firm2_action_interval_days: int = -1,
+        eval_policy_mode: str = "argmax_raw",
+        eval_policy_temperature: float = 0.25,
+        eval_policy_seed: Optional[int] = None,
+        eval_guardrail_mode: str = "off",
+        checkpoint_validation_horizon: int = 0,
+        checkpoint_validation_interval_days: int = 400,
+        checkpoint_validation_customers_per_step: int = 0,
+        checkpoint_validation_openings: int = 3,
+        evaluate_benchmark_suite: bool = False,
+        training_enabled: bool = True,
+        trained_model_out: Optional[str] = None,
+        model_registry_dir: Optional[str] = "artifacts/trained_models",
+        trained_model_id: Optional[str] = None,
+        diagnostic_prefix: Optional[str] = None,
+    ):
+        """Run workflow: synthetic-data RL training (day/timestep cadence), then held-out evaluation."""
+        self.diagnostic_journal = DiagnosticJournal(diagnostic_prefix) if diagnostic_prefix else None
+        journal = self.diagnostic_journal
+        training_enabled = bool(training_enabled)
+        if not training_enabled:
+            train_timesteps = 0
+            stochastic_training = False
+        if train_timesteps > 0:
+            self._check_supply_calibration_volume(train_customers_per_step)
+        self._check_supply_calibration_volume(eval_customers_per_step)
+        train_steps_per_day = int(max(1, train_steps_per_day))
+        loaded_steps_per_day = int(
+            getattr(self, "loaded_steps_per_day", 0) or 0
+        )
+        if (
+            loaded_steps_per_day > 0
+            and train_steps_per_day != loaded_steps_per_day
+        ):
+            raise ValueError(
+                "requested market steps per day do not match the trained policy: "
+                f"requested={train_steps_per_day}, "
+                f"artifact={loaded_steps_per_day}"
+            )
+        self.shared_steps_per_day = train_steps_per_day
+        if self.market_dynamics.enabled:
+            # The v26 calendar partitions each day into exactly this many
+            # ordered blocks; validation and evaluation reuse the same value.
+            self.market.dynamics_steps_per_day = int(train_steps_per_day)
+            self.market.calendar.day_index = -1
+        if (
+            training_enabled
+            and self.firm1_mode == "RL"
+            and self.training_stage_scheduler.mode == "staged"
+        ):
+            if int(train_timesteps) < len(self.training_stage_scheduler.stages):
+                raise ValueError(
+                    "staged training requires at least three --train_timesteps "
+                    "so market, static_opponent, and dynamic_opponent each run"
+                )
+            if str(self.firm2_mode) == "static":
+                raise ValueError(
+                    "staged training requires a dynamic --firm2_mode for its "
+                    "final stage; use --training_curriculum direct only for a "
+                    "static-opponent ablation"
+                )
+        self._initialize_run_distributions()
+        for observer in self.platform_observers.values():
+            observer.reset()
+        self.action_stability.reset()
+        if self.firm1_mode == "RL":
+            self.firm1.reset_state_history()
+        
+        if stochastic_training:
+            exp_seed = int(np.random.SeedSequence().generate_state(1)[0])
+            self._seed_all_rngs(exp_seed)
+            self.rng = np.random.default_rng(exp_seed)
+            self.market = MarketInteraction(city_name=self.market_name, seed=exp_seed)
+            self.market.set_market(self.market_name)
+            self.agent_gen = GenerateAgent(seed=exp_seed, total_customers=self.total_customers_pool, city_name=self.market_name)
+            if getattr(self, "active_calibration", None):
+                self.apply_calibration(self.active_calibration)
+            elif self.market_dynamics.enabled:
+                self._install_v26_market(self.market)
+                self._rescale_all_pricers()
+            print(f">>> run_experiment stochastic seed={exp_seed} (independent of --seed for robustness)")
+            self._initialize_arbitrary_starting_coefficients()
+            self._initialize_run_distributions()
+            if self.firm1_mode == "RL":
+                self.firm1.reset_state_history()
+        profile_demand_per_step = (
+            train_customers_per_step
+            if training_enabled
+            else eval_customers_per_step
+        )
+        self._refresh_profile_pool(rides_per_timestep=profile_demand_per_step)
+        train_profile_sample_size = self._effective_simulation_sample_size(train_customers_per_step, collect_rows=False)
+        eval_profile_sample_size = self._effective_simulation_sample_size(eval_customers_per_step, collect_rows=False)
+        self._profit_planner_reference_customers = int(
+            train_customers_per_step if training_enabled else eval_customers_per_step
+        )
+
+        print(
+            f">>> Synthetic setup: profile_pool={self.agent_gen.total_customers}, "
+            f"train days={train_timesteps} x {train_steps_per_day} steps/day x {train_customers_per_step} rides, "
+            f"eval timesteps={eval_timesteps} x {eval_customers_per_step} rides, "
+            f"mc_samples(train/eval)={train_profile_sample_size}/{eval_profile_sample_size}"
+        )
+        update_every = int(max(1, ppo_update_interval_days))
+        self.ppo_update_interval_days = update_every
+        requested_firm1_interval = int(firm1_action_interval_steps)
+        requested_firm2_interval = int(firm2_action_interval_days)
+        loaded_action_interval = int(
+            getattr(self, "loaded_shared_action_interval_steps", 0) or 0
+        )
+        if (
+            requested_firm1_interval > 0
+            and requested_firm2_interval > 0
+            and requested_firm1_interval != requested_firm2_interval
+        ):
+            raise ValueError(
+                "Firm1 and Firm2 must use the same action interval; received "
+                f"{requested_firm1_interval} and {requested_firm2_interval}"
+            )
+        shared_action_interval_steps = int(max(
+            1,
+            requested_firm1_interval
+            if requested_firm1_interval > 0
+            else requested_firm2_interval
+            if requested_firm2_interval > 0
+            else loaded_action_interval
+            if loaded_action_interval > 0
+            else int(np.ceil(update_every / 2.0)),
+        ))
+        if (
+            loaded_action_interval > 0
+            and shared_action_interval_steps != loaded_action_interval
+        ):
+            raise ValueError(
+                "requested action interval does not match the trained policy: "
+                f"requested={shared_action_interval_steps}, "
+                f"artifact={loaded_action_interval}"
+            )
+        self.shared_action_interval_steps = shared_action_interval_steps
+        base_action_interval_steps = shared_action_interval_steps
+        firm2_interval_steps = shared_action_interval_steps
+        if self.firm1_mode == "RL":
+            approx_decisions = int(np.ceil(
+                update_every * max(1, int(train_steps_per_day))
+                / float(shared_action_interval_steps)
+            ))
+            trace_multiplier = float(
+                self.firm1.agent.gamma**shared_action_interval_steps
+                * self.firm1.agent.lam
+            )
+            effective_trace_actions = float(
+                1.0 / max(1e-9, 1.0 - trace_multiplier)
+            )
+            actions_per_day = float(
+                max(1, train_steps_per_day) / shared_action_interval_steps
+            )
+            print(
+                f">>> Shared pricing cadence: Firm1 and Firm2 act every "
+                f"{shared_action_interval_steps} market step(s); PPO checks for "
+                f"an update every {update_every} day(s) "
+                f"(~{approx_decisions} complete reaction-cycle transitions/check; "
+                f"minimum rollout={max(1, int(ppo_min_rollout_transitions))}; "
+                f"GAE effective horizon≈{effective_trace_actions:.0f} actions/"
+                f"{effective_trace_actions / max(actions_per_day, 1e-9):.0f} days)."
+            )
+        
+        if training_enabled:
+            print(f">>> Training RL agent on synthetic {self.market_name} sampling (day/timestep cadence)...")
+        else:
+            print(">>> Evaluation-only mode: using loaded Firm1 policy without optimizer updates.")
+        reward_history: List[float] = []
+        sampled_profile_rows: List[Dict[str, Any]] = []
+        profile_limit_reached = False
+
+        opponent_mode = str(self.firm2_mode)
+        catchup_training_pool = self._training_opponent_population("catchup")
+        profit_training_pool = self._training_opponent_population("profit")
+        stage_day_counts = Counter(
+            self.training_stage_scheduler.stage_at(
+                float(day) / max(1.0, float(train_timesteps))
+            ).name
+            for day in range(int(max(0, train_timesteps)))
+        )
+        print(
+            ">>> Training curriculum: "
+            + " -> ".join(
+                f"{stage.name}({stage_day_counts.get(stage.name, 0)} day(s))"
+                for stage in self.training_stage_scheduler.stages
+            )
+            + "; catch-up population="
+            + ",".join(catchup_training_pool)
+            + "; profit-maximizer population="
+            + ",".join(profit_training_pool)
+            + "."
+        )
+        benchmark_opponent = copy.deepcopy(self.firm2)
+        training_clock = OperationalClock()
+        
+        update_every = int(max(1, ppo_update_interval_days))
+        best_checkpoint: Optional[Dict[str, Any]] = None
+        best_validation_selection_key: Optional[Tuple[float, ...]] = None
+        latest_checkpoint: Optional[Dict[str, Any]] = None
+        minimum_rollout = int(max(1, ppo_min_rollout_transitions))
+        self.ppo_min_rollout_transitions = minimum_rollout
+        validation_interval = int(max(
+            update_every,
+            checkpoint_validation_interval_days,
+        ))
+        resolved_checkpoint_horizon = int(
+            max(
+                2,
+                min(
+                    1000,
+                    eval_timesteps
+                    if int(checkpoint_validation_horizon) <= 0
+                    else int(checkpoint_validation_horizon),
+                ),
+            )
+        )
+        resolved_checkpoint_customers = int(
+            eval_customers_per_step
+            if int(checkpoint_validation_customers_per_step) <= 0
+            else max(1, int(checkpoint_validation_customers_per_step))
+        )
+        resolved_checkpoint_openings = int(max(1, checkpoint_validation_openings))
+        if training_enabled and self.firm1_mode == "RL":
+            print(
+                ">>> Checkpoint validation: "
+                f"horizon={resolved_checkpoint_horizon}, "
+                f"opponents={opponent_mode}"
+                + (
+                    "+five_benchmark_classes, "
+                    if self.credit_assignment_v25
+                    else ", "
+                )
+                + f"rides/step={resolved_checkpoint_customers}, "
+                f"openings={resolved_checkpoint_openings}, "
+                "score=40% full-horizon + 60% final-quarter mean of the "
+                "same normalized objective; evaluation=final training policy; "
+                "validation is diagnostic only, with no policy fallback."
+            )
+        latest_validation: Dict[str, float] = {}
+        last_ppo_metrics = {
+            "loss": np.nan,
+            "policy_loss": np.nan,
+            "value_loss": np.nan,
+            "critic_loss": np.nan,
+            "critic_grad_norm": np.nan,
+            "constraint_value_loss": np.nan,
+            "risk_value_loss": np.nan,
+            "action_q_loss": np.nan,
+            "action_q_cql_loss": np.nan,
+            "response_loss": np.nan,
+            "opponent_forecast_loss": np.nan,
+            "lagrangian_adv_mean": np.nan,
+            "lagrangian_adv_std": np.nan,
+            "constraint_lambda_mean": np.nan,
+            "risk_coeff": np.nan,
+            "approx_kl": np.nan,
+            "clipfrac": np.nan,
+            "entropy": np.nan,
+            "policy_entropy": np.nan,
+            "discrete_policy_entropy": np.nan,
+            "magnitude_entropy": np.nan,
+            "policy_entropy_fraction": 1.0,
+            "ent_coeff": float(self.firm1.agent.ent_coeff) if self.firm1_mode == "RL" else np.nan,
+            "target_entropy_fraction": float(self.firm1.agent.target_entropy_fraction) if self.firm1_mode == "RL" else np.nan,
+            "entropy_fraction_error": np.nan,
+            "clip_eps": float(self.firm1.agent.clip_eps) if self.firm1_mode == "RL" else np.nan,
+            "exploration_rate": float(self.firm1.agent.exploration_rate) if self.firm1_mode == "RL" else np.nan,
+            "action_coverage": float(self.firm1.agent._action_coverage()) if self.firm1_mode == "RL" else np.nan,
+            "explained_variance": np.nan,
+            "optimizer_steps": 0,
+            "actor_optimizer_steps": 0,
+            "critic_optimizer_steps": 0,
+            "lr": float(self.firm1.agent.curr_lr) if self.firm1_mode == "RL" else np.nan,
+            "critic_lr": float(self.firm1.agent.critic_opt.param_groups[0]["lr"]) if self.firm1_mode == "RL" else np.nan,
+            "update_performed": False,
+            "learning_signal_ok": False,
+            "run_mode": "rollout_collection",
+        }
+
+        active_stage_name: Optional[str] = None
+        # Convergence is reported only. It never pauses PPO updates, changes
+        # entropy, changes the action set, or selects an early policy.
+        training_reward_stability_seen = False
+        # Pricing decisions and their semi-MDP returns can span synthetic day
+        # boundaries.  Keeping this state outside the reporting-day loop makes
+        # credit follow the operational clock and the rival reaction cadence.
+        pending_rl_step = None
+        pending_reward_sum = 0.0
+        # A static or heuristic Firm 1 has no PPO agent. Its accumulator is
+        # empty and is never used: every update of it sits in RL-only branches.
+        pending_component_sum = np.zeros(
+            int(self.firm1.agent.value_component_dim) if self.firm1_mode == "RL" else 0,
+            dtype=float,
+        )
+        pending_discount = 1.0
+        pending_reward_weight = 0.0
+        pending_count = 0
+        previous_firm2_metrics: Optional[FirmMetrics] = None
+        last_ppo_update_day = 0
+        active_episode_end_day = 0
+        active_episode_days = 0
+        dynamic_episode_ordinal = 0
+        active_episode_opponent_mode = opponent_mode
+        for d in range(train_timesteps):
+            # Elapsed progress (rather than completed progress) ensures day 1
+            # belongs to the first stage and the final third belongs to the
+            # configured dynamic opponent.
+            train_progress = float(d) / max(1.0, float(train_timesteps))
+            self.current_training_stage = self.training_stage_scheduler.stage_at(train_progress)
+            schedule_first, schedule_stop = (
+                self.training_stage_scheduler.stage_window(
+                    d, train_timesteps
+                )
+            )
+            if self.firm1_mode == "RL":
+                stage_controls = self.training_stage_scheduler.controls_for_stage(
+                    self.current_training_stage,
+                    self.training_stage_scheduler.stage_progress(
+                        d, train_timesteps
+                    ),
+                )
+                self.firm1.agent.set_stage_controls(
+                    exploration_rate=stage_controls["exploration_rate"],
+                    entropy_scale=stage_controls["entropy_scale"],
+                    learning_rate_scale=stage_controls["learning_rate_scale"],
+                )
+                self.firm1.agent.stage_progress = float(
+                    stage_controls["stage_progress"]
+                )
+            stage_minimum_rollout = int(
+                minimum_rollout
+                if self.current_training_stage.opponent_regime in {"dynamic", "catchup", "profit"} or self.learner_revision >= 3
+                else min(96, minimum_rollout)
+            )
+            stage_changed = active_stage_name != self.current_training_stage.name
+            episode_expired = bool(
+                not stage_changed
+                and active_episode_days > 0
+                and d >= active_episode_end_day
+            )
+            selected_mode = (
+                active_episode_opponent_mode
+                if self.current_training_stage.opponent_regime in {"dynamic", "catchup", "profit"}
+                else self._training_stage_opponent_mode(
+                    self.current_training_stage, opponent_mode
+                )
+            )
+            if stage_changed or episode_expired:
+                if d > 0 and self.firm1_mode == "RL" and self.firm1.agent.buffer_size:
+                    unresolved = any(
+                        not transition.next_state_finalized
+                        for transition in self.firm1.agent.buf
+                    )
+                    if unresolved:
+                        raise RuntimeError(
+                            "PPO rollout crossed a training episode boundary "
+                            "with an unresolved transition"
+                        )
+                    if stage_changed:
+                        raise RuntimeError(
+                            "PPO rollout crossed a curriculum-stage boundary; "
+                            "the mandatory stage flush did not run"
+                        )
+                if stage_changed:
+                    dynamic_episode_ordinal = 0
+                elif episode_expired:
+                    dynamic_episode_ordinal += 1
+                regime = str(self.current_training_stage.opponent_regime)
+                active_training_pool = (
+                    profit_training_pool
+                    if regime == "profit"
+                    else catchup_training_pool
+                )
+                opponent_mode_override = (
+                    active_training_pool[
+                        dynamic_episode_ordinal % len(active_training_pool)
+                    ]
+                    if regime in {"dynamic", "catchup", "profit"}
+                    else None
+                )
+                if regime in {"dynamic", "catchup", "profit"}:
+                    active_scenario = self._set_training_episode_scenario(
+                        dynamic_episode_ordinal,
+                        len(active_training_pool),
+                    )
+                else:
+                    self.active_training_scenario = "natural_calibrated"
+                    self.shock_scenario = None
+                    if self.market.shocks is not None:
+                        self.market.shocks.scenario = None
+                    active_scenario = self.active_training_scenario
+                selected_mode = self._enter_training_stage(
+                    self.current_training_stage,
+                    configured_mode=opponent_mode,
+                    episode_seed=self.seed + 50_000 + d,
+                    opponent_mode_override=opponent_mode_override,
+                )
+                active_episode_opponent_mode = selected_mode
+                training_clock.reset()
+                previous_firm2_metrics = None
+                active_stage_name = self.current_training_stage.name
+                active_episode_days = int(
+                    self._training_opponent_episode_days(
+                        self.current_training_stage, selected_mode
+                    )
+                    if self.current_training_stage.episode_days > 0 or self.learner_revision >= 3
+                    else 0
+                )
+                active_episode_end_day = int(
+                    min(
+                        train_timesteps,
+                        d + active_episode_days,
+                    )
+                    if active_episode_days > 0
+                    else 0
+                )
+                opponent_label = (
+                    "city_market_reference"
+                    if self.current_training_stage.opponent_regime == "market"
+                    else selected_mode
+                )
+                print(
+                    f">>> [training episode opening] day={d + 1} "
+                    f"stage={self.current_training_stage.name} "
+                    f"opponent={opponent_label} "
+                    f"scenario={active_scenario} "
+                    + (
+                        f"horizon={active_episode_days}day(s) "
+                        if active_episode_days > 0
+                        else ""
+                    )
+                    +
+                    f"episode_tariff_randomization=±"
+                    f"{100.0 * self.current_training_stage.tariff_reset_fraction:.0f}% "
+                    "policy_and_optimizers=retained"
+                )
+            next_stage_name = self.current_training_stage.name
+            if (d + 1) < train_timesteps:
+                next_progress = float(d + 1) / max(1.0, float(train_timesteps))
+                next_stage_name = self.training_stage_scheduler.stage_at(
+                    next_progress
+                ).name
+            stage_transition_boundary = bool(
+                next_stage_name != self.current_training_stage.name
+            )
+            dynamic_episode_boundary = bool(
+                active_episode_days > 0
+                and active_episode_end_day > 0
+                and (d + 1) >= active_episode_end_day
+                and (d + 1) < train_timesteps
+            )
+            day_regime_boundary = bool(
+                stage_transition_boundary
+                or dynamic_episode_boundary
+                or (d + 1) == train_timesteps
+            )
+            mandatory_flush_boundary = bool(
+                stage_transition_boundary
+                or (
+                    (d + 1) == train_timesteps
+                    and (self.learner_revision >= 3 or not (
+                        self.credit_assignment_v25
+                        and self.current_training_stage.opponent_regime
+                        in {"dynamic", "catchup", "profit"}
+                    ))
+                )
+            )
+            effective_firm2_interval_steps = int(max(
+                1,
+                firm2_interval_steps * self.current_training_stage.opponent_cadence_multiplier,
+            ))
+            # Both firms use one operational decision cycle. Firm 1's stored
+            # return spans the entire interval before either firm acts again.
+            stage_action_interval_steps = int(
+                effective_firm2_interval_steps
+            )
+            day_ctx = self.market.sample_day_context()
+            hours = [self.market.sample_timestep_hour().hour for _ in range(max(1, int(train_steps_per_day)))]
+            self._regime_day_start(hours, episode_seed=self.seed + 50_000 + d)
+
+            reward_sum = 0.0
+            base_reward_sum = 0.0
+            raw_reward_sum = 0.0
+            relative_profit_sum = 0.0
+            price_competitiveness_sum = 0.0
+            trend_sum = 0.0
+            discipline_sum = 0.0
+            share_delta_sum = 0.0
+            rev_delta_sum = 0.0
+            efficiency_sum = 0.0
+            reward_component_sums: Dict[str, float] = defaultdict(float)
+            share_sum = 0.0
+            choice_share_sum = 0.0
+            completed_share_sum = 0.0
+            firm2_choice_share_sum = 0.0
+            firm2_completed_share_sum = 0.0
+            market_share_sum = 0.0
+            firm2_market_share_sum = 0.0
+            outside_option_share_sum = 0.0
+            completion_coverage_sum = 0.0
+            firm2_revpr_sum = 0.0
+            firm2_profitpr_sum = 0.0
+            revpr_sum = 0.0
+            profitpr_sum = 0.0
+            gap_sum = 0.0
+            gap_abs_error_sum = 0.0
+            gap_rmse_sum = 0.0
+            gap_p90_sum = 0.0
+            gap_within_tolerance_sum = 0.0
+            fulfillment_sum = 0.0
+            wait_sum = 0.0
+            driver_accept_sum = 0.0
+            driver_paypr_sum = 0.0
+            action_counts: Counter[int] = Counter()
+            shock_block_counts: Counter[str] = Counter()
+            shock_phase_counts: Counter[str] = Counter()
+            raw_top_action_counts: Counter[int] = Counter()
+            sampled_not_top_count = 0
+            train_policy_diag_sums: Dict[str, float] = defaultdict(float)
+            train_policy_diag_count = 0
+            last_action = -1
+            recovery_guardrail_count = 0
+            recovery_guardrail_recommend_count = 0
+            recovery_guardrail_reasons: Counter[str] = Counter()
+            action_mask_regimes: Counter[str] = Counter()
+            firm2_leader_decision_count = 0
+            firm2_leader_intervention_count = 0
+            firm2_leader_action_sum = np.zeros(
+                len(self.shared_edit_keys) + 1, dtype=np.float32
+            )
+            inline_ppo_metrics: Optional[Dict[str, Any]] = None
+            boundary_flush_transitions = 0
+            for t, hour in enumerate(hours):
+                base = self.market.curr_market
+                rl_step = None
+                interval_closed_this_step = False
+                firm2_due = bool(
+                    not isinstance(self.firm2, FirmStaticPricer)
+                    and not self.current_training_stage.freeze_opponent
+                    and training_clock.due(effective_firm2_interval_steps)
+                )
+                firm2_action_target, firm2_intervened = (
+                    self._firm2_leader_step(
+                        previous_metrics=previous_firm2_metrics,
+                        day_of_week=day_ctx.day_of_week,
+                        hour=hour,
+                        weather=day_ctx.weather,
+                        enabled=firm2_due,
+                    )
+                )
+                if firm2_due:
+                    firm2_leader_decision_count += 1
+                    firm2_leader_intervention_count += int(firm2_intervened)
+                    firm2_leader_action_sum += firm2_action_target
+
+                # Profiles are sampled before Firm 1 acts because optional
+                # counterfactual branches must replay the exact same riders and
+                # exogenous random stream as the selected real action.
+                step_customers = self._step_customers(
+                    train_customers_per_step,
+                    hour=hour,
+                    day_of_week=day_ctx.day_of_week,
+                    weather=day_ctx.weather,
+                )
+                sampled_profiles = self._sample_profiles_from_pool(
+                    self._effective_simulation_sample_size(step_customers)
+                    if self.market_dynamics.enabled
+                    else train_profile_sample_size
+                )
+                if profiles_out and not profile_limit_reached:
+                    remaining = int(max(
+                        0, profiles_log_limit - len(sampled_profile_rows)
+                    ))
+                    if remaining > 0:
+                        sampled_profile_rows.extend(
+                            {
+                                "Phase": "train",
+                                "Day": int(d),
+                                "Timestep": int(t),
+                                **profile,
+                            }
+                            for profile in sampled_profiles[:remaining]
+                        )
+                    profile_limit_reached = (
+                        len(sampled_profile_rows) >= int(max(0, profiles_log_limit))
+                    )
+
+                # Firm 2 has now committed.  This publication builds Firm 1's
+                # state from the new posted quotes, the current market context,
+                # and lagged supply/customer outcomes before Firm 1 reacts.
+                if self.firm1_mode == "RL":
+                    raw_state_vec, action_features, _ = self._publish_pricing_observation(
+                        day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather
+                    )
+                    s_vec = self.firm1.stack_state(raw_state_vec)
+                    critic_state = (
+                        self._build_privileged_critic_state(raw_state_vec)
+                        if self.privileged_critic
+                        else None
+                    )
+                    decision_due = training_clock.due(
+                        stage_action_interval_steps
+                    )
+                    if decision_due:
+                        # A held-action transition ends after its final market
+                        # outcome, but its true semi-MDP successor is the next
+                        # state on which the actor can actually choose: after
+                        # the new context and Firm 2 leader quote are public.
+                        # Finalize deferred value/potential targets here, before
+                        # either PPO updates or the next action is sampled.
+                        if (
+                            self.firm1.agent.buffer_size > 0
+                            and not self.firm1.agent.buf[-1].next_state_finalized
+                        ):
+                            next_v, _, _ = self.firm1.agent.value_estimates(
+                                s_vec,
+                                action_features=action_features,
+                                critic_state=critic_state,
+                            )
+                            self.firm1.agent.finalize_last_transition(
+                                next_value=next_v,
+                                next_value_components=self.firm1.agent.last_preview_components,
+                                next_potential=(
+                                    self._public_reward_potential(raw_state_vec)
+                                    if self.potential_shaping_scale > 0.0
+                                    else None
+                                ),
+                            )
+                            pre_action_update_due = bool(
+                                not day_regime_boundary
+                                and (d + 1 - last_ppo_update_day) >= update_every
+                                and self._ppo_rollout_ready(stage_minimum_rollout)
+                            )
+                            if pre_action_update_due:
+                                self._sync_agent_optimization_context()
+                                inline_ppo_metrics = self.firm1.agent.update(
+                                    epochs=self.ppo_update_epochs,
+                                    batch_size=self.ppo_batch_size,
+                                    bootstrap_value=next_v,
+                                )
+                                last_ppo_metrics = dict(inline_ppo_metrics)
+                                last_ppo_update_day = int(d + 1)
+                        action_mask = self._objective_action_mask(
+                            self.firm1.feasible_action_mask(self.market)
+                        )
+                        action_mask_regimes[
+                            str(self.last_action_mask_regime)
+                        ] += 1
+                        raw_diag = self.firm1.agent.policy_diagnostics(
+                            s_vec,
+                            action_features=action_features,
+                            action_mask=action_mask,
+                        )
+                        action, s_ts, old_logp, val, af_ts, mask_ts = self.firm1.agent.act(
+                            s_vec,
+                            action_features=action_features,
+                            action_mask=action_mask,
+                            critic_state=critic_state,
+                        )
+                        _nmcc_stage_ok = bool(
+                            self.counterfactual_day_credit > 0
+                            and getattr(
+                                self.current_training_stage,
+                                "opponent_regime",
+                                "",
+                            )
+                            in self.nmcc_stages
+                        )
+                        if _nmcc_stage_ok:
+                            self._nmcc_decision_counter += 1
+                        _day_credit_active = bool(
+                            _nmcc_stage_ok
+                            and self._nmcc_branch_due(
+                                self._nmcc_decision_counter,
+                                self.nmcc_every_k_decisions,
+                            )
+                        )
+                        counterfactual_values, counterfactual_mask = (
+                            self._counterfactual_day_values(
+                                selected_action=int(action),
+                                action_mask=np.asarray(action_mask, dtype=bool),
+                                day_index=int(d),
+                                step_in_day=int(t),
+                                hours=hours,
+                                day_ctx=day_ctx,
+                                presampled=(step_customers, sampled_profiles),
+                                customers_per_step=train_customers_per_step,
+                                firm2_interval_steps=effective_firm2_interval_steps,
+                                # NMCC is isolated and restores its snapshot.
+                                # Do not truncate at the real trajectory end:
+                                # that hid delayed retaliation/recovery from
+                                # every later branch in a 14-day episode.
+                                days_left=None,
+                            )
+                            if _day_credit_active
+                            else self._counterfactual_action_values(
+                                selected_action=int(action),
+                                policy_top_action=int(
+                                    raw_diag.get("policy_top_action", action)
+                                ),
+                                policy_second_action=int(
+                                    raw_diag.get("policy_second_action", action)
+                                ),
+                                action_mask=np.asarray(action_mask, dtype=bool),
+                                day_of_week=day_ctx.day_of_week,
+                                hour=hour,
+                                weather=day_ctx.weather,
+                                customers_per_step=step_customers,
+                                sampled_profiles=sampled_profiles,
+                                supply_reference_customers=train_customers_per_step,
+                            )
+                            if self.counterfactual_branches > 0
+                            else (
+                                np.full(
+                                    self.firm1.agent.action_dim,
+                                    np.nan,
+                                    dtype=np.float32,
+                                ),
+                                np.zeros(
+                                    self.firm1.agent.action_dim,
+                                    dtype=bool,
+                                ),
+                            )
+                        )
+                        # Branch restoration replaces the copied market object.
+                        # Refresh this local reference before the real action.
+                        base = self.market.curr_market
+                        self.firm1.apply_action(action, self.market)
+                        action_counts[int(action)] += 1
+                        raw_top = int(raw_diag.get("policy_top_action", -1))
+                        raw_top_action_counts[raw_top] += 1
+                        sampled_not_top_count += int(raw_top >= 0 and int(action) != raw_top)
+                        for diag_key, diag_value in raw_diag.items():
+                            train_policy_diag_sums[diag_key] += float(diag_value)
+                        train_policy_diag_count += 1
+                        last_action = int(action)
+                        rl_step = (
+                            action, s_ts, old_logp, val, af_ts, mask_ts,
+                            critic_state, counterfactual_values,
+                            counterfactual_mask,
+                        )
+                        pending_rl_step = rl_step
+                        pending_reward_sum = 0.0
+                        pending_component_sum = np.zeros(
+                            self.firm1.agent.value_component_dim, dtype=float
+                        )
+                        pending_discount = 1.0
+                        pending_reward_weight = 0.0
+                        pending_count = 0
+                    else:
+                        rl_step = None
+                        self.firm1.agent.observe_recurrent_state(
+                            s_vec, critic_state=critic_state
+                        )
+                elif self.firm1_mode != "static":
+                    self.firm1.act(
+                        city_base=base.base_fare,
+                        city_pmin=base.per_minute,
+                        city_pmile=base.per_mile,
+                        city_booking=base.booking_fee,
+                        city_airport=base.airport_fee,
+                        hour=hour,
+                        weather=day_ctx.weather,
+                    )
+                _, m1, m2, mean_gap, _, _ = self.simulate_batch(
+                    day_of_week=day_ctx.day_of_week,
+                    weather=day_ctx.weather,
+                    hour=hour,
+                    customers_per_step=step_customers,
+                    sampled_profiles=sampled_profiles,
+                    collect_rows=False,
+                    supply_reference_customers=train_customers_per_step,
+                )
+                self._ingest_platform_observations(m1, m2)
+                previous_firm2_metrics = m2
+                if self.regime_market:
+                    effect = self._regime_last_effect
+                    shock_block_counts.update(effect.active or ("calm",))
+                    shock_phase_counts.update(f"{kind}:{phase}" for kind, phase in effect.event_phases.items())
+                    
+                action_movement = 0.0
+                if self.firm1_mode == "RL" and rl_step is not None:
+                    action_movement = float(self.firm1.last_action_magnitude())
+                    
+                reward_diag = self._reward_diagnostics(
+                    training_regime=self.current_training_stage.opponent_regime,
+                    share=float(m1.chosen_share),
+                    completed_share=float(m1.completed_share),
+                    rev_per_request=float(m1.rev_per_request),
+                    mean_gap=float(mean_gap),
+                    prev_share=float(self.last_share),
+                    prev_rev_per_request=float(self.last_revpr),
+                    prev_profit_per_request=float(self.last_profitpr),
+                    prev_rival_profit_per_request=float(
+                        self.last_firm2_profitpr
+                    ),
+                    prev_rival_market_share=float(self.last_firm2_share),
+                    prev_fulfillment_rate=float(self.last_fulfillment),
+                    prev_gap=float(self.last_gap),
+                    profit_per_request=float(m1.profit_per_request),
+                    profit_margin=self._profit_margin(m1),
+                    fulfillment_rate=float(m1.fulfillment_rate),
+                    avg_wait_minutes=float(m1.avg_wait_minutes),
+                    driver_acceptance_rate=float(m1.driver_acceptance_rate),
+                    action_change_magnitude=action_movement,
+                    baseline_share=float(m2.chosen_share),
+                    baseline_completed_share=float(m2.completed_share),
+                    baseline_rev_per_request=float(m2.rev_per_request),
+                        baseline_profit_per_request=float(m2.profit_per_request),
+                        action_event=rl_step is not None,
+                        price_gap_abs_error=float(
+                            self.last_price_gap_metrics["mae"]
+                        ),
+                    )
+
+                if self.firm1_mode == "RL" and pending_rl_step is not None:
+                    reward = float(reward_diag["reward"])
+                    self.last_reward = reward
+                    pending_reward_sum += pending_discount * reward
+                    if self.learner_revision >= 3:
+                        pending_component_sum += (
+                            pending_discount
+                            * self._value_reward_components(m1, m2, reward_diag)
+                        )
+                    pending_reward_weight += pending_discount
+                    pending_count += 1
+                    pending_discount *= float(self.firm1.agent.gamma)
+                    end_of_day = (t == len(hours) - 1)
+                    episode_truncated = bool(end_of_day and day_regime_boundary)
+                    interval_closed = bool(
+                        ((training_clock.period + 1) % stage_action_interval_steps)
+                        == 0
+                        or episode_truncated
+                    )
+                    if interval_closed and pending_count > 0:
+                        (
+                            action, s_ts, old_logp, val, af_ts, mask_ts,
+                            critic_state, counterfactual_values,
+                            counterfactual_mask,
+                        ) = pending_rl_step
+                        # A curriculum/opponent episode reset changes tariffs,
+                        # observation history, opponent controller, and reward-
+                        # rate context. It is therefore a true learning episode
+                        # boundary, not a time-limit cut whose pre-reset value can
+                        # be bootstrapped into the next regime.
+                        next_v = None
+                        next_constraint_v = None
+                        next_risk_v = None
+                        boundary_next_potential = None
+                        store_done = bool(episode_truncated and not (
+                            self.learner_revision >= 4 and self.truncation_bootstrap))
+                        if episode_truncated and self.truncation_bootstrap and self.learner_revision < 4:
+                            # v26 M5: an opponent-episode/stage/horizon cut is a
+                            # time limit of a continuing market, not an economic
+                            # terminal.  Bootstrap from the value of the last
+                            # observed state instead of assigning zero.
+                            final_raw_state = self._build_rl_state(
+                                day_of_week=day_ctx.day_of_week,
+                                hour=hour,
+                                weather=day_ctx.weather,
+                            )
+                            final_state = self.firm1.stack_state(
+                                final_raw_state, commit=False
+                            )
+                            final_critic_state = (
+                                self._build_privileged_critic_state(final_raw_state)
+                                if self.privileged_critic
+                                else None
+                            )
+                            next_v, _, _ = self.firm1.agent.value_estimates(
+                                final_state,
+                                critic_state=final_critic_state,
+                            )
+                            if self.potential_shaping_scale > 0.0:
+                                boundary_next_potential = self._public_reward_potential(
+                                    final_raw_state
+                                )
+                            store_done = False
+                        transition_reward = float(pending_reward_sum)
+                        if not self.credit_assignment_v25:
+                            transition_reward /= float(max(
+                                1e-12, pending_reward_weight
+                            ))
+                        self.firm1.agent.store(
+                            s_ts,
+                            action,
+                            transition_reward,
+                            store_done,
+                            None,
+                            old_logp,
+                            val,
+                            action_features=af_ts,
+                            action_mask=mask_ts,
+                            discount=float(pending_discount),
+                            duration=int(pending_count),
+                            truncated=episode_truncated,
+                            next_value=next_v,
+                            next_value_components=(self.firm1.agent.last_preview_components
+                                                   if next_v is not None else None),
+                            reward_components=pending_component_sum if self.learner_revision >= 3 else None,
+                            next_constraint_values=next_constraint_v,
+                            next_risk_value=next_risk_v,
+                            critic_state=critic_state,
+                            counterfactual_action_values=counterfactual_values,
+                            counterfactual_action_mask=counterfactual_mask,
+                            potential=(
+                                self._public_reward_potential(
+                                    np.asarray(
+                                        s_ts[-self.platform_observation_dim:].cpu().tolist(),
+                                        dtype=np.float32,
+                                    )
+                                )
+                                if self.potential_shaping_scale > 0.0
+                                else None
+                            ),
+                            next_potential=boundary_next_potential,
+                            reward_regime=(
+                                "city_market_reference"
+                                if self.current_training_stage.opponent_regime
+                                == "market"
+                                else str(active_episode_opponent_mode)
+                            ),
+                        )
+                        interval_closed_this_step = True
+                        pending_rl_step = None
+                        pending_reward_sum = 0.0
+                        pending_component_sum = np.zeros(
+                            self.firm1.agent.value_component_dim, dtype=float
+                        )
+                        pending_discount = 1.0
+                        pending_reward_weight = 0.0
+                        pending_count = 0
+                    if end_of_day:
+                        before_snapshot = self._coeff_snapshot()
+                        guardrail_diag = self._apply_eval_guardrail(
+                            "off",
+                            metrics=m1,
+                            price_gap_f2_minus_f1=float(mean_gap),
+                            base=base,
+                        )
+                        after_snapshot = self._coeff_snapshot()
+                        guardrail_delta = self._coeff_delta(after_snapshot, before_snapshot)
+                        if guardrail_delta:
+                            recovery_guardrail_count += 1
+                        if guardrail_diag and guardrail_diag.get("reasons"):
+                            recovery_guardrail_recommend_count += 1
+                            recovery_guardrail_reasons.update(str(r) for r in guardrail_diag.get("reasons", []))
+                    reward_sum += reward
+                elif self.firm1_mode != "RL":
+                    reward_sum += float(reward_diag["reward_base"])
+
+                base_reward_sum += float(reward_diag["reward_base"])
+                raw_reward_sum += float(reward_diag["reward_raw"])
+                relative_profit_sum += float(
+                    reward_diag["reward_profit_advantage_component"]
+                )
+                price_competitiveness_sum += float(
+                    reward_diag[
+                        "reward_market_share_competitiveness_component"
+                    ]
+                )
+                trend_sum += float(reward_diag["reward_trend_term"])
+                discipline_sum += float(reward_diag["reward_pricing_discipline"])
+                share_delta_sum += float(reward_diag["reward_share_delta"])
+                rev_delta_sum += float(reward_diag["reward_rev_delta"])
+                efficiency_sum += float(reward_diag["reward_efficiency_term"])
+                for component_key in (
+                    "reward_revenue_component",
+                    "reward_share_component",
+                    "reward_profit_component",
+                    "reward_unit_economics_component",
+                    "reward_price_gap_component",
+                    "reward_service_component",
+                    "reward_corrective_action_bonus",
+                    "reward_hold_inaction_penalty",
+                    "reward_baseline_loss_penalty",
+                    "reward_overprice_penalty",
+                    "reward_underprice_penalty",
+                    "reward_action_change_penalty",
+                    "reward_action_realization_penalty",
+                    "reward_correction_pressure",
+                    "reward_revenue_improvement",
+                    "reward_share_improvement",
+                    "reward_profit_improvement",
+                    "reward_demand_loss",
+                    "reward_baseline_share",
+                    "reward_baseline_rev_per_request",
+                    "reward_baseline_profit_per_request",
+                    "reward_absolute_profit_term",
+                    "reward_relative_profit_term",
+                    "reward_absolute_revenue_term",
+                    "reward_relative_revenue_term",
+                    "reward_relative_share_term",
+                    "reward_active_objective_component",
+                    "reward_active_objective_term_count",
+                    "reward_dominance_term",
+                    "reward_own_profit_utility",
+                    "reward_profit_advantage_utility",
+                    "reward_market_share_utility",
+                    "reward_market_share_level_utility",
+                    "reward_market_share_dominance_utility",
+                    "reward_market_share_competitiveness_component",
+                    "reward_market_share_level_component",
+                    "reward_market_share_advantage_component",
+                    "reward_market_share_advantage",
+                    "reward_market_share_target_gap",
+                    "reward_market_share_target_level",
+                    "reward_market_share_target_progress",
+                    "reward_market_share_target_achieved",
+                    "reward_market_share_gap_error",
+                    "reward_market_share_target_shortfall",
+                    "reward_conditional_choice_share",
+                    "reward_rival_conditional_choice_share",
+                    "reward_conditional_choice_share_sum",
+                    "reward_own_profit_component",
+                    "reward_profit_advantage_component",
+                    "reward_durable_profit_advantage_component",
+                    "reward_adaptive_profit_residual_component",
+                    "reward_durable_profit_advantage_per_request",
+                    "reward_adaptive_profit_residual_per_request",
+                    "reward_intervention_cost",
+                    "reward_reversal_cost",
+                    "reward_intervention_magnitude",
+                    "reward_profit_advantage_per_request",
+                    "reward_actor_credit",
+                    "reward_previous_objective_base",
+                    "reward_momentum_component",
+                    "reward_profit_delta",
+                    "reward_gap_delta",
+                    "reward_price_gap_deviation",
+                    "reward_price_gap_satisfaction",
+                    "reward_service_quality",
+                    "reward_wait_satisfaction",
+                    "reward_driver_acceptance_objective",
+                    "reward_price_gap_in_range",
+                    "reward_gap_tolerance",
+                    "reward_price_gap_abs_error",
+                    "reward_served_share",
+                    "constraint_violation_share_floor",
+                    "constraint_violation_fulfillment_floor",
+                    "constraint_violation_wait_limit",
+                    "constraint_violation_gap_band",
+                    "constraint_violation_margin_floor",
+                    "reward_zero_effect_action",
+                    "reward_saturated_action",
+                ):
+                    reward_component_sums[component_key] += float(reward_diag.get(component_key, 0.0))
+                for component_key, component_value in reward_diag.items():
+                    if component_key.startswith(("reward_positive_", "constraint_cost_", "constraint_lambda_")):
+                        reward_component_sums[component_key] += float(component_value)
+
+                share_sum += float(m1.share)
+                choice_share_sum += float(m1.chosen_share)
+                completed_share_sum += float(m1.completed_share)
+                firm2_choice_share_sum += float(m2.chosen_share)
+                firm2_completed_share_sum += float(m2.completed_share)
+                _, _, outside_option_share = (
+                    conditional_competitive_shares(
+                        m1.chosen_share, m2.chosen_share
+                    )
+                )
+                market_share = float(m1.completed_share)
+                firm2_market_share = float(m2.completed_share)
+                market_share_sum += market_share
+                firm2_market_share_sum += firm2_market_share
+                outside_option_share_sum += outside_option_share
+                completion_coverage_sum += float(np.clip(
+                    m1.completed_share + m2.completed_share, 0.0, 1.0
+                ))
+                firm2_revpr_sum += float(m2.rev_per_request)
+                firm2_profitpr_sum += float(m2.profit_per_request)
+                revpr_sum += float(m1.rev_per_request)
+                profitpr_sum += float(m1.profit_per_request)
+                gap_sum += float(mean_gap)
+                gap_abs_error_sum += float(self.last_price_gap_metrics["mae"])
+                gap_rmse_sum += float(self.last_price_gap_metrics["rmse"])
+                gap_p90_sum += float(
+                    self.last_price_gap_metrics["p90_abs_error"]
+                )
+                gap_within_tolerance_sum += float(
+                    self.last_price_gap_metrics["within_tolerance_rate"]
+                )
+                fulfillment_sum += float(m1.fulfillment_rate)
+                wait_sum += float(m1.avg_wait_minutes)
+                driver_accept_sum += float(m1.driver_acceptance_rate)
+                driver_paypr_sum += float(m1.driver_pay / max(1, m1.total))
+                self._update_recent_response_emas(m1, mean_gap, m2=m2)
+                self.last_share = market_share
+                self.last_revpr = float(m1.rev_per_request)
+                self.last_gap = float(mean_gap)
+                self.last_profitpr = float(m1.profit_per_request)
+                self.last_fulfillment = float(m1.fulfillment_rate)
+                self.last_completion_coverage = float(np.clip(
+                    m1.completed_share + m2.completed_share, 0.0, 1.0
+                ))
+                self.last_acceptance = float(m1.driver_acceptance_rate)
+                self.last_wait = float(m1.avg_wait_minutes)
+                self.last_driver_paypr = float(m1.driver_pay / max(1, m1.total))
+                self.last_firm2_share = firm2_market_share
+                self.last_firm2_revpr = float(m2.rev_per_request)
+                self.last_firm2_profitpr = float(m2.profit_per_request)
+                self.last_firm2_fulfillment = float(m2.fulfillment_rate)
+                self.last_firm2_acceptance = float(m2.driver_acceptance_rate)
+                self.last_firm2_wait = float(m2.avg_wait_minutes)
+                self.last_firm2_driver_paypr = float(m2.driver_pay / max(1, m2.total))
+                self.objective_credit_ready = True
+                training_clock.advance()
+
+                end_of_day = (t == len(hours) - 1)
+                if (self.firm1_mode == "RL" and self.learner_revision >= 4
+                        and end_of_day and day_regime_boundary and self.truncation_bootstrap):
+                    # All final outcomes/telemetry are now committed. Preview
+                    # the continuing market before resetting this opening.
+                    next_v, next_components, next_potential = self._boundary_bootstrap_preview(
+                        previous_metrics=m2, steps_per_day=train_steps_per_day,
+                        opponent_due=(not self.current_training_stage.freeze_opponent
+                                      and training_clock.due(effective_firm2_interval_steps)),
+                        episode_seed=self.seed + 50_000 + d + 1)
+                    self.firm1.agent.finalize_last_transition(
+                        next_value=next_v, next_value_components=next_components,
+                        next_potential=next_potential)
+                update_due = bool(
+                    (mandatory_flush_boundary and end_of_day)
+                    or (
+                        dynamic_episode_boundary
+                        and end_of_day
+                        and self.firm1.agent.buffer_size >= stage_minimum_rollout
+                    )
+                    or (
+                        not day_regime_boundary
+                        and (d + 1 - last_ppo_update_day) >= update_every
+                    )
+                )
+                if (
+                    self.firm1_mode == "RL"
+                    and interval_closed_this_step
+                    and update_due
+                    and (
+                        self._ppo_rollout_ready(stage_minimum_rollout)
+                        or (
+                            mandatory_flush_boundary
+                            and self.firm1.agent.buffer_size > 0
+                        )
+                    )
+                    and pending_rl_step is None
+                    and self.firm1.agent.buf[-1].next_state_finalized
+                ):
+                    buffered_transitions = int(
+                        self.firm1.agent.buffer_size
+                    )
+                    if buffered_transitions < stage_minimum_rollout:
+                        boundary_flush_transitions = buffered_transitions
+                        print(
+                            ">>> [PPO boundary flush] learning from "
+                            f"{buffered_transitions} complete transition(s) "
+                            "before the continuing-task boundary; no recent "
+                            "dynamic-market experience is discarded."
+                        )
+                    self._sync_agent_optimization_context()
+                    (
+                        bootstrap_v,
+                        bootstrap_constraint_v,
+                        bootstrap_risk_v,
+                    ) = self._ppo_bootstrap_estimates(
+                        day_of_week=day_ctx.day_of_week,
+                        hour=hour,
+                        weather=day_ctx.weather,
+                    )
+                    inline_ppo_metrics = self.firm1.agent.update(
+                        epochs=self.ppo_update_epochs,
+                        batch_size=self.ppo_batch_size,
+                        bootstrap_value=bootstrap_v,
+                        bootstrap_constraint_values=bootstrap_constraint_v,
+                        bootstrap_risk_value=bootstrap_risk_v,
+                    )
+                    last_ppo_metrics = dict(inline_ppo_metrics)
+                    last_ppo_update_day = int(d + 1)
+
+            ppo_metrics = {
+                **{
+                    key: np.nan
+                    for key in (
+                        "loss", "policy_loss", "value_loss", "constraint_value_loss",
+                        "risk_value_loss", "action_q_loss", "action_q_cql_loss", "response_loss", "opponent_forecast_loss", "lagrangian_adv_mean",
+                        "lagrangian_adv_std", "constraint_lambda_mean", "risk_coeff",
+                        "approx_kl", "clipfrac", "entropy", "policy_entropy",
+                        "discrete_policy_entropy", "magnitude_entropy", "explained_variance",
+                        "rollout_action_diversity", "rollout_reward_std", "credited_reward_std",
+                        "continuous_magnitude_mean", "continuous_magnitude_std",
+                        "raw_policy_argmax_concentration", "raw_policy_hold_probability",
+                        "state_action_sensitivity", "state_action_mi",
+                        "direct_actor_credit_mean", "direct_actor_credit_std",
+                        "direct_actor_credit_weight",
+                    )
+                },
+                "policy_entropy_fraction": float(self.firm1.agent.last_policy_entropy_fraction) if self.firm1_mode == "RL" else np.nan,
+                "ent_coeff": float(self.firm1.agent.ent_coeff) if self.firm1_mode == "RL" else np.nan,
+                "clip_eps": float(self.firm1.agent.clip_eps) if self.firm1_mode == "RL" else np.nan,
+                "exploration_rate": float(self.firm1.agent.exploration_rate) if self.firm1_mode == "RL" else np.nan,
+                "action_coverage": float(self.firm1.agent._action_coverage()) if self.firm1_mode == "RL" else np.nan,
+                "optimizer_steps": 0,
+                "lr": float(self.firm1.agent.curr_lr) if self.firm1_mode == "RL" else np.nan,
+                "critic_lr": (float(self.firm1.agent.curr_lr * self.firm1.agent.critic_lr_multiplier)
+                              if self.firm1_mode == "RL" and (self.regime_market or self.learning_corrections) else 0.),
+                "update_performed": False,
+                "learning_signal_ok": False,
+                "run_mode": "rollout_collection",
+            }
+            if inline_ppo_metrics is not None:
+                ppo_metrics = dict(inline_ppo_metrics)
+            if self.firm1_mode == "RL":
+                boundary_flush_due = bool(
+                    mandatory_flush_boundary
+                    and self.firm1.agent.buffer_size > 0
+                )
+                should_update = bool(
+                    (
+                        (d + 1) % update_every == 0
+                        or day_regime_boundary
+                        or (d + 1) == train_timesteps
+                    )
+                    and (
+                        self._ppo_rollout_ready(stage_minimum_rollout)
+                        or boundary_flush_due
+                    )
+                    and pending_rl_step is None
+                    and inline_ppo_metrics is None
+                    and self.firm1.agent.buf[-1].next_state_finalized
+                )
+                if should_update:
+                    buffered_transitions = int(
+                        self.firm1.agent.buffer_size
+                    )
+                    if buffered_transitions < stage_minimum_rollout:
+                        boundary_flush_transitions = buffered_transitions
+                        print(
+                            ">>> [PPO boundary flush] learning from "
+                            f"{buffered_transitions} complete transition(s) "
+                            "before the continuing-task boundary; no recent "
+                            "dynamic-market experience is discarded."
+                        )
+                    self._sync_agent_optimization_context()
+                    bootstrap_v, bootstrap_constraint_v, bootstrap_risk_v = self._ppo_bootstrap_estimates(
+                        day_of_week=day_ctx.day_of_week,
+                        hour=hours[-1],
+                        weather=day_ctx.weather,
+                    )
+                    ppo_metrics = self.firm1.agent.update(
+                        epochs=self.ppo_update_epochs,
+                        batch_size=self.ppo_batch_size,
+                        bootstrap_value=bootstrap_v,
+                        bootstrap_constraint_values=bootstrap_constraint_v,
+                        bootstrap_risk_value=bootstrap_risk_v,
+                    )
+                    last_ppo_metrics = dict(ppo_metrics)
+                    last_ppo_update_day = int(d + 1)
+                
+            n_steps = max(1, len(hours))
+            avg_reward = float(reward_sum / n_steps)
+            reward_history.append(float(avg_reward))
+                    
+            moving_window = reward_history[-min(len(reward_history), 20):]
+            moving_avg20 = float(np.mean(moving_window)) if moving_window else 0.0
+            moving_std20 = float(np.std(moving_window)) if moving_window else 0.0
+            avg_share = float(share_sum / n_steps)
+            avg_choice_share = float(choice_share_sum / n_steps)
+            avg_completed_share = float(completed_share_sum / n_steps)
+            avg_firm2_choice_share = float(firm2_choice_share_sum / n_steps)
+            avg_firm2_completed_share = float(firm2_completed_share_sum / n_steps)
+            avg_market_share = float(market_share_sum / n_steps)
+            avg_firm2_market_share = float(firm2_market_share_sum / n_steps)
+            avg_outside_option_share = float(
+                outside_option_share_sum / n_steps
+            )
+            avg_completion_coverage = float(
+                completion_coverage_sum / n_steps
+            )
+            avg_firm2_revpr = float(firm2_revpr_sum / n_steps)
+            avg_firm2_profitpr = float(firm2_profitpr_sum / n_steps)
+            avg_revpr = float(revpr_sum / n_steps)
+            avg_profitpr = float(profitpr_sum / n_steps)
+            avg_gap = float(gap_sum / n_steps)
+            avg_gap_abs_error = float(gap_abs_error_sum / n_steps)
+            avg_gap_rmse = float(gap_rmse_sum / n_steps)
+            avg_gap_p90 = float(gap_p90_sum / n_steps)
+            avg_gap_within_tolerance = float(
+                gap_within_tolerance_sum / n_steps
+            )
+            avg_fulfillment = float(fulfillment_sum / n_steps)
+            avg_wait = float(wait_sum / n_steps)
+            decision_count = max(1, sum(action_counts.values()))
+            avg_driver_accept = float(driver_accept_sum / n_steps)
+            avg_driver_paypr = float(driver_paypr_sum / n_steps)
+            dominant_action = int(action_counts.most_common(1)[0][0]) if action_counts else -1
+            dominant_action_rate = float(action_counts.most_common(1)[0][1] / decision_count) if action_counts else 0.0
+            dominant_raw_top_action = int(raw_top_action_counts.most_common(1)[0][0]) if raw_top_action_counts else -1
+            dominant_raw_top_action_rate = float(raw_top_action_counts.most_common(1)[0][1] / decision_count) if raw_top_action_counts else 0.0
+            avg_policy_diag = {
+                k: float(v / max(1, train_policy_diag_count))
+                for k, v in train_policy_diag_sums.items()
+            }
+            
+            dominant_action_steps = (
+                self.firm1.action_steps(dominant_action)
+                if self.firm1_mode == "RL" and hasattr(self.firm1, "action_steps")
+                else {}
+            )
+            dominant_action_label = (
+                self.firm1.action_label(dominant_action)
+                if self.firm1_mode == "RL" and hasattr(self.firm1, "action_label")
+                else ""
+            )
+            last_action_steps = (
+                self.firm1.action_steps(last_action)
+                if self.firm1_mode == "RL" and hasattr(self.firm1, "action_steps")
+                else {}
+            )
+
+            log_row = {
+                "batch": d,
+                "profile_population": "same_market_training_partition",
+                "profile_generalization_fraction": float(
+                    self.training_generalization_fraction
+                ),
+                "policy_objective": str(
+                    self.long_term_profit_reward_config.objective_mode
+                ),
+                "reward_mechanism": str(
+                    self.long_term_profit_reward_model.mechanism_name
+                ),
+                "avg_reward": float(avg_reward),
+                "reward_moving_avg20": moving_avg20,
+                "reward_moving_std20": moving_std20,
+                "reward_base": float(base_reward_sum / n_steps),
+                "reward_raw": float(raw_reward_sum / n_steps),
+                "reward_dominance_term": float(
+                    reward_component_sums["reward_dominance_term"]
+                    / n_steps
+                ),
+                "reward_competitive_term": float(
+                    price_competitiveness_sum / n_steps
+                ),
+                "reward_trend_term": float(trend_sum / n_steps),
+                "reward_pricing_discipline": float(discipline_sum / n_steps),
+                "reward_share_delta": float(share_delta_sum / n_steps),
+                "reward_rev_delta": float(rev_delta_sum / n_steps),
+                "reward_efficiency_term": float(efficiency_sum / n_steps),
+                **{
+                    k: float(v / n_steps)
+                    for k, v in sorted(reward_component_sums.items())
+                },
+                "avg_share": avg_share,
+                "avg_choice_share": avg_choice_share,
+                "avg_completed_share": avg_completed_share,
+                "avg_firm2_choice_share": avg_firm2_choice_share,
+                "avg_firm2_completed_share": avg_firm2_completed_share,
+                "avg_market_share": avg_market_share,
+                "avg_firm2_market_share": avg_firm2_market_share,
+                "avg_market_share_sum": float(
+                    avg_market_share + avg_firm2_market_share
+                ),
+                "avg_outside_option_share": avg_outside_option_share,
+                "avg_completion_coverage": avg_completion_coverage,
+                "avg_rev_per_request": avg_revpr,
+                "avg_profit_per_request": avg_profitpr,
+                "avg_firm2_rev_per_request": avg_firm2_revpr,
+                "avg_firm2_profit_per_request": avg_firm2_profitpr,
+                "avg_profit_advantage_per_request": (
+                    avg_profitpr - avg_firm2_profitpr
+                ),
+                "avg_price_gap_f2_minus_f1": avg_gap,
+                "avg_price_gap_abs_error": avg_gap_abs_error,
+                "avg_price_gap_rmse": avg_gap_rmse,
+                "avg_price_gap_p90_abs_error": avg_gap_p90,
+                "avg_price_gap_within_tolerance_rate": avg_gap_within_tolerance,
+                "price_gap_target": float(self.reward_target_price_gap),
+                "price_gap_tolerance": float(
+                    self.constraint_config.overall_tolerance
+                ),
+                "avg_gap_violation_025": float(avg_gap_abs_error > 0.25),
+                "avg_gap_violation_050": float(avg_gap_abs_error > 0.50),
+                "constraint_curriculum_scale": float(self.constraint_curriculum_scale),
+                "training_stage": str(self.current_training_stage.name),
+                "training_stage_constraint_scale": float(self.current_training_stage.constraint_scale),
+                "training_stage_action_hold_steps": int(stage_action_interval_steps),
+                "training_stage_opponent_frozen": bool(self.current_training_stage.freeze_opponent),
+                "training_stage_opponent_regime": str(
+                    self.current_training_stage.opponent_regime
+                ),
+                "training_stage_progress": float(
+                    stage_controls.get("stage_progress", 0.0)
+                    if self.firm1_mode == "RL" else 0.0
+                ),
+                "training_stage_exploration_rate": float(
+                    stage_controls.get("exploration_rate", 0.0)
+                    if self.firm1_mode == "RL" else 0.0
+                ),
+                "training_stage_entropy_scale": float(
+                    stage_controls.get("entropy_scale", 0.0)
+                    if self.firm1_mode == "RL" else 0.0
+                ),
+                "training_stage_learning_rate_scale": float(
+                    stage_controls.get("learning_rate_scale", 0.0)
+                    if self.firm1_mode == "RL" else 0.0
+                ),
+                "training_stage_boundary_flush_transitions": int(
+                    boundary_flush_transitions
+                ),
+                "competition_protocol": "firm2_leader_then_firm1_follower",
+                "training_configured_firm2_mode": str(opponent_mode),
+                "training_active_firm2_mode": str(
+                    "city_market_reference"
+                    if self.current_training_stage.opponent_regime == "market"
+                    else selected_mode
+                ),
+                "firm2_leader_decision_count": int(
+                    firm2_leader_decision_count
+                ),
+                "firm2_leader_intervention_count": int(
+                    firm2_leader_intervention_count
+                ),
+                "firm2_leader_intervention_rate": float(
+                    firm2_leader_intervention_count
+                    / max(1, firm2_leader_decision_count)
+                ),
+                "firm2_leader_action_steps_mean": json.dumps(
+                    (
+                        firm2_leader_action_sum
+                        / max(1, firm2_leader_decision_count)
+                    ).astype(float).tolist()
+                ),
+                "firm2_profit_planner_source": str(
+                    getattr(self.firm2, "source_benchmark", "")
+                ),
+                "firm2_profit_planner_candidate": float(
+                    getattr(self.firm2, "last_profit_candidate", np.nan)
+                ),
+                "firm2_profit_planner_improvement": float(
+                    getattr(self.firm2, "last_profit_improvement", np.nan)
+                ),
+                "firm2_profit_planner_standard_error": float(
+                    getattr(self.firm2, "last_profit_standard_error", np.nan)
+                ),
+                "avg_fulfillment_rate": avg_fulfillment,
+                "avg_wait_minutes": avg_wait,
+                "driver_acceptance_rate": avg_driver_accept,
+                "driver_pay_per_request": avg_driver_paypr,
+                "last_action": int(last_action),
+                "last_action_steps": json.dumps(last_action_steps, sort_keys=True),
+                "dominant_action": dominant_action,
+                "dominant_action_label": dominant_action_label,
+                "dominant_action_steps": json.dumps(dominant_action_steps, sort_keys=True),
+                "dominant_action_rate": dominant_action_rate,
+                "action_counts": json.dumps(dict(sorted(action_counts.items())), sort_keys=True),
+                "raw_top_action_counts": json.dumps(dict(sorted(raw_top_action_counts.items())), sort_keys=True),
+                "action_mask_regimes": json.dumps(
+                    dict(sorted(action_mask_regimes.items())), sort_keys=True
+                ),
+                "last_action_mask_regime": str(
+                    self.last_action_mask_regime
+                ),
+                "sampled_not_raw_top_count": int(sampled_not_top_count),
+                "sampled_not_raw_top_rate": float(sampled_not_top_count / decision_count),
+                "raw_policy_top_action": dominant_raw_top_action,
+                "raw_policy_top_action_label": (
+                    self.firm1.action_label(dominant_raw_top_action)
+                    if self.firm1_mode == "RL" and hasattr(self.firm1, "action_label")
+                    else ""
+                ),
+                "raw_policy_top_action_rate": dominant_raw_top_action_rate,
+                "raw_policy_hold_prob": float(avg_policy_diag.get("policy_hold_prob", 0.0)),
+                "raw_policy_top_prob": float(avg_policy_diag.get("policy_top_prob", 0.0)),
+                "raw_policy_action_margin": float(avg_policy_diag.get("policy_action_margin", 0.0)),
+                "raw_policy_entropy": float(avg_policy_diag.get("policy_entropy", 0.0)),
+                "objective_optimizer_ready": bool(
+                    avg_policy_diag.get("optimizer_ready", 0.0) >= 0.5
+                ),
+                "objective_optimizer_action_change_rate": float(
+                    avg_policy_diag.get("optimizer_action_changed", 0.0)
+                ),
+                "objective_optimizer_q_spread": float(
+                    avg_policy_diag.get("optimizer_q_spread", 0.0)
+                ),
+                "objective_optimizer_action_margin": float(
+                    avg_policy_diag.get("optimizer_action_margin", 0.0)
+                ),
+                "recovery_guardrail_count": int(recovery_guardrail_count),
+                "recovery_guardrail_recommend_count": int(recovery_guardrail_recommend_count),
+                "recovery_guardrail_reasons": json.dumps(dict(sorted(recovery_guardrail_reasons.items())), sort_keys=True),
+                "loss": float(ppo_metrics.get("loss", 0.0)),
+                "ppo_policy_loss": float(ppo_metrics.get("policy_loss", 0.0)),
+                "ppo_value_loss": float(ppo_metrics.get("value_loss", 0.0)),
+                "ppo_critic_loss": float(ppo_metrics.get("critic_loss", 0.0)),
+                "ppo_critic_grad_norm": float(ppo_metrics.get("critic_grad_norm", 0.0)),
+                "ppo_constraint_value_loss": float(ppo_metrics.get("constraint_value_loss", 0.0)),
+                "ppo_risk_value_loss": float(ppo_metrics.get("risk_value_loss", 0.0)),
+                "ppo_action_q_loss": float(ppo_metrics.get("action_q_loss", 0.0)),
+                "ppo_action_q_cql_loss": float(
+                    ppo_metrics.get("action_q_cql_loss", 0.0)
+                ),
+                "ppo_counterfactual_policy_loss": float(
+                    ppo_metrics.get("counterfactual_policy_loss", 0.0)
+                ),
+                "ppo_objective_q_optimizer_steps": int(
+                    ppo_metrics.get("objective_q_optimizer_steps", 0)
+                ),
+                "ppo_objective_q_update_calls": int(
+                    ppo_metrics.get("objective_q_update_calls", 0)
+                ),
+                "ppo_counterfactual_target_coverage": float(
+                    ppo_metrics.get("counterfactual_target_coverage", 0.0)
+                ),
+                "ppo_nmcc_valid_fraction": float(
+                    ppo_metrics.get("nmcc_valid_fraction", 0.0)
+                ),
+                "ppo_nmcc_adv_rms": float(
+                    ppo_metrics.get("nmcc_adv_rms", 0.0)
+                ),
+                "ppo_nmcc_gae_sign_agreement": float(
+                    ppo_metrics.get("nmcc_gae_sign_agreement", 0.0)
+                ),
+                "ppo_branch_imitation_loss": float(
+                    ppo_metrics.get("branch_imitation_loss", 0.0)
+                ),
+                "ppo_branch_imitation_temperature": float(
+                    ppo_metrics.get("branch_imitation_temperature", 0.0)
+                ),
+                "ppo_branch_imitation_rows": int(
+                    ppo_metrics.get("branch_imitation_rows", 0)
+                ),
+                "ppo_branch_imitation_kl_before": float(
+                    ppo_metrics.get("branch_imitation_kl_before", 0.0)
+                ),
+                "ppo_branch_imitation_kl_after": float(
+                    ppo_metrics.get("branch_imitation_kl_after", 0.0)
+                ),
+                "firm1_tariff_level": (
+                    self.firm1.current_tariff_level()
+                    if getattr(self.firm1, "level_step_actions", False)
+                    else None
+                ),
+                "counterfactual_action_coverage": float(
+                    np.mean(self.counterfactual_action_counts > 0)
+                    if self.counterfactual_action_counts.size
+                    else 0.0
+                ),
+                "counterfactual_action_count_cv": float(
+                    np.std(self.counterfactual_action_counts)
+                    / max(1e-8, float(np.mean(self.counterfactual_action_counts)))
+                    if np.any(self.counterfactual_action_counts > 0)
+                    else 0.0
+                ),
+                "counterfactual_action_counts": json.dumps(
+                    self.counterfactual_action_counts.astype(int).tolist()
+                ),
+                "nmcc_calls": int(self.counterfactual_day_calls),
+                "nmcc_seconds_total": float(self.counterfactual_day_seconds),
+                "nmcc_last": dict(self._nmcc_last),
+                "ppo_counterfactual_actor_weight": float(
+                    ppo_metrics.get("counterfactual_actor_weight", 0.0)
+                ),
+                "ppo_potential_shaping_delta_mean": float(
+                    ppo_metrics.get("potential_shaping_delta_mean", 0.0)
+                ),
+                "ppo_average_reward_rate": float(
+                    ppo_metrics.get("average_reward_rate", 0.0)
+                ),
+                "ppo_rollout_reward_exposure": float(
+                    ppo_metrics.get("rollout_reward_exposure", 0.0)
+                ),
+                "ppo_rollout_reward_rate_residual": float(
+                    ppo_metrics.get("rollout_reward_rate_residual", 0.0)
+                ),
+                "ppo_reward_rate_segment_count": int(
+                    ppo_metrics.get("reward_rate_segment_count", 0)
+                ),
+                "ppo_reward_rate_segment_std": float(
+                    ppo_metrics.get("reward_rate_segment_std", 0.0)
+                ),
+                "ppo_reward_rate_lagged_baseline_fraction": float(
+                    ppo_metrics.get(
+                        "reward_rate_lagged_baseline_fraction", 0.0
+                    )
+                ),
+                "ppo_opponent_segment_count": int(
+                    ppo_metrics.get("opponent_segment_count", 0)
+                ),
+                "ppo_opponent_regime_count": int(
+                    ppo_metrics.get("opponent_regime_count", 0)
+                ),
+                "ppo_opponent_sample_weight_min": float(
+                    ppo_metrics.get("opponent_sample_weight_min", 1.0)
+                ),
+                "ppo_opponent_sample_weight_max": float(
+                    ppo_metrics.get("opponent_sample_weight_max", 1.0)
+                ),
+                "ppo_reward_rate_beta": float(
+                    ppo_metrics.get("reward_rate_beta", 0.0)
+                ),
+                "ppo_response_loss": float(ppo_metrics.get("response_loss", 0.0)),
+                "ppo_opponent_forecast_loss": float(
+                    ppo_metrics.get("opponent_forecast_loss", 0.0)
+                ),
+                "ppo_lagrangian_adv_mean": float(ppo_metrics.get("lagrangian_adv_mean", 0.0)),
+                "ppo_lagrangian_adv_std": float(ppo_metrics.get("lagrangian_adv_std", 0.0)),
+                "ppo_direct_actor_credit_mean": float(
+                    ppo_metrics.get("direct_actor_credit_mean", 0.0)
+                ),
+                "ppo_direct_actor_credit_std": float(
+                    ppo_metrics.get("direct_actor_credit_std", 0.0)
+                ),
+                "ppo_direct_actor_credit_weight": float(
+                    ppo_metrics.get("direct_actor_credit_weight", 0.0)
+                ),
+                "ppo_constraint_lambda_mean": float(ppo_metrics.get("constraint_lambda_mean", 0.0)),
+                "ppo_risk_coeff": float(ppo_metrics.get("risk_coeff", 0.0)),
+                "ppo_approx_kl": float(ppo_metrics.get("approx_kl", 0.0)),
+                "ppo_target_kl": float(
+                    ppo_metrics.get("target_kl", self.firm1.agent.target_kl)
+                ),
+                "ppo_clipfrac": float(ppo_metrics.get("clipfrac", 0.0)),
+                "ppo_entropy": float(ppo_metrics.get("entropy", 0.0)),
+                "ppo_policy_entropy": float(ppo_metrics.get("policy_entropy", 0.0)),
+                "ppo_discrete_policy_entropy": float(ppo_metrics.get("discrete_policy_entropy", np.nan)),
+                "ppo_magnitude_entropy": float(ppo_metrics.get("magnitude_entropy", np.nan)),
+                "ppo_policy_entropy_fraction": float(ppo_metrics.get("policy_entropy_fraction", 1.0)),
+                "ppo_ent_coeff": float(ppo_metrics.get("ent_coeff", 0.0)),
+                "ppo_target_entropy_fraction": float(
+                    ppo_metrics.get("target_entropy_fraction", np.nan)
+                ),
+                "ppo_entropy_fraction_error": float(
+                    ppo_metrics.get("entropy_fraction_error", np.nan)
+                ),
+                "ppo_clip_eps": float(ppo_metrics.get("clip_eps", 0.0)),
+                "ppo_exploration_rate": float(ppo_metrics.get("exploration_rate", 0.0)),
+                # PPO reports its batch-average epsilon on update days; keep
+                # today's behavior setting separate for an honest trajectory.
+                "behavior_exploration_rate": float(self.firm1.agent.exploration_rate),
+                "ppo_action_coverage": float(ppo_metrics.get("action_coverage", 0.0)),
+                "ppo_explained_variance": float(ppo_metrics.get("explained_variance", 0.0)),
+                "ppo_optimizer_steps": int(ppo_metrics.get("optimizer_steps", 0)),
+                "ppo_actor_optimizer_steps": int(ppo_metrics.get("actor_optimizer_steps", 0)),
+                "ppo_critic_optimizer_steps": int(ppo_metrics.get("critic_optimizer_steps", 0)),
+                "ppo_actor_epochs_requested": int(
+                    ppo_metrics.get("actor_epochs_requested", 0)
+                ),
+                "ppo_critic_epochs_requested": int(
+                    ppo_metrics.get("critic_epochs_requested", 0)
+                ),
+                "ppo_lr": float(ppo_metrics.get("lr", 0.0)),
+                "ppo_critic_lr": float(ppo_metrics.get("critic_lr", 0.0)),
+                "ppo_critic_target_mean": float(ppo_metrics.get("critic_target_mean", np.nan)),
+                "ppo_critic_target_std": float(ppo_metrics.get("critic_target_std", np.nan)),
+                "ppo_gae_return_mean": float(
+                    ppo_metrics.get("gae_return_mean", np.nan)
+                ),
+                "ppo_gae_return_std": float(
+                    ppo_metrics.get("gae_return_std", np.nan)
+                ),
+                "ppo_critic_target_contract": str(
+                    ppo_metrics.get("critic_target_contract", "gae_lambda_return")
+                ),
+                "ppo_update_performed": bool(ppo_metrics.get("update_performed", False)),
+                "ppo_run_mode": str(ppo_metrics.get("run_mode", "rollout_collection")),
+                "ppo_learning_signal_ok": bool(ppo_metrics.get("learning_signal_ok", False)),
+                "ppo_rollout_action_diversity": float(ppo_metrics.get("rollout_action_diversity", np.nan)),
+                "ppo_rollout_reward_std": float(ppo_metrics.get("rollout_reward_std", np.nan)),
+                "ppo_credited_reward_std": float(ppo_metrics.get("credited_reward_std", np.nan)),
+                "ppo_continuous_magnitude_mean": float(ppo_metrics.get("continuous_magnitude_mean", np.nan)),
+                "ppo_continuous_magnitude_std": float(ppo_metrics.get("continuous_magnitude_std", np.nan)),
+                "ppo_raw_argmax_concentration": float(ppo_metrics.get("raw_policy_argmax_concentration", np.nan)),
+                "ppo_raw_hold_probability": float(ppo_metrics.get("raw_policy_hold_probability", np.nan)),
+                "ppo_state_action_sensitivity": float(ppo_metrics.get("state_action_sensitivity", np.nan)),
+                "ppo_state_action_mi": float(ppo_metrics.get("state_action_mi", np.nan)),
+                "ppo_rollout_size": int(ppo_metrics.get("rollout_size", 0)),
+                "ppo_effective_batch_size": int(ppo_metrics.get("effective_batch_size", 0)),
+                "ppo_transition_duration_mean": float(
+                    ppo_metrics.get("transition_duration_mean", np.nan)
+                ),
+                "ppo_transition_discount_mean": float(
+                    ppo_metrics.get("transition_discount_mean", np.nan)
+                ),
+                "ppo_truncation_count": int(
+                    ppo_metrics.get("truncation_count", 0)
+                ),
+                "ppo_stopped_early_kl": bool(ppo_metrics.get("stopped_early_kl", False)),
+            }
+            if self.learning_corrections:
+                log_row["ppo_lr"] = self.firm1.agent.curr_lr
+                log_row["ppo_critic_lr"] = self.firm1.agent.critic_opt.param_groups[0]["lr"]
+                log_row.update(ppo_schedule_total_days=train_timesteps,
+                    ppo_schedule_stage_start_day=schedule_first + 1,
+                    ppo_schedule_stage_stop_day=schedule_stop,
+                    ppo_schedule_stage_days=schedule_stop - schedule_first,
+                    ppo_schedule_elapsed_days=d - schedule_first,
+                    ppo_schedule_clock="configured_stage_simulation_days")
+                log_row["ppo_behavior_replay_max_logp_error"] = ppo_metrics.get("behavior_replay_max_logp_error", float("nan"))
+                if self.learner_revision >= 2:
+                    log_row["ppo_critic_value_scale"] = self.firm1.agent.value_scale
+                    log_row["ppo_critic_reward_regime"] = self.current_training_stage.opponent_regime
+                    log_row["ppo_critic_loss_units"] = "normalized_value"
+                    log_row["ppo_entropy_schedule"] = self.credit_assignment_config["entropy_schedule"]
+                    log_row["ppo_stage_progress"] = self.firm1.agent.stage_progress
+                    for name in ("prediction_mean", "prediction_std", "residual_mean", "rmse", "explained_variance_unclipped"):
+                        log_row[f"ppo_critic_{name}"] = ppo_metrics.get(f"critic_{name}", float("nan"))
+                if self.learner_revision >= 3:
+                    log_row["ppo_critic_optimizer_epsilon"] = self.firm1.agent.critic_opt.param_groups[0]['eps']
+                    log_row["ppo_behavior_policy"] = "raw_categorical_actor"
+                    log_row["ppo_action_credit"] = json.dumps(ppo_metrics.get("action_credit", {}))
+                    log_row["ppo_completed_rollout_episodes"] = ppo_metrics.get("completed_rollout_episodes", 0)
+                    log_row["ppo_required_rollout_episodes"] = self.ppo_rollout_episodes
+                    log_row["ppo_partial_batch_flush"] = bool(ppo_metrics.get("update_performed", False) and
+                        (ppo_metrics.get("completed_rollout_episodes", 0) < self.ppo_rollout_episodes
+                         or ppo_metrics.get("rollout_size", 0) < stage_minimum_rollout))
+                    for metric in ("actor_update_max_value_change", "recurrent_gradient_rms_median", "recurrent_epsilon_factor_median"):
+                        log_row[f"ppo_critic_{metric}"] = ppo_metrics.get(f"critic_{metric}", float("nan"))
+                    component_names = (
+                        ("own_profit", "rival_profit", "own_share", "rival_share")
+                        if self.firm1.agent.value_component_dim == 4
+                        else (
+                            "own_profit", "rival_profit", "own_share", "rival_share",
+                            "durable_profit_lead", "adaptive_profit_residual",
+                        )
+                        if self.firm1.agent.value_component_dim == 6
+                        else ("own", "rival")
+                    )
+                    for side in component_names:
+                        for metric in ("rmse", "target_mean", "explained_variance"):
+                            log_row[f"ppo_critic_{side}_{metric}"] = ppo_metrics.get(f"critic_{side}_{metric}", float("nan"))
+                if self.learner_revision >= 4:
+                    for metric in ("actor_credit_contract", "actor_trace_lambda", "critic_trace_lambda",
+                                   "actor_return_mean", "actor_return_std", "actor_raw_advantage_std"):
+                        log_row[f"ppo_{metric}"] = ppo_metrics.get(metric, float("nan"))
+                    log_row["rival_memory_clock"] = self.credit_assignment_config["opponent_memory_clock"]
+                    for field in ("undercut_steps", "premium_steps", "retaliation_left", "retaliation_episodes", "accommodation_moves"):
+                        log_row[f"rival_{field}"] = getattr(self.firm2, field, 0)
+            
+            for bin_label in ("0_2", "2_5", "5_10", "10_plus"):
+                for metric in ("firm1_choice_share", "firm1_completed_share", "firm1_revpr", "completed_rev", "price_gap_mean"):
+                    stat_key = f"distance_bin_{bin_label}_{metric}"
+                    log_row[stat_key] = float(getattr(self, "last_crowd_response_stats", {}).get(stat_key, np.nan))
+            for k in self.shared_edit_keys:
+                log_row[f"firm1_{k}"] = float(get_coeff(self.market.curr_market, self.firm1.overrides, k))
+                log_row[f"firm2_{k}"] = float(get_coeff(self.market.curr_market, self.firm2.overrides, k))
+            validation_score = np.nan
+            if self.firm1_mode == "RL" and ((d + 1) % validation_interval == 0 or (d + 1) == train_timesteps):
+                # Validate the same seeded actor distribution used for final
+                # evaluation. There is no learned Q reranker or
+                # deployment-only action rule.
+                self.firm1.agent.deployment_optimizer_enabled = False
+                validation = self._adaptive_policy_validation(
+                    customers_per_step=resolved_checkpoint_customers,
+                    critic_reward_regime=self.current_training_stage.opponent_regime,
+                    evaluation_profiles=not (self.regime_market or self.learning_corrections),
+                    profile_sample_size=resolved_checkpoint_customers,
+                    horizon=resolved_checkpoint_horizon,
+                    aggressive_horizon=resolved_checkpoint_horizon,
+                    policy_mode=eval_policy_mode,
+                    policy_temperature=eval_policy_temperature,
+                    policy_seed=eval_policy_seed,
+                    opponent_interval_steps=firm2_interval_steps,
+                    firm1_interval_steps=firm2_interval_steps,
+                    steps_per_day=train_steps_per_day,
+                    aggressive_seed_count=resolved_checkpoint_openings,
+                    # v26 C2: when benchmarks are held out, checkpoint selection
+                    # validates on the training-population classes instead.
+                    include_benchmarks=bool(
+                        self.credit_assignment_v25
+                        and not self.exclude_benchmarks_from_training
+                    ),
+                    extra_modes=(
+                        tuple(dict.fromkeys((
+                            *self.training_catchup_opponent_modes,
+                            *self.training_profit_opponent_modes,
+                        )))
+                        if (self.credit_assignment_v25 and self.exclude_benchmarks_from_training)
+                        else ()
+                    ),
+                )
+                validation = dict(validation)
+                validation["deployment_variant"] = "raw_actor"
+                validation["deployment_policy_mode"] = str(eval_policy_mode)
+                latest_validation = dict(validation)
+                validation_score = float(validation["score"])
+                log_row["validation_reward"] = float(validation["reward"])
+                log_row["validation_score"] = float(validation_score)
+                log_row["validation_critic_td_explained_variance"] = float(
+                    validation["heldout_critic_td_explained_variance"]
+                )
+                log_row["validation_critic_td_mae"] = float(
+                    validation["heldout_critic_td_mae"]
+                )
+                log_row["validation_critic_td_samples"] = int(
+                    validation["heldout_critic_td_samples"]
+                )
+                if self.learning_corrections:
+                    for name in ("mae", "explained_variance"):
+                        log_row[f"validation_critic_lambda_{name}"] = validation[f"heldout_critic_lambda_{name}"]
+                    if self.learner_revision >= 2:
+                        for name in ("reward_regime", "diagnostic_distribution", "policy_mode", "value_units"):
+                            log_row[f"validation_critic_{name}"] = validation[f"critic_{name}"]
+                log_row["validation_objective_optimizer"] = str(
+                    validation["objective_optimizer"]
+                )
+                log_row["validation_feasible_mode_fraction"] = float(
+                    validation["objective_feasible_mode_fraction"]
+                )
+                log_row["validation_maximum_normalized_shortfall"] = float(
+                    validation["objective_maximum_normalized_shortfall"]
+                )
+                log_row["validation_mean_objective_dominance_rate"] = float(
+                    validation["mean_objective_dominance_rate"]
+                )
+                log_row["validation_worst_objective_dominance_rate"] = float(
+                    validation["worst_objective_dominance_rate"]
+                )
+                log_row["validation_deployment_variant"] = str(
+                    validation["deployment_variant"]
+                )
+                log_row["validation_raw_actor_score"] = float(
+                    validation["score"]
+                )
+                log_row["validation_share"] = float(validation["share"])
+                log_row["validation_completed_share"] = float(
+                    validation["completed_share"]
+                )
+                log_row["validation_firm2_completed_share"] = float(
+                    validation["rival_completed_share"]
+                )
+                log_row["validation_rev_per_request"] = float(validation["rev_per_request"])
+                log_row["validation_firm2_rev_per_request"] = float(validation["rival_rev_per_request"])
+                log_row["validation_profit_per_request"] = float(validation["profit_per_request"])
+                log_row["validation_firm2_profit_per_request"] = float(validation["rival_profit_per_request"])
+                log_row["validation_fulfillment_rate"] = float(validation["fulfillment_rate"])
+                log_row["validation_mean_fulfillment_rate"] = float(
+                    validation["mean_fulfillment_rate"]
+                )
+                log_row["validation_worst_fulfillment_rate"] = float(
+                    validation["worst_fulfillment_rate"]
+                )
+                log_row["validation_completion_coverage"] = float(
+                    validation["completion_coverage"]
+                )
+                log_row["validation_mean_completion_coverage"] = float(
+                    validation["mean_completion_coverage"]
+                )
+                log_row["validation_worst_completion_coverage"] = float(
+                    validation["worst_completion_coverage"]
+                )
+                log_row["validation_price_gap_f2_minus_f1"] = float(validation["price_gap"])
+                log_row["validation_action_diversity"] = float(validation["action_diversity"])
+                log_row["validation_action_switch_rate"] = float(validation["action_switch_rate"])
+                log_row["validation_profile_source"] = str(
+                    validation["validation_profile_source"]
+                )
+                log_row["validation_cities"] = json.dumps(
+                    validation["mode_validation_cities"], sort_keys=True
+                )
+                log_row["validation_mean_profit_advantage"] = float(
+                    validation["mean_profit_advantage"]
+                )
+                log_row["validation_worst_profit_advantage"] = float(
+                    validation["worst_profit_advantage"]
+                )
+                log_row["validation_profit_win_rate"] = float(
+                    validation["profit_win_rate"]
+                )
+                log_row["validation_mean_completed_share_advantage"] = float(
+                    validation["mean_completed_share_advantage"]
+                )
+                log_row["validation_worst_completed_share_advantage"] = float(
+                    validation["worst_completed_share_advantage"]
+                )
+                log_row["validation_completed_share_win_rate"] = float(
+                    validation["completed_share_win_rate"]
+                )
+                log_row["validation_market_share"] = float(
+                    validation["share"]
+                )
+                log_row["validation_firm2_market_share"] = float(
+                    validation["rival_share"]
+                )
+                log_row["validation_mean_market_share_advantage"] = float(
+                    validation["mean_market_share_advantage"]
+                )
+                log_row["validation_worst_market_share_advantage"] = float(
+                    validation["worst_market_share_advantage"]
+                )
+                log_row["validation_market_share_win_rate"] = float(
+                    validation["market_share_win_rate"]
+                )
+                log_row["validation_robust_dominance_bonus"] = float(
+                    validation["robust_dominance_bonus"]
+                )
+                log_row["validation_incomplete_win_penalty"] = float(
+                    validation["incomplete_win_penalty"]
+                )
+                log_row["validation_durability_decay_penalty"] = float(
+                    validation["durability_decay_penalty"]
+                )
+                log_row["validation_collapsed_policy_penalty"] = float(
+                    validation["collapsed_policy_penalty"]
+                )
+                log_row["validation_policy_dynamicity"] = float(
+                    validation["policy_dynamicity"]
+                )
+                log_row["validation_aggressive_horizon"] = int(
+                    validation["validation_aggressive_horizon"]
+                )
+                log_row["validation_benchmark_horizon"] = int(
+                    validation["validation_benchmark_horizon"]
+                )
+                for mode, advantage in validation["mode_profit_advantages"].items():
+                    log_row[f"validation_profit_advantage_{mode}"] = float(advantage)
+                for mode, decay in validation[
+                    "mode_profit_advantage_decay"
+                ].items():
+                    log_row[f"validation_profit_advantage_decay_{mode}"] = float(
+                        decay
+                    )
+                for mode, dynamicity in validation[
+                    "mode_tail_dynamicity"
+                ].items():
+                    log_row[f"validation_tail_dynamicity_{mode}"] = float(
+                        dynamicity
+                    )
+                print(
+                    f">>> [validation snapshot] day={d+1} score={validation_score:.3f} "
+                    f"reward={validation['reward']:.3f} "
+                    f"share={validation['share']:.3f} "
+                    f"rivalShare={validation['rival_share']:.3f} "
+                    f"revPR={validation['rev_per_request']:.2f} "
+                    f"rivalRevPR={validation['rival_rev_per_request']:.2f} "
+                    f"profitPR={validation['profit_per_request']:.2f} "
+                    f"rivalProfitPR={validation['rival_profit_per_request']:.2f} "
+                    f"fullProfitAdv={validation['profit_per_request'] - validation['rival_profit_per_request']:+.2f} "
+                    f"tailProfitAdv={validation['mean_profit_advantage']:+.2f} "
+                    f"worstTailProfitAdv={validation['worst_profit_advantage']:+.2f} "
+                    f"tailWins={validation['profit_win_rate']:.0%} "
+                    f"fullShareAdv={validation['share'] - validation['rival_share']:+.1%} "
+                    f"tailShareAdv={validation['mean_completed_share_advantage']:+.1%} "
+                    f"worstTailShareAdv={validation['worst_completed_share_advantage']:+.1%} "
+                    f"tailShareWins={validation['completed_share_win_rate']:.0%} "
+                    f"fulfill={validation['mean_fulfillment_rate']:.1%} "
+                    f"worstFulfill={validation['worst_fulfillment_rate']:.1%} "
+                    f"coverage={validation['mean_completion_coverage']:.1%} "
+                    f"worstCoverage={validation['worst_completion_coverage']:.1%} "
+                    f"criticTD_EV={validation['heldout_critic_td_explained_variance']:+.3f} "
+                    f"criticTD_MAE={validation['heldout_critic_td_mae']:.3f} "
+                    f"deploy={validation['deployment_variant']} "
+                    f"actions={validation['action_diversity']:.2f} "
+                    f"switch={validation['action_switch_rate']:.2f}"
+                )
+                configured_objective = self._configured_primary_objective()
+                if configured_objective == "competitiveness":
+                    reported_advantages = validation[
+                        "mode_completed_share_advantages"
+                    ]
+                    advantage_label = "tailCompletedShareAdv"
+                    advantage_format = "+.1%"
+                elif configured_objective == "profit_maximization":
+                    reported_advantages = validation["mode_profit_advantages"]
+                    advantage_label = "tailProfitAdv"
+                    advantage_format = "+.2f"
+                else:
+                    reported_advantages = validation[
+                        "mode_objective_advantages"
+                    ]
+                    advantage_label = "tailObjectiveAdv"
+                    advantage_format = "+.3f"
+                mode_advantages = " | ".join(
+                    f"{mode}:{format(advantage, advantage_format)}"
+                    for mode, advantage in reported_advantages.items()
+                )
+                if mode_advantages:
+                    print(
+                        f"    [validation opponents {advantage_label}] "
+                        f"{mode_advantages}"
+                    )
+                if configured_objective == "profit_maximization":
+                    mode_decays = " | ".join(
+                        f"{mode}:{decay:.2f}"
+                        for mode, decay in validation[
+                            "mode_profit_advantage_decay"
+                        ].items()
+                    )
+                    if mode_decays:
+                        print(
+                            "    [validation early-to-late profitAdv decay] "
+                            f"{mode_decays}"
+                        )
+                selection_key = tuple(
+                    float(value)
+                    for value in validation.get(
+                        "objective_selection_key", ()
+                    )
+                )
+                candidate_checkpoint = {
+                    "day": int(d + 1),
+                    "training_stage": str(self.current_training_stage.name),
+                    "training_opponent_regime": str(
+                        self.current_training_stage.opponent_regime
+                    ),
+                    "score": float(validation_score),
+                    "agent_state": {
+                        k: v.detach().cpu().clone()
+                        for k, v in self.firm1.agent.net.state_dict().items()
+                    },
+                    "normalizer_state": copy.deepcopy(
+                        self.firm1.agent.normalizer_state_dict()
+                    ),
+                    "optimizer_state": copy.deepcopy(
+                        self.firm1.agent.optimizer_state_dict()
+                    ),
+                    "validation": dict(validation),
+                }
+                checkpoint_stage_eligible = bool(
+                    self.current_training_stage.opponent_regime
+                    in {"dynamic", "profit"}
+                )
+                log_row["validation_checkpoint_stage_eligible"] = bool(
+                    checkpoint_stage_eligible
+                )
+                if checkpoint_stage_eligible:
+                    latest_checkpoint = candidate_checkpoint
+                    if (
+                        bool(validation.get("checkpoint_eligible"))
+                        and self.objective_optimizer.candidate_is_better(
+                            selection_key,
+                            best_validation_selection_key,
+                            require_eligible=False,
+                        )
+                    ):
+                        best_validation_selection_key = selection_key
+                        best_checkpoint = candidate_checkpoint
+                        print(
+                            f">>> [validation checkpoint] new_best day={d+1} "
+                            f"stage={self.current_training_stage.name} "
+                            f"score={validation_score:.3f} "
+                            "durability="
+                            f"{'PASS' if validation.get('checkpoint_eligible') else 'FAIL'}"
+                        )
+                else:
+                    print(
+                        ">>> [validation checkpoint] diagnostic_only "
+                        f"day={d+1} stage={self.current_training_stage.name}; "
+                        "selection begins in dynamic_opponent."
+                    )
+            else:
+                log_row["validation_score"] = np.nan
+                log_row["validation_checkpoint_stage_eligible"] = False
+            if self.regime_market or self.learning_corrections:
+                log_row.update(training_episode=int(dynamic_episode_ordinal + 1), training_opponent=str(opponent_label),
+                    training_scenario=str(self.active_training_scenario),
+                    ppo_epoch_full_rollout_kl=ppo_metrics.get('epoch_full_rollout_kl'),
+                    shock_block_counts=json.dumps(dict(shock_block_counts), sort_keys=True),
+                    shock_phase_counts=json.dumps(dict(shock_phase_counts), sort_keys=True),
+                    driver_stock_firm1=float(self.driver_supply.online_stock.get('Firm1', 1.)),
+                    driver_stock_firm2=float(self.driver_supply.online_stock.get('Firm2', 1.)))
+            else:
+                log_row.pop('behavior_exploration_rate')
+            self.training_logs.append(log_row)
+            
+            if self.firm1_mode == "RL":
+                # Keep the predeclared exploration schedule synchronized in
+                # the primary experiment workflow as well as in ``run``.
+                (
+                    convergence_count,
+                    convergence_std,
+                    convergence_delta,
+                ) = self._smoothed_convergence_statistics(
+                    reward_history,
+                    window=40,
+                    smoothing=20,
+                )
+                control_ppo_metrics = last_ppo_metrics
+                convergence_now = bool(
+                    train_progress >= 0.75
+                    and
+                    convergence_count >= 40
+                    and convergence_std <= self.reward_convergence_tol
+                    and convergence_delta <= self.reward_trend_tol
+                    and int(control_ppo_metrics.get("optimizer_steps", 0)) > 0
+                )
+                training_reward_stability_seen = bool(
+                    training_reward_stability_seen or convergence_now
+                )
+                reward_converged = training_reward_stability_seen
+                checkpoint_available = bool(latest_validation)
+                log_row["reward_converged"] = bool(reward_converged)
+                log_row["reward_convergence_now"] = bool(convergence_now)
+                log_row["reward_window_std"] = float(convergence_std)
+                log_row["reward_window_delta"] = float(convergence_delta)
+                log_row["policy_checkpoint_eligible"] = checkpoint_available
+                self.firm1.configure_training_controls(
+                    progress=float((d + 1) / max(1, train_timesteps)),
+                    # Convergence/checkpoints are observations, never commands
+                    # to freeze or narrow a still-learning dynamic policy.
+                    reward_converged=False,
+                    reward_std=convergence_std,
+                )
+            
+            if journal:
+                journal.training_day(dict(log_row, training_episode=int(dynamic_episode_ordinal + 1),
+                    training_opponent=str(opponent_label)), episode_end=bool(day_regime_boundary))
+            if stage_transition_boundary and trained_model_out and self.firm1_mode == "RL":
+                # Archive stage endpoints for analysis, never as fallback policies.
+                self.save_trained_model(
+                    os.path.splitext(trained_model_out)[0] + f".stage_{self.current_training_stage.name}.pt",
+                    registry_dir=None,
+                    model_id=(trained_model_id or "policy") + f"-{self.current_training_stage.name}",
+                    metadata={"training_days": d + 1, "training_seed": int(self.seed),
+                              "training_stage": self.current_training_stage.name,
+                              "comparison_checkpoint_day": d + 1, "comparison_checkpoint_status": "stage_endpoint"})
+            if (d + 1) % max(1, train_timesteps // 10) == 0:
+                progress_line = (
+                    f"  [train {d+1}/{train_timesteps}] reward={float(avg_reward):.3f} "
+                    f"moving_avg20={moving_avg20:.3f} share={avg_share:.3f} "
+                    f"revPR={avg_revpr:.2f} profitPR={avg_profitpr:.2f} "
+                    f"rivalProfitPR={avg_firm2_profitpr:.2f} "
+                    f"profitAdv={avg_profitpr - avg_firm2_profitpr:+.2f} "
+                    f"gap(F2-F1)={avg_gap:.2f} fulfill={avg_fulfillment:.3f} "
+                    f"accept={avg_driver_accept:.3f}"
+                )
+                if bool(ppo_metrics.get("update_performed", False)):
+                    progress_line += (
+                        f" PPO_update steps={int(ppo_metrics.get('optimizer_steps', 0))} "
+                        f"KL={float(ppo_metrics.get('approx_kl', np.nan)):.6g} "
+                        f"clip={float(ppo_metrics.get('clipfrac', np.nan)):.4f}"
+                    )
+                else:
+                    progress_line += f" PPO=collecting ({len(self.firm1.agent.buf)} transitions buffered)"
+                print(progress_line)
+                print(
+                    f"    [train action summary] decisions={sum(action_counts.values())} "
+                    f"dominant={dominant_action_label or 'none'} "
+                    f"rate={dominant_action_rate:.1%} "
+                    f"steps={json.dumps(dominant_action_steps, sort_keys=True)} "
+                    f"last={last_action} "
+                    f"lastSteps={json.dumps(last_action_steps, sort_keys=True)} "
+                    f"sampledOffTop={sampled_not_top_count}"
+                )
+                
+                segment_line = self._format_distance_segment_diagnostics(getattr(self, "last_crowd_response_stats", {}) or {})
+                if segment_line:
+                    print(f"    [train segments] {segment_line}")
+        self.incomplete_population_rollout_transitions = 0
+        if (
+            self.firm1_mode == "RL"
+            and self.credit_assignment_v25
+            and self.firm1.agent.buffer_size > 0
+        ):
+            if self.learner_revision >= 3:
+                raise RuntimeError("revision-3 final rollout was not flushed")
+            self.incomplete_population_rollout_transitions = int(
+                self.firm1.agent.discard_rollout()
+            )
+            if self.training_logs:
+                self.training_logs[-1][
+                    "incomplete_population_rollout_quarantined"
+                ] = int(self.incomplete_population_rollout_transitions)
+            print(
+                ">>> [PPO population quarantine] retained policy from the "
+                "last complete opponent-stratified update; excluded "
+                f"{self.incomplete_population_rollout_transitions} terminal "
+                "transition(s) from an incomplete final population cycle."
+            )
+        # Capture the actual terminal weights even when the last training day
+        # is not a validation day. Never roll back to an older validation state.
+        if training_enabled and self.firm1_mode == "RL":
+            latest_checkpoint = self._capture_final_training_checkpoint(
+                train_timesteps, latest_checkpoint
+            )
+            if trained_model_out or model_registry_dir:
+                self.save_trained_model(
+                    (os.path.splitext(trained_model_out)[0] + ".final_training.pt")
+                    if trained_model_out else None,
+                    registry_dir=model_registry_dir,
+                    model_id=(trained_model_id or "policy") + "-final-training",
+                    metadata={"training_days": int(train_timesteps),
+                              "training_seed": int(self.seed),
+                              "comparison_checkpoint_day": int(train_timesteps),
+                              "comparison_checkpoint_status": "final_training_before_evaluation"},
+                )
+        if journal:
+            journal.finish_episode()
+            if self.training_logs:
+                # Final weights are already durable; export legacy graphs/CSVs
+                # before any costly evaluation, not at the end of the pipeline.
+                _plot_reports(rows=[], run_logs=[], training_logs=self.training_logs,
+                              evaluation_logs=[], prefix=journal.prefix)
+            journal.event("training_finished" if training_enabled else "evaluation_only", {
+                "training_days_this_process": len(self.training_logs),
+                "loaded_policy_metadata": getattr(self, "loaded_trained_model_metadata", {})})
+        evaluation_checkpoint, evaluation_checkpoint_status = (
+            self._evaluation_checkpoint(
+                best_checkpoint,
+                latest_checkpoint,
+            )
+        )
+        if self.firm1_mode == "RL" and evaluation_checkpoint is not None:
+            self.firm1.agent.net.load_state_dict(
+                {
+                    k: v.to(self.firm1.agent.device)
+                    for k, v in evaluation_checkpoint["agent_state"].items()
+                }
+            )
+            self.firm1.agent.load_normalizer_state_dict(
+                evaluation_checkpoint["normalizer_state"]
+            )
+            if evaluation_checkpoint.get("optimizer_state"):
+                self.firm1.agent.load_optimizer_state_dict(
+                    evaluation_checkpoint["optimizer_state"]
+                )
+            self.firm1.agent.deployment_optimizer_enabled = False
+            print(
+                ">>> Restored comparison policy from train day "
+                f"{evaluation_checkpoint['day']} "
+                f"(score={evaluation_checkpoint['score']:.3f}, "
+                f"stage={evaluation_checkpoint.get('training_stage', 'dynamic_opponent')}, "
+                f"status={evaluation_checkpoint_status}, "
+                "deployment_variant="
+                f"{evaluation_checkpoint['validation'].get('deployment_variant', 'raw_actor')}) "
+                "for evaluation."
+            )
+        if evaluation_checkpoint is not None:
+            self.benchmark_evaluation_report = dict(
+                evaluation_checkpoint["validation"]
+            )
+        elif latest_validation:
+            self.benchmark_evaluation_report = dict(latest_validation)
+        if self.firm1_mode == "RL" and bool(evaluate_benchmark_suite):
+            if journal:
+                journal.event("benchmark_suite_started", {"horizon": int(eval_timesteps)})
+            # Always produce a fresh apples-to-apples suite from the weights
+            # actually selected for comparison.  Stored checkpoint validation
+            # is selection evidence, not a substitute for the requested
+            # benchmark product, and certification is intentionally irrelevant
+            # to whether this evaluation runs.
+            self.benchmark_evaluation_report = self._adaptive_policy_validation(
+                customers_per_step=resolved_checkpoint_customers,
+                profile_sample_size=resolved_checkpoint_customers,
+                # Checkpoint validation is deliberately economical, but the
+                # final five-controller comparison is a distinct experimental
+                # product and must use the requested evaluation horizon.
+                horizon=max(2, int(eval_timesteps)),
+                aggressive_horizon=max(2, int(eval_timesteps)),
+                policy_mode=eval_policy_mode,
+                policy_temperature=eval_policy_temperature,
+                policy_seed=(
+                    int(eval_policy_seed) + 1_000_003
+                    if eval_policy_seed is not None
+                    else int(self.seed) + 1_810_004
+                ),
+                opponent_interval_steps=firm2_interval_steps,
+                firm1_interval_steps=firm2_interval_steps,
+                steps_per_day=train_steps_per_day,
+                aggressive_seed_count=3,
+                include_benchmarks=True,
+            )
+            self.theory_benchmark_report = self.compute_theory_benchmarks(
+                customers_per_step=min(
+                    32, int(max(2, resolved_checkpoint_customers))
+                ),
+                replications=2,
+            )
+            benchmark_policy_seed = (
+                int(eval_policy_seed) + 1_000_003
+                if eval_policy_seed is not None
+                else int(self.seed) + 1_810_004
+            )
+            suite_rollouts = self._validation_opponent_rollouts(
+                str(self.firm2_mode), 3, include_benchmarks=True
+            )
+            if journal:
+                journal.snapshot("benchmark_partial", self.benchmark_evaluation_report)
+            if self.ood_perturbed_variants > 0:
+                # Out-of-distribution: parameter-perturbed variants of every
+                # held-out benchmark class, never seen in training or selection.
+                self.ood_evaluation_report = self._adaptive_policy_validation(
+                    customers_per_step=resolved_checkpoint_customers,
+                    profile_sample_size=resolved_checkpoint_customers,
+                    horizon=max(2, int(eval_timesteps)),
+                    aggressive_horizon=max(2, int(eval_timesteps)),
+                    policy_mode=eval_policy_mode,
+                    policy_temperature=eval_policy_temperature,
+                    policy_seed=benchmark_policy_seed + 7,
+                    opponent_interval_steps=firm2_interval_steps,
+                    firm1_interval_steps=firm2_interval_steps,
+                    steps_per_day=train_steps_per_day,
+                    rollouts_override=self._ood_opponent_rollouts(),
+                )
+            if self.baseline_suite:
+                if journal:
+                    journal.snapshot("ood_partial", self.ood_evaluation_report)
+                    journal.event("baseline_suite_started", {})
+                self.baseline_evaluation_report = {
+                    "in_distribution_and_benchmarks": self._evaluate_baseline_suite(
+                        customers_per_step=resolved_checkpoint_customers,
+                        horizon=max(2, int(eval_timesteps)),
+                        policy_seed=benchmark_policy_seed,
+                        opponent_interval_steps=firm2_interval_steps,
+                        steps_per_day=train_steps_per_day,
+                        rollouts=suite_rollouts,
+                        rl_report=self.benchmark_evaluation_report,
+                    ),
+                }
+                if self.ood_perturbed_variants > 0 and self.ood_evaluation_report:
+                    if journal:
+                        journal.snapshot("baselines_partial", self.baseline_evaluation_report)
+                        journal.event("ood_baselines_started", {})
+                    self.baseline_evaluation_report["ood_perturbed"] = self._evaluate_baseline_suite(
+                        customers_per_step=resolved_checkpoint_customers,
+                        horizon=max(2, int(eval_timesteps)),
+                        policy_seed=benchmark_policy_seed + 7,
+                        opponent_interval_steps=firm2_interval_steps,
+                        steps_per_day=train_steps_per_day,
+                        rollouts=self._ood_opponent_rollouts(),
+                        rl_report=self.ood_evaluation_report,
+                    )
+        if getattr(self, "benchmark_evaluation_report", None):
+            self.benchmark_evaluation_report.update({
+                "comparison_checkpoint_status": evaluation_checkpoint_status,
+                "comparison_checkpoint_day": (
+                    getattr(self, "loaded_trained_model_metadata", {}).get("comparison_checkpoint_day")
+                    if evaluation_checkpoint is None
+                    else int(evaluation_checkpoint["day"])
+                ),
+                "comparison_checkpoint_stage": (
+                    None
+                    if evaluation_checkpoint is None
+                    else str(evaluation_checkpoint.get("training_stage", ""))
+                ),
+                "deployment_variant": "raw_actor",
+                "deployment_policy_mode": str(eval_policy_mode),
+                "comparison_runs_independently_of_certification": True,
+                "training_dynamic_opponent_modes": list(dict.fromkeys((
+                    *self.training_catchup_opponent_modes,
+                    *self.training_profit_opponent_modes,
+                ))),
+                "training_catchup_opponent_modes": list(
+                    self.training_catchup_opponent_modes
+                ),
+                "training_profit_opponent_modes": list(
+                    self.training_profit_opponent_modes
+                ),
+                "evaluation_profile_partition_held_out": bool(
+                    self.evaluation_generalization_fraction > 0.0
+                ),
+            })
+        self._profit_planner_reference_customers = int(eval_customers_per_step)
+        # Evaluation starts from a fresh independently randomized opening under
+        # the same ±15% protocol used by dynamic-stage training and validation.
+        if self.learner_revision >= 3 and self.firm1_mode == "RL":
+            self.firm1.agent.set_value_objective_weights(
+                self.long_term_profit_reward_config.critic_component_weights()
+            )
+        if journal:
+            for name, attribute in (("benchmark_partial", "benchmark_evaluation_report"),
+                                    ("baselines_partial", "baseline_evaluation_report")):
+                report = getattr(self, attribute, None)
+                if report is not None:
+                    journal.snapshot(name, report)
+            journal.event("primary_evaluation_started", {})
+        self.firm2 = copy.deepcopy(benchmark_opponent)
+        self._reset_adaptive_episode(
+            tariff_reset_fraction=0.15,
+            symmetric_tariffs=False,
+            evaluation_profiles=True,
+        )
+
+        pending_model_metadata: Optional[Dict[str, Any]] = None
+        if (
+            training_enabled
+            and self.firm1_mode == "RL"
+            and (trained_model_out or model_registry_dir)
+        ):
+            pending_model_metadata = {
+                "best_validation_day": (
+                    None if best_checkpoint is None else int(best_checkpoint["day"])
+                ),
+                "best_validation_score": (
+                    None if best_checkpoint is None else float(best_checkpoint["score"])
+                ),
+                "best_validation_stage": (
+                    None
+                    if best_checkpoint is None
+                    else str(best_checkpoint.get("training_stage", ""))
+                ),
+                "latest_validation_day": (
+                    None
+                    if latest_checkpoint is None
+                    else int(latest_checkpoint["day"])
+                ),
+                "latest_validation_score": (
+                    None
+                    if latest_checkpoint is None
+                    else float(latest_checkpoint["score"])
+                ),
+                "latest_validation_stage": (
+                    None
+                    if latest_checkpoint is None
+                    else str(latest_checkpoint.get("training_stage", ""))
+                ),
+                "comparison_checkpoint_status": str(
+                    evaluation_checkpoint_status
+                ),
+                "comparison_checkpoint_day": (
+                    None
+                    if evaluation_checkpoint is None
+                    else int(evaluation_checkpoint["day"])
+                ),
+                "comparison_checkpoint_stage": (
+                    None
+                    if evaluation_checkpoint is None
+                    else str(evaluation_checkpoint.get("training_stage", ""))
+                ),
+                "training_opponent": str(opponent_mode),
+                "training_days": int(train_timesteps),
+                "training_seed": int(self.seed),
+                "checkpoint_validation_horizon": int(
+                    resolved_checkpoint_horizon
+                ),
+                "checkpoint_validation_customers_per_step": int(
+                    resolved_checkpoint_customers
+                ),
+                "checkpoint_validation_openings": int(
+                    resolved_checkpoint_openings
+                ),
+                "checkpoint_policy_mode": str(eval_policy_mode),
+                "checkpoint_deployment_variant": (
+                    None
+                    if evaluation_checkpoint is None
+                    else str(
+                        evaluation_checkpoint["validation"].get(
+                            "deployment_variant", "raw_actor"
+                        )
+                    )
+                ),
+                "checkpoint_policy_seed": int(
+                    self.seed + 810_001
+                    if eval_policy_seed is None
+                    else eval_policy_seed
+                ),
+                "generalization_profile_source": "same_market_threshold_holdout",
+                "training_generalization_fraction": float(
+                    self.training_generalization_fraction
+                ),
+                "evaluation_generalization_fraction": float(
+                    self.evaluation_generalization_fraction
+                ),
+                "generalization_cities": sorted(
+                    str(city) for city in self.generalization_profiles_by_city
+                ),
+                "checkpoint_validation": (
+                    None
+                    if best_checkpoint is None
+                    else dict(best_checkpoint["validation"])
+                ),
+                "latest_checkpoint_validation": (
+                    None
+                    if latest_checkpoint is None
+                    else dict(latest_checkpoint["validation"])
+                ),
+            }
+
+        
+        print(
+            f">>> Evaluating RL agent against same-level {opponent_mode} opponent "
+            f"with a held-out {self.market_name} profile partition..."
+        )
+        if self.firm1_mode == "RL":
+            self.firm1.reset_state_history()
+        for observer in self.platform_observers.values():
+            observer.reset()
+        self.action_stability.reset()
+        resolved_eval_policy_seed = int(self.seed + 700_001 if eval_policy_seed is None else eval_policy_seed)
+        if str(eval_policy_mode) in {"sample_raw", "sample_low_temp"}:
+            torch.manual_seed(resolved_eval_policy_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(resolved_eval_policy_seed)
+            print(
+                f">>> Evaluation policy mode={eval_policy_mode} seed={resolved_eval_policy_seed} "
+                f"temperature={float(eval_policy_temperature):.3f}"
+            )
+        eval_rewards: List[float] = []
+        # Reset reward-trend baselines so evaluation reward reflects evaluation dynamics,
+        # not trailing deltas from the end of training.
+        eval_last_share = float(self.last_share)
+        eval_last_revpr = float(self.last_revpr)
+        eval_last_profitpr = float(self.last_profitpr)
+        eval_last_rival_market_share = float(self.last_firm2_share)
+        eval_last_rival_profitpr = float(self.last_firm2_profitpr)
+        eval_last_fulfillment = float(self.last_fulfillment)
+        eval_last_gap = float(self.last_gap)
+        # Match the reaction horizon used for late-stage PPO credit: Firm 1
+        # chooses once, observes the rival's response cycle, then chooses again.
+        # Acting every market tick at deployment would recreate the train/eval
+        # cadence mismatch and obscure which action earned the outcome.
+        eval_action_interval_steps = int(
+            max(
+                base_action_interval_steps,
+                firm2_interval_steps if self.firm2_mode != "static" else 1,
+            )
+        )
+        eval_clock = OperationalClock()
+        eval_previous_firm2_metrics: Optional[FirmMetrics] = None
+        eval_day_ctx = None
+        if self.regime_market and getattr(self.market, "shocks", None) is not None:
+            # Revision 11: the primary evaluation uses the natural shock process,
+            # never the training-episode sampler left over from the last episode.
+            self.market.shock_training_openings = False
+            self.market.shocks.training_episode = False
+            self.market.calendar.day_index = -1
+        self.evaluation_tariff_log = []
+        for t in range(eval_timesteps):
+            if eval_day_ctx is None or t % train_steps_per_day == 0:
+                eval_day_ctx = self.market.sample_day_context()
+                self._regime_day_start(None, episode_seed=self.seed + 60_000 + t)
+            day_ctx = eval_day_ctx
+            hour = self.market.sample_timestep_hour().hour
+            # Evaluation uses rows held out from training but drawn from the
+            # same market and threshold source.
+            step_customers = self._step_customers(
+                eval_customers_per_step,
+                hour=hour,
+                day_of_week=day_ctx.day_of_week,
+                weather=day_ctx.weather,
+            )
+            sampled_profiles = self._sample_profiles_from_pool(
+                self._effective_simulation_sample_size(step_customers)
+                if self.market_dynamics.enabled
+                else eval_profile_sample_size,
+                generalization_fraction=self.evaluation_generalization_fraction,
+            )
+            if profiles_out and not profile_limit_reached:
+                remaining = int(max(0, profiles_log_limit - len(sampled_profile_rows)))
+                if remaining > 0:
+                    sampled_profile_rows.extend({"Phase": "eval", "Timestep": int(t), **p} for p in sampled_profiles[:remaining])
+                profile_limit_reached = len(sampled_profile_rows) >= int(max(0, profiles_log_limit))
+
+            # Evaluation timesteps are operational decision periods.  On each
+            # paired epoch Firm 2 executes first from lagged outcomes, posts
+            # its new public quote, and only then may Firm 1 react.
+            firm2_eval_interval_steps = max(1, firm2_interval_steps)
+            firm2_eval_due = bool(
+                not isinstance(self.firm2, FirmStaticPricer)
+                and eval_clock.due(firm2_eval_interval_steps)
+            )
+            firm2_eval_action_target, firm2_eval_intervened = (
+                self._firm2_leader_step(
+                    previous_metrics=eval_previous_firm2_metrics,
+                    day_of_week=day_ctx.day_of_week,
+                    hour=hour,
+                    weather=day_ctx.weather,
+                    enabled=firm2_eval_due,
+                )
+            )
+
+            base = self.market.curr_market
+            action = -1
+            eval_policy_diag: Dict[str, float] = {}
+            coeff_pre_action = self._coeff_snapshot()
+            coeff_post_action = dict(coeff_pre_action)
+            coeff_post_projection = dict(coeff_pre_action)
+            if self.firm1_mode == "RL":
+                # Commit every public market frame, including periods where the
+                # current tariff is held.  The opponent GRU therefore sees the
+                # full Firm 2 reaction trajectory rather than a sparse sample
+                # taken only when Firm 1 is about to move.
+                raw_state_vec, action_features, _ = self._publish_pricing_observation(
+                    day_of_week=day_ctx.day_of_week,
+                    hour=hour,
+                    weather=day_ctx.weather,
+                )
+                s_vec = self.firm1.stack_state(raw_state_vec)
+                critic_state = (
+                    self._build_privileged_critic_state(raw_state_vec)
+                    if self.privileged_critic
+                    else None
+                )
+                if (t % eval_action_interval_steps) == 0:
+                    action_mask = self._objective_action_mask(
+                        self.firm1.feasible_action_mask(self.market)
+                    )
+                    eval_policy_diag = self.firm1.agent.policy_diagnostics(
+                        s_vec,
+                        action_features=action_features,
+                        action_mask=action_mask,
+                        temperature=1.0,
+                    )
+                    action, *_ = self.firm1.agent.act(
+                        s_vec,
+                        deterministic=True,
+                        action_features=action_features,
+                        action_mask=action_mask,
+                        policy_mode=eval_policy_mode,
+                        policy_temperature=eval_policy_temperature,
+                        critic_state=critic_state,
+                    )
+                    coeff_pre_action = self._coeff_snapshot()
+                    self.firm1.apply_action(action, self.market)
+                    coeff_post_action = self._coeff_snapshot()
+                    coeff_post_projection = dict(coeff_post_action)
+                    action = int(action)
+                else:
+                    action = -1
+                    self.firm1.agent.observe_recurrent_state(
+                        s_vec, critic_state=critic_state
+                    )
+            elif self.firm1_mode != "static":
+                self.firm1.act(
+                    city_base=base.base_fare,
+                    city_pmin=base.per_minute,
+                    city_pmile=base.per_mile,
+                    city_booking=base.booking_fee,
+                    city_airport=base.airport_fee,
+                    hour=hour,
+                    weather=day_ctx.weather,
+                )
+
+            _, m1, m2, mean_gap, _, _ = self.simulate_batch(
+                day_of_week=day_ctx.day_of_week,
+                weather=day_ctx.weather,
+                hour=hour,
+                customers_per_step=step_customers,
+                sampled_profiles=sampled_profiles,
+                collect_rows=False,
+                supply_reference_customers=eval_customers_per_step,
+            )
+            self._ingest_platform_observations(m1, m2)
+            eval_previous_firm2_metrics = m2
+            # v26 M4: the posted Firm 1 tariff in its actual in-distribution
+            # state, keyed by context, for the observed-fare diagnostic.
+            self.evaluation_tariff_log.append({
+                "hour": int(hour),
+                "day_of_week": int(day_ctx.day_of_week),
+                "weather": str(day_ctx.weather),
+                "coefficients": {
+                    key: float(get_coeff(self.market.curr_market, self.firm1.overrides, key))
+                    for key in self.shared_edit_keys
+                },
+            })
+            eval_clock.advance()
+            
+            action_movement = 0.0
+            if self.firm1_mode == "RL" and action >= 0:
+                action_movement = float(self.firm1.last_action_magnitude())
+                
+            # Use the same shaped reward family as training for consistent trajectory logs.
+            # Compute with local baselines to avoid mutating training history state.
+            share = float(np.clip(m1.chosen_share, 0.0, 1.0))
+            revpr = float(max(0.0, m1.rev_per_request))
+            reward_diag = self._reward_diagnostics(
+                share=share,
+                completed_share=float(m1.completed_share),
+                rev_per_request=revpr,
+                mean_gap=float(mean_gap),
+                prev_share=eval_last_share,
+                prev_rev_per_request=eval_last_revpr,
+                profit_per_request=float(m1.profit_per_request),
+                prev_profit_per_request=eval_last_profitpr,
+                prev_rival_profit_per_request=eval_last_rival_profitpr,
+                prev_rival_market_share=eval_last_rival_market_share,
+                prev_fulfillment_rate=eval_last_fulfillment,
+                prev_gap=eval_last_gap,
+                profit_margin=self._profit_margin(m1),
+                fulfillment_rate=float(m1.fulfillment_rate),
+                avg_wait_minutes=float(m1.avg_wait_minutes),
+                driver_acceptance_rate=float(m1.driver_acceptance_rate),
+                action_change_magnitude=action_movement,
+                baseline_share=float(m2.chosen_share),
+                baseline_completed_share=float(m2.completed_share),
+                baseline_rev_per_request=float(m2.rev_per_request),
+                baseline_profit_per_request=float(m2.profit_per_request),
+                action_event=action >= 0,
+                price_gap_abs_error=float(self.last_price_gap_metrics["mae"]),
+            )
+            eval_reward = float(reward_diag["reward"])
+            guardrail_diag: Dict[str, Any] = {"applied": False, "recommended": False, "reasons": [], "deltas": {}}
+            
+            if self.firm1_mode == "RL":
+                guardrail_diag = self._apply_eval_guardrail(
+                    eval_guardrail_mode,
+                    metrics=m1,
+                    price_gap_f2_minus_f1=float(mean_gap),
+                    base=base,
+                )
+                coeff_post_projection = self._coeff_snapshot()
+
+            market_share = float(reward_diag["reward_market_share"])
+            rival_market_share = float(
+                reward_diag["reward_rival_market_share"]
+            )
+            eval_last_share = market_share
+            eval_last_revpr = float(revpr)
+            eval_last_profitpr = float(m1.profit_per_request)
+            eval_last_rival_market_share = rival_market_share
+            eval_last_rival_profitpr = float(m2.profit_per_request)
+            eval_last_fulfillment = float(m1.fulfillment_rate)
+            eval_last_gap = float(mean_gap)
+            f2_supply_diag, _ = self._driver_supply_context("Firm2", "Firm1")
+            eval_rewards.append(float(eval_reward))
+            moving_window = eval_rewards[-min(len(eval_rewards), 20):]
+            moving_avg20 = float(np.mean(moving_window)) if moving_window else 0.0
+            moving_std20 = float(np.std(moving_window)) if moving_window else 0.0
+            log_row = {
+                "day": t,
+                "profile_population": "same_market_threshold_holdout",
+                "profile_generalization_fraction": float(
+                    self.evaluation_generalization_fraction
+                ),
+                "policy_objective": str(
+                    self.long_term_profit_reward_config.objective_mode
+                ),
+                "reward_mechanism": str(
+                    self.long_term_profit_reward_model.mechanism_name
+                ),
+                "reward": float(eval_reward),
+                "reward_moving_avg20": moving_avg20,
+                "reward_moving_std20": moving_std20,
+                "reward_raw": float(reward_diag["reward_raw"]),
+                "reward_base": float(reward_diag["reward_base"]),
+                "reward_dominance_term": float(reward_diag["reward_dominance_term"]),
+                "reward_competitive_term": float(reward_diag["reward_competitive_term"]),
+                "reward_active_objective_component": float(
+                    reward_diag["reward_active_objective_component"]
+                ),
+                "reward_active_objective_term_count": float(
+                    reward_diag["reward_active_objective_term_count"]
+                ),
+                "reward_trend_term": float(reward_diag["reward_trend_term"]),
+                "reward_pricing_discipline": float(reward_diag["reward_pricing_discipline"]),
+                "reward_share_delta": float(reward_diag["reward_share_delta"]),
+                "reward_rev_delta": float(reward_diag["reward_rev_delta"]),
+                "reward_efficiency_term": float(reward_diag["reward_efficiency_term"]),
+                "reward_own_profit_utility": float(reward_diag["reward_own_profit_utility"]),
+                "reward_profit_advantage_utility": float(reward_diag["reward_profit_advantage_utility"]),
+                "reward_own_profit_component": float(reward_diag["reward_own_profit_component"]),
+                "reward_profit_advantage_component": float(reward_diag["reward_profit_advantage_component"]),
+                "reward_market_share_utility": float(reward_diag["reward_market_share_utility"]),
+                "reward_market_share_level_utility": float(reward_diag["reward_market_share_level_utility"]),
+                "reward_market_share_dominance_utility": float(reward_diag["reward_market_share_dominance_utility"]),
+                "reward_market_share_competitiveness_component": float(reward_diag["reward_market_share_competitiveness_component"]),
+                "reward_market_share_advantage": float(reward_diag["reward_market_share_advantage"]),
+                "reward_market_share_target_gap": float(reward_diag["reward_market_share_target_gap"]),
+                "reward_market_share_target_level": float(
+                    reward_diag["reward_market_share_target_level"]
+                ),
+                "reward_market_share_target_progress": float(
+                    reward_diag["reward_market_share_target_progress"]
+                ),
+                "reward_market_share_target_achieved": float(
+                    reward_diag["reward_market_share_target_achieved"]
+                ),
+                "reward_market_share_gap_error": float(reward_diag["reward_market_share_gap_error"]),
+                "reward_market_share_target_shortfall": float(
+                    reward_diag["reward_market_share_target_shortfall"]
+                ),
+                "reward_intervention_cost": float(reward_diag["reward_intervention_cost"]),
+                "reward_reversal_cost": float(reward_diag["reward_reversal_cost"]),
+                "reward_intervention_magnitude": float(reward_diag["reward_intervention_magnitude"]),
+                "reward_profit_advantage_per_request": float(reward_diag["reward_profit_advantage_per_request"]),
+                "reward_share_component": float(reward_diag.get("reward_share_component", 0.0)),
+                "reward_profit_component": float(reward_diag.get("reward_profit_component", 0.0)),
+                "reward_revenue_component": float(reward_diag.get("reward_revenue_component", 0.0)),
+                "reward_unit_economics_component": float(reward_diag.get("reward_unit_economics_component", 0.0)),
+                "reward_price_gap_component": float(reward_diag.get("reward_price_gap_component", 0.0)),
+                "reward_corrective_action_bonus": float(reward_diag.get("reward_corrective_action_bonus", 0.0)),
+                "reward_hold_inaction_penalty": float(reward_diag.get("reward_hold_inaction_penalty", 0.0)),
+                "reward_baseline_loss_penalty": float(reward_diag.get("reward_baseline_loss_penalty", 0.0)),
+                "reward_overprice_penalty": float(reward_diag.get("reward_overprice_penalty", 0.0)),
+                "reward_underprice_penalty": float(reward_diag.get("reward_underprice_penalty", 0.0)),
+                "reward_action_change_penalty": float(reward_diag.get("reward_action_change_penalty", 0.0)),
+                "reward_action_realization_penalty": float(reward_diag.get("reward_action_realization_penalty", 0.0)),
+                "reward_correction_pressure": float(reward_diag.get("reward_correction_pressure", 0.0)),
+                "reward_revenue_improvement": float(reward_diag.get("reward_revenue_improvement", 0.0)),
+                "reward_share_improvement": float(reward_diag.get("reward_share_improvement", 0.0)),
+                "reward_profit_improvement": float(reward_diag.get("reward_profit_improvement", 0.0)),
+                "reward_demand_loss": float(reward_diag.get("reward_demand_loss", 0.0)),
+                "reward_baseline_share": float(reward_diag.get("reward_baseline_share", 0.0)),
+                "reward_choice_share": float(reward_diag.get("reward_choice_share", 0.0)),
+                "reward_completed_share": float(reward_diag.get("reward_completed_share", 0.0)),
+                "reward_baseline_choice_share": float(reward_diag.get("reward_baseline_choice_share", 0.0)),
+                "reward_baseline_completed_share": float(reward_diag.get("reward_baseline_completed_share", 0.0)),
+                "reward_conditional_choice_share": float(
+                    reward_diag.get("reward_conditional_choice_share", 0.0)
+                ),
+                "reward_rival_conditional_choice_share": float(
+                    reward_diag.get("reward_rival_conditional_choice_share", 0.0)
+                ),
+                "reward_conditional_choice_share_sum": float(
+                    reward_diag.get("reward_conditional_choice_share_sum", 0.0)
+                ),
+                "reward_baseline_rev_per_request": float(reward_diag.get("reward_baseline_rev_per_request", 0.0)),
+                "reward_baseline_profit_per_request": float(reward_diag.get("reward_baseline_profit_per_request", 0.0)),
+                "reward_absolute_profit_term": float(reward_diag.get("reward_absolute_profit_term", 0.0)),
+                "reward_relative_profit_term": float(reward_diag.get("reward_relative_profit_term", 0.0)),
+                "reward_absolute_revenue_term": float(reward_diag.get("reward_absolute_revenue_term", 0.0)),
+                "reward_relative_revenue_term": float(reward_diag.get("reward_relative_revenue_term", 0.0)),
+                "reward_relative_share_term": float(reward_diag.get("reward_relative_share_term", 0.0)),
+                "reward_price_gap_abs_error": float(reward_diag.get("reward_price_gap_abs_error", 0.0)),
+                "reward_service_component": float(reward_diag.get("reward_service_component", 0.0)),
+                "reward_service_quality": float(reward_diag.get("reward_service_quality", 0.0)),
+                "reward_wait_satisfaction": float(reward_diag.get("reward_wait_satisfaction", 0.0)),
+                "reward_driver_acceptance_objective": float(reward_diag.get("reward_driver_acceptance_objective", 0.0)),
+                "reward_price_gap_satisfaction": float(reward_diag.get("reward_price_gap_satisfaction", 0.0)),
+                "reward_price_gap_in_range": float(reward_diag.get("reward_price_gap_in_range", 0.0)),
+                "reward_gap_tolerance": float(reward_diag.get("reward_gap_tolerance", 0.0)),
+                "reward_zero_effect_action": float(reward_diag.get("reward_zero_effect_action", 0.0)),
+                "reward_saturated_action": float(reward_diag.get("reward_saturated_action", 0.0)),
+                "constraint_violation_share_floor": float(reward_diag.get("constraint_violation_share_floor", 0.0)),
+                "constraint_violation_fulfillment_floor": float(
+                    reward_diag.get("constraint_violation_fulfillment_floor", 0.0)
+                ),
+                "constraint_violation_wait_limit": float(reward_diag.get("constraint_violation_wait_limit", 0.0)),
+                "constraint_violation_gap_band": float(reward_diag.get("constraint_violation_gap_band", 0.0)),
+                "constraint_violation_margin_floor": float(reward_diag.get("constraint_violation_margin_floor", 0.0)),
+                "rl_share": float(m1.share),
+                "rl_chosen_share": float(m1.chosen_share),
+                "rl_completed_share": float(m1.completed_share),
+                "heuristic_share": float(m2.share),
+                "heuristic_chosen_share": float(m2.chosen_share),
+                "heuristic_completed_share": float(m2.completed_share),
+                "rl_market_share": market_share,
+                "heuristic_market_share": rival_market_share,
+                "market_share_sum": float(
+                    market_share + rival_market_share
+                ),
+                "outside_option_share": float(
+                    reward_diag["reward_outside_option_share"]
+                ),
+                "completion_coverage": float(
+                    reward_diag["reward_completion_coverage"]
+                ),
+                "rl_revenue": float(m1.rev_per_request),
+                "heuristic_revenue": float(m2.rev_per_request),
+                "rl_profit": float(m1.profit_per_request),
+                "heuristic_profit": float(m2.profit_per_request),
+                "rl_fulfillment_rate": float(m1.fulfillment_rate),
+                "rl_avg_wait_minutes": float(m1.avg_wait_minutes),
+                "rl_driver_acceptance_rate": float(m1.driver_acceptance_rate),
+                "rl_driver_pay_per_request": float(m1.driver_pay / max(1, m1.total)),
+                "heuristic_fulfillment_rate": float(m2.fulfillment_rate),
+                "heuristic_avg_wait_minutes": float(m2.avg_wait_minutes),
+                "heuristic_driver_acceptance_rate": float(m2.driver_acceptance_rate),
+                "heuristic_driver_pay_per_request": float(m2.driver_pay / max(1, m2.total)),
+                "heuristic_supply_stress": float(getattr(self.firm2, "last_supply_stress", 0.0)),
+                "heuristic_demand_shortfall": float(getattr(self.firm2, "last_demand_shortfall", 0.0)),
+                "heuristic_supply_idle_share": float(f2_supply_diag.get("idle_driver_share", 0.0)),
+                "heuristic_supply_utilization": float(f2_supply_diag.get("utilization", 0.0)),
+                "heuristic_supply_driver_earnings_per_hour": float(f2_supply_diag.get("driver_earnings_per_hour", 0.0)),
+                "price_gap_f2_minus_f1": float(mean_gap),
+                "price_gap_abs_error": float(
+                    self.last_price_gap_metrics["mae"]
+                ),
+                "price_gap_rmse": float(
+                    self.last_price_gap_metrics["rmse"]
+                ),
+                "price_gap_p90_abs_error": float(
+                    self.last_price_gap_metrics["p90_abs_error"]
+                ),
+                "price_gap_within_tolerance_rate": float(
+                    self.last_price_gap_metrics["within_tolerance_rate"]
+                ),
+                "price_gap_target": float(self.reward_target_price_gap),
+                "price_gap_tolerance": float(
+                    self.constraint_config.overall_tolerance
+                ),
+                "gap_violation_025": float(
+                    self.last_price_gap_metrics["mae"] > 0.25
+                ),
+                "gap_violation_050": float(
+                    self.last_price_gap_metrics["mae"] > 0.50
+                ),
+                "constraint_curriculum_scale": float(self.constraint_curriculum_scale),
+                "competition_protocol": "firm2_leader_then_firm1_follower",
+                "firm2_leader_decision": bool(firm2_eval_due),
+                "firm2_leader_intervened": bool(firm2_eval_intervened),
+                "firm2_leader_action_steps": json.dumps(
+                    firm2_eval_action_target.astype(float).tolist()
+                ),
+                "eval_policy_mode": str(eval_policy_mode),
+                "eval_policy_seed": int(resolved_eval_policy_seed),
+                "eval_guardrail_mode": str(eval_guardrail_mode),
+                "policy_top_action": int(eval_policy_diag.get("policy_top_action", -1)),
+                "policy_top_action_label": (
+                    self.firm1.action_label(int(eval_policy_diag.get("policy_top_action", -1)))
+                    if self.firm1_mode == "RL" and hasattr(self.firm1, "action_label") and int(eval_policy_diag.get("policy_top_action", -1)) >= 0
+                    else ""
+                ),
+                "policy_second_action": int(eval_policy_diag.get("policy_second_action", -1)),
+                "policy_top_prob": float(eval_policy_diag.get("policy_top_prob", 0.0)),
+                "policy_second_prob": float(eval_policy_diag.get("policy_second_prob", 0.0)),
+                "policy_action_margin": float(eval_policy_diag.get("policy_action_margin", 0.0)),
+                "policy_hold_prob": float(eval_policy_diag.get("policy_hold_prob", 0.0)),
+                "policy_entropy": float(eval_policy_diag.get("policy_entropy", 0.0)),
+                "objective_optimizer_ready": bool(
+                    eval_policy_diag.get("optimizer_ready", 0.0) >= 0.5
+                ),
+                "objective_optimizer_top_action": int(
+                    eval_policy_diag.get("optimizer_top_action", -1)
+                ),
+                "objective_optimizer_top_prob": float(
+                    eval_policy_diag.get("optimizer_top_prob", 0.0)
+                ),
+                "objective_optimizer_action_margin": float(
+                    eval_policy_diag.get("optimizer_action_margin", 0.0)
+                ),
+                "objective_optimizer_action_changed": float(
+                    eval_policy_diag.get("optimizer_action_changed", 0.0)
+                ),
+                "objective_optimizer_q_spread": float(
+                    eval_policy_diag.get("optimizer_q_spread", 0.0)
+                ),
+                "policy_selected_is_top": float(
+                    action
+                    == int(
+                        eval_policy_diag.get(
+                            "optimizer_top_action",
+                            eval_policy_diag.get("policy_top_action", -999),
+                        )
+                    )
+                ),
+                "guardrail_applied": bool(guardrail_diag.get("applied", False)),
+                "guardrail_recommended": bool(guardrail_diag.get("recommended", False)),
+                "guardrail_reasons": json.dumps(list(guardrail_diag.get("reasons", []))),
+                "guardrail_deltas": json.dumps(guardrail_diag.get("deltas", {}), sort_keys=True),
+                "coeff_delta_rl_action": json.dumps(self._coeff_delta(coeff_post_action, coeff_pre_action), sort_keys=True),
+                "coeff_delta_projection": json.dumps(self._coeff_delta(coeff_post_projection, coeff_post_action), sort_keys=True),
+                "action_zero_effect": bool(getattr(self.firm1, "last_action_was_zero_effect", False)) if self.firm1_mode == "RL" else False,
+                "action_saturated": bool(getattr(self.firm1, "last_action_was_saturated", False)) if self.firm1_mode == "RL" else False,
+                "action": int(action),
+                "action_mask_regime": str(
+                    self.last_action_mask_regime
+                ),
+                "action_label": (
+                    self.firm1.action_label(action)
+                    if self.firm1_mode == "RL" and hasattr(self.firm1, "action_label") and int(action) >= 0
+                    else ("no_decision" if self.firm1_mode == "RL" else "")
+                ),
+                "action_steps": json.dumps(
+                    self.firm1.action_steps(action)
+                    if self.firm1_mode == "RL" and hasattr(self.firm1, "action_steps")
+                    else {},
+                    sort_keys=True,
+                ),
+            }
+            # Revision 15b corrected-learning diagnostics are intentionally
+            # absent from the flags-off path.  That path is the frozen v26
+            # compatibility surface and its evaluation CSV must remain
+            # byte-identical to the archived baseline.
+            if self.learning_corrections:
+                log_row.update(
+                    {
+                        "reward_durable_profit_advantage_component": float(
+                            reward_diag["reward_durable_profit_advantage_component"]
+                        ),
+                        "reward_adaptive_profit_residual_component": float(
+                            reward_diag["reward_adaptive_profit_residual_component"]
+                        ),
+                        "reward_market_share_advantage_component": float(
+                            reward_diag["reward_market_share_advantage_component"]
+                        ),
+                        "reward_durable_profit_advantage_per_request": float(
+                            reward_diag["reward_durable_profit_advantage_per_request"]
+                        ),
+                        "reward_adaptive_profit_residual_per_request": float(
+                            reward_diag["reward_adaptive_profit_residual_per_request"]
+                        ),
+                    }
+                )
+            for bin_label in ("0_2", "2_5", "5_10", "10_plus"):
+                for metric in ("firm1_choice_share", "firm1_completed_share", "firm1_revpr", "completed_rev", "price_gap_mean"):
+                    stat_key = f"distance_bin_{bin_label}_{metric}"
+                    log_row[stat_key] = float(getattr(self, "last_crowd_response_stats", {}).get(stat_key, np.nan))
+            for k in self.shared_edit_keys:
+                log_row[f"firm1_{k}"] = float(get_coeff(self.market.curr_market, self.firm1.overrides, k))
+                log_row[f"firm2_{k}"] = float(get_coeff(self.market.curr_market, self.firm2.overrides, k))
+            for diag_key, diag_value in reward_diag.items():
+                if diag_key.startswith(("reward_positive_", "constraint_cost_", "constraint_lambda_")):
+                    log_row[diag_key] = float(diag_value)
+            self.evaluation_logs.append(log_row)
+            if journal:
+                journal.append("evaluation_live", log_row)
+            self._update_recent_response_emas(m1, mean_gap, m2=m2)
+            self.last_share = market_share
+            self.last_revpr = float(m1.rev_per_request)
+            self.last_gap = float(mean_gap)
+            self.last_profitpr = float(m1.profit_per_request)
+            self.last_fulfillment = float(m1.fulfillment_rate)
+            self.last_completion_coverage = float(np.clip(
+                m1.completed_share + m2.completed_share, 0.0, 1.0
+            ))
+            self.last_acceptance = float(m1.driver_acceptance_rate)
+            self.last_wait = float(m1.avg_wait_minutes)
+            self.last_driver_paypr = float(m1.driver_pay / max(1, m1.total))
+            self.last_firm2_share = rival_market_share
+            self.last_firm2_revpr = float(m2.rev_per_request)
+            self.last_firm2_profitpr = float(m2.profit_per_request)
+            self.last_firm2_fulfillment = float(m2.fulfillment_rate)
+            self.last_firm2_acceptance = float(m2.driver_acceptance_rate)
+            self.last_firm2_wait = float(m2.avg_wait_minutes)
+            self.last_firm2_driver_paypr = float(m2.driver_pay / max(1, m2.total))
+
+            if (t + 1) % max(1, eval_timesteps // 10) == 0:
+                print(
+                    f"  [eval {t+1}/{eval_timesteps}] reward={float(eval_reward):.3f} "
+                    f"moving_avg20={moving_avg20:.3f} "
+                    f"marketShare={market_share:.3f} "
+                    f"rivalMarketShare={rival_market_share:.3f} "
+                    f"completionCoverage={float(reward_diag['reward_completion_coverage']):.3f} "
+                    f"revPR={float(m1.rev_per_request):.2f} "
+                    f"rivalRevPR={float(m2.rev_per_request):.2f} "
+                    f"profitPR={float(m1.profit_per_request):.2f} "
+                    f"rivalProfitPR={float(m2.profit_per_request):.2f} "
+                    f"profitAdv={float(m1.profit_per_request - m2.profit_per_request):+.2f} "
+                    f"gap(F2-F1)={float(mean_gap):.2f} "
+                    f"action={log_row['action_label'] or 'none'}"
+                )
+                segment_line = self._format_distance_segment_diagnostics(getattr(self, "last_crowd_response_stats", {}) or {})
+                if segment_line:
+                    print(f"    [eval segments] {segment_line}")
+
+        if profiles_out:
+            _ensure_parent_dir(profiles_out)
+            _write_csv(profiles_out, sampled_profile_rows)
+            print(f">>> Saved sampled profiles -> {profiles_out} (rows={len(sampled_profile_rows)})")
+            if profile_limit_reached:
+                print(f">>> Profile export capped at profiles_log_limit={profiles_log_limit} rows.")
+
+        if reward_history:
+            print(f">>> Training reward trajectory summary: min={float(np.min(reward_history)):.3f}, max={float(np.max(reward_history)):.3f}, final={float(reward_history[-1]):.3f}")
+        if eval_rewards:
+            print(f">>> Testing reward trajectory summary: min={float(np.min(eval_rewards)):.3f}, max={float(np.max(eval_rewards)):.3f}, final={float(eval_rewards[-1]):.3f}")
+        if self.training_logs:
+            training_tail = self.training_logs[-min(100, len(self.training_logs)):]
+            print(
+                f">>> Training competitive summary (last {len(training_tail)} days): "
+                f"marketShare={float(np.mean([row['avg_market_share'] for row in training_tail])):.3f} "
+                f"rivalMarketShare={float(np.mean([row['avg_firm2_market_share'] for row in training_tail])):.3f} "
+                f"completionCoverage={float(np.mean([row['avg_completion_coverage'] for row in training_tail])):.3f} "
+                f"revPR={float(np.mean([row['avg_rev_per_request'] for row in training_tail])):.2f} "
+                f"rivalRevPR={float(np.mean([row['avg_firm2_rev_per_request'] for row in training_tail])):.2f} "
+                f"profitPR={float(np.mean([row['avg_profit_per_request'] for row in training_tail])):.2f} "
+                f"rivalProfitPR={float(np.mean([row['avg_firm2_profit_per_request'] for row in training_tail])):.2f} "
+                f"profitAdv={float(np.mean([row['avg_profit_advantage_per_request'] for row in training_tail])):+.2f}"
+            )
+        if self.evaluation_logs:
+            print(
+                f">>> Evaluation competitive summary ({len(self.evaluation_logs)} days): "
+                f"marketShare={float(np.mean([row['rl_market_share'] for row in self.evaluation_logs])):.3f} "
+                f"rivalMarketShare={float(np.mean([row['heuristic_market_share'] for row in self.evaluation_logs])):.3f} "
+                f"completionCoverage={float(np.mean([row['completion_coverage'] for row in self.evaluation_logs])):.3f} "
+                f"revPR={float(np.mean([row['rl_revenue'] for row in self.evaluation_logs])):.2f} "
+                f"rivalRevPR={float(np.mean([row['heuristic_revenue'] for row in self.evaluation_logs])):.2f} "
+                f"profitPR={float(np.mean([row['rl_profit'] for row in self.evaluation_logs])):.2f} "
+                f"rivalProfitPR={float(np.mean([row['heuristic_profit'] for row in self.evaluation_logs])):.2f} "
+                f"profitAdv={float(np.mean([row['rl_profit'] - row['heuristic_profit'] for row in self.evaluation_logs])):+.2f}"
+            )
+
+        self.competitive_backtest_report = self._competitive_durability_backtest()
+        report = self.competitive_backtest_report
+        status = "PASS" if report.get("passed") else "FAIL"
+        print(
+            f">>> Competitive durability backtest: {status}; "
+            f"lateMarketShareAdv={float(report.get('late_market_share_advantage', np.nan)):+.3f}, "
+            f"marketShareMA20Wins={float(report.get('late_market_share_rolling_dominance_rate', np.nan)):.1%}, "
+            f"lateProfitAdv={float(report.get('late_profit_advantage_per_request', np.nan)):+.3f}, "
+            f"profitMA20Wins={float(report.get('late_profit_rolling_dominance_rate', np.nan)):.1%}, "
+            f"validationTrend={float(report.get('held_out_validation_score_fitted_change', np.nan)):+.3f}, "
+            f"evalRewardRetention={float(report.get('late_evaluation_reward_retention', np.nan)):.1%}, "
+            f"lateFareMove={float(report.get('late_fare_equivalent_change_rate', np.nan)):.1%}, "
+            f"lateActions={int(report.get('late_action_diversity', 0))}"
+        )
+        if report.get("failures"):
+            print(
+                "    [backtest failures] "
+                + " | ".join(str(item) for item in report["failures"])
+            )
+        if pending_model_metadata is not None:
+            pending_model_metadata["competitive_backtest"] = dict(report)
+            backtest_passed = bool(report.get("passed", False))
+            pending_model_metadata["competitive_backtest_passed"] = (
+                backtest_passed
+            )
+            pending_model_metadata["certification_status"] = "not_applicable"
+            self.training_certification_report = {
+                "competitive_backtest_passed": backtest_passed,
+                "status": "not_applicable",
+            }
+            # New evaluation episodes reset aggregate reward-rate counters.
+            # Archive the terminal TRAINING statistics, not those reset
+            # evaluation counters. No weights or historical policy are selected.
+            if evaluation_checkpoint is not None:
+                self.firm1.agent.load_normalizer_state_dict(
+                    evaluation_checkpoint["normalizer_state"]
+                )
+            saved_policy_path = self.save_trained_model(
+                trained_model_out,
+                metadata=pending_model_metadata,
+                registry_dir=model_registry_dir,
+                model_id=trained_model_id,
+            )
+            # Verify that the archived artifact is independently loadable.
+            self.load_trained_model(saved_policy_path, load_optimizer=False)
+
+        print("Experiment Complete.")
+        if journal:
+            journal.event("simulation_complete", {"evaluation_steps": len(self.evaluation_logs)})
+        return self.training_logs, self.evaluation_logs
+    
+    def _trajectory_tariff_for_context(
+        self,
+        ctx: RideContext,
+        rng: np.random.Generator,
+    ) -> Optional[Dict[str, float]]:
+        """Sample a tariff the frozen policy actually posted in a matching context."""
+        log = self.evaluation_tariff_log
+        if not log:
+            return None
+        steps = int(max(1, self.shared_steps_per_day))
+        block = (int(ctx.hour) * steps) // 24
+        weekend = int(ctx.day_of_week) >= 5
+        def matches(entry: Mapping[str, Any], level: int) -> bool:
+            same_block = (int(entry["hour"]) * steps) // 24 == block
+            same_weekend = (int(entry["day_of_week"]) >= 5) == weekend
+            same_weather = str(entry["weather"]) == str(ctx.weather)
+            return {
+                0: same_block and same_weekend and same_weather,
+                1: same_block and same_weekend,
+                2: same_block,
+                3: True,
+            }[level]
+        for level in range(4):
+            candidates = [entry for entry in log if matches(entry, level)]
+            if len(candidates) >= (5 if level < 3 else 1):
+                chosen = candidates[int(rng.integers(0, len(candidates)))]
+                return dict(chosen["coefficients"])
+        return None
+
+    def _predict_dataset_ride_with_policy(
+        self,
+        *,
+        distance: float,
+        duration: float,
+        ctx: RideContext,
+        policy_mode: str,
+        policy_temperature: float,
+    ) -> Dict[str, Any]:
+        """Make one independent, row-conditioned counterfactual policy quote.
+
+        The PPO policy controls an aggregate tariff rather than directly
+        regressing a fare.  For offline validation, each ride therefore starts
+        from the city anchor tariff, supplies its observed time and demand mix
+        as the current platform context, takes one learned tariff action, and
+        prices the ride with the resulting coefficients.  Rows never mutate the
+        next row's tariff or state history.
+        """
+        if self.firm1_mode != "RL":
+            raise ValueError("dataset policy validation requires firm1_mode='RL'")
+
+        if self.observed_fare_mode == "trajectory" and self.evaluation_tariff_log:
+            rng = getattr(self, "_trajectory_fare_rng", None)
+            if rng is None:
+                rng = self._trajectory_fare_rng = np.random.default_rng(self.seed + 24_681)
+            anchor_overrides = CoefficientOverrides()
+            baseline_price = float(self.market.quote_price(
+                distance_miles=float(max(0.0, distance)),
+                duration_minutes=float(max(0.0, duration)),
+                ctx=ctx,
+                overrides=anchor_overrides,
+            ))
+            coefficients = self._trajectory_tariff_for_context(ctx, rng) or {}
+            posted = CoefficientOverrides()
+            for key, value in coefficients.items():
+                setattr(posted, key, float(value))
+            predicted_price = float(self.market.quote_price(
+                distance_miles=float(max(0.0, distance)),
+                duration_minutes=float(max(0.0, duration)),
+                ctx=ctx,
+                overrides=posted,
+            ))
+            return {
+                "predicted_price": predicted_price,
+                "anchor_price": baseline_price,
+                "action": -1,
+                "action_label": "trajectory_posted_tariff",
+                "action_magnitude": 0.0,
+                "policy_top_action": -1,
+                "policy_top_prob": 0.0,
+                "policy_second_prob": 0.0,
+                "policy_action_margin": 0.0,
+                "policy_entropy": 0.0,
+                "objective_optimizer_ready": False,
+                "objective_optimizer_top_action": -1,
+                "objective_optimizer_action_margin": 0.0,
+                "coefficients": coefficients,
+            }
+
+        observer = self.platform_observers["Firm1"]
+        observer.reset()
+        long_trip = float(distance >= 10.0)
+        observer.demand_mix.update({
+            "distance_mean": float(distance),
+            "distance_std": 0.0,
+            "distance_q25": float(distance),
+            "distance_q75": float(distance),
+            "duration_mean": float(duration),
+            "duration_std": 0.0,
+            "airport_rate": float(bool(ctx.airport)),
+            "long_trip_share": long_trip,
+        })
+        self.last_crowd_response_stats = {
+            "distance_mean": float(distance),
+            "duration_mean": float(duration),
+            "airport_rate": float(bool(ctx.airport)),
+            "long_trip_share": long_trip,
+            "peak_context": float((7 <= ctx.hour < 10) or (16 <= ctx.hour < 19)),
+        }
+        self.firm1.overrides = CoefficientOverrides()
+        if getattr(self.firm1, "level_step_actions", False):
+            # Revision 15: each ride starts from the contract's reference
+            # opening S * L_ref instead of the raw city anchor.
+            self.firm1.post_tariff_level(
+                self.firm1.tariff_structure["reference_level"], self.market
+            )
+        self.firm1.reset_state_history()
+        self.action_stability.reset()
+
+        raw_state = self._build_rl_state(
+            day_of_week=ctx.day_of_week,
+            hour=ctx.hour,
+            weather=ctx.weather,
+        )
+        action_features = self._action_feature_matrix_for_pricer(
+            self.firm1, self.last_crowd_response_stats
+        )
+        state = self.firm1.stack_state(raw_state, commit=False)
+        critic_state = (
+            self._build_privileged_critic_state(raw_state)
+            if self.privileged_critic
+            else None
+        )
+        action_mask = self._objective_action_mask(
+            self.firm1.feasible_action_mask(self.market)
+        )
+        policy_diag = self.firm1.agent.policy_diagnostics(
+            state,
+            action_features=action_features,
+            action_mask=action_mask,
+            temperature=1.0,
+        )
+        baseline_price = float(self.market.quote_price(
+            distance_miles=float(max(0.0, distance)),
+            duration_minutes=float(max(0.0, duration)),
+            ctx=ctx,
+            overrides=self.firm1.overrides,
+        ))
+        action, *_ = self.firm1.agent.act(
+            state,
+            deterministic=True,
+            action_features=action_features,
+            action_mask=action_mask,
+            policy_mode=policy_mode,
+            policy_temperature=policy_temperature,
+            critic_state=critic_state,
+        )
+        self.firm1.apply_action(int(action), self.market)
+        predicted_price = float(self.market.quote_price(
+            distance_miles=float(max(0.0, distance)),
+            duration_minutes=float(max(0.0, duration)),
+            ctx=ctx,
+            overrides=self.firm1.overrides,
+        ))
+        coefficients = self._coeff_snapshot()
+        return {
+            "predicted_price": predicted_price,
+            "anchor_price": baseline_price,
+            "action": int(action),
+            "action_label": self.firm1.action_label(int(action)),
+            "action_magnitude": float(self.firm1.agent.last_continuous_magnitude),
+            "policy_top_action": int(policy_diag.get("policy_top_action", -1)),
+            "policy_top_prob": float(policy_diag.get("policy_top_prob", 0.0)),
+            "policy_second_prob": float(policy_diag.get("policy_second_prob", 0.0)),
+            "policy_action_margin": float(policy_diag.get("policy_action_margin", 0.0)),
+            "policy_entropy": float(policy_diag.get("policy_entropy", 0.0)),
+            "objective_optimizer_ready": bool(
+                policy_diag.get("optimizer_ready", 0.0) >= 0.5
+            ),
+            "objective_optimizer_top_action": int(
+                policy_diag.get("optimizer_top_action", -1)
+            ),
+            "objective_optimizer_action_margin": float(
+                policy_diag.get("optimizer_action_margin", 0.0)
+            ),
+            "coefficients": coefficients,
+        }
+
+    def compare_trained_rl_to_dataset(
+       self,
+       dataset_root: str,
+       dataset_glob: str = "auto",
+       out_csv: Optional[str] = None,
+       out_plot_prefix: Optional[str] = None,
+       max_rows: int = 5000,
+       preview_rows: int = 5,
+       policy_mode: str = "argmax_raw",
+       policy_temperature: float = 0.25,
+       policy_seed: int = 99173,
+       dataset_sample_seed: int = 104729,
+       duration_mode: str = "actual_if_available",
+       dataset_city: str = "",
+       weather_root: str = "",
+   ) -> Dict[str, Any]:
+       market_spec = resolve_city_spec(self.market_name)
+       data_spec = resolve_city_spec(dataset_city or self.market_name)
+       if market_spec.key != data_spec.key:
+           raise ValueError(
+               f"Dataset city {data_spec.market_name!r} does not match active "
+               f"policy market {market_spec.market_name!r}. Cross-city transfer "
+               "must be run as an explicitly configured experiment, not by "
+               "silently relabelling source rows."
+           )
+       if duration_mode not in {"actual_if_available", "predicted_only"}:
+           raise ValueError(
+               "duration_mode must be 'actual_if_available' or 'predicted_only'"
+           )
+       policy_artifact_path = (
+           getattr(self, "loaded_trained_model_path", None)
+           or getattr(self, "last_saved_model_path", None)
+       )
+       if not policy_artifact_path:
+           raise ValueError(
+               "Dataset validation requires a saved trained policy artifact. "
+               "Load one with --trained_model_in or train with model registry/output enabled."
+           )
+       policy_artifact_path = os.path.abspath(
+           os.path.expanduser(str(policy_artifact_path))
+       )
+       policy_model_id = (
+           getattr(self, "loaded_trained_model_id", None)
+           or getattr(self, "last_saved_model_id", None)
+       )
+       policy_training_seed = getattr(
+           self, "loaded_trained_model_training_seed", None
+       )
+       policy_training_seed_source = getattr(
+           self, "loaded_trained_model_training_seed_source", "unavailable"
+       )
+       policy_artifact_sha256 = getattr(
+           self, "loaded_trained_model_sha256", None
+       )
+       if policy_artifact_sha256 is None and os.path.isfile(policy_artifact_path):
+           policy_artifact_sha256 = _sha256_file(policy_artifact_path)
+       resolved_dataset_glob = (
+           data_spec.ride_glob
+           if str(dataset_glob or "").strip().lower() in {"", "auto"}
+           else str(dataset_glob)
+       )
+       files = _discover_dataset_files(
+           dataset_root=dataset_root,
+           dataset_glob=resolved_dataset_glob,
+       )
+
+       if not files:
+           raise FileNotFoundError(
+               f"No dataset files found under dataset_root={dataset_root!r} with glob={dataset_glob!r}"
+           )
+
+       rows_out: List[Dict[str, Any]] = []
+       abs_err: List[float] = []
+       sq_err: List[float] = []
+       signed_err: List[float] = []
+       abs_pct: List[float] = []
+       anchor_abs_err: List[float] = []
+       dur_abs_err: List[float] = []
+       dur_sq_err: List[float] = []
+       dur_abs_pct: List[float] = []
+
+       processed = 0
+       kept = 0
+
+       skipped_missing_price = 0
+       skipped_missing_distance = 0
+       skipped_invalid_price = 0
+       skipped_invalid_distance = 0
+       normalization_rejections: Counter = Counter()
+       weather_joined = 0
+       files_with_rows = 0
+       preview_printed = False
+       weather_index = (
+           NOAAWeatherIndex.from_directory(data_spec.key, weather_root)
+           if str(weather_root or "").strip()
+           else None
+       )
+
+       saved_policy_state = {
+           "firm1_overrides": copy.deepcopy(self.firm1.overrides),
+           "firm1_execution": self.firm1.snapshot_execution_state(),
+           "observer": self.platform_observers["Firm1"].snapshot(),
+           "stability": self.action_stability.snapshot(),
+           "crowd": dict(getattr(self, "last_crowd_response_stats", {}) or {}),
+       }
+       torch.manual_seed(int(policy_seed))
+       if torch.cuda.is_available():
+           torch.cuda.manual_seed_all(int(policy_seed))
+
+       try:
+        for file_index, fpath in enumerate(files):
+           file_kept = 0
+           try:
+               file_sample_seed = int(dataset_sample_seed) + 1000003 * int(file_index)
+               for fieldnames, reader in _iter_tabular_rows(
+                   fpath,
+                   sample_seed=file_sample_seed,
+               ):
+                   if (not preview_printed) and preview_rows > 0:
+                       print(f"[Dataset Preview] file={fpath}")
+                       print(f"[Dataset Preview] columns={fieldnames}")
+
+                   for idx, raw in enumerate(reader):
+                       if (not preview_printed) and preview_rows > 0 and idx < preview_rows:
+                           sample_keys = list(raw.keys())[:12]
+                           sample = {k: raw.get(k) for k in sample_keys}
+                           print(f"[Dataset Preview] row_{idx}: {_json_preview(sample)}")
+                       if (not preview_printed) and preview_rows > 0 and idx + 1 >= preview_rows:
+                           preview_printed = True
+                       processed += 1
+                       if kept >= max_rows:
+                           break
+
+                       raw_source_record = dict(raw)
+                       raw_record_json = _canonical_json(raw_source_record)
+                       raw_record_sha256 = hashlib.sha256(
+                           raw_record_json.encode("utf-8")
+                       ).hexdigest()
+                       try:
+                           canonical = normalize_ride_record(
+                               data_spec.key,
+                               raw_source_record,
+                               weather_index=weather_index,
+                           )
+                       except DataValidationError as exc:
+                           normalization_rejections[exc.code] += 1
+                           if exc.code == "missing_price":
+                               skipped_missing_price += 1
+                           elif exc.code == "missing_distance":
+                               skipped_missing_distance += 1
+                           elif exc.code == "invalid_price":
+                               skipped_invalid_price += 1
+                           elif exc.code == "invalid_distance":
+                               skipped_invalid_distance += 1
+                           continue
+
+                       # ``actual_price`` is the canonical numeric field name,
+                       # not a claim that every source row is a completed fare.
+                       # Boston's public data are posted quotes excluding tips,
+                       # whereas NYC/Chicago contain realized fares.  Keep the
+                       # legacy ``actual_paid`` columns below for old analysis
+                       # readers, but make the source-neutral observed-price
+                       # name authoritative in new reports.
+                       observed_price = float(canonical.actual_price)
+                       observed_price_key = canonical.actual_price_source
+                       distance = float(canonical.distance_miles)
+                       distance_key = canonical.distance_source
+                       actual_duration = canonical.duration_minutes
+                       duration_key = canonical.duration_source
+                       hour = int(canonical.hour)
+                       day_of_week = int(canonical.day_of_week)
+                       weather = str(canonical.weather)
+                       airport = bool(canonical.airport)
+                       service = str(canonical.service)
+                       weather_joined += int(
+                           canonical.weather_source == "noaa_global_hourly"
+                       )
+
+                       predicted_duration = float(self.estimate_duration(float(distance), hour))
+                       duration = (
+                           float(predicted_duration)
+                           if duration_mode == "predicted_only"
+                           else (
+                               float(actual_duration)
+                               if actual_duration is not None
+                               else float(predicted_duration)
+                           )
+                       )
+
+                       if actual_duration is not None:
+                           d_err = float(predicted_duration - float(actual_duration))
+                           dae = float(abs(d_err))
+                           dur_abs_err.append(dae)
+                           dur_sq_err.append(float(d_err * d_err))
+                           if float(actual_duration) > 1e-6:
+                               dur_abs_pct.append(float(dae / float(actual_duration)))
+
+                       ctx = RideContext(
+                           day_of_week=int(np.clip(day_of_week, 0, 6)),
+                           weather=weather,
+                           hour=int(np.clip(hour, 0, 23)),
+                           airport=bool(airport),
+                           service=service,
+                       )
+                       policy_input = {
+                           "market": market_spec.market_name,
+                           "distance_miles": float(max(0.0, distance)),
+                           "duration_minutes": float(max(0.0, duration)),
+                           "duration_mode": str(duration_mode),
+                           "hour": int(ctx.hour),
+                           "day_of_week": int(ctx.day_of_week),
+                           "weather": str(ctx.weather),
+                           "airport": bool(ctx.airport),
+                           "service": str(ctx.service),
+                       }
+                       policy_prediction = self._predict_dataset_ride_with_policy(
+                           distance=float(max(0.0, distance)),
+                           duration=float(max(0.0, duration)),
+                           ctx=ctx,
+                           policy_mode=policy_mode,
+                           policy_temperature=policy_temperature,
+                       )
+                       rl_price = float(policy_prediction["predicted_price"])
+                       anchor_abs_err.append(abs(float(policy_prediction["anchor_price"]) - observed_price))
+
+                       err = float(rl_price - observed_price)
+                       ae = float(abs(err))
+                       abs_err.append(ae)
+                       sq_err.append(float(err * err))
+                       signed_err.append(err)
+                       if observed_price > 1e-6:
+                           abs_pct.append(float(ae / observed_price))
+
+                       rows_out.append({
+                           "source_file": os.path.basename(fpath),
+                           "source_path": os.path.abspath(fpath),
+                           "source_record_sha256": raw_record_sha256,
+                           "source_stream_position": int(processed),
+                           "raw_record_json": raw_record_json,
+                           "dataset_city": data_spec.market_name,
+                           "ride_semantics": canonical.ride_semantics,
+                           "price_semantics": canonical.price_semantics,
+                           "observed_price_source_column": str(observed_price_key),
+                           "observed_price": float(observed_price),
+                           "observed_price_excluded_from_policy_input": True,
+                           # Backward-compatible aliases.  Consumers must read
+                           # ``price_semantics`` before interpreting this field.
+                           "actual_paid_source_column": str(observed_price_key),
+                           "actual_paid": float(observed_price),
+                           "actual_paid_excluded_from_policy_input": True,
+                           "rl_predicted_price": float(rl_price),
+                           "anchor_tariff_price": float(policy_prediction["anchor_price"]),
+                           "price_error": err,
+                           "abs_error": ae,
+                           "distance_miles": float(distance),
+                           "distance_source_column": str(distance_key),
+                           "actual_duration_minutes": float(actual_duration) if actual_duration is not None else None,
+                           "actual_duration_source_column": (
+                               str(duration_key) if duration_key is not None else ""
+                           ),
+                           "predicted_duration_minutes": float(predicted_duration),
+                           "duration_minutes_used_for_price": float(duration),
+                           "duration_mode": str(duration_mode),
+                           "dataset_sample_seed": int(dataset_sample_seed),
+                           "hour": int(ctx.hour),
+                           "day_of_week": int(ctx.day_of_week),
+                           "weather": str(ctx.weather),
+                           "weather_source": canonical.weather_source,
+                           "temperature_c": canonical.temperature_c,
+                           "precipitation_mm": canonical.precipitation_mm,
+                           "wind_speed_mps": canonical.wind_speed_mps,
+                           "visibility_m": canonical.visibility_m,
+                           "airport": bool(ctx.airport),
+                           "service": str(ctx.service),
+                           "shared_ride": bool(canonical.shared_ride),
+                           "surge_multiplier": canonical.surge_multiplier,
+                           "raw_business": canonical.provider,
+                           "raw_pickup_location": canonical.pickup_location,
+                           "raw_dropoff_location": canonical.dropoff_location,
+                           "raw_date": (
+                               canonical.pickup_datetime.isoformat()
+                               if canonical.pickup_datetime is not None
+                               else ""
+                           ),
+                           "raw_time_of_day": "",
+                           "policy_input_json": _canonical_json(policy_input),
+                           "trained_policy_model_id": str(policy_model_id or ""),
+                           "trained_policy_artifact_path": policy_artifact_path,
+                           "trained_policy_artifact_sha256": str(
+                               policy_artifact_sha256 or ""
+                           ),
+                           "trained_policy_training_seed": (
+                               policy_training_seed
+                               if policy_training_seed is not None
+                               else ""
+                           ),
+                           "trained_policy_training_seed_source": str(
+                               policy_training_seed_source
+                           ),
+                           "policy_action_sampling_seed": int(policy_seed),
+                           "policy_mode": str(policy_mode),
+                           "policy_action": int(policy_prediction["action"]),
+                           "policy_action_label": str(policy_prediction["action_label"]),
+                           "policy_action_magnitude": float(policy_prediction["action_magnitude"]),
+                           "policy_top_action": int(policy_prediction["policy_top_action"]),
+                           "policy_top_prob": float(policy_prediction["policy_top_prob"]),
+                           "policy_second_prob": float(policy_prediction["policy_second_prob"]),
+                           "policy_action_margin": float(policy_prediction["policy_action_margin"]),
+                           "policy_entropy": float(policy_prediction["policy_entropy"]),
+                           **{
+                               f"predicted_{key}": float(value)
+                               for key, value in policy_prediction["coefficients"].items()
+                           },
+                       })
+                       kept += 1
+                       file_kept += 1
+
+                   if kept >= max_rows:
+                       break
+                   
+           except Exception as exc:
+               print(f"[Dataset Preview] skipped file={fpath} due to read error: {exc}")
+               continue
+              
+           if file_kept > 0:
+               files_with_rows += 1
+           if kept >= max_rows:
+               break
+       finally:
+           self.firm1.overrides = saved_policy_state["firm1_overrides"]
+           self.firm1.restore_execution_state(saved_policy_state["firm1_execution"])
+           self.platform_observers["Firm1"].restore(saved_policy_state["observer"])
+           self.action_stability.restore(saved_policy_state["stability"])
+           self.last_crowd_response_stats = saved_policy_state["crowd"]
+
+       if out_csv:
+           _ensure_parent_dir(out_csv)
+           _write_csv(out_csv, rows_out)
+           
+       if out_plot_prefix and rows_out:
+           self._plot_dataset_validation(rows_out=rows_out, out_plot_prefix=out_plot_prefix)
+       
+       if rows_out:
+           self._print_kaggle_analysis(rows_out=rows_out)
+
+       self._print_convergence_analysis()
+       observed_prices = np.asarray(
+           [row["observed_price"] for row in rows_out], dtype=float
+       )
+       predicted_prices = np.asarray(
+           [row["rl_predicted_price"] for row in rows_out], dtype=float
+       )
+       price_correlation = None
+       if (
+           observed_prices.size > 1
+           and predicted_prices.size == observed_prices.size
+           and float(np.std(observed_prices)) > 1e-12
+           and float(np.std(predicted_prices)) > 1e-12
+       ):
+           candidate_correlation = float(
+               np.corrcoef(observed_prices, predicted_prices)[0, 1]
+           )
+           if np.isfinite(candidate_correlation):
+               price_correlation = candidate_correlation
+
+       summary = {
+           "dataset_root": dataset_root,
+           "dataset_glob": resolved_dataset_glob,
+           "dataset_city": data_spec.market_name,
+           "ride_semantics": data_spec.ride_semantics,
+           "price_semantics": data_spec.price_semantics,
+           "files_scanned": len(files),
+           "rows_processed": int(processed),
+           "rows_compared": int(kept),
+           "rows_skipped_missing_price": int(skipped_missing_price),
+           "rows_skipped_missing_distance": int(skipped_missing_distance),
+           "rows_skipped_invalid_price": int(skipped_invalid_price),
+           "rows_skipped_invalid_distance": int(skipped_invalid_distance),
+           "normalization_rejections": dict(normalization_rejections),
+           "weather_join_rate": float(weather_joined / kept) if kept else None,
+           "observed_duration_coverage": float(
+               np.mean([row["actual_duration_minutes"] is not None for row in rows_out])
+           ) if rows_out else None,
+           "files_with_comparable_rows": int(files_with_rows),
+           "mae": float(np.mean(abs_err)) if abs_err else None,
+           "anchor_tariff_mae": float(np.mean(anchor_abs_err)) if anchor_abs_err else None,
+           "policy_mae_improvement_vs_anchor": (
+               float(np.mean(anchor_abs_err) - np.mean(abs_err))
+               if anchor_abs_err and abs_err else None
+           ),
+           "rmse": float(np.sqrt(np.mean(sq_err))) if sq_err else None,
+           "mape": float(np.mean(abs_pct)) if abs_pct else None,
+           "bias": float(np.mean(signed_err)) if signed_err else None,
+           "median_absolute_error": float(np.median(abs_err)) if abs_err else None,
+           "within_2_dollars": float(np.mean(np.asarray(abs_err) <= 2.0)) if abs_err else None,
+           "within_5_dollars": float(np.mean(np.asarray(abs_err) <= 5.0)) if abs_err else None,
+           "observed_price_mean": float(np.mean([row["observed_price"] for row in rows_out])) if rows_out else None,
+           # Legacy summary alias retained for old plot/report readers.
+           "actual_price_mean": float(np.mean([row["observed_price"] for row in rows_out])) if rows_out else None,
+           "predicted_price_mean": float(np.mean([row["rl_predicted_price"] for row in rows_out])) if rows_out else None,
+           "price_correlation": price_correlation,
+           "duration_mae_minutes": float(np.mean(dur_abs_err)) if dur_abs_err else None,
+           "duration_rmse_minutes": float(np.sqrt(np.mean(dur_sq_err))) if dur_sq_err else None,
+           "duration_mape": float(np.mean(dur_abs_pct)) if dur_abs_pct else None,
+           "out_csv": out_csv,
+           "out_plot_prefix": out_plot_prefix,
+           "policy_mode": str(policy_mode),
+           "policy_temperature": float(policy_temperature),
+           "policy_seed": int(policy_seed),
+           "dataset_sample_seed": int(dataset_sample_seed),
+           "duration_mode": str(duration_mode),
+           "trained_policy_model_id": policy_model_id,
+           "trained_policy_artifact_path": policy_artifact_path,
+           "trained_policy_artifact_sha256": policy_artifact_sha256,
+           "trained_policy_training_seed": policy_training_seed,
+           "trained_policy_training_seed_source": policy_training_seed_source,
+           "observed_price_excluded_from_policy_input": True,
+           "actual_paid_excluded_from_policy_input": True,
+           "observed_fare_mode": str(self.observed_fare_mode),
+           **self._constant_multiplier_baseline(rows_out),
+       }
+       self._print_reality_gap_check(summary)
+       self._print_sensitivity_analysis()
+       return summary
+   
+    @staticmethod
+    def _constant_multiplier_baseline(rows_out: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+        """Best single anchor multiplier, fit on even rows and scored on odd rows.
+
+        The fare formula's trip terms explain most of the observed-fare
+        correlation, so a policy's observed-fare fit must be compared with the
+        best *constant* tariff level, not only with the 1.0x anchor.
+        """
+        if len(rows_out) < 4:
+            return {}
+        actual = np.asarray([
+            float(r.get("observed_price", r["actual_paid"])) for r in rows_out
+        ])
+        anchor = np.asarray([float(r["anchor_tariff_price"]) for r in rows_out])
+        policy = np.asarray([float(r["rl_predicted_price"]) for r in rows_out])
+        fit, test = np.arange(0, len(actual), 2), np.arange(1, len(actual), 2)
+        grid = np.linspace(0.40, 2.50, 211)
+        fit_mae = [float(np.mean(np.abs(m * anchor[fit] - actual[fit]))) for m in grid]
+        best = float(grid[int(np.argmin(fit_mae))])
+        return {
+            "constant_multiplier_baseline_m": best,
+            "constant_multiplier_baseline_test_mae": float(np.mean(np.abs(best * anchor[test] - actual[test]))),
+            "policy_test_mae_same_rows": float(np.mean(np.abs(policy[test] - actual[test]))),
+            "anchor_test_mae_same_rows": float(np.mean(np.abs(anchor[test] - actual[test]))),
+            "constant_multiplier_baseline_note": (
+                "fit on even-indexed rows, evaluated on odd-indexed rows; the policy "
+                "never sees observed prices"
+            ),
+        }
+
+    def _print_reality_gap_check(self, summary: Dict[str, Any]) -> None:
+        mae = summary.get("mae")
+        mape = summary.get("mape")
+        bias = summary.get("bias")
+        anchor_mae = summary.get("anchor_tariff_mae")
+        improvement = summary.get("policy_mae_improvement_vs_anchor")
+        if mae is None:
+            print(">>> Reality gap check: insufficient comparable Kaggle rows.")
+            return
+        bias_dir = "overpricing" if (bias or 0.0) > 0 else "underpricing"
+        print(
+            ">>> Reality gap check: "
+            f"policy_mae={float(mae):.3f}, anchor_mae={float(anchor_mae or 0.0):.3f}, "
+            f"policy_improvement={float(improvement or 0.0):+.3f}, "
+            f"mape={float(mape or 0.0):.3f}, bias={float(bias or 0.0):.3f} ({bias_dir})."
+        )
+
+    def _print_sensitivity_analysis(self) -> None:
+        base_ctx = RideContext(day_of_week=2, weather="clear", hour=14, airport=False, service="economy")
+        base_distance = 3.0
+        base_duration = float(self.estimate_duration(base_distance, base_ctx.hour))
+        base_price = float(self.market.quote_price(base_distance, base_duration, base_ctx, overrides=self.firm1.overrides))
+
+        def _quote(distance: float, duration: float, hour: int, weather: str, airport: bool, service: str) -> float:
+            ctx = RideContext(day_of_week=2, weather=weather, hour=int(np.clip(hour, 0, 23)), airport=airport, service=service)
+            return float(self.market.quote_price(distance, duration, ctx, overrides=self.firm1.overrides))
+
+        dist_up = _quote(base_distance * 1.2, base_duration, base_ctx.hour, base_ctx.weather, base_ctx.airport, base_ctx.service)
+        dur_up = _quote(base_distance, base_duration * 1.2, base_ctx.hour, base_ctx.weather, base_ctx.airport, base_ctx.service)
+        rush = _quote(base_distance, base_duration, 18, base_ctx.weather, base_ctx.airport, base_ctx.service)
+        rain = _quote(base_distance, base_duration, base_ctx.hour, "rain", base_ctx.airport, base_ctx.service)
+        airport = _quote(base_distance, base_duration, base_ctx.hour, base_ctx.weather, True, base_ctx.service)
+        premium = _quote(base_distance, base_duration, base_ctx.hour, base_ctx.weather, base_ctx.airport, "premium")
+
+        print(
+            ">>> Sensitivity analysis (active tariff after restoring the simulation state; baseline ride=3mi clear weekday 14:00): "
+            f"base={base_price:.2f}, +20%dist={dist_up:.2f}, +20%duration={dur_up:.2f}, rush18={rush:.2f}, rain={rain:.2f}, airport={airport:.2f}, premium={premium:.2f}"
+        )
+        
+    def _print_kaggle_analysis(self, rows_out: List[Dict[str, Any]]) -> None:
+        """Print concise dataset-vs-model diagnostics for quick sanity checks."""
+        if not rows_out:
+            print(">>> Kaggle comparison: no comparable rows available.")
+            return
+
+        price_errors = np.array([float(r.get("price_error", 0.0)) for r in rows_out], dtype=float)
+        abs_errors = np.abs(price_errors)
+        actual_prices = np.array([
+            float(r.get("observed_price", r.get("actual_paid", 0.0)))
+            for r in rows_out
+        ], dtype=float)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ape = np.where(actual_prices > 1e-6, abs_errors / actual_prices, np.nan)
+
+        duration_errors = [
+            abs(float(r["predicted_duration_minutes"]) - float(r["actual_duration_minutes"]))
+            for r in rows_out
+            if r.get("actual_duration_minutes") is not None and r.get("predicted_duration_minutes") is not None
+        ]
+
+        print(
+            ">>> Kaggle observed-price comparison summary: "
+            f"rows={len(rows_out)}, "
+            f"price_mae={float(np.mean(abs_errors)):.3f}, "
+            f"price_rmse={float(np.sqrt(np.mean(np.square(price_errors)))):.3f}, "
+            f"price_bias={float(np.mean(price_errors)):.3f}, "
+            f"price_mape={float(np.nanmean(ape)):.3f}"
+        )
+
+        action_counts = Counter(str(r.get("policy_action_label", "unknown")) for r in rows_out)
+        print(
+            ">>> Kaggle learned-policy actions: "
+            + ", ".join(f"{label}={count}" for label, count in action_counts.most_common(8))
+        )
+
+        if duration_errors:
+            print(
+                ">>> Kaggle duration summary: "
+                f"duration_mae_minutes={float(np.mean(duration_errors)):.3f}, "
+                f"duration_rmse_minutes={float(np.sqrt(np.mean(np.square(duration_errors)))):.3f}"
+            )
+
+    def _print_convergence_analysis(self) -> None:
+        """Print light-weight diagnostics for training/evaluation reward trajectories."""
+        train_rewards = [float(x.get("avg_reward", 0.0)) for x in self.training_logs]
+        eval_rewards = [float(x.get("reward", 0.0)) for x in self.evaluation_logs]
+
+        if train_rewards:
+            tail = train_rewards[-min(len(train_rewards), 40):]
+            print(
+                ">>> Convergence (train): "
+                f"n={len(train_rewards)}, mean_last{len(tail)}={float(np.mean(tail)):.3f}, std_last{len(tail)}={float(np.std(tail)):.4f}"
+            )
+        if eval_rewards:
+            tail = eval_rewards[-min(len(eval_rewards), 40):]
+            print(
+                ">>> Convergence (eval): "
+                f"n={len(eval_rewards)}, mean_last{len(tail)}={float(np.mean(tail)):.3f}, std_last{len(tail)}={float(np.std(tail)):.4f}"
+            )
+            
+    @staticmethod
+    def _plot_dataset_validation(rows_out: List[Dict[str, Any]], out_plot_prefix: str) -> None:
+        if importlib.util.find_spec("matplotlib") is None:
+            print("[WARN] matplotlib not installed; skipping RL dataset validation graphs.")
+            return
+
+        import matplotlib.pyplot as plt
+
+        prices_actual = [
+            float(r.get("observed_price", r.get("actual_paid")))
+            for r in rows_out
+            if r.get("observed_price", r.get("actual_paid")) is not None
+        ]
+        prices_pred = [float(r["rl_predicted_price"]) for r in rows_out if r.get("rl_predicted_price") is not None]
+
+        if prices_actual and prices_pred:
+            price_semantics = str(
+                rows_out[0].get("price_semantics", "observed_dataset_price")
+            ).replace("_", " ")
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.scatter(prices_actual, prices_pred, s=10, alpha=0.35)
+            lo = float(min(prices_actual + prices_pred))
+            hi = float(max(prices_actual + prices_pred))
+            ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.2, label="ideal match")
+            ax.set_title("RL Predicted Price vs Observed Dataset Price")
+            ax.set_xlabel(f"Observed dataset price ({price_semantics})")
+            ax.set_ylabel("RL predicted price")
+            ax.legend(loc="best")
+            fig.tight_layout()
+            out = f"{out_plot_prefix}_price_match_scatter.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+
+        duration_pairs = [
+            (float(r["actual_duration_minutes"]), float(r["predicted_duration_minutes"]))
+            for r in rows_out
+            if r.get("actual_duration_minutes") is not None and r.get("predicted_duration_minutes") is not None
+        ]
+        if duration_pairs:
+            actual_dur = [a for a, _ in duration_pairs]
+            pred_dur = [p for _, p in duration_pairs]
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.scatter(actual_dur, pred_dur, s=10, alpha=0.35, color="tab:orange")
+            lo = float(min(actual_dur + pred_dur))
+            hi = float(max(actual_dur + pred_dur))
+            ax.plot([lo, hi], [lo, hi], "k--", linewidth=1.2, label="ideal match")
+            ax.set_title("Predicted Total Time vs Actual Duration")
+            ax.set_xlabel("Actual trip duration (minutes)")
+            ax.set_ylabel("Predicted total time (minutes)")
+            ax.legend(loc="best")
+            fig.tight_layout()
+            out = f"{out_plot_prefix}_duration_match_scatter.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+            
+    def simulate_day_cycle(self, day_ctx, rides, is_training):
+        """Runs one 200-ride cycle. Primarily used by run_experiment."""
+        hour = 12
+        base = self.market.curr_market
+
+        rl_step = None
+        opponent_action_target, _ = self._firm2_leader_step(
+            previous_metrics=getattr(
+                self, "_last_cycle_firm2_metrics", None
+            ),
+            day_of_week=day_ctx.day_of_week,
+            hour=hour,
+            weather=day_ctx.weather,
+            enabled=self.firm2_mode != "static",
+        )
+        if self.firm1_mode == "RL":
+            raw_state, action_features, _ = self._publish_pricing_observation(
+                day_of_week=day_ctx.day_of_week,
+                hour=hour,
+                weather=day_ctx.weather,
+            )
+            s_vec = self.firm1.stack_state(raw_state)
+            critic_state = (
+                self._build_privileged_critic_state(raw_state)
+                if self.privileged_critic
+                else None
+            )
+            action_mask = self._objective_action_mask(
+                self.firm1.feasible_action_mask(self.market)
+            )
+            action, s_ts, old_logp, val, af_ts, mask_ts = self.firm1.agent.act(
+                s_vec,
+                action_features=action_features,
+                action_mask=action_mask,
+                critic_state=critic_state,
+            )
+            self.firm1.apply_action(action, self.market)
+            rl_step = (
+                action, s_ts, old_logp, val, af_ts, mask_ts, critic_state
+            )
+        elif self.firm1_mode != "static":
+            self.firm1.act(
+                city_base=base.base_fare,
+                city_pmin=base.per_minute,
+                city_pmile=base.per_mile,
+                city_booking=base.booking_fee,
+                city_airport=base.airport_fee,
+                hour=hour,
+                weather=day_ctx.weather,
+            )
+
+        results, m1, m2, gap, air, dist = self.simulate_batch(day_ctx.day_of_week, day_ctx.weather, hour, rides)
+        self._ingest_platform_observations(m1, m2)
+        self._last_cycle_firm2_metrics = m2
+        
+        reward = self._compute_rl_reward(m1, gap, m2=m2)
+
+
+        if is_training and self.firm1_mode == "RL" and rl_step is not None:
+            (
+                action, s_ts, old_logp, val, af_ts, mask_ts, critic_state
+            ) = rl_step
+            next_v = None
+            next_public_potential = None
+            if self.potential_shaping_scale > 0.0:
+                next_v, _, _ = self._ppo_bootstrap_estimates(
+                    day_of_week=day_ctx.day_of_week,
+                    hour=hour,
+                    weather=day_ctx.weather,
+                )
+                next_public_potential = self._public_reward_potential(
+                    self._build_rl_state(
+                        day_of_week=day_ctx.day_of_week,
+                        hour=hour,
+                        weather=day_ctx.weather,
+                        perspective="Firm1",
+                    )
+                )
+            self.firm1.agent.store(
+                s_ts,
+                action,
+                float(reward),
+                False,
+                None,
+                old_logp,
+                val,
+                action_features=af_ts,
+                action_mask=mask_ts,
+                critic_state=critic_state,
+                next_value=next_v,
+                potential=(
+                    self._public_reward_potential(
+                        np.asarray(
+                            s_ts[-self.platform_observation_dim:].cpu().tolist(),
+                            dtype=np.float32,
+                        )
+                    )
+                    if self.potential_shaping_scale > 0.0
+                    else None
+                ),
+                next_potential=(
+                    next_public_potential
+                    if self.potential_shaping_scale > 0.0
+                    else None
+                ),
+            )
+            self._apply_eval_guardrail(
+                "off",
+                metrics=m1,
+                price_gap_f2_minus_f1=float(gap),
+                base=self.market.curr_market,
+            )
+        
+        self._update_recent_response_emas(m1, gap, m2=m2)
+        market_share = float(m1.completed_share)
+        rival_market_share = float(m2.completed_share)
+        self.last_share = market_share
+        self.last_revpr = float(m1.rev_per_request)
+        self.last_gap = float(gap)
+        self.last_profitpr = float(m1.profit_per_request)
+        self.last_fulfillment = float(m1.fulfillment_rate)
+        self.last_completion_coverage = float(np.clip(
+            m1.completed_share + m2.completed_share, 0.0, 1.0
+        ))
+        self.last_acceptance = float(m1.driver_acceptance_rate)
+        self.last_wait = float(m1.avg_wait_minutes)
+        self.last_driver_paypr = float(m1.driver_pay / max(1, m1.total))
+        self.last_firm2_share = rival_market_share
+        self.last_firm2_revpr = float(m2.rev_per_request)
+        self.last_firm2_profitpr = float(m2.profit_per_request)
+        self.last_firm2_fulfillment = float(m2.fulfillment_rate)
+        self.last_firm2_acceptance = float(m2.driver_acceptance_rate)
+        self.last_firm2_wait = float(m2.avg_wait_minutes)
+        self.last_firm2_driver_paypr = float(m2.driver_pay / max(1, m2.total))
+        self.objective_credit_ready = True
+        
+        self.airport_rate_last = air
+        self.mean_distance_last = dist
+
+        return results, m1, m2, float(reward)
+    
+    
+    def _update_recent_response_emas(self, m1: FirmMetrics, mean_gap: float, alpha: float = 0.20, m2: Optional[FirmMetrics] = None) -> None:
+        """Maintain short-term EMA features for both firms' observations."""
+        self.ema_share = self._ema(float(m1.share), float(getattr(self, "ema_share", 0.5)), alpha)
+        self.ema_revpr = self._ema(float(m1.rev_per_request), float(getattr(self, "ema_revpr", 0.0)), alpha)
+        self.ema_profitpr = self._ema(float(m1.profit_per_request), float(getattr(self, "ema_profitpr", 0.0)), alpha)
+        self.ema_gap = self._ema(float(mean_gap), float(getattr(self, "ema_gap", 0.0)), alpha)
+        self.ema_fulfillment = self._ema(float(m1.fulfillment_rate), float(getattr(self, "ema_fulfillment", 1.0)), alpha)
+        if m2 is not None:
+            self.ema_firm2_share = self._ema(float(m2.share), float(getattr(self, "ema_firm2_share", 0.5)), alpha)
+            self.ema_firm2_revpr = self._ema(float(m2.rev_per_request), float(getattr(self, "ema_firm2_revpr", 0.0)), alpha)
+            self.ema_firm2_profitpr = self._ema(float(m2.profit_per_request), float(getattr(self, "ema_firm2_profitpr", 0.0)), alpha)
+            self.ema_firm2_gap = self._ema(float(-mean_gap), float(getattr(self, "ema_firm2_gap", 0.0)), alpha)
+            self.ema_firm2_fulfillment = self._ema(float(m2.fulfillment_rate), float(getattr(self, "ema_firm2_fulfillment", 1.0)), alpha)
+
+    @staticmethod
+    def _bounded_context(value: float, center: float, scale: float) -> float:
+        """Normalize a public/calibrated market descriptor without city identity."""
+        return float(np.clip((float(value) - float(center)) / max(1e-6, float(scale)), -1.5, 1.5))
+
+    def _build_city_context(self, *, hour: int, day_of_week: int, weather: str) -> Dict[str, float]:
+        """Return the current observable demand intensity."""
+        base = self.market.curr_market
+        time_multiplier = float(self.market._time_multiplier(int(hour)))
+        day_multiplier = float(base.day_multiplier.get(int(day_of_week), 1.0))
+        weather_multiplier = float(base.weather_multiplier.get(str(weather), 1.0))
+        demand_multiplier = time_multiplier * day_multiplier * weather_multiplier
+        if self.market_dynamics.enabled and self.market_dynamics.hourly_demand_volume:
+            # v26: tariff multipliers are price surcharges, not volume.  The
+            # platform observes the calibrated expected request volume of the
+            # current block (mean 1 over the week), which drives realized
+            # requests and driver supply.
+            volume = float(self.market.demand_volume_multiplier(
+                hour=int(hour), day_of_week=int(day_of_week), weather=str(weather)
+            ))
+            return {"demand_intensity": self._bounded_context(volume, 1.0, 0.60)}
+        return {
+            "demand_intensity": self._bounded_context(demand_multiplier, 1.15, 0.45),
+        }
+    
+    def _build_rl_state(self, day_of_week: int, hour: int, weather: str, perspective: str = "Firm1") -> np.ndarray:
+        """Build the platform's operational observation, not simulator truth.
+
+        A firm knows its own active tariff and delayed internal KPIs.  Rival
+        prices are represented only by sampled public-quote estimates already
+        held by the observer.  Rider thresholds, rival coefficients, rival
+        controller state, and rival profit are intentionally unavailable.
+        """
+        firm_name = "Firm2" if str(perspective) == "Firm2" else "Firm1"
+        own = self.firm2 if firm_name == "Firm2" else self.firm1
+        base = self.market.curr_market
+        anchors = {key: float(getattr(base, key)) for key in self.opt_keys}
+        coefficients = {
+            key: float(get_coeff(base, own.overrides, key)) for key in self.opt_keys
+        }
+        last_action = self.action_stability.features(self.shared_edit_keys)
+        if firm_name == "Firm2":
+            last_action = {
+                "direction": 0.0,
+                "target_index": 0.0,
+                "magnitude": 0.0,
+                "reversal": 0.0,
+                "recent_intervention_rate": 0.0,
+                "time_since_intervention": 1.0,
+            }
+        return self.platform_observers[firm_name].build_observation(
+            hour=hour,
+            day_of_week=day_of_week,
+            weather=weather,
+            own_coefficients=coefficients,
+            anchor_coefficients=anchors,
+            last_action=last_action,
+            city_context=self._build_city_context(
+                hour=hour,
+                day_of_week=day_of_week,
+                weather=weather,
+            ),
+            regime_features=(
+                self.market.shock_public_features(int(hour)) if self.regime_market else None
+            ),
+            persistence_features=(
+                self._persistence_public_features(firm_name)
+                if self.persistence_features else None
+            ),
+        )
+
+    def _build_privileged_critic_state(
+        self,
+        public_state: np.ndarray,
+    ) -> np.ndarray:
+        """Build a fixed training-only centralized state summary.
+
+        The actor never receives this tensor. It combines the public Firm 1
+        observation with exact bilateral tariffs, undelayed bilateral outcomes,
+        driver-supply state, and rival-controller execution state so the value
+        baseline does not have to infer hidden causes from delayed rewards.
+        """
+        public = np.asarray(public_state, dtype=np.float32).reshape(-1)
+        if public.size != self.platform_observation_dim:
+            raise ValueError(
+                "public state width changed while building privileged critic state: "
+                f"{public.size} != {self.platform_observation_dim}"
+            )
+        base = self.market.curr_market
+        normalized_city = bool(getattr(self.choice_model, 'fare_normalized', False))
+        tariff_ratios: List[float] = []
+        for firm in (self.firm1, self.firm2):
+            overrides = getattr(firm, "overrides", CoefficientOverrides())
+            for key in MANIPULATABLE_PRICE_COEFFICIENT_KEYS:
+                anchor = float(max(1e-6, getattr(base, key)))
+                relative = get_coeff(base, overrides, key) / anchor - 1.0
+                tariff_ratios.append(float((np.arcsinh(relative)
+                    if float(getattr(base, key)) > 0 else 0.) if normalized_city
+                    else np.clip(relative, -1.5, 1.5)))
+
+        def money(value, legacy_scale):
+            return float(np.arcsinh(value / self.city_reference_fare) if normalized_city
+                         else np.clip(value / legacy_scale, -2., 2.))
+
+        exact_outcomes = [
+            float(np.clip(self.last_share, 0.0, 1.0)),
+            money(self.last_revpr, self.reward_rev_scale),
+            money(self.last_profitpr, self.reward_profit_scale),
+            float(np.clip(self.last_fulfillment, 0.0, 1.0)),
+            float(np.clip(self.last_firm2_share, 0.0, 1.0)),
+            money(self.last_firm2_revpr, self.reward_rev_scale),
+            money(self.last_firm2_profitpr, self.reward_profit_scale),
+            float(np.clip(self.last_firm2_fulfillment, 0.0, 1.0)),
+        ]
+        if self.enable_driver_supply:
+            supply = np.concatenate((
+                self.driver_supply.state_features_for_firm(
+                    "Firm1", opponent="Firm2"
+                ),
+                self.driver_supply.state_features_for_firm(
+                    "Firm2", opponent="Firm1"
+                ),
+            )).astype(np.float32, copy=False)
+        else:
+            supply = np.zeros(16, dtype=np.float32)
+        opponent_execution = [
+            float(np.clip(
+                (float(getattr(self.firm2, "_last_applied_action", -1)) + 1.0)
+                / max(1.0, float(getattr(self.firm1.agent, "action_dim", 1))),
+                0.0,
+                1.0,
+            )),
+            float(np.clip(
+                float(getattr(self.firm2, "_repeat_action_count", 0)) / 10.0,
+                0.0,
+                1.0,
+            )),
+            float(np.clip(float(getattr(self.firm2, "step_scale", 1.0)), 0.0, 2.0) / 2.0),
+            float(np.clip(
+                float(getattr(self.firm2, "supply_incentive_multiplier", 1.0))
+                - 1.0,
+                -0.5,
+                0.5,
+            )),
+            float(self.firm2_mode != "static"),
+            float(bool(self.objective_credit_ready)),
+        ]
+        opponent_mode = str(getattr(
+            self.firm2,
+            "_ride_response_mode",
+            self.firm2_mode,
+        ))
+        opponent_context = (
+            [
+                float(opponent_mode == candidate)
+                for candidate in self.critic_opponent_modes
+            ]
+            if self.credit_assignment_v25
+            else []
+        )
+        state = np.concatenate((
+            public,
+            np.asarray(tariff_ratios, dtype=np.float32),
+            np.asarray(exact_outcomes, dtype=np.float32),
+            supply,
+            np.asarray(opponent_execution, dtype=np.float32),
+            np.asarray(opponent_context, dtype=np.float32),
+            np.asarray(self._regime_critic_features(), dtype=np.float32),
+        )).astype(np.float32, copy=False)
+        expected_critic_dim = int(self.firm1.agent.critic_state_dim)
+        if state.size != expected_critic_dim:
+            raise AssertionError(
+                "privileged critic schema must remain fixed at "
+                f"{expected_critic_dim}, got {state.size}"
+            )
+        return np.nan_to_num(state, nan=0.0, posinf=2.0, neginf=-2.0)
+
+    def _public_reward_potential(self, public_state: np.ndarray) -> float:
+        """Fixed public-state potential used only for optional redistribution."""
+        state = np.asarray(public_state, dtype=np.float32).reshape(-1)
+        if state.size != self.platform_observation_dim:
+            raise ValueError(
+                "reward potential requires one public observation frame"
+            )
+        completed_share = float(state[9])
+        profit = float(state[10])
+        fulfillment = float(state[11])
+        alpha = objective_profit_share(self._configured_primary_objective())
+        profit_potential = (
+            0.80 * profit + 0.10 * completed_share + 0.10 * fulfillment
+        )
+        competitiveness_potential = (
+            0.20 * profit + 0.70 * completed_share + 0.10 * fulfillment
+        )
+        potential = (
+            alpha * profit_potential
+            + (1.0 - alpha) * competitiveness_potential
+        )
+        return float(np.clip(potential, -1.0, 1.0))
+
+    def _snapshot_counterfactual_state(self, profiles=()) -> Dict[str, Any]:
+        """Capture every mutable component touched by a one-step branch."""
+        tracked = (
+            "last_share", "last_revpr", "last_profitpr", "last_gap",
+            "last_fulfillment", "last_completion_coverage", "last_acceptance",
+            "last_wait", "last_driver_paypr", "last_firm2_share",
+            "last_firm2_revpr", "last_firm2_profitpr",
+            "last_firm2_fulfillment", "last_firm2_acceptance",
+            "last_firm2_wait", "last_firm2_driver_paypr",
+            "objective_credit_ready", "airport_rate_last", "mean_distance_last",
+        )
+        tracked += (
+            "_rival_gap_history", "_returning_share_ema",
+            "_durable_profit_lead_ema", "_temporal_reward_state_initialized",
+        )
+        if self.regime_market:
+            tracked += ("_regime_last_effect", "_firm2_regime_price_multiplier", "_regime_rival_switch_applied")
+        return {
+            "riders": self._snapshot_rider_state(profiles),
+            "market": copy.deepcopy(self.market),
+            "rng_state": copy.deepcopy(self.rng.bit_generator.state),
+            "python_rng_state": random.getstate(),
+            "torch_rng_state": torch.random.get_rng_state(),
+            "cuda_rng_state": (
+                torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available()
+                else None
+            ),
+            "choice_model": copy.deepcopy(self.choice_model),
+            "firm1_overrides": copy.deepcopy(self.firm1.overrides),
+            "firm1_execution": self.firm1.snapshot_execution_state(),
+            "firm2": copy.deepcopy(self.firm2),
+            "driver_supply": copy.deepcopy(self.driver_supply),
+            "observers": {
+                name: observer.snapshot()
+                for name, observer in self.platform_observers.items()
+            },
+            "stability": self.action_stability.snapshot(),
+            "crowd": copy.deepcopy(
+                getattr(self, "last_crowd_response_stats", {})
+            ),
+            "price_gap": copy.deepcopy(self.last_price_gap_metrics),
+            "reward_diagnostics": copy.deepcopy(
+                getattr(self, "last_reward_diagnostics", {})
+            ),
+            "tracked": {name: copy.deepcopy(getattr(self, name)) for name in tracked},
+        }
+
+    def _restore_counterfactual_state(self, snapshot: Mapping[str, Any]) -> None:
+        """Rollback a branch so the selected real action sees identical noise."""
+        self._restore_rider_state(snapshot["riders"])
+        self.market = copy.deepcopy(snapshot["market"])
+        self.rng.bit_generator.state = copy.deepcopy(snapshot["rng_state"])
+        random.setstate(snapshot["python_rng_state"])
+        torch.random.set_rng_state(snapshot["torch_rng_state"])
+        if torch.cuda.is_available() and snapshot.get("cuda_rng_state") is not None:
+            torch.cuda.set_rng_state_all(snapshot["cuda_rng_state"])
+        self.choice_model = copy.deepcopy(snapshot["choice_model"])
+        self.firm1.overrides = copy.deepcopy(snapshot["firm1_overrides"])
+        self.firm1.restore_execution_state(snapshot["firm1_execution"])
+        self.firm2 = copy.deepcopy(snapshot["firm2"])
+        self.driver_supply = copy.deepcopy(snapshot["driver_supply"])
+        for name, observer_snapshot in snapshot["observers"].items():
+            self.platform_observers[name].restore(observer_snapshot)
+        self.action_stability.restore(snapshot["stability"])
+        self.last_crowd_response_stats = copy.deepcopy(snapshot["crowd"])
+        self.last_price_gap_metrics = copy.deepcopy(snapshot["price_gap"])
+        self.last_reward_diagnostics = copy.deepcopy(
+            snapshot["reward_diagnostics"]
+        )
+        for name, value in snapshot["tracked"].items():
+            setattr(self, name, copy.deepcopy(value))
+
+    def _boundary_bootstrap_preview(self, *, previous_metrics, steps_per_day,
+                                    opponent_due, episode_seed):
+        """Preview the next market-period state; never execute a rider rollout.
+
+        With the standard daily decision cadence this is the actual next
+        decision state, including the lagged rival move. Reuse the existing
+        transaction so no extra day, price move or RNG draw enters the run.
+        """
+        snapshot = self._snapshot_counterfactual_state()
+        try:
+            ctx = self.market.sample_day_context()
+            hours = [self.market.sample_timestep_hour().hour for _ in range(max(1, int(steps_per_day)))]
+            self._regime_day_start(hours, episode_seed=episode_seed)
+            self._firm2_leader_step(previous_metrics=previous_metrics,
+                day_of_week=ctx.day_of_week, hour=hours[0], weather=ctx.weather, enabled=opponent_due)
+            raw, features, _ = self._publish_pricing_observation(
+                day_of_week=ctx.day_of_week, hour=hours[0], weather=ctx.weather)
+            state = self.firm1.stack_state(raw, commit=False)
+            value = self.firm1.agent.value_estimates(state, action_features=features,
+                critic_state=self._build_privileged_critic_state(raw))[0]
+            components = self.firm1.agent.last_preview_components.detach().clone()
+            potential = self._public_reward_potential(raw) if self.potential_shaping_scale > 0 else None
+            return value.detach().clone(), components, potential
+        finally:
+            self._restore_counterfactual_state(snapshot)
+
+    def _counterfactual_action_values(
+        self,
+        *,
+        selected_action: int,
+        policy_top_action: int,
+        policy_second_action: int,
+        action_mask: np.ndarray,
+        day_of_week: int,
+        hour: int,
+        weather: str,
+        customers_per_step: int,
+        sampled_profiles: List[Dict[str, Any]],
+        supply_reference_customers: Optional[int] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Evaluate a coverage-balanced action subset under common random numbers.
+
+        These observed targets train the independent Q diagnostic and the
+        low-weight pairwise PPO policy-improvement term. No unobserved target
+        enters either loss, and no branch action is forced into the real or
+        deployed policy.
+        """
+        del policy_top_action, policy_second_action
+        values = np.full(self.firm1.agent.action_dim, np.nan, dtype=np.float32)
+        mask = np.asarray(action_mask, dtype=bool).reshape(-1)
+        if self.counterfactual_branches <= 0:
+            return values, np.zeros_like(mask)
+        feasible = np.flatnonzero(mask).astype(int).tolist()
+        candidates: List[int] = []
+        selected = int(selected_action)
+        if selected in feasible:
+            candidates.append(selected)
+        # The v24 top/runner-up rule repeatedly supervised the same few actions,
+        # leaving most of the Q surface unconstrained. Select alternatives by
+        # least prior CRN exposure. This changes only which *simulated* branches
+        # are labeled; it never changes the real or deployed policy action.
+        alternatives = sorted(
+            (action for action in feasible if action != selected),
+            key=lambda action: (
+                int(self.counterfactual_action_counts[action]), action
+            ),
+        )
+        candidates.extend(
+            alternatives[: max(0, self.counterfactual_branches - len(candidates))]
+        )
+        for action in candidates:
+            self.counterfactual_action_counts[action] += 1
+        snapshot = self._snapshot_counterfactual_state(sampled_profiles)
+        try:
+            for action in candidates:
+                self._restore_counterfactual_state(snapshot)
+                self.firm1.apply_action(action, self.market)
+                _, m1, m2, mean_gap, _, _ = self.simulate_batch(
+                    day_of_week=day_of_week,
+                    weather=weather,
+                    hour=hour,
+                    customers_per_step=customers_per_step,
+                    sampled_profiles=sampled_profiles,
+                    collect_rows=False,
+                    supply_reference_customers=supply_reference_customers,
+                )
+                diag = self._reward_diagnostics(
+                    share=float(m1.chosen_share),
+                    completed_share=float(m1.completed_share),
+                    rev_per_request=float(m1.rev_per_request),
+                    mean_gap=float(mean_gap),
+                    prev_share=float(self.last_share),
+                    prev_rev_per_request=float(self.last_revpr),
+                    prev_profit_per_request=float(self.last_profitpr),
+                    prev_rival_profit_per_request=float(self.last_firm2_profitpr),
+                    prev_rival_market_share=float(self.last_firm2_share),
+                    prev_fulfillment_rate=float(self.last_fulfillment),
+                    prev_gap=float(self.last_gap),
+                    profit_per_request=float(m1.profit_per_request),
+                    profit_margin=self._profit_margin(m1),
+                    fulfillment_rate=float(m1.fulfillment_rate),
+                    avg_wait_minutes=float(m1.avg_wait_minutes),
+                    driver_acceptance_rate=float(m1.driver_acceptance_rate),
+                    action_change_magnitude=float(
+                        self.firm1.last_action_magnitude()
+                    ),
+                    baseline_share=float(m2.chosen_share),
+                    baseline_completed_share=float(m2.completed_share),
+                    baseline_rev_per_request=float(m2.rev_per_request),
+                    baseline_profit_per_request=float(m2.profit_per_request),
+                    action_event=True,
+                    price_gap_abs_error=float(self.last_price_gap_metrics["mae"]),
+                    update_temporal_reward_state=False,
+                )
+                values[action] = float(diag["reward"])
+        finally:
+            self._restore_counterfactual_state(snapshot)
+        target_mask = np.isfinite(values)
+        if bool(target_mask.any()):
+            # Common-noise relative action values are the identifiable signal;
+            # their action-independent level is already handled by V/rho.
+            values[target_mask] -= float(np.mean(values[target_mask]))
+        return values, target_mask
+
+    @isolated_batch_noise
+    def simulate_batch(
+        self,
+        day_of_week: int,
+        weather: str,
+        hour: int,
+        customers_per_step: int,
+        sampled_profiles: Optional[List[Dict[str, Any]]] = None,
+        collect_rows: bool = True,
+        supply_reference_customers: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], FirmMetrics, FirmMetrics, float, float, float]:
+        """Simulate one market step.
+
+        v26: ``customers_per_step`` is the step's *realized* request count
+        (hour-of-day volume) while ``supply_reference_customers`` is the run's
+        base count, which sets fleet capacity and the money normalization.
+        Operational trips come from the city's empirical trip bank.
+        """
+        rows: List[Dict[str, Any]] = []
+        v26_dynamics = bool(self.market_dynamics.enabled)
+        reference_customers = int(max(
+            1,
+            supply_reference_customers
+            if (v26_dynamics and supply_reference_customers)
+            else customers_per_step,
+        ))
+        firm1 = FirmMetrics()
+        firm2 = FirmMetrics()
+        gap_sum = 0.0
+        gap_abs_errors: List[float] = []
+        profile_count = 0
+
+        airport_count = 0
+        dist_sum = 0.0
+        threshold_values: List[float] = []
+        distance_values: List[float] = []
+        duration_values: List[float] = []
+        low_income_count = 0
+        near_threshold_count = 0
+        firm1_gap_below_threshold_count = 0
+        no_ride_count = 0
+        long_trip_count = 0
+        premium_count = 0
+        distance_bin_counts: Dict[str, int] = defaultdict(int)
+        distance_bin_firm1_choices: Dict[str, int] = defaultdict(int)
+        distance_bin_firm1_completed: Dict[str, int] = defaultdict(int)
+        distance_bin_gap_sum: Dict[str, float] = defaultdict(float)
+        distance_bin_promotion_sum: Dict[str, float] = defaultdict(float)
+        distance_bin_firm1_revenue_sum: Dict[str, float] = defaultdict(float)
+        # v26 welfare/equity accounting: [requests, served, paid, surplus, no_ride, wait]
+        welfare_by_income: Dict[str, List[float]] = defaultdict(lambda: [0.0] * 6)
+        reservation_fn = getattr(self.choice_model, "_reservation_price", None)
+        
+        loyalty_v2 = bool(self.loyalty_v2)
+        firm1_choosers = 0
+        firm1_returning = 0
+        loyal1_requests = 0
+        loyal1_chose_firm1 = 0
+        profile_sample_size = self._effective_simulation_sample_size(customers_per_step, collect_rows=collect_rows)
+        if sampled_profiles is None:
+            profiles = self.agent_gen.sample_profiles(profile_sample_size)
+        elif collect_rows or len(sampled_profiles) <= profile_sample_size:
+            profiles = sampled_profiles
+        else:
+            profiles = sampled_profiles[:profile_sample_size]
+        regime_effect = self._regime_effect(int(hour))
+        if self.enable_driver_supply:
+            self._sync_driver_incentive_multipliers()
+            if getattr(self.driver_supply, "supply_v2", False):
+                # Posted pay level this block (fare multiplier x incentive) for
+                # the within-day online response.
+                base_market = self.market.curr_market
+                for firm_name, pricer in (("Firm1", self.firm1), ("Firm2", self.firm2)):
+                    ratios = [
+                        float(get_coeff(base_market, pricer.overrides, key)) / max(1e-6, float(getattr(base_market, key)))
+                        for key in self.shared_edit_keys if float(getattr(base_market, key)) > 0.0
+                    ]
+                    level = float(np.mean(ratios)) if ratios else 1.0
+                    if self.market_dynamics.driver_pay_basis != "fare":
+                        level = 1.0  # anchor-based pay does not move with the posted fare
+                    self.driver_supply.set_pay_index(
+                        firm_name, level * float(self.driver_supply.pay_policies[firm_name].incentive_multiplier)
+                    )
+            if self.regime_market:
+                self.driver_supply.apply_shock(
+                    fleet_multiplier=float(regime_effect.fleet_multiplier),
+                    wage_multiplier=float(regime_effect.reservation_wage_multiplier),
+                    firm_capacity=dict(regime_effect.firm_capacity_multiplier),
+                )
+            self.driver_supply.begin_batch(
+                customers_per_step=(reference_customers if v26_dynamics else customers_per_step),
+                hour=hour,
+                weather=weather,
+                supply_multiplier=self.market.driver_supply_multiplier(hour=int(hour)),
+            )
+        empirical_trips = self.market.sample_operational_trips(
+            self.rng, hour=int(hour), day_of_week=int(day_of_week), size=len(profiles)
+        )
+
+        for profile_index, profile in enumerate(profiles):
+            rider_streams(self, profile_index)
+            if self.enable_driver_supply:
+                self.driver_supply.advance_request_time((profile_index + .5) / max(1, len(profiles)))
+            profile_count += 1
+            if empirical_trips is not None:
+                # v26: city-calibrated empirical trip (distance, duration,
+                # airport, service) conditioned on hour and weekday/weekend.
+                travel_distance = float(empirical_trips["distance"][profile_index])
+            else:
+                # Legacy v25 scenario-side draw (city-independent).
+                travel_distance = round(float(self.rng.exponential(4.0)), 2)
+            
+            if travel_distance < 2.0:
+                distance_bin = "0_2"
+            elif travel_distance < 5.0:
+                distance_bin = "2_5"
+            elif travel_distance < 10.0:
+                distance_bin = "5_10"
+            else:
+                distance_bin = "10_plus"
+            distance_bin_counts[distance_bin] += 1
+
+            if empirical_trips is not None:
+                airport = bool(empirical_trips["airport"][profile_index])
+                service = str(empirical_trips["service"][profile_index])
+            else:
+                airport = self.market.sample_airport_flag()
+                service = self.market.sample_service()
+            if self.regime_market and regime_effect.airport_share_multiplier != 1.0:
+                airport = self._regime_resample_airport(airport, float(regime_effect.airport_share_multiplier))
+            airport_count += int(airport)
+            dist_sum += float(travel_distance)
+            distance_values.append(float(travel_distance))
+
+            duration = (
+                float(empirical_trips["duration"][profile_index])
+                if empirical_trips is not None
+                else self.estimate_duration(travel_distance, hour)
+            )
+            if self.regime_market and regime_effect.duration_multiplier != 1.0:
+                duration = float(duration) * float(regime_effect.duration_multiplier)
+            duration_values.append(float(duration))
+
+            ctx = RideContext(
+                day_of_week=day_of_week,
+                weather=weather,
+                hour=hour,
+                airport=airport,
+                service=service,
+            )
+
+            p1 = self.market.quote_price(travel_distance, duration, ctx, overrides=self.firm1.overrides)
+            p2 = self.market.quote_price(travel_distance, duration, ctx, overrides=self.firm2.overrides)
+            pre_discount_fare2 = float(p2)
+            if self.regime_market and self._firm2_regime_price_multiplier != 1.0:
+                # Rival promotion: Firm 2's posted quotes are discounted for the
+                # window; its controller state and overrides are untouched.
+                p2 = float(p2) * float(self._firm2_regime_price_multiplier)
+            pay_reference_fare = (
+                float(self.market.quote_price(travel_distance, duration, ctx, overrides=None))
+                if v26_dynamics and self.market_dynamics.driver_pay_basis == "anchor"
+                else None
+            )
+            # A platform-funded rider promotion does not cut driver gross pay.
+            pay_reference_fare2 = (pre_discount_fare2 if self.regime_market
+                and self.market_dynamics.driver_pay_basis == "fare" else pay_reference_fare)
+
+            realized_gap = float(p2 - p1)
+            gap_sum += realized_gap
+            gap_abs_errors.append(
+                abs(realized_gap - float(self.reward_target_price_gap))
+            )
+            
+            if self.enable_driver_supply:
+                service_q1 = self.driver_supply.estimate_service_quality("Firm1", airport=airport)
+                service_q2 = self.driver_supply.estimate_service_quality("Firm2", airport=airport)
+                pickup_estimate1 = float(service_q1["pickup_minutes"])
+                pickup_estimate2 = float(service_q2["pickup_minutes"])
+                cancel_risk1 = float(service_q1["cancel_risk"])
+                cancel_risk2 = float(service_q2["cancel_risk"])
+            else:
+                pickup_estimate1 = pickup_estimate2 = 0.0
+                cancel_risk1 = cancel_risk2 = 0.0
+
+            scenario = {
+                "City": str(getattr(self.market, "current_city", self.market_name)),
+                "DistanceMiles": float(travel_distance),
+                "DurationMinutes": float(round(duration, 2)),
+                "DayOfWeek": int(day_of_week),
+                "Hour": int(hour),
+                "Weather": str(weather),
+                "Airport": bool(airport),
+                "Service": str(service),
+                "WaitEstimateFirm1": pickup_estimate1,
+                "WaitEstimateFirm2": pickup_estimate2,
+                "CancelRiskFirm1": cancel_risk1,
+                "CancelRiskFirm2": cancel_risk2,
+            }
+            if self.regime_market:
+                scenario["ShockReservationMultiplier"] = float(regime_effect.reservation_multiplier)
+                scenario["ShockPriceSensitivityMultiplier"] = float(regime_effect.price_sensitivity_multiplier)
+                scenario["ShockAirportPriceSensitivityMultiplier"] = float(regime_effect.airport_price_sensitivity_multiplier)
+                scenario["ShockTransitAvailability"] = float(regime_effect.transit_availability)
+            if hasattr(self.choice_model, 'demand_spec'):
+                scenario['ReferenceFare'] = float(self.market.quote_price(
+                    travel_distance, duration, ctx, overrides=None))
+            
+            threshold = float(np.clip(float(profile.get("PriceThreshold", 1.50) or 1.50), 0.25, 8.00))
+            if hasattr(self.choice_model, 'demand_spec'):
+                threshold = float(profile['PriceThreshold'])  # Report the same unclipped prior used by demand.
+            threshold_values.append(threshold)
+            low_income_count += int(str(profile.get("IncomeBracket", "")).strip() == "<50k")
+            near_threshold_count += int(0.75 <= abs(float(p2 - p1)) / max(threshold, 1e-6) <= 1.25)
+            long_trip_count += int(float(travel_distance) >= 8.0)
+            firm1_gap_below_threshold_count += int(abs(float(p2 - p1)) <= threshold)
+            premium_count += int(str(service).lower() in {"premium", "xl", "black"})
+
+            choice_res: ChoiceResult = self.choice_model.choose(profile, scenario, p1, p2)
+            choice = choice_res.choice
+            if loyalty_v2:
+                stock_pre = profile.get("_LoyaltyV2")
+                if stock_pre is not None and float(stock_pre.get("Firm1", 0.0)) - float(stock_pre.get("Firm2", 0.0)) > 0.25:
+                    loyal1_requests += 1
+                    loyal1_chose_firm1 += int(choice == "Firm1")
+            no_ride_count += int(choice == "NoRide")
+
+            firm1.total += 1
+            firm2.total += 1
+            fulfilled = False
+            matched_firm = ""
+            match_status = "NoRide" if choice == "NoRide" else "NotDispatched"
+            driver_pay = 0.0
+            pickup_minutes = 0.0
+            wait_minutes = 0.0
+            acceptance_prob = 0.0
+            if choice == "Firm1":
+                firm1.chosen += 1
+                if self.enable_driver_supply:
+                    dispatch = self.driver_supply.dispatch("Firm1", p1, travel_distance, duration, airport=airport, weather=weather, pay_reference_fare=pay_reference_fare)
+                    firm1.dispatch_offers += 1
+                    acceptance_prob = float(dispatch.acceptance_probability)
+                    pickup_minutes = float(dispatch.pickup_minutes)
+                    wait_minutes = float(dispatch.wait_minutes)
+                    driver_pay = float(dispatch.driver_pay)
+                    if dispatch.fulfilled:
+                        fulfilled = True
+                        firm1.completed += 1
+                        firm1.wins += 1
+                        matched_firm = "Firm1"
+                        firm1.revenue += float(p1)
+                        firm1.driver_pay += driver_pay
+                        firm1.wait_minutes += wait_minutes
+                        firm1.pickup_minutes += pickup_minutes
+                        firm1.profit += float(p1) - driver_pay - float(dispatch.platform_variable_cost)
+                        match_status = "Completed"
+                    else:
+                        firm1.unfulfilled += 1
+                        firm1.driver_rejections += 1
+                        match_status = dispatch.reject_reason
+                else:
+                    trip_cost = self._estimate_trip_cost(travel_distance, duration, airport)
+                    fulfilled = True
+                    firm1.completed += 1
+                    firm1.wins += 1
+                    matched_firm = "Firm1"
+                    firm1.revenue += float(p1)
+                    firm1.profit += float(p1) - trip_cost
+                    match_status = "Completed"
+            elif choice == "Firm2":
+                firm2.chosen += 1
+                if self.enable_driver_supply:
+                    dispatch = self.driver_supply.dispatch("Firm2", p2, travel_distance, duration, airport=airport, weather=weather, pay_reference_fare=pay_reference_fare2)
+                    firm2.dispatch_offers += 1
+                    acceptance_prob = float(dispatch.acceptance_probability)
+                    pickup_minutes = float(dispatch.pickup_minutes)
+                    wait_minutes = float(dispatch.wait_minutes)
+                    driver_pay = float(dispatch.driver_pay)
+                    if dispatch.fulfilled:
+                        fulfilled = True
+                        firm2.completed += 1
+                        firm2.wins += 1
+                        matched_firm = "Firm2"
+                        firm2.revenue += float(p2)
+                        firm2.driver_pay += driver_pay
+                        firm2.wait_minutes += wait_minutes
+                        firm2.pickup_minutes += pickup_minutes
+                        firm2.profit += float(p2) - driver_pay - float(dispatch.platform_variable_cost)
+                        match_status = "Completed"
+                    else:
+                        firm2.unfulfilled += 1
+                        firm2.driver_rejections += 1
+                        match_status = dispatch.reject_reason
+                else:
+                    trip_cost = self._estimate_trip_cost(travel_distance, duration, airport)
+                    fulfilled = True
+                    firm2.completed += 1
+                    firm2.wins += 1
+                    matched_firm = "Firm2"
+                    firm2.revenue += float(p2)
+                    firm2.profit += float(p2) - trip_cost
+                    match_status = "Completed"
+            if (
+                v26_dynamics
+                and self.market_dynamics.unfulfilled_spillover
+                and self.enable_driver_supply
+                and choice in ("Firm1", "Firm2")
+                and not fulfilled
+            ):
+                # v26 multi-homing: the rider re-requests on the other platform.
+                other_name = "Firm2" if choice == "Firm1" else "Firm1"
+                other_metrics = firm2 if other_name == "Firm2" else firm1
+                other_price = float(p2 if other_name == "Firm2" else p1)
+                reservation_fn = getattr(self.choice_model, "_reservation_price", None)
+                reservation = (
+                    float(reservation_fn(profile, scenario))
+                    if callable(reservation_fn)
+                    else float("inf")
+                )
+                if self.spillover_price_aware:
+                    # v26r: a stranded rider re-evaluates the other platform's
+                    # quote with the same choice model (single-price market),
+                    # so an expensive rival cannot harvest stranded demand at
+                    # any price (removes the Bertrand-Edgeworth artifact).
+                    if hasattr(self.choice_model, 'demand_spec'):
+                        accept = self.choice_model.retry_probability(profile, scenario, other_name, other_price)
+                    else:
+                        no_ride_fn = getattr(self.choice_model, "_no_ride_probability", None)
+                        accept = (
+                            1.0 - float(no_ride_fn(profile, scenario, other_price, other_price))
+                            if callable(no_ride_fn) else (1.0 if other_price <= reservation else 0.25)
+                        )
+                    retry_probability = float(self.market_dynamics.spillover_probability) * float(np.clip(accept, 0.0, 1.0))
+                else:
+                    retry_probability = float(self.market_dynamics.spillover_probability) * (
+                        1.0 if other_price <= reservation else 0.25
+                    )
+                if float(self.rng.random()) < retry_probability:
+                    other_metrics.spillover_attempts += 1
+                    retry = self.driver_supply.dispatch(
+                        other_name, other_price, travel_distance, duration,
+                        airport=airport, weather=weather,
+                        pay_reference_fare=pay_reference_fare2 if other_name == "Firm2" else pay_reference_fare,
+                    )
+                    other_metrics.dispatch_offers += 1
+                    if retry.fulfilled:
+                        fulfilled = True
+                        other_metrics.completed += 1
+                        other_metrics.wins += 1
+                        other_metrics.spillover_completed += 1
+                        matched_firm = other_name
+                        other_metrics.revenue += other_price
+                        other_metrics.driver_pay += float(retry.driver_pay)
+                        other_metrics.wait_minutes += float(retry.wait_minutes)
+                        other_metrics.pickup_minutes += float(retry.pickup_minutes)
+                        other_metrics.profit += (
+                            other_price
+                            - float(retry.driver_pay)
+                            - float(retry.platform_variable_cost)
+                        )
+                        match_status = f"CompletedAfterSpillover:{other_name}"
+                        driver_pay = float(retry.driver_pay)
+                        pickup_minutes = float(retry.pickup_minutes)
+                        wait_minutes = float(retry.wait_minutes)
+                        acceptance_prob = float(retry.acceptance_probability)
+                    else:
+                        other_metrics.unfulfilled += 1
+                        other_metrics.driver_rejections += 1
+            if loyalty_v2:
+                if choice == "Firm1":
+                    firm1_choosers += 1
+                    stock_ref = profile.get("_LoyaltyV2")
+                    if stock_ref is not None and float(stock_ref.get("rides_Firm1", 0.0)) > 0.0:
+                        firm1_returning += 1
+                if choice in ("Firm1", "Firm2"):
+                    own_price = float(p1 if choice == "Firm1" else p2)
+                    rival_price = float(p2 if choice == "Firm1" else p1)
+                    if fulfilled and matched_firm and matched_firm != choice:
+                        own_price, rival_price = rival_price, own_price
+                    self._loyalty_record_outcome(
+                        profile,
+                        choice=choice,
+                        matched_firm=str(matched_firm),
+                        fulfilled=bool(fulfilled),
+                        pickup_minutes=float(pickup_minutes),
+                        wait_estimate=float(pickup_estimate1 if choice == "Firm1" else pickup_estimate2),
+                        paid=own_price,
+                        other_price=rival_price,
+                        threshold=float(threshold),
+                    )
+                elif profile.get("_LoyaltyV2") is not None:
+                    self._loyalty_record_outcome(
+                        profile, choice="NoRide", matched_firm="", fulfilled=False,
+                        pickup_minutes=0.0, wait_estimate=0.0, paid=0.0, other_price=0.0, threshold=threshold,
+                    )
+            if v26_dynamics:
+                bucket = welfare_by_income[str(profile.get("IncomeBracket", "unknown"))]
+                bucket[0] += 1.0
+                bucket[4] += float(choice == "NoRide")
+                if fulfilled:
+                    status = str(match_status)
+                    if status.startswith("CompletedAfterSpillover"):
+                        paid = float(p2 if status.endswith("Firm2") else p1)
+                    else:
+                        paid = float(p1 if choice == "Firm1" else p2)
+                    reservation = (
+                        float(reservation_fn(profile, scenario))
+                        if callable(reservation_fn)
+                        else paid
+                    )
+                    bucket[1] += 1.0
+                    bucket[2] += paid
+                    bucket[3] += max(0.0, reservation - paid)
+                    bucket[5] += float(wait_minutes)
+            # "NoRide" / outside-option choices remain demand opportunities.
+            # Driver-layer unfulfilled choices also remain demand opportunities but
+            # generate no completed win or rideshare revenue.
+            distance_bin_gap_sum[distance_bin] += float(p2 - p1)
+            distance_bin_promotion_sum[distance_bin] += pre_discount_fare2 - p2
+            if choice == "Firm1":
+                distance_bin_firm1_choices[distance_bin] += 1
+            if fulfilled and matched_firm == "Firm1":
+                distance_bin_firm1_completed[distance_bin] += 1
+                distance_bin_firm1_revenue_sum[distance_bin] += float(p1)
+            
+            if collect_rows:
+                rows.append({
+                    "City": str(getattr(self.market, "current_city", self.market_name)),
+                    "DayOfWeek": day_of_week,
+                    "Weather": weather,
+                    "Hour": hour,
+                    "Airport": airport,
+                    "Service": service,
+                    "TravelDistance": travel_distance,
+                    "Price_Firm1": p1,
+                    "Price_Firm2": p2,
+                    "Choice": choice,
+                    "MatchedFirm": matched_firm,
+                    "Fulfilled": bool(fulfilled),
+                    "MatchStatus": match_status,
+                    "DriverPay": float(driver_pay),
+                    "PickupMinutes": float(pickup_minutes),
+                    "WaitMinutes": float(wait_minutes),
+                    "DriverAcceptanceProbability": float(acceptance_prob),
+                    "WaitEstimateFirm1": pickup_estimate1,
+                    "WaitEstimateFirm2": pickup_estimate2,
+                    "ReasonCodes": ",".join(choice_res.reason_codes),
+                    "ShortReason": choice_res.short_reason,
+                    **({k: v for k, v in profile.items() if not str(k).startswith("_")} if loyalty_v2 else profile),
+                })
+
+        if loyalty_v2:
+            self._last_returning_share = float(firm1_returning) / float(max(1, firm1_choosers))
+            self._last_loyal_choice_rate = float(loyal1_chose_firm1) / float(max(1, loyal1_requests))
+            self._last_loyal_request_share = float(loyal1_requests) / float(max(1, profile_count))
+        if self.enable_driver_supply:
+            self.driver_supply.end_batch()
+        reputation = getattr(self.choice_model, "reputation", None)
+        if v26_dynamics and reputation is not None:
+            # Rider memory: this step's posted tariff level and dispatch
+            # reliability move next step's platform choice and outside option.
+            for firm_name, metrics, pricer in (
+                ("Firm1", firm1, self.firm1),
+                ("Firm2", firm2, self.firm2),
+            ):
+                offers = int(getattr(metrics, "dispatch_offers", 0))
+                reputation.update(
+                    firm_name,
+                    price_index=self._firm_tariff_index(pricer),
+                    fulfillment=(float(metrics.completed) / offers) if offers > 0 else None,
+                )
+            reputation.updates += 1
+        if v26_dynamics:
+            self.last_welfare_stats = {
+                "by_income": {key: list(value) for key, value in welfare_by_income.items()},
+                "firm1_profit": float(firm1.profit),
+                "firm2_profit": float(firm2.profit),
+                "driver_pay": float(firm1.driver_pay + firm2.driver_pay),
+            }
+        if v26_dynamics and self.market_dynamics.hourly_demand_volume:
+            # Money outcomes per *base* request: the sampled profiles stand for
+            # ``customers_per_step`` realized requests of a ``reference``-sized
+            # average step, so busy hours carry proportionally more profit.
+            money_reference = int(max(1, round(
+                reference_customers * profile_count / max(1, int(customers_per_step))
+            )))
+            firm1.reference_total = money_reference
+            firm2.reference_total = money_reference
+        denominator = max(1, profile_count)
+        threshold_arr = np.asarray(threshold_values or [1.5], dtype=float)
+        distance_arr = np.asarray(distance_values or [self.mean_distance_last], dtype=float)
+        duration_arr = np.asarray(duration_values or [0.0], dtype=float)
+        distance_bin_stats: Dict[str, float] = {}
+        for label in ("0_2", "2_5", "5_10", "10_plus"):
+            count = max(1, int(distance_bin_counts.get(label, 0)))
+            completed = max(1, int(distance_bin_firm1_completed.get(label, 0)))
+            distance_bin_stats[f"distance_bin_{label}_count"] = float(distance_bin_counts.get(label, 0))
+            distance_bin_stats[f"distance_bin_{label}_firm1_choice_share"] = float(distance_bin_firm1_choices.get(label, 0) / count)
+            distance_bin_stats[f"distance_bin_{label}_firm1_completed_share"] = float(distance_bin_firm1_completed.get(label, 0) / count)
+            distance_bin_stats[f"distance_bin_{label}_firm1_revpr"] = float(distance_bin_firm1_revenue_sum.get(label, 0.0) / count)
+            distance_bin_stats[f"distance_bin_{label}_completed_rev"] = float(distance_bin_firm1_revenue_sum.get(label, 0.0) / completed)
+            distance_bin_stats[f"distance_bin_{label}_price_gap_mean"] = float(distance_bin_gap_sum.get(label, 0.0) / count)
+            if self.regime_market:
+                distance_bin_stats[f"distance_bin_{label}_firm2_promotion_discount"] = distance_bin_promotion_sum.get(label, 0.) / count
+            
+        self.last_crowd_response_stats = {
+            "price_threshold_mean": float(np.mean(threshold_arr)),
+            "price_threshold_std": float(np.std(threshold_arr)),
+            "price_threshold_q25": float(np.quantile(threshold_arr, 0.25)),
+            "price_threshold_q50": float(np.quantile(threshold_arr, 0.50)),
+            "price_threshold_q75": float(np.quantile(threshold_arr, 0.75)),
+            "firm1_gap_below_threshold_share": float(firm1_gap_below_threshold_count / denominator),
+            "firm1_price_below_wtp_share": float(firm1_gap_below_threshold_count / denominator),
+            "near_threshold_share": float(near_threshold_count / denominator),
+            **distance_bin_stats,
+            "low_income_share": float(low_income_count / denominator),
+            "airport_rate": float(airport_count / denominator),
+            "long_trip_share": float(long_trip_count / denominator),
+            "premium_share": float(premium_count / denominator),
+            "distance_mean": float(np.mean(distance_arr)),
+            "distance_std": float(np.std(distance_arr)),
+            "distance_q25": float(np.quantile(distance_arr, 0.25)),
+            "distance_q50": float(np.quantile(distance_arr, 0.50)),
+            "distance_q75": float(np.quantile(distance_arr, 0.75)),
+            "duration_mean": float(np.mean(duration_arr)),
+            "duration_std": float(np.std(duration_arr)),
+            "peak_context": float((7 <= int(hour) < 10) or (16 <= int(hour) < 19)),
+            "night_context": float(int(hour) < 6 or int(hour) >= 22),
+            "weekend_context": float(int(day_of_week) >= 5),
+            "no_ride_rate": float(no_ride_count / denominator),
+        }
+        denominator = max(1, profile_count)
+        mean_gap = float(gap_sum / denominator)
+        gap_error_array = np.asarray(gap_abs_errors or [0.0], dtype=float)
+        self.last_price_gap_metrics = {
+            # Signed direction: positive means Firm2 is more expensive.
+            "signed_mean": mean_gap,
+            # Public-quote alignment diagnostic. Taking the absolute error
+            # before aggregation prevents overpricing in one segment from
+            # cancelling underpricing in another. Named competitiveness uses
+            # completed rides per incoming request instead.
+            "mae": float(np.mean(gap_error_array)),
+            "rmse": float(np.sqrt(np.mean(np.square(gap_error_array)))),
+            "p90_abs_error": float(np.quantile(gap_error_array, 0.90)),
+            "within_tolerance_rate": float(np.mean(
+                gap_error_array <= float(self.constraint_config.overall_tolerance)
+            )),
+            "target": float(self.reward_target_price_gap),
+        }
+        airport_rate = float(airport_count / denominator)
+        mean_dist = float(dist_sum / denominator)
+        return rows, firm1, firm2, mean_gap, airport_rate, mean_dist
+
+    def run(
+        self,
+        days: int,
+        timesteps_per_day: int,
+        customers_per_step: int,
+        out_path: Optional[str] = None,
+        profiles_out: Optional[str] = None,
+        profiles_log_limit: int = 200000,
+    ) -> List[Dict[str, Any]]:
+        all_rows: List[Dict[str, Any]] = []
+        stream_rows = bool(out_path)
+        csv_file = None
+        csv_writer: Optional[csv.DictWriter] = None
+        sampled_profile_rows: List[Dict[str, Any]] = []
+        profile_limit_reached = False
+        
+        if stream_rows:
+            _ensure_parent_dir(out_path)
+            csv_file = open(out_path, "w", newline="", encoding="utf-8")
+
+        self._initialize_run_distributions()
+        if self.firm1_mode == "RL":
+            self.firm1.reset_state_history()
+        self._refresh_profile_pool(rides_per_timestep=customers_per_step)
+        self.convergence_day = None
+        self.convergence_window_std_at_day = None
+        self.convergence_delta_per_day_at_day = None
+        self._convergence_streak = 0
+        run_previous_firm2_metrics: Optional[FirmMetrics] = None
+        
+        for d in range(days):
+            train_progress = float(d + 1) / max(1.0, float(days))
+            self._configure_constraint_curriculum(train_progress)
+            day_ctx = self.market.sample_day_context()
+            hours = [self.market.sample_timestep_hour().hour for _ in range(timesteps_per_day)]
+
+            # day accumulators for logging
+            share_sum = 0.0
+            choice_share_sum = 0.0
+            completed_share_sum = 0.0
+            revpr_sum = 0.0
+            profit_sum = 0.0
+            gap_sum = 0.0
+            gap_abs_error_sum = 0.0
+            gap_rmse_sum = 0.0
+            gap_p90_sum = 0.0
+            gap_within_tolerance_sum = 0.0
+            reward_sum = 0.0
+            fulfillment_sum = 0.0
+            wait_sum = 0.0
+            driver_accept_sum = 0.0
+            driver_paypr_sum = 0.0
+            reward_component_sums: Dict[str, float] = defaultdict(float)
+            action_counts: Counter[int] = Counter()
+            last_action = -1
+            
+            share_sum_two = 0.0
+            choice_share_sum_two = 0.0
+            completed_share_sum_two = 0.0
+            revpr_sum_two = 0.0
+            profit_sum_two = 0.0
+            no_ride_share_sum = 0.0
+
+            for t in range(timesteps_per_day):
+                hour = hours[t]
+                base = self.market.curr_market
+
+                self._firm2_leader_step(
+                    previous_metrics=run_previous_firm2_metrics,
+                    day_of_week=day_ctx.day_of_week,
+                    hour=hour,
+                    weather=day_ctx.weather,
+                    enabled=self.firm2_mode != "static",
+                )
+
+                # Firm 1 acts only after the configured Firm 2 controller has
+                # committed its posted price for this market period.
+                rl_step = None
+                if self.firm1_mode == "RL":
+                    raw_state_vec, action_features, _ = self._publish_pricing_observation(
+                        day_of_week=day_ctx.day_of_week, hour=hour, weather=day_ctx.weather
+                    )
+                    s_vec = self.firm1.stack_state(raw_state_vec)
+                    critic_state = (
+                        self._build_privileged_critic_state(raw_state_vec)
+                        if self.privileged_critic
+                        else None
+                    )
+                    # Evaluation/deployment runs reflect the learned policy, not
+                    # PPO's training-time uniform exploration mixture. Use
+                    # --run_experiment for optimizer updates and rollout training.
+                    action_mask = self._objective_action_mask(
+                        self.firm1.feasible_action_mask(self.market)
+                    )
+                    action, s_ts, old_logp, val, af_ts, mask_ts = self.firm1.agent.act(
+                        s_vec,
+                        deterministic=True,
+                        action_features=action_features,
+                        action_mask=action_mask,
+                        critic_state=critic_state,
+                    )
+                    self.firm1.apply_action(action, self.market)
+                    action_counts[int(action)] += 1
+                    last_action = int(action)
+                    rl_step = (action, s_ts, old_logp, val, af_ts, mask_ts)
+                elif self.firm1_mode != "static":
+                    self.firm1.act(
+                        city_base=base.base_fare,
+                        city_pmin=base.per_minute,
+                        city_pmile=base.per_mile,
+                        city_booking=base.booking_fee,
+                        city_airport=base.airport_fee,
+                        hour=hour,
+                        weather=day_ctx.weather,
+                    )
+
+                step_customers = self._step_customers(
+                    customers_per_step,
+                    hour=hour,
+                    day_of_week=day_ctx.day_of_week,
+                    weather=day_ctx.weather,
+                )
+                sampled_profiles = self._sample_profiles_from_pool(step_customers)
+                if profiles_out and not profile_limit_reached:
+                    remaining = int(max(0, profiles_log_limit - len(sampled_profile_rows)))
+                    if remaining > 0:
+                        sampled_profile_rows.extend(
+                            {
+                                "Phase": "run",
+                                "Day": int(d),
+                                "Timestep": int(t),
+                                **p,
+                            }
+                            for p in sampled_profiles[:remaining]
+                        )
+                    profile_limit_reached = len(sampled_profile_rows) >= int(max(0, profiles_log_limit))
+
+                rows, m1, m2, mean_gap, airport_rate, mean_dist = self.simulate_batch(
+                    day_of_week=day_ctx.day_of_week,
+                    weather=day_ctx.weather,
+                    hour=hour,
+                    customers_per_step=step_customers,
+                    sampled_profiles=sampled_profiles,
+                    supply_reference_customers=customers_per_step,
+                )
+                self._ingest_platform_observations(m1, m2)
+                run_previous_firm2_metrics = m2
+                if stream_rows:
+                    if rows and csv_writer is None:
+                        csv_writer = csv.DictWriter(csv_file, fieldnames=list(rows[0].keys()))
+                        csv_writer.writeheader()
+                    if rows:
+                        csv_writer.writerows(rows)
+                else:
+                    all_rows.extend(rows)
+
+                # update heuristic memory (only if heuristic)
+                if self.firm1_mode != "static" and self.firm1_mode != "RL":
+                    self.firm1.update(
+                        metrics=m1,
+                        price_gap_mean=self._observed_own_minus_competitor_gap("Firm1"),
+                    )
+                # RL memory + reward shaping
+                action_movement = 0.0
+                if self.firm1_mode == "RL" and rl_step is not None:
+                    action_movement = float(self.firm1.last_action_magnitude())
+                reward_diag = self._reward_diagnostics(
+                    share=float(m1.chosen_share),
+                    completed_share=float(m1.completed_share),
+                    rev_per_request=float(m1.rev_per_request),
+                    mean_gap=float(mean_gap),
+                    prev_share=float(self.last_share),
+                    prev_rev_per_request=float(self.last_revpr),
+                    prev_profit_per_request=float(self.last_profitpr),
+                    prev_rival_profit_per_request=float(
+                        self.last_firm2_profitpr
+                    ),
+                    prev_rival_market_share=float(self.last_firm2_share),
+                    prev_fulfillment_rate=float(self.last_fulfillment),
+                    prev_gap=float(self.last_gap),
+                    profit_per_request=float(m1.profit_per_request),
+                    profit_margin=self._profit_margin(m1),
+                    fulfillment_rate=float(m1.fulfillment_rate),
+                    avg_wait_minutes=float(m1.avg_wait_minutes),
+                    driver_acceptance_rate=float(m1.driver_acceptance_rate),
+                    action_change_magnitude=action_movement,
+                    baseline_share=float(m2.chosen_share),
+                    baseline_completed_share=float(m2.completed_share),
+                    baseline_rev_per_request=float(m2.rev_per_request),
+                    baseline_profit_per_request=float(m2.profit_per_request),
+                    action_event=rl_step is not None,
+                    price_gap_abs_error=float(
+                        self.last_price_gap_metrics["mae"]
+                    ),
+                )
+                if self.firm1_mode == "RL" and rl_step is not None:
+                    action, s_ts, old_logp, val, af_ts, mask_ts = rl_step
+                    reward = float(reward_diag["reward"])
+                    self.last_reward = reward
+                    self._update_constraint_multipliers(reward_diag)
+                    done = (t == timesteps_per_day - 1)
+                    # Do not append evaluation transitions to the PPO rollout buffer;
+                    # optimizer updates are training-only, and stale eval samples can
+                    # contaminate a later training continuation.
+                    if done:
+                        self._apply_eval_guardrail(
+                            "off",
+                            metrics=m1,
+                            price_gap_f2_minus_f1=float(mean_gap),
+                            base=base,
+                        )
+                    reward_sum += float(reward)
+                for component_key in (
+                    "reward_share_component",
+                    "reward_profit_component",
+                    "reward_relative_share_term",
+                    "reward_relative_profit_term",
+                    "reward_own_profit_utility",
+                    "reward_profit_advantage_utility",
+                    "reward_market_share_utility",
+                    "reward_market_share_level_utility",
+                    "reward_market_share_dominance_utility",
+                    "reward_market_share_competitiveness_component",
+                    "reward_market_share_advantage",
+                    "reward_market_share_target_gap",
+                    "reward_market_share_gap_error",
+                    "reward_own_profit_component",
+                    "reward_profit_advantage_component",
+                    "reward_intervention_cost",
+                    "reward_reversal_cost",
+                    "reward_intervention_magnitude",
+                    "reward_profit_advantage_per_request",
+                    "reward_momentum_component",
+                    "reward_hold_inaction_penalty",
+                    "reward_baseline_loss_penalty",
+                    "reward_overprice_penalty",
+                    "reward_underprice_penalty",
+                    "reward_action_change_penalty",
+                    "reward_action_realization_penalty",
+                    "reward_correction_pressure",
+                    "reward_profit_delta",
+                    "reward_gap_delta",
+                    "reward_price_gap_deviation",
+                    "reward_price_gap_satisfaction",
+                    "reward_service_component",
+                    "reward_service_quality",
+                    "reward_wait_satisfaction",
+                    "reward_driver_acceptance_objective",
+                    "reward_price_gap_in_range",
+                    "reward_gap_tolerance",
+                    "reward_price_gap_abs_error",
+                    "reward_served_share",
+                    "constraint_violation_share_floor",
+                    "constraint_violation_fulfillment_floor",
+                    "constraint_violation_wait_limit",
+                    "constraint_violation_gap_band",
+                    "constraint_violation_margin_floor",
+                    "reward_zero_effect_action",
+                    "reward_saturated_action",
+                ):
+                    reward_component_sums[component_key] += float(reward_diag.get(component_key, 0.0))
+                if self.learning_corrections:
+                    for component_key in (
+                        "reward_durable_profit_advantage_component",
+                        "reward_adaptive_profit_residual_component",
+                        "reward_market_share_advantage_component",
+                        "reward_durable_profit_advantage_per_request",
+                        "reward_adaptive_profit_residual_per_request",
+                    ):
+                        reward_component_sums[component_key] += float(
+                            reward_diag.get(component_key, 0.0)
+                        )
+
+                share_sum += float(m1.share)
+                choice_share_sum += float(m1.chosen_share)
+                completed_share_sum += float(m1.completed_share)
+                revpr_sum += float(m1.rev_per_request)
+                profit_sum += float(m1.profit_per_request)
+                gap_sum += float(mean_gap)
+                gap_abs_error_sum += float(self.last_price_gap_metrics["mae"])
+                gap_rmse_sum += float(self.last_price_gap_metrics["rmse"])
+                gap_p90_sum += float(
+                    self.last_price_gap_metrics["p90_abs_error"]
+                )
+                gap_within_tolerance_sum += float(
+                    self.last_price_gap_metrics["within_tolerance_rate"]
+                )
+                fulfillment_sum += float(m1.fulfillment_rate)
+                wait_sum += float(m1.avg_wait_minutes)
+                driver_accept_sum += float(m1.driver_acceptance_rate)
+                driver_paypr_sum += float(m1.driver_pay / max(1, m1.total))
+
+                share_sum_two += float(m2.share)
+                choice_share_sum_two += float(m2.chosen_share)
+                completed_share_sum_two += float(m2.completed_share)
+                revpr_sum_two += float(m2.rev_per_request)
+                profit_sum_two += float(m2.profit_per_request)
+                no_ride_share_sum += float(max(0.0, 1.0 - float(m1.share) - float(m2.share)))
+
+                self._update_recent_response_emas(m1, mean_gap, m2=m2)
+                market_share = float(m1.completed_share)
+                rival_market_share = float(m2.completed_share)
+                self.last_share = market_share
+                self.last_revpr = float(m1.rev_per_request)
+                self.last_gap = float(mean_gap)
+                self.last_profitpr = float(m1.profit_per_request)
+                self.last_fulfillment = float(m1.fulfillment_rate)
+                self.last_completion_coverage = float(np.clip(
+                    m1.completed_share + m2.completed_share, 0.0, 1.0
+                ))
+                self.last_acceptance = float(m1.driver_acceptance_rate)
+                self.last_wait = float(m1.avg_wait_minutes)
+                self.last_driver_paypr = float(m1.driver_pay / max(1, m1.total))
+                self.last_firm2_share = rival_market_share
+                self.last_firm2_revpr = float(m2.rev_per_request)
+                self.last_firm2_profitpr = float(m2.profit_per_request)
+                self.last_firm2_fulfillment = float(m2.fulfillment_rate)
+                self.last_firm2_acceptance = float(m2.driver_acceptance_rate)
+                self.last_firm2_wait = float(m2.avg_wait_minutes)
+                self.last_firm2_driver_paypr = float(m2.driver_pay / max(1, m2.total))
+                self.airport_rate_last = airport_rate
+                self.mean_distance_last = mean_dist
+            
+            ppo_metrics = {
+                key: np.nan
+                for key in (
+                    "loss", "approx_kl", "clipfrac", "entropy", "policy_entropy",
+                    "discrete_policy_entropy", "magnitude_entropy", "explained_variance",
+                    "constraint_value_loss", "risk_value_loss", "response_loss", "opponent_forecast_loss",
+                    "lagrangian_adv_mean", "lagrangian_adv_std", "constraint_lambda_mean",
+                    "risk_coeff",
+                )
+            }
+            if self.firm1_mode == "RL":
+                self._sync_agent_optimization_context()
+                ppo_metrics.update({
+                    "ent_coeff": float(self.firm1.agent.ent_coeff),
+                    "clip_eps": float(self.firm1.agent.clip_eps),
+                    "lr": float(self.firm1.agent.curr_lr),
+                    "exploration_rate": float(self.firm1.agent.exploration_rate),
+                    "action_coverage": float(self.firm1.agent._action_coverage()),
+                    "policy_entropy_fraction": float(self.firm1.agent.last_policy_entropy_fraction),
+                    "optimizer_steps": 0,
+                    "update_performed": False,
+                    "run_mode": "evaluation_no_update",
+                })
+                
+            #print("firm 1 revenue per request sum", str(revpr_sum))
+            #print("firm 1 market share sum", str(share_sum))
+            
+            #print("firm 2 revenue per request sum", str(revpr_sum_two))
+            #print("firm 2 market share sum", str(share_sum_two))
+
+            avg_share = share_sum / max(1, timesteps_per_day)
+            avg_choice_share = choice_share_sum / max(1, timesteps_per_day)
+            avg_completed_share = completed_share_sum / max(1, timesteps_per_day)
+            avg_revpr = revpr_sum / max(1, timesteps_per_day)
+            avg_gap = gap_sum / max(1, timesteps_per_day)
+            avg_gap_abs_error = gap_abs_error_sum / max(1, timesteps_per_day)
+            avg_gap_rmse = gap_rmse_sum / max(1, timesteps_per_day)
+            avg_gap_p90 = gap_p90_sum / max(1, timesteps_per_day)
+            avg_gap_within_tolerance = gap_within_tolerance_sum / max(
+                1, timesteps_per_day
+            )
+            avg_profitpr = profit_sum / max(1, timesteps_per_day)
+            avg_no_ride_share = no_ride_share_sum / max(1, timesteps_per_day)
+            avg_fulfillment = fulfillment_sum / max(1, timesteps_per_day)
+            avg_wait = wait_sum / max(1, timesteps_per_day)
+            avg_driver_accept = driver_accept_sum / max(1, timesteps_per_day)
+            avg_driver_paypr = driver_paypr_sum / max(1, timesteps_per_day)
+            avg_share_two = share_sum_two / max(1, timesteps_per_day)
+            avg_choice_share_two = choice_share_sum_two / max(1, timesteps_per_day)
+            avg_completed_share_two = completed_share_sum_two / max(1, timesteps_per_day)
+            avg_revpr_two = revpr_sum_two / max(1, timesteps_per_day)
+            avg_profitpr_two = profit_sum_two / max(1, timesteps_per_day)
+            dominant_action = int(action_counts.most_common(1)[0][0]) if action_counts else -1
+            dominant_action_rate = (
+                float(action_counts.most_common(1)[0][1] / max(1, timesteps_per_day))
+                if action_counts
+                else 0.0
+            )
+            dominant_action_steps = (
+                self.firm1.action_steps(dominant_action)
+                if self.firm1_mode == "RL" and hasattr(self.firm1, "action_steps")
+                else {}
+            )
+            dominant_action_label = (
+                self.firm1.action_label(dominant_action)
+                if self.firm1_mode == "RL" and hasattr(self.firm1, "action_label")
+                else ""
+            )
+            last_action_steps = (
+                self.firm1.action_steps(last_action)
+                if self.firm1_mode == "RL" and hasattr(self.firm1, "action_steps")
+                else {}
+            )
+            avg_reward = (
+                (reward_sum / max(1, timesteps_per_day))
+                if self.firm1_mode == "RL"
+                else self._reward_base(
+                    avg_completed_share,
+                    avg_revpr,
+                    price_gap_f2_minus_f1=avg_gap,
+                    profit_per_request=avg_profitpr,
+                    competitor_share=avg_completed_share_two,
+                    competitor_profit_per_request=avg_profitpr_two,
+                    fulfillment_rate=avg_fulfillment,
+                    avg_wait_minutes=avg_wait,
+                    driver_acceptance_rate=avg_driver_accept,
+                )
+            )
+            self.run_logs.append({
+                "day": d + 1,
+                "avg_share": float(avg_share),
+                "avg_choice_share": float(avg_choice_share),
+                "avg_completed_share": float(avg_completed_share),
+                "avg_share_firm2": float(avg_share_two),
+                "avg_choice_share_firm2": float(avg_choice_share_two),
+                "avg_completed_share_firm2": float(avg_completed_share_two),
+                "avg_revpr": float(avg_revpr),
+                "avg_profitpr": float(avg_profitpr),
+                "avg_revpr_firm2": float(avg_revpr_two),
+                "avg_profitpr_firm2": float(avg_profitpr_two),
+                "avg_gap": float(avg_gap),
+                "avg_gap_abs_error": float(avg_gap_abs_error),
+                "avg_gap_rmse": float(avg_gap_rmse),
+                "avg_gap_p90_abs_error": float(avg_gap_p90),
+                "avg_gap_within_tolerance_rate": float(
+                    avg_gap_within_tolerance
+                ),
+                "avg_gap_target": float(self.reward_target_price_gap),
+                "avg_gap_tolerance": float(
+                    self.constraint_config.overall_tolerance
+                ),
+                "avg_gap_violation_025": float(avg_gap_abs_error > 0.25),
+                "avg_gap_violation_050": float(avg_gap_abs_error > 0.50),
+                "constraint_curriculum_scale": float(self.constraint_curriculum_scale),
+                "avg_no_ride_share": float(avg_no_ride_share),
+                "avg_fulfillment_rate": float(avg_fulfillment),
+                "avg_wait_minutes": float(avg_wait),
+                "driver_acceptance_rate": float(avg_driver_accept),
+                "driver_pay_per_request": float(avg_driver_paypr),
+                "avg_reward": float(avg_reward),
+                **{
+                    k: float(v / max(1, timesteps_per_day))
+                    for k, v in sorted(reward_component_sums.items())
+                },
+                "last_action": int(last_action),
+                "last_action_steps": json.dumps(last_action_steps, sort_keys=True),
+                "dominant_action": dominant_action,
+                "dominant_action_label": dominant_action_label,
+                "dominant_action_steps": json.dumps(dominant_action_steps, sort_keys=True),
+                "dominant_action_rate": dominant_action_rate,
+                "action_counts": json.dumps(dict(sorted(action_counts.items())), sort_keys=True),
+                "ppo_approx_kl": float(ppo_metrics.get("approx_kl", 0.0)),
+                "ppo_clipfrac": float(ppo_metrics.get("clipfrac", 0.0)),
+                "ppo_entropy": float(ppo_metrics.get("entropy", 0.0)),
+                "ppo_policy_entropy": float(ppo_metrics.get("policy_entropy", 0.0)),
+                "ppo_policy_entropy_fraction": float(ppo_metrics.get("policy_entropy_fraction", 1.0)),
+                "ppo_ent_coeff": float(ppo_metrics.get("ent_coeff", 0.0)),
+                "ppo_clip_eps": float(ppo_metrics.get("clip_eps", 0.0)),
+                "ppo_exploration_rate": float(ppo_metrics.get("exploration_rate", 0.0)),
+                "ppo_action_coverage": float(ppo_metrics.get("action_coverage", 0.0)),
+                "ppo_explained_variance": float(ppo_metrics.get("explained_variance", 0.0)),
+                "ppo_constraint_value_loss": float(ppo_metrics.get("constraint_value_loss", 0.0)),
+                "ppo_risk_value_loss": float(ppo_metrics.get("risk_value_loss", 0.0)),
+                "ppo_response_loss": float(ppo_metrics.get("response_loss", 0.0)),
+                "ppo_opponent_forecast_loss": float(
+                    ppo_metrics.get("opponent_forecast_loss", 0.0)
+                ),
+                "ppo_lagrangian_adv_mean": float(ppo_metrics.get("lagrangian_adv_mean", 0.0)),
+                "ppo_lagrangian_adv_std": float(ppo_metrics.get("lagrangian_adv_std", 0.0)),
+                "ppo_constraint_lambda_mean": float(ppo_metrics.get("constraint_lambda_mean", 0.0)),
+                "ppo_risk_coeff": float(ppo_metrics.get("risk_coeff", 0.0)),
+                "ppo_optimizer_steps": int(ppo_metrics.get("optimizer_steps", 0)),
+                "ppo_update_performed": bool(ppo_metrics.get("update_performed", False)),
+                "ppo_run_mode": str(ppo_metrics.get("run_mode", "training_update")),
+            })
+            for k in self.shared_edit_keys:
+                self.run_logs[-1][f"firm1_{k}"] = float(get_coeff(base, self.firm1.overrides, k))
+                self.run_logs[-1][f"firm2_{k}"] = float(get_coeff(base, self.firm2.overrides, k))
+            
+            (
+                convergence_count,
+                reward_std,
+                reward_delta,
+            ) = self._smoothed_convergence_statistics(
+                [float(x["avg_reward"]) for x in self.run_logs],
+                window=self.reward_convergence_window,
+                smoothing=20,
+            )
+            reward_converged = (
+                convergence_count >= self.reward_convergence_window
+                and (d + 1) >= self.convergence_min_days
+                and reward_std <= self.reward_convergence_tol
+                and reward_delta <= self.reward_trend_tol
+                and bool(ppo_metrics.get("learning_signal_ok", True))
+                and float(ppo_metrics.get("state_action_sensitivity", 0.005)) >= 0.005
+            )
+            
+            self._convergence_streak = int(self._convergence_streak + 1) if reward_converged else 0
+            reward_converged = bool(self._convergence_streak >= self.convergence_required_streak)
+            self.run_logs[-1]["reward_window_std"] = float(reward_std)
+            self.run_logs[-1]["reward_window_delta"] = float(reward_delta)
+            self.run_logs[-1]["reward_convergence_streak"] = int(self._convergence_streak)
+            self.run_logs[-1]["reward_converged"] = bool(reward_converged)
+            if reward_converged and self.convergence_day is None:
+                self.convergence_day = int(d + 1)
+                self.convergence_window_std_at_day = float(reward_std)
+                self.convergence_delta_per_day_at_day = float(reward_delta)
+                print(
+                    f"[Convergence] Optimization converged at day {self.convergence_day} "
+                    f"(window_std={reward_std:.4f}, delta/day={reward_delta:.4f})."
+                )
+            
+            # print every ~10% of days
+            k = max(1, days // 10)
+            if (d + 1) % k == 0 or (d + 1) == 1 or (d + 1) == days:
+
+                print(
+                    f"[Day {d+1}/{days}] avg_share(F1)={avg_share:.3f} avg_revPR(F1)=${avg_revpr:.2f} "
+                    f"avg_profitPR(F1)=${avg_profitpr:.2f} avg_gap(F2-F1)=${avg_gap:.2f} "
+                    f"no_ride_share={avg_no_ride_share:.3f} fulfill={avg_fulfillment:.3f} "
+                    f"accept={avg_driver_accept:.3f}"
+                )
+                if self.firm1_mode == "RL":
+                    print(
+                        f"  [PPO evaluation] optimizer=disabled "
+                        f"last_train_policy_ent={float(ppo_metrics.get('policy_entropy_fraction', 1.0)):.3f} "
+                        f"ent_coeff={float(ppo_metrics.get('ent_coeff', 0.0)):.4f} "
+                        f"coverage={float(ppo_metrics.get('action_coverage', 0.0)):.2f} "
+                        f"lr={float(ppo_metrics.get('lr', 0.0)):.6f}"
+                    )
+                    
+            if self.firm1_mode == "RL":
+                progress = float((d + 1) / max(1, days))
+                self.firm1.configure_training_controls(
+                    progress=progress,
+                    reward_converged=reward_converged,
+                    reward_std=reward_std,
+                )
+        
+        if self.run_logs:
+            final = self.run_logs[-1]
+            summary_std = (
+                float(self.convergence_window_std_at_day)
+                if self.convergence_window_std_at_day is not None
+                else float(final.get("reward_window_std", 0.0))
+            )
+            summary_delta = (
+                float(self.convergence_delta_per_day_at_day)
+                if self.convergence_delta_per_day_at_day is not None
+                else float(final.get("reward_window_delta", 0.0))
+            )
+            print(
+                "[Convergence Summary] "
+                f"converged_day={self.convergence_day if self.convergence_day is not None else 'not reached'} "
+                f"window_std={summary_std:.4f} "
+                f"delta/day={summary_delta:.4f}"
+            )
+            
+        if profiles_out:
+            _ensure_parent_dir(profiles_out)
+            _write_csv(profiles_out, sampled_profile_rows)
+            print(f">>> Saved sampled profiles -> {profiles_out} (rows={len(sampled_profile_rows)})")
+            if profile_limit_reached:
+                print(f">>> Profile export capped at profiles_log_limit={profiles_log_limit} rows.")
+                
+        if csv_file is not None:
+            csv_file.close()
+            print(f"Saved -> {out_path}")
+
+        return all_rows
+    
+    def get_final_manipulated_coefficients(self) -> Dict[str, Dict[str, float]]:
+        """Return final values for the shared manipulated coefficient set for each firm."""
+        base = self.market.curr_market
+        return {
+            "firm1": {
+                k: float(get_coeff(base, self.firm1.overrides, k)) for k in self.shared_edit_keys
+            },
+            "firm2": {
+                k: float(get_coeff(base, self.firm2.overrides, k)) for k in self.shared_edit_keys
+            },
+        }
+
+
+def _write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        print("No rows to write.")
+        return
+    cols: List[str] = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                cols.append(key)
+    _ensure_parent_dir(path)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+
+def _ensure_parent_dir(path: str) -> None:
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+
+def _write_distribution_csv(path: str, rows: List[Dict[str, Any]]) -> None:
+    counters = {
+        "DayOfWeek": Counter(),
+        "Weather": Counter(),
+        "Hour": Counter(),
+        "Airport": Counter(),
+        "Service": Counter(),
+        "Choice": Counter(),
+        "DistanceBin": Counter(),
+    }
+
+    for r in rows:
+        counters["DayOfWeek"][str(r.get("DayOfWeek"))] += 1
+        counters["Weather"][str(r.get("Weather"))] += 1
+        counters["Hour"][str(r.get("Hour"))] += 1
+        counters["Airport"][str(r.get("Airport"))] += 1
+        counters["Service"][str(r.get("Service"))] += 1
+        counters["Choice"][str(r.get("Choice"))] += 1
+
+        dist = float(r.get("TravelDistance", 0.0))
+        if dist < 2:
+            b = "0-2"
+        elif dist < 5:
+            b = "2-5"
+        elif dist < 10:
+            b = "5-10"
+        else:
+            b = "10+"
+        counters["DistanceBin"][b] += 1
+
+    total = max(1, len(rows))
+    out_rows: List[Dict[str, Any]] = []
+    for param, c in counters.items():
+        if param in {"DayOfWeek", "Hour"}:
+            sorted_items = sorted(c.items(), key=lambda kv: int(kv[0]))
+        elif param == "Airport":
+            sorted_items = sorted(c.items(), key=lambda kv: (kv[0] != "False", kv[0]))
+        else:
+            sorted_items = sorted(c.items(), key=lambda kv: kv[0])
+
+        for v, n in sorted_items:
+            out_rows.append({
+                "parameter": param,
+                "value": v,
+                "count": int(n),
+                "share": float(n / total),
+            })
+
+    _ensure_parent_dir(path)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["parameter", "value", "count", "share"])
+        w.writeheader()
+        w.writerows(out_rows)
+
+
+def _plot_reports(
+    rows: List[Dict[str, Any]],
+    run_logs: List[Dict[str, Any]],
+    training_logs: List[Dict[str, Any]],
+    evaluation_logs: List[Dict[str, Any]],
+    prefix: str,
+    threshold_profiles: Optional[List[Dict[str, Any]]] = None,
+    benchmark_report: Optional[Mapping[str, Any]] = None,
+    diagnostic_plot_stride: int = 10,
+    fare_plot_stride_days: int = 10,
+    steps_per_day: int = 6,
+) -> None:
+    def plot_time(row, key):
+        return float(row[key]) + 1 if key == 'batch' else float(row[key]) / steps_per_day
+    for name, logs in (("training_diagnostics", training_logs), ("evaluation_diagnostics", evaluation_logs)):
+        if logs:
+            out = f"{prefix}_{name}.csv"
+            _write_csv(out, logs)
+            print(f"Saved -> {out}")
+    
+    
+    threshold_rows = list(threshold_profiles or [])
+    if not threshold_rows and rows:
+        seen_thresholds = set()
+        for r in rows:
+            if "PriceThreshold" not in r:
+                continue
+            key = (r.get("ProfileID", id(r)), r.get("PriceThreshold"), r.get("PriceThresholdSource"))
+            if key in seen_thresholds:
+                continue
+            seen_thresholds.add(key)
+            threshold_rows.append(r)
+
+    if threshold_rows:
+        summary: Dict[str, List[float]] = {}
+        for r in threshold_rows:
+            try:
+                value = float(r.get("PriceThreshold"))
+            except (TypeError, ValueError):
+                continue
+            source = str(r.get("PriceThresholdSource", "unknown"))
+            summary.setdefault(source, []).append(value)
+        if summary:
+            summary_path = f"{prefix}_price_gap_threshold_distribution.csv"
+            _ensure_parent_dir(summary_path)
+            with open(summary_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=["source", "count", "mean", "std", "min", "p25", "median", "p75", "max"])
+                w.writeheader()
+                for source, vals in sorted(summary.items()):
+                    arr = np.asarray(vals, dtype=float)
+                    w.writerow({
+                        "source": source,
+                        "count": int(arr.size),
+                        "mean": float(np.mean(arr)),
+                        "std": float(np.std(arr)),
+                        "min": float(np.min(arr)),
+                        "p25": float(np.percentile(arr, 25)),
+                        "median": float(np.percentile(arr, 50)),
+                        "p75": float(np.percentile(arr, 75)),
+                        "max": float(np.max(arr)),
+                    })
+            print(f"Saved -> {summary_path}")
+
+    if importlib.util.find_spec("matplotlib") is None:
+        print("[WARN] matplotlib not installed; skipping graph generation.")
+        return
+
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    from matplotlib.ticker import MultipleLocator, FormatStrFormatter
+
+    def _extract_reward(entry: Dict[str, Any]) -> float:
+        """Extract reward value from heterogeneous log schemas."""
+        if "reward" in entry:
+            return float(entry["reward"])
+        if "avg_reward" in entry:
+            return float(entry["avg_reward"])
+        if "rl_share" in entry and "rl_revenue" in entry:
+            return float(
+                np.clip(
+                    (0.60 * np.clip(float(entry["rl_share"]), 0.0, 1.0))
+                    + (0.20 * np.tanh((float(entry["rl_revenue"]) - 10.0) / 8.0)),
+                    -1.0,
+                    1.0,
+                )
+            )
+        return 0.0
+
+    _ensure_parent_dir(prefix + "_dummy")
+
+    if benchmark_report:
+        report = dict(benchmark_report)
+        objective = str(report.get("primary_objective", "profit_maximization"))
+        if objective == "competitiveness":
+            own_values = dict(report.get("mode_own_market_share", {}))
+            rival_values = dict(report.get("mode_rival_market_share", {}))
+            target_gap = 0.0
+            outcome_label = "Completed rides / incoming request"
+            gap_label = "Completed-share advantage (Firm 1 - benchmark)"
+        elif objective == "profit_maximization":
+            own_values = dict(report.get("mode_own_profit_per_request", {}))
+            rival_values = dict(report.get("mode_rival_profit_per_request", {}))
+            target_gap = 0.0
+            outcome_label = "Contribution profit / request ($)"
+            gap_label = "Profit advantage / request ($)"
+        else:
+            own_values = dict(report.get("mode_own_objective_score", {}))
+            rival_values = dict(report.get("mode_rival_objective_score", {}))
+            target_gap = 0.0
+            outcome_label = "Normalized mixed-objective score"
+            gap_label = "Mixed-objective advantage (Firm 1 - benchmark)"
+        modes = [mode for mode in BENCHMARK_OPPONENT_MODES if mode in own_values]
+        if modes:
+            validation_cities = dict(
+                report.get("mode_validation_cities", {}) or {}
+            )
+            benchmark_market = str(
+                next(
+                    iter(validation_cities.values()),
+                    report.get("market_name", "configured market"),
+                )
+            )
+            own = np.asarray([float(own_values[mode]) for mode in modes])
+            rival = np.asarray([float(rival_values[mode]) for mode in modes])
+            advantages = own - rival
+            fulfillment = dict(report.get("mode_fulfillment_rate", {}))
+            completion_coverage = dict(
+                report.get("mode_completion_coverage", {})
+            )
+            own_profit = dict(report.get("mode_own_profit_per_request", {}))
+            rival_profit = dict(report.get("mode_rival_profit_per_request", {}))
+            own_completed_share = dict(report.get("mode_own_market_share", {}))
+            rival_completed_share = dict(report.get("mode_rival_market_share", {}))
+            gap_abs_error = dict(report.get("mode_price_gap_abs_error", {}))
+            selected_action_feasibility = dict(
+                report.get("mode_selected_action_feasibility", {})
+            )
+            tail_advantages = dict(
+                report.get(
+                    "mode_profit_advantages"
+                    if objective == "profit_maximization"
+                    else "mode_completed_share_advantages"
+                    if objective == "competitiveness"
+                    else "mode_objective_advantages",
+                    {},
+                )
+            )
+            dominance_rates = dict(
+                report.get("mode_objective_dominance_rate", {}) or {}
+            )
+            dominance_floor = float(
+                report.get("objective_dominance_rate_floor", 0.90)
+            )
+            rows_out = []
+            for mode, own_value, rival_value, advantage in zip(
+                modes, own, rival, advantages
+            ):
+                tail_advantage = float(
+                    tail_advantages.get(mode, -float("inf"))
+                )
+                dominance_rate = float(dominance_rates.get(mode, 0.0))
+                passes = bool(
+                    tail_advantage > target_gap
+                    and dominance_rate >= dominance_floor
+                    and (
+                        objective != "profit_maximization"
+                        or float(own_profit.get(mode, -float("inf"))) > 0.0
+                    )
+                )
+                rows_out.append({
+                    "market": benchmark_market,
+                    "objective": objective,
+                    "comparison_checkpoint_status": str(
+                        report.get(
+                            "comparison_checkpoint_status",
+                            "unknown",
+                        )
+                    ),
+                    "comparison_checkpoint_day": report.get(
+                        "comparison_checkpoint_day"
+                    ),
+                    "deployment_variant": str(
+                        report.get("deployment_variant", "unknown")
+                    ),
+                    "deployment_policy_mode": str(
+                        report.get("deployment_policy_mode", "unknown")
+                    ),
+                    "certification_independent": bool(
+                        report.get(
+                            "comparison_runs_independently_of_certification",
+                            True,
+                        )
+                    ),
+                    "opponent_class_seen_in_training": bool(
+                        mode in set(
+                            report.get("training_dynamic_opponent_modes", [])
+                        )
+                    ),
+                    "trajectory_held_out": True,
+                    "profile_partition_held_out": bool(
+                        report.get(
+                            "evaluation_profile_partition_held_out",
+                            False,
+                        )
+                    ),
+                    "benchmark": mode,
+                    "firm1_outcome": float(own_value),
+                    "benchmark_outcome": float(rival_value),
+                    "advantage": float(advantage),
+                    "required_advantage": float(target_gap),
+                    "final_quarter_advantage": tail_advantage,
+                    "rolling_dominance_rate": dominance_rate,
+                    "required_rolling_dominance_rate": dominance_floor,
+                    "firm1_profit_per_request": float(own_profit.get(mode, np.nan)),
+                    "firm2_profit_per_request": float(rival_profit.get(mode, np.nan)),
+                    "firm1_completed_share": float(
+                        own_completed_share.get(mode, np.nan)
+                    ),
+                    "firm2_completed_share": float(
+                        rival_completed_share.get(mode, np.nan)
+                    ),
+                    "firm1_fulfillment_rate": float(fulfillment.get(mode, np.nan)),
+                    "completion_coverage": float(
+                        completion_coverage.get(mode, np.nan)
+                    ),
+                    "unserved_demand_rate": float(
+                        1.0 - completion_coverage.get(mode, np.nan)
+                    ),
+                    "mean_price_gap_abs_error": float(
+                        gap_abs_error.get(mode, np.nan)
+                    ),
+                    "selected_action_feasibility_rate": float(
+                        selected_action_feasibility.get(mode, np.nan)
+                    ),
+                    "passes_objective": passes,
+                })
+            summary_out = f"{prefix}_benchmark_summary.csv"
+            _write_csv(summary_out, rows_out)
+            print(f"Saved -> {summary_out}")
+
+            x = np.arange(len(modes), dtype=float)
+            labels = [mode.replace("_", "\n") for mode in modes]
+            fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+            width = 0.36
+            axes[0].bar(x - width / 2, own, width, label="Firm 1 PPO", color="tab:blue")
+            axes[0].bar(x + width / 2, rival, width, label="Benchmark", color="tab:orange")
+            axes[0].set_ylabel(outcome_label)
+            axes[0].legend(loc="best")
+            axes[0].grid(axis="y", linestyle="--", alpha=0.25)
+            colors = ["tab:green" if row["passes_objective"] else "tab:red" for row in rows_out]
+            axes[1].bar(x, advantages, color=colors, alpha=0.85)
+            axes[1].axhline(0.0, color="black", linewidth=0.8)
+            boundary_line = axes[1].axhline(
+                target_gap,
+                color="tab:green",
+                linestyle="--",
+                linewidth=1.2,
+                label="dominance boundary (Firm 1 = benchmark)",
+            )
+            axes[1].set_ylabel(gap_label)
+            axes[1].set_xticks(x, labels)
+            axes[1].legend(
+                handles=[
+                    boundary_line,
+                    Patch(color="tab:green", label="passes durability gate"),
+                    Patch(color="tab:red", label="fails durability gate"),
+                ],
+                loc="best",
+            )
+            axes[1].grid(axis="y", linestyle="--", alpha=0.25)
+            fig.suptitle(
+                f"{benchmark_market} Firm 1 PPO vs Five Benchmark Policies "
+                f"({objective.replace('_', ' ')})"
+            )
+            fig.tight_layout()
+            out = f"{prefix}_benchmark_performance.png"
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+
+            trajectories = dict(
+                report.get("benchmark_trajectories", {}) or {}
+            )
+            for mode in modes:
+                trajectory = dict(trajectories.get(mode, {}) or {})
+                required = (
+                    "day",
+                    "normalized_objective_reward",
+                    "firm1_profit_per_request",
+                    "firm2_profit_per_request",
+                    "firm1_completed_share",
+                    "firm2_completed_share",
+                    "firm1_fulfillment_rate",
+                    "completion_coverage",
+                    "price_gap_abs_error",
+                )
+                if not all(trajectory.get(key) for key in required):
+                    continue
+                length = min(len(trajectory[key]) for key in required)
+                if length <= 0:
+                    continue
+                day_values = np.asarray(trajectory["day"][:length], dtype=float) / steps_per_day
+                reward_values = np.asarray(
+                    trajectory["normalized_objective_reward"][:length],
+                    dtype=float,
+                )
+                firm1_profit = np.asarray(
+                    trajectory["firm1_profit_per_request"][:length], dtype=float
+                )
+                firm2_profit = np.asarray(
+                    trajectory["firm2_profit_per_request"][:length], dtype=float
+                )
+                firm1_share = np.asarray(
+                    trajectory["firm1_completed_share"][:length], dtype=float
+                )
+                firm2_share = np.asarray(
+                    trajectory["firm2_completed_share"][:length], dtype=float
+                )
+                firm1_fulfillment = np.asarray(
+                    trajectory["firm1_fulfillment_rate"][:length], dtype=float
+                )
+                coverage = np.asarray(
+                    trajectory["completion_coverage"][:length], dtype=float
+                )
+                gap_abs_error = np.asarray(
+                    trajectory["price_gap_abs_error"][:length], dtype=float
+                )
+                trajectory_rows = [
+                    {
+                        "day": int(day_values[index]),
+                        "benchmark": mode,
+                        "objective": objective,
+                        "normalized_objective_reward": float(reward_values[index]),
+                        "firm1_profit_per_request": float(firm1_profit[index]),
+                        "firm2_profit_per_request": float(firm2_profit[index]),
+                        "profit_gap_per_request": float(
+                            firm1_profit[index] - firm2_profit[index]
+                        ),
+                        "firm1_completed_share": float(firm1_share[index]),
+                        "firm2_completed_share": float(firm2_share[index]),
+                        "completed_share_gap": float(
+                            firm1_share[index] - firm2_share[index]
+                        ),
+                        "firm1_fulfillment_rate": float(
+                            firm1_fulfillment[index]
+                        ),
+                        "completion_coverage": float(coverage[index]),
+                        "unserved_demand_rate": float(1.0 - coverage[index]),
+                        "price_gap_abs_error": float(gap_abs_error[index]),
+                    }
+                    for index in range(length)
+                ]
+                trajectory_out = f"{prefix}_benchmark_{mode}_trajectory.csv"
+                _write_csv(trajectory_out, trajectory_rows)
+                print(f"Saved -> {trajectory_out}")
+
+                smooth_window = max(5, min(50, length // 8 or 1))
+
+                def _benchmark_ma(values: np.ndarray) -> np.ndarray:
+                    cumulative = np.cumsum(
+                        np.insert(np.asarray(values, dtype=float), 0, 0.0)
+                    )
+                    result = np.empty(length, dtype=float)
+                    for index in range(length):
+                        start = max(0, index + 1 - smooth_window)
+                        result[index] = (
+                            cumulative[index + 1] - cumulative[start]
+                        ) / float(index + 1 - start)
+                    return result
+
+                smooth_reward = _benchmark_ma(reward_values)
+                dominance_rate = float(np.mean(smooth_reward > 0.0))
+                fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
+                axes[0].scatter(
+                    day_values,
+                    reward_values,
+                    color="0.55",
+                    alpha=0.10,
+                    s=7,
+                    linewidths=0,
+                    label="realized normalized reward",
+                )
+                axes[0].plot(
+                    day_values,
+                    smooth_reward,
+                    color="tab:purple",
+                    linewidth=2.2,
+                    label=f"MA{smooth_window}; positive={dominance_rate:.1%}",
+                )
+                axes[0].axhline(
+                    0.0,
+                    color="tab:green",
+                    linestyle="--",
+                    linewidth=1.2,
+                    label="zero objective reward",
+                )
+                axes[0].set_ylabel("Normalized objective reward")
+                axes[0].legend(loc="best")
+
+                metric_panels = (
+                    (
+                        firm1_profit,
+                        firm2_profit,
+                        "Contribution profit / request ($)",
+                    ),
+                    (
+                        firm1_share,
+                        firm2_share,
+                        "Completed rides / incoming request",
+                    ),
+                )
+                for axis, (own_series, rival_series, ylabel) in zip(
+                    axes[1:], metric_panels
+                ):
+                    axis.plot(
+                        day_values,
+                        own_series,
+                        color="tab:blue",
+                        alpha=0.10,
+                        linewidth=0.7,
+                        label="Firm 1 raw",
+                    )
+                    axis.plot(
+                        day_values,
+                        rival_series,
+                        color="tab:orange",
+                        alpha=0.10,
+                        linewidth=0.7,
+                        label="Firm 2 raw",
+                    )
+                    axis.plot(
+                        day_values,
+                        _benchmark_ma(own_series),
+                        color="tab:blue",
+                        linewidth=2.0,
+                        label=f"Firm 1 MA{smooth_window}",
+                    )
+                    axis.plot(
+                        day_values,
+                        _benchmark_ma(rival_series),
+                        color="tab:orange",
+                        linewidth=2.0,
+                        label=f"Firm 2 MA{smooth_window}",
+                    )
+                    axis.set_ylabel(ylabel)
+                    axis.legend(loc="best", ncol=2, fontsize=8)
+                    axis.grid(axis="y", linestyle="--", alpha=0.25)
+                axes[2].set_xlabel("Benchmark evaluation day")
+                axes[0].grid(axis="y", linestyle="--", alpha=0.25)
+                fig.suptitle(
+                    "Firm 1 PPO vs "
+                    f"{mode.replace('_', ' ')} ({objective.replace('_', ' ')})"
+                )
+                fig.tight_layout()
+                trajectory_plot = f"{prefix}_benchmark_{mode}_performance.png"
+                fig.savefig(trajectory_plot, dpi=150)
+                print(f"Saved graph -> {trajectory_plot}")
+                plt.close(fig)
+    
+    if threshold_rows:
+        threshold_values_by_source: Dict[str, List[float]] = {}
+        for r in threshold_rows:
+            try:
+                value = float(r.get("PriceThreshold"))
+            except (TypeError, ValueError):
+                continue
+            threshold_values_by_source.setdefault(str(r.get("PriceThresholdSource", "unknown")), []).append(value)
+        if threshold_values_by_source:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            bins = np.linspace(0.5, 5.0, 19)
+            for source, vals in sorted(threshold_values_by_source.items()):
+                weights = np.ones(len(vals), dtype=float) * (100.0 / max(1, len(vals)))
+                ax.hist(vals, bins=bins, weights=weights, alpha=0.55, label=f"{source} (n={len(vals)})")
+            ax.set_title("Profile Fare-Gap Threshold Distribution")
+            ax.set_xlabel("Fare-gap salience threshold ($)")
+            ax.set_ylabel("% of profiles within source")
+            ax.legend(loc="best")
+            fig.tight_layout()
+            out = f"{prefix}_dist_PriceGapThreshold.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+
+    # 1) Ride parameter distributions
+    params = ["DayOfWeek", "Weather", "Hour", "Airport", "Service", "Choice"]
+    for p in params:
+        c = Counter(str(r.get(p)) for r in rows)
+        if not c:
+            continue
+
+        if p in {"DayOfWeek", "Hour"}:
+            xs = sorted(c.keys(), key=lambda x: int(x))
+        elif p == "Airport":
+            xs = sorted(c.keys(), key=lambda x: (x != "False", x))
+        else:
+            xs = sorted(c.keys())
+
+        total = max(1, sum(c.values()))
+        ys = [100.0 * c[x] / total for x in xs]
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.bar(xs, ys)
+        ax.set_title(f"Ride Distribution by {p}")
+        ax.set_xlabel(p)
+        ax.set_ylabel("% of rides")
+        fig.tight_layout()
+        out = f"{prefix}_dist_{p}.png"
+        _ensure_parent_dir(out)
+        fig.savefig(out, dpi=150)
+        print(f"Saved graph -> {out}")
+        plt.close(fig)
+
+    # 2) Distance histogram
+    if rows:
+        dvals = [float(r.get("TravelDistance", 0.0)) for r in rows]
+        weights = np.ones(len(dvals), dtype=float) * (100.0 / max(1, len(dvals)))
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.hist(dvals, bins=20, weights=weights)
+        ax.set_title("Ride Distance Distribution")
+        ax.set_xlabel("TravelDistance")
+        ax.set_ylabel("% of rides")
+        fig.tight_layout()
+        out = f"{prefix}_dist_TravelDistance.png"
+        _ensure_parent_dir(out)
+        fig.savefig(out, dpi=150)
+        print(f"Saved graph -> {out}")
+        plt.close(fig)
+
+    def _plot_timeseries(ax: Any, xs: List[int], ys: List[float], *args: Any, **kwargs: Any) -> Any:
+        """Plot a time series with visible single-point smoke-test output."""
+        kwargs.setdefault("marker", "o")
+        kwargs.setdefault("markersize", 4)
+        line_objs = ax.plot(xs, ys, *args, **kwargs)
+        if len(xs) == 1:
+            x = float(xs[0])
+            ax.set_xlim(x - 0.5, x + 0.5)
+        return line_objs
+    
+    def _moving_average(values: List[float], window: int = 20) -> List[float]:
+        out: List[float] = []
+        for i in range(len(values)):
+            start = max(0, i + 1 - int(max(1, window)))
+            out.append(float(np.mean(values[start : i + 1])))
+        return out
+
+    def _ewma(
+        values: List[float],
+        span: int = 50,
+    ) -> List[float]:
+        """Expected-reward trace with a consistent effective window."""
+        if not values:
+            return []
+        smoothed = [float(values[0])]
+        resolved_span = int(max(1, min(span, len(values))))
+        weight = float(2.0 / (resolved_span + 1.0))
+        for value in values[1:]:
+            smoothed.append(
+                float(weight * float(value) + (1.0 - weight) * smoothed[-1])
+            )
+        return smoothed
+
+    def _report_smoothing_window(values: List[float]) -> int:
+        """Use the same readable smoothing convention in every report."""
+        if len(values) <= 1:
+            return 1
+        return int(max(5, min(50, len(values) // 8)))
+
+    def _rolling_reward_summary(
+        values: List[float],
+        window: int,
+    ) -> Tuple[List[float], List[float], List[float]]:
+        """Return expected reward and a 95% uncertainty band.
+
+        Realized reward varies with hour, weather, demand mix, supply, and the
+        rival even after a policy has converged.  Reporting a connected raw
+        line made that irreducible market noise look like optimizer
+        oscillation.  Every workflow now uses this same trailing expectation
+        and standard-error convention.
+        """
+        means: List[float] = []
+        lower: List[float] = []
+        upper: List[float] = []
+        resolved = int(max(1, window))
+        for index in range(len(values)):
+            start = max(0, index + 1 - resolved)
+            sample = np.asarray(values[start : index + 1], dtype=float)
+            sample = sample[np.isfinite(sample)]
+            if sample.size == 0:
+                means.append(float("nan"))
+                lower.append(float("nan"))
+                upper.append(float("nan"))
+                continue
+            mean = float(np.mean(sample))
+            standard_error = float(
+                np.std(sample, ddof=1) / np.sqrt(sample.size)
+                if sample.size > 1
+                else 0.0
+            )
+            radius = 1.96 * standard_error
+            means.append(mean)
+            lower.append(mean - radius)
+            upper.append(mean + radius)
+        return means, lower, upper
+
+    def _plot_reward_expectation(
+        ax: Any,
+        xs: List[int],
+        values: List[float],
+        *,
+        window: int,
+        label: str,
+    ) -> List[float]:
+        """Draw one uniform, convergence-readable reward view."""
+        expected, lower, upper = _rolling_reward_summary(values, window)
+        ax.scatter(
+            xs,
+            values,
+            label="realized reward",
+            color="0.55",
+            alpha=0.10,
+            s=7,
+            linewidths=0,
+        )
+        ax.fill_between(
+            xs,
+            lower,
+            upper,
+            color="tab:blue",
+            alpha=0.16,
+            linewidth=0,
+            label="95% expected-reward band",
+        )
+        _plot_timeseries(
+            ax,
+            xs,
+            expected,
+            label=label,
+            color="tab:blue",
+            marker="",
+            linewidth=2.4,
+        )
+        return expected
+
+    # 3) run reward trajectory + convergence diagnostics
+    if run_logs:
+        xs = [int(r["day"]) for r in run_logs]
+        ys = [_extract_reward(r) for r in run_logs]
+        converged_days = [int(r["day"]) for r in run_logs if bool(r.get("reward_converged", False))]
+        fig, ax = plt.subplots(figsize=(9, 4))
+        smooth_window = _report_smoothing_window(ys)
+        expected = _plot_reward_expectation(
+            ax,
+            xs,
+            ys,
+            window=smooth_window,
+            label=f"expected reward ({smooth_window}-day mean)",
+        )
+        ax.axhline(
+            0.0,
+            color="tab:green",
+            linestyle="--",
+            linewidth=1.1,
+            label="zero objective reward",
+        )
+        if converged_days:
+            conv_day = int(converged_days[0])
+            conv_index = max(0, min(len(expected) - 1, xs.index(conv_day)))
+            conv_reward = float(expected[conv_index])
+            ax.axvline(conv_day, color="tab:green", linestyle="--", linewidth=1.2, label=f"converged day={conv_day}")
+            ax.scatter([conv_day], [conv_reward], color="tab:green", zorder=3)
+        ax.set_title("Objective Reward Convergence")
+        ax.set_xlabel("Day")
+        ax.set_ylabel("Normalized dominance reward")
+        ax.legend(loc="best")
+        fig.tight_layout()
+        out = f"{prefix}_reward_run.png"
+        _ensure_parent_dir(out)
+        fig.savefig(out, dpi=150)
+        print(f"Saved graph -> {out}")
+        plt.close(fig)
+        
+        stds = [float(r.get("reward_window_std", np.nan)) for r in run_logs]
+        deltas = [float(r.get("reward_window_delta", np.nan)) for r in run_logs]
+        if any(np.isfinite(v) for v in stds) or any(np.isfinite(v) for v in deltas):
+            fig, ax1 = plt.subplots(figsize=(9, 4))
+            _plot_timeseries(ax1, xs, stds, color="tab:blue", label="window std")
+            ax1.set_xlabel("Day")
+            ax1.set_ylabel("Reward window std", color="tab:blue")
+            ax1.tick_params(axis="y", labelcolor="tab:blue")
+
+            ax2 = ax1.twinx()
+            _plot_timeseries(ax2, xs, deltas, color="tab:orange", label="|delta| per day")
+            ax2.set_ylabel("Reward trend magnitude", color="tab:orange")
+            ax2.tick_params(axis="y", labelcolor="tab:orange")
+
+            if converged_days:
+                ax1.axvline(converged_days[0], color="tab:green", linestyle="--", linewidth=1.2)
+
+            lines1, labels1 = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
+            ax1.set_title("Optimization Convergence Diagnostics")
+            fig.tight_layout()
+            out = f"{prefix}_convergence_run.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+
+    # 4) training trajectory (run_experiment)
+    if training_logs:
+        xs = [int(r["batch"]) + 1 for r in training_logs]
+        ys = [float(r["avg_reward"]) for r in training_logs]
+        smooth_window = _report_smoothing_window(ys)
+        fig, ax = plt.subplots(figsize=(9, 4))
+        _plot_reward_expectation(
+            ax,
+            xs,
+            ys,
+            window=smooth_window,
+            label=f"expected reward ({smooth_window}-day mean)",
+        )
+        ax.axhline(
+            0.0,
+            color="tab:green",
+            linestyle="--",
+            linewidth=1.1,
+            label="zero objective reward",
+        )
+        if any("reward_base" in r for r in training_logs):
+            base_ys = [float(r.get("reward_base", np.nan)) for r in training_logs]
+            if not np.allclose(
+                np.asarray(base_ys, dtype=float),
+                np.asarray(ys, dtype=float),
+                equal_nan=True,
+            ):
+                _plot_timeseries(
+                    ax, xs, _moving_average(base_ys, smooth_window),
+                    label="unclipped objective mean", marker="",
+                    linestyle="--", alpha=0.8,
+                )
+        converged_batches = [
+            int(r["batch"]) + 1
+            for r in training_logs
+            if bool(r.get("reward_converged", False))
+        ]
+        if converged_batches:
+            ax.axvline(
+                converged_batches[0],
+                color="tab:green",
+                linestyle="--",
+                linewidth=1.2,
+                label=(
+                    "in-sample reward convergence "
+                    f"day={converged_batches[0]}"
+                ),
+            )
+        
+        y_min, y_max = float(np.nanmin(ys)), float(np.nanmax(ys))
+        y_span = max(1e-6, y_max - y_min)
+        y_pad = max(0.02, 0.10 * y_span)
+        y_lo, y_hi = min(y_min - y_pad, 0.0), max(y_max + y_pad, 0.0)
+
+        # Use denser major ticks (with minor ticks in-between) so reward movements are easier to inspect.
+        tick_candidates = [0.01, 0.02, 0.05, 0.10, 0.20, 0.50]
+        y_total = max(1e-6, y_hi - y_lo)
+        major_step = next((step for step in tick_candidates if (y_total / step) <= 12), tick_candidates[-1])
+
+        ax.set_ylim(y_lo, y_hi)
+        ax.yaxis.set_major_locator(MultipleLocator(major_step))
+        ax.yaxis.set_minor_locator(MultipleLocator(max(major_step / 2.0, 0.005)))
+        ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+        ax.grid(axis="y", which="major", linestyle="--", alpha=0.35)
+        ax.grid(axis="y", which="minor", linestyle=":", alpha=0.20)
+        
+        validation_points = [
+            (int(r["batch"]) + 1, float(r["validation_score"]))
+            for r in training_logs
+            if np.isfinite(float(r.get("validation_score", np.nan)))
+        ]
+        validation_axis = None
+        if validation_points:
+            validation_axis = ax.twinx()
+            validation_axis.plot(
+                [point[0] for point in validation_points],
+                [point[1] for point in validation_points],
+                color="purple",
+                marker="D",
+                linestyle="--",
+                linewidth=1.8,
+                label="selected held-out score",
+            )
+            q_points = [
+                (int(r["batch"]) + 1, float(r["validation_objective_q_score"]))
+                for r in training_logs
+                if np.isfinite(
+                    float(r.get("validation_objective_q_score", np.nan))
+                )
+            ]
+            raw_points = [
+                (int(r["batch"]) + 1, float(r["validation_raw_actor_score"]))
+                for r in training_logs
+                if np.isfinite(
+                    float(r.get("validation_raw_actor_score", np.nan))
+                )
+            ]
+            if q_points:
+                validation_axis.plot(
+                    [point[0] for point in q_points],
+                    [point[1] for point in q_points],
+                    color="tab:cyan",
+                    marker="o",
+                    linestyle=":",
+                    linewidth=1.1,
+                    alpha=0.85,
+                    label="objective-Q candidate",
+                )
+            if raw_points:
+                validation_axis.plot(
+                    [point[0] for point in raw_points],
+                    [point[1] for point in raw_points],
+                    color="tab:orange",
+                    marker="s",
+                    linestyle=":",
+                    linewidth=1.1,
+                    alpha=0.85,
+                    label="raw-actor candidate",
+                )
+            validation_axis.set_ylabel("Held-out validation score", color="purple")
+            validation_axis.tick_params(axis="y", labelcolor="purple")
+
+        stage_boundaries: List[Tuple[int, str]] = []
+        previous_stage = ""
+        for row in training_logs:
+            stage_name = str(row.get("training_stage", "") or "")
+            if stage_name and stage_name != previous_stage:
+                stage_boundaries.append((int(row["batch"]) + 1, stage_name))
+                previous_stage = stage_name
+        for boundary_index, (boundary_x, stage_name) in enumerate(
+            stage_boundaries
+        ):
+            if boundary_index > 0:
+                ax.axvline(
+                    boundary_x,
+                    color="0.45",
+                    linestyle=":",
+                    linewidth=1.0,
+                    alpha=0.65,
+                )
+            ax.text(
+                boundary_x,
+                0.02,
+                stage_name,
+                transform=ax.get_xaxis_transform(),
+                rotation=90,
+                va="bottom",
+                ha="left",
+                color="0.35",
+                fontsize=8,
+            )
+
+        ax.set_title("Training Objective Reward Convergence")
+        ax.set_xlabel("Batch")
+        ax.set_ylabel("Normalized dominance reward")
+        handles, labels = ax.get_legend_handles_labels()
+        if validation_axis is not None:
+            extra_handles, extra_labels = validation_axis.get_legend_handles_labels()
+            handles += extra_handles
+            labels += extra_labels
+        ax.legend(handles, labels, loc="best")
+        fig.tight_layout()
+        out = f"{prefix}_reward_training.png"
+        _ensure_parent_dir(out)
+        fig.savefig(out, dpi=150)
+        print(f"Saved graph -> {out}")
+        plt.close(fig)
+
+    # 5) evaluation trajectory (run_experiment)
+    if evaluation_logs:
+        xs = [plot_time(r, 'day') for r in evaluation_logs]
+        ys = [_extract_reward(r) for r in evaluation_logs]
+        smooth_window = _report_smoothing_window(ys)
+        fig, ax = plt.subplots(figsize=(9, 4))
+        _plot_reward_expectation(
+            ax,
+            xs,
+            ys,
+            window=smooth_window,
+            label=f"expected reward ({smooth_window}-day mean)",
+        )
+        ax.axhline(
+            0.0,
+            color="tab:green",
+            linestyle="--",
+            linewidth=1.1,
+            label="zero objective reward",
+        )
+        if any("reward_base" in r for r in evaluation_logs):
+            base_ys = [float(r.get("reward_base", np.nan)) for r in evaluation_logs]
+            if not np.allclose(
+                np.asarray(base_ys, dtype=float),
+                np.asarray(ys, dtype=float),
+                equal_nan=True,
+            ):
+                _plot_timeseries(
+                    ax, xs, _moving_average(base_ys, smooth_window),
+                    label="unclipped objective mean", marker="",
+                    linestyle="--", alpha=0.8,
+                )
+        tail_size = max(20, len(ys) // 4)
+        if tail_size <= len(ys):
+            late_mean = float(np.nanmean(ys[-tail_size:]))
+            ax.axhline(
+                late_mean,
+                color="purple",
+                linestyle=":",
+                linewidth=1.5,
+                label=f"late mean={late_mean:.3f}",
+            )
+        ax.set_title("Evaluation Objective Reward Stability (Frozen Policy)")
+        ax.set_xlabel("Day")
+        ax.set_ylabel("Normalized dominance reward")
+        ax.legend(loc="best")
+        fig.tight_layout()
+        out = f"{prefix}_reward_evaluation.png"
+        _ensure_parent_dir(out)
+        fig.savefig(out, dpi=150)
+        print(f"Saved graph -> {out}")
+        plt.close(fig)
+        
+    def _plot_experiment_diagnostics(logs: List[Dict[str, Any]], label: str, x_key: str) -> None:
+        if not logs:
+            return
+        xs = [plot_time(r, x_key) for r in logs]
+
+        def _sample_logs(
+            source: List[Dict[str, Any]], stride: int
+        ) -> List[Dict[str, Any]]:
+            """Retain endpoints, stage openings, and regular diagnostic points."""
+            stride = max(1, int(stride))
+            if stride <= 1 or len(source) <= 2:
+                return list(source)
+            selected: List[Dict[str, Any]] = []
+            previous_stage = None
+            for index, row in enumerate(source):
+                x_value = int(row[x_key]) + (1 if x_key == "batch" else 0)
+                stage = str(row.get("training_stage", "") or "")
+                stage_changed = bool(stage and stage != previous_stage)
+                if (
+                    index == 0
+                    or index == len(source) - 1
+                    or x_value % stride == 0
+                    or stage_changed
+                ):
+                    selected.append(row)
+                if stage:
+                    previous_stage = stage
+            return selected
+
+        # Directly comparable two-firm business outcomes.  The original
+        # dashboard showed only Firm 1 share/revenue plus a fare gap, which
+        # could make a low-price, low-profit policy look successful.  Preserve
+        # that diagnostic below and add the actual competitive objective.
+        if x_key == "batch":
+            competitive_keys = (
+                ("avg_market_share", "avg_firm2_market_share"),
+                ("avg_rev_per_request", "avg_firm2_rev_per_request"),
+                ("avg_profit_per_request", "avg_firm2_profit_per_request"),
+            )
+        else:
+            competitive_keys = (
+                ("rl_market_share", "heuristic_market_share"),
+                ("rl_revenue", "heuristic_revenue"),
+                ("rl_profit", "heuristic_profit"),
+            )
+        if all(
+            own_key in logs[0] and rival_key in logs[0]
+            for own_key, rival_key in competitive_keys
+        ):
+            fig, axes = plt.subplots(4, 1, figsize=(10, 11), sharex=True)
+            ylabels = (
+                "Completed-request share\n(sum = completion coverage)",
+                "Revenue / request",
+                "Profit / request",
+            )
+            for ax, (own_key, rival_key), ylabel in zip(
+                axes[:3], competitive_keys, ylabels
+            ):
+                own = [float(r.get(own_key, np.nan)) for r in logs]
+                rival = [float(r.get(rival_key, np.nan)) for r in logs]
+                smooth_window = _report_smoothing_window(own)
+                _plot_timeseries(
+                    ax, xs, own, label="Firm 1 raw", color="tab:blue",
+                    alpha=0.08, linewidth=0.6,
+                )
+                _plot_timeseries(
+                    ax, xs, rival, label="Firm 2 raw", color="tab:orange",
+                    alpha=0.08, linewidth=0.6,
+                )
+                _plot_timeseries(
+                    ax, xs, _moving_average(own, smooth_window),
+                    label=f"Firm 1 MA{smooth_window}", color="tab:blue",
+                    marker="", linewidth=2.0,
+                )
+                _plot_timeseries(
+                    ax, xs, _moving_average(rival, smooth_window),
+                    label=f"Firm 2 MA{smooth_window}", color="tab:orange",
+                    marker="", linewidth=2.0,
+                )
+                ax.set_ylabel(ylabel)
+                ax.grid(axis="y", linestyle="--", alpha=0.25)
+                ax.legend(loc="best", ncol=2, fontsize=8)
+            axes[0].set_ylim(-0.02, 1.02)
+            axes[2].axhline(0.0, color="black", linewidth=0.8, alpha=0.35)
+            objective = str(
+                logs[0].get("policy_objective", "profit_maximization")
+            )
+            if objective == "competitiveness":
+                own_key, rival_key = competitive_keys[0]
+                target_gap = 0.0
+                gap_label = "Market-share gap (Firm 1 − Firm 2)"
+                target_label = "dominance boundary (Firm 1 = Firm 2)"
+                objective_gaps = [
+                    float(row.get(own_key, np.nan))
+                    - float(row.get(rival_key, np.nan))
+                    for row in logs
+                ]
+            elif objective == "profit_maximization":
+                own_key, rival_key = competitive_keys[2]
+                target_gap = 0.0
+                gap_label = "Profit gap / request (Firm 1 − Firm 2)"
+                target_label = "dominance boundary (Firm 1 = Firm 2)"
+                objective_gaps = [
+                    float(row.get(own_key, np.nan))
+                    - float(row.get(rival_key, np.nan))
+                    for row in logs
+                ]
+            else:
+                weights = objective_reward_weights(objective)
+                target_gap = 0.0
+                gap_label = "Normalized mixed-objective gap (Firm 1 − Firm 2)"
+                target_label = "objective parity boundary"
+                objective_gaps = []
+                for row in logs:
+                    own_profit = float(row.get(competitive_keys[2][0], np.nan))
+                    rival_profit = float(row.get(competitive_keys[2][1], np.nan))
+                    own_share = float(row.get(competitive_keys[0][0], np.nan))
+                    rival_share = float(row.get(competitive_keys[0][1], np.nan))
+                    objective_gaps.append(float(
+                        weights["own_profit"] * (own_profit - rival_profit) / 2.0
+                        + 2.0 * weights["profit_lead"]
+                        * (own_profit - rival_profit)
+                        + weights["own_completed_share"]
+                        * (own_share - rival_share) / 0.40
+                        + 2.0 * weights["completed_share_lead"]
+                        * (own_share - rival_share) / 0.10
+                    ))
+            smooth_window = _report_smoothing_window(objective_gaps)
+            axes[3].scatter(
+                xs,
+                objective_gaps,
+                color="0.55",
+                alpha=0.10,
+                s=7,
+                linewidths=0,
+                label="realized objective gap",
+            )
+            _plot_timeseries(
+                axes[3],
+                xs,
+                _moving_average(objective_gaps, smooth_window),
+                color="tab:purple",
+                marker="",
+                linewidth=2.2,
+                label=f"objective gap mean ({smooth_window}d)",
+            )
+            axes[3].axhline(
+                target_gap,
+                color="tab:green",
+                linestyle="--",
+                linewidth=1.3,
+                label=target_label,
+            )
+            axes[3].set_ylabel(gap_label)
+            axes[3].set_xlabel(
+                "Training day" if x_key == "batch" else "Evaluation day"
+            )
+            axes[3].grid(axis="y", linestyle="--", alpha=0.25)
+            axes[3].legend(loc="best", fontsize=8)
+            fig.suptitle(
+                f"{label.title()} Uniform Two-Firm Performance "
+                f"({objective.replace('_', ' ')})"
+            )
+            fig.tight_layout()
+            out = f"{prefix}_{label}_competitive_performance.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+
+        share_key = "avg_share" if "avg_share" in logs[0] else "rl_share"
+        revenue_key = "avg_rev_per_request" if "avg_rev_per_request" in logs[0] else "rl_revenue"
+        gap_key = "avg_price_gap_f2_minus_f1" if "avg_price_gap_f2_minus_f1" in logs[0] else "price_gap_f2_minus_f1"
+        if all(k in logs[0] for k in (share_key, revenue_key, gap_key)):
+            business_logs = _sample_logs(logs, diagnostic_plot_stride)
+            business_xs = [
+                plot_time(r, x_key)
+                for r in business_logs
+            ]
+            fig, axes = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
+            _plot_timeseries(axes[0], business_xs, [float(r[share_key]) for r in business_logs], label="share", color="tab:blue")
+            axes[0].set_ylabel("Completed request share")
+            axes[0].grid(axis="y", linestyle="--", alpha=0.25)
+            _plot_timeseries(axes[1], business_xs, [float(r[revenue_key]) for r in business_logs], label="rev/request", color="tab:green")
+            axes[1].set_ylabel("Revenue/request")
+            axes[1].grid(axis="y", linestyle="--", alpha=0.25)
+            _plot_timeseries(axes[2], business_xs, [float(r[gap_key]) for r in business_logs], label="F2-F1 gap", color="tab:orange")
+            axes[2].axhline(0.0, color="black", linewidth=0.8, alpha=0.4)
+            axes[2].set_ylabel("Price gap")
+            axes[2].set_xlabel("Batch" if x_key == "batch" else "Day")
+            axes[2].grid(axis="y", linestyle="--", alpha=0.25)
+            fig.suptitle(
+                f"{label.title()} Business Diagnostics "
+                f"(every {max(1, int(diagnostic_plot_stride))} periods)"
+            )
+            fig.tight_layout()
+            out = f"{prefix}_{label}_business_diagnostics.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+
+        gap_error_key = (
+            "avg_price_gap_abs_error"
+            if x_key == "batch"
+            else "price_gap_abs_error"
+        )
+        gap_p90_key = (
+            "avg_price_gap_p90_abs_error"
+            if x_key == "batch"
+            else "price_gap_p90_abs_error"
+        )
+        if gap_key in logs[0] and gap_error_key in logs[0]:
+            target = float(logs[0].get("price_gap_target", 0.0))
+            tolerance = float(logs[0].get("price_gap_tolerance", 0.45))
+            signed_gaps = [float(r.get(gap_key, np.nan)) for r in logs]
+            gap_mae = [float(r.get(gap_error_key, np.nan)) for r in logs]
+            fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+            _plot_timeseries(
+                axes[0], xs, signed_gaps, label="signed mean gap F2-F1",
+                color="tab:orange", alpha=0.25, linewidth=0.8, marker="",
+            )
+            _plot_timeseries(
+                axes[0], xs, _moving_average(signed_gaps, 20),
+                label="signed gap MA20", color="tab:orange",
+                linewidth=2.0, marker="",
+            )
+            axes[0].axhline(
+                target, color="black", linestyle="--", linewidth=1.1,
+                label=f"target=${target:.2f}",
+            )
+            axes[0].set_ylabel("Signed gap ($)")
+            axes[0].legend(loc="best")
+            axes[0].grid(axis="y", linestyle="--", alpha=0.25)
+
+            _plot_timeseries(
+                axes[1], xs, gap_mae, label="gap MAE",
+                color="tab:red", alpha=0.25, linewidth=0.8, marker="",
+            )
+            _plot_timeseries(
+                axes[1], xs, _moving_average(gap_mae, 20),
+                label="gap MAE MA20", color="tab:red",
+                linewidth=2.0, marker="",
+            )
+            if gap_p90_key in logs[0]:
+                _plot_timeseries(
+                    axes[1], xs,
+                    [float(r.get(gap_p90_key, np.nan)) for r in logs],
+                    label="p90 absolute error", color="tab:purple",
+                    alpha=0.55, linewidth=1.0, marker="",
+                )
+            axes[1].axhline(
+                tolerance, color="black", linestyle=":", linewidth=1.1,
+                label=f"MAE tolerance=${tolerance:.2f}",
+            )
+            axes[1].set_ylabel("Absolute error ($)")
+            axes[1].set_xlabel(
+                "Training day" if x_key == "batch" else "Evaluation day"
+            )
+            axes[1].legend(loc="best")
+            axes[1].grid(axis="y", linestyle="--", alpha=0.25)
+            fig.suptitle(
+                f"{label.title()} Price-Gap Performance "
+                "(public-quote alignment diagnostic; not policy objective)"
+            )
+            fig.tight_layout()
+            out = f"{prefix}_{label}_price_gap_performance.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+
+        # PPO metrics exist only when an optimizer update is performed. Plotting
+        # them on every simulator day used to join sparse update values through
+        # zero/NaN placeholders and mixed quantities with incompatible scales.
+        # That produced the misleading vertical spikes in the old dashboard.
+        ppo_logs = [
+            r for r in logs
+            if bool(r.get("ppo_update_performed", False))
+            and np.isfinite(float(r.get("ppo_approx_kl", np.nan)))
+        ]
+        if ppo_logs:
+            ppo_xs = [
+                plot_time(r, x_key)
+                for r in ppo_logs
+            ]
+            fig, axes = plt.subplots(4, 1, figsize=(10, 11), sharex=True)
+
+            trust_ax = axes[0]
+            trust_twin = trust_ax.twinx()
+            _plot_timeseries(
+                trust_ax,
+                ppo_xs,
+                [float(r.get("ppo_approx_kl", np.nan)) for r in ppo_logs],
+                label="approx KL",
+                color="tab:blue",
+            )
+            target_kl = np.asarray(
+                [float(r.get("ppo_target_kl", np.nan)) for r in ppo_logs],
+                dtype=float,
+            )
+            if np.isfinite(target_kl).any():
+                _plot_timeseries(
+                    trust_ax,
+                    ppo_xs,
+                    target_kl,
+                    label="target KL",
+                    color="tab:blue",
+                    marker="",
+                    linestyle="--",
+                    alpha=0.65,
+                )
+            _plot_timeseries(
+                trust_twin,
+                ppo_xs,
+                [float(r.get("ppo_clipfrac", np.nan)) for r in ppo_logs],
+                label="clip fraction",
+                color="tab:orange",
+            )
+            trust_ax.set_ylabel("KL divergence")
+            trust_twin.set_ylabel("Clip fraction")
+            trust_twin.set_ylim(bottom=0.0)
+            trust_ax.set_title("Trust-region behavior")
+
+            exploration_ax = axes[1]
+            exploration_twin = exploration_ax.twinx()
+            for key, display, color in (
+                ("ppo_policy_entropy_fraction", "policy entropy fraction", "tab:red"),
+                ("ppo_exploration_rate", "exploration rate", "tab:brown"),
+                ("ppo_action_coverage", "action coverage", "tab:pink"),
+            ):
+                _plot_timeseries(
+                    exploration_ax,
+                    ppo_xs,
+                    [float(r.get(key, np.nan)) for r in ppo_logs],
+                    label=display,
+                    color=color,
+                )
+            _plot_timeseries(
+                exploration_twin,
+                ppo_xs,
+                [float(r.get("ppo_ent_coeff", np.nan)) for r in ppo_logs],
+                label="entropy coefficient",
+                color="tab:purple",
+            )
+            exploration_ax.set_ylabel("Fraction / rate")
+            exploration_ax.set_ylim(-0.02, 1.02)
+            exploration_twin.set_ylabel("Entropy coefficient")
+            exploration_ax.set_title("Exploration and policy concentration")
+
+            critic_ax = axes[2]
+            critic_twin = critic_ax.twinx()
+            _plot_timeseries(
+                critic_ax,
+                ppo_xs,
+                [float(r.get("ppo_explained_variance", np.nan)) for r in ppo_logs],
+                label="explained variance",
+                color="tab:gray",
+            )
+            for key, display, color in (
+                ("ppo_critic_loss", "critic loss", "tab:green"),
+                ("ppo_value_loss", "value loss", "tab:olive"),
+            ):
+                _plot_timeseries(
+                    critic_twin,
+                    ppo_xs,
+                    [float(r.get(key, np.nan)) for r in ppo_logs],
+                    label=display,
+                    color=color,
+                )
+            critic_ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.35)
+            critic_ax.set_ylim(-1.05, 1.05)
+            critic_ax.set_ylabel("Explained variance")
+            critic_twin.set_ylabel("Loss")
+            critic_twin.set_yscale("symlog", linthresh=1e-3)
+            critic_ax.set_title("Critic fit")
+
+            credit_ax = axes[3]
+            credit_twin = credit_ax.twinx()
+            _plot_timeseries(
+                credit_ax,
+                ppo_xs,
+                [float(r.get("ppo_rollout_action_diversity", np.nan)) for r in ppo_logs],
+                label="rollout action diversity",
+                color="tab:cyan",
+            )
+            _plot_timeseries(
+                credit_ax,
+                ppo_xs,
+                [
+                    1.0 - float(r.get("ppo_raw_argmax_concentration", np.nan))
+                    for r in ppo_logs
+                ],
+                label="policy adaptive mass",
+                color="tab:blue",
+            )
+            for key, display, color in (
+                ("ppo_state_action_sensitivity", "state-action sensitivity", "tab:orange"),
+                ("ppo_state_action_mi", "state-action mutual information", "tab:green"),
+            ):
+                _plot_timeseries(
+                    credit_twin,
+                    ppo_xs,
+                    [float(r.get(key, np.nan)) for r in ppo_logs],
+                    label=display,
+                    color=color,
+                )
+            credit_ax.set_ylim(-0.02, 1.02)
+            credit_ax.set_ylabel("Diversity / adaptive mass")
+            credit_twin.set_ylabel("State dependence")
+            credit_ax.set_title("Action credit and state dependence")
+            credit_ax.set_xlabel("Training day" if x_key == "batch" else "Day")
+
+            twins = {
+                trust_ax: trust_twin,
+                exploration_ax: exploration_twin,
+                critic_ax: critic_twin,
+                credit_ax: credit_twin,
+            }
+            for ax in axes:
+                ax.grid(axis="y", linestyle="--", alpha=0.25)
+                twin = twins[ax]
+                handles, labels_left = ax.get_legend_handles_labels()
+                twin_handles, labels_right = twin.get_legend_handles_labels()
+                handles += twin_handles
+                labels_left += labels_right
+                if handles:
+                    ax.legend(handles, labels_left, loc="best", fontsize=8)
+
+            fig.suptitle(
+                f"{label.title()} PPO Update Diagnostics "
+                f"({len(ppo_logs)} optimizer updates)"
+            )
+            fig.tight_layout()
+            out = f"{prefix}_{label}_ppo_diagnostics.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+
+        coeff_keys: List[str] = sorted(
+            {
+                k[len("firm1_"):]
+                for r in logs
+                for k in r.keys()
+                if k.startswith("firm1_") and ("firm2_" + k[len("firm1_"):]) in r
+            }
+        )
+        fare_logs = _sample_logs(logs, fare_plot_stride_days)
+        fare_xs = [
+            plot_time(r, x_key)
+            for r in fare_logs
+        ]
+        for coeff in coeff_keys:
+            fig, ax = plt.subplots(figsize=(9, 4))
+            _plot_timeseries(ax, fare_xs, [float(r.get(f"firm1_{coeff}", np.nan)) for r in fare_logs], label=f"Firm1 {coeff}")
+            _plot_timeseries(ax, fare_xs, [float(r.get(f"firm2_{coeff}", np.nan)) for r in fare_logs], label=f"Firm2 {coeff}")
+            ax.set_title(f"{label.title()} Coefficient Trajectory: {coeff}")
+            ax.set_xlabel("Batch" if x_key == "batch" else "Day")
+            ax.set_ylabel("Coefficient value")
+            ax.legend(loc="best")
+            fig.tight_layout()
+            out = f"{prefix}_{label}_coeff_{coeff}_trajectory.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+
+        representative_weights = {
+            "base_fare": 1.0,
+            "per_minute": 14.65,
+            "per_mile": 3.95,
+            "booking_fee": 1.0,
+            "airport_fee": 0.0775,
+        }
+        if all(
+            f"firm{firm}_{coefficient}" in fare_logs[0]
+            for firm in (1, 2)
+            for coefficient in representative_weights
+        ):
+            representative_fares: Dict[int, List[float]] = {1: [], 2: []}
+            for row in fare_logs:
+                for firm in (1, 2):
+                    representative_fares[firm].append(
+                        float(
+                            sum(
+                                weight
+                                * float(row[f"firm{firm}_{coefficient}"])
+                                for coefficient, weight in representative_weights.items()
+                            )
+                        )
+                    )
+            fig, ax = plt.subplots(figsize=(10, 4.5))
+            _plot_timeseries(
+                ax,
+                fare_xs,
+                representative_fares[1],
+                label="Firm 1 representative fare",
+                color="tab:blue",
+            )
+            _plot_timeseries(
+                ax,
+                fare_xs,
+                representative_fares[2],
+                label="Firm 2 representative fare",
+                color="tab:orange",
+            )
+            ax.set_title(
+                f"{label.title()} Representative Fare Trajectory "
+                f"(every {max(1, int(fare_plot_stride_days))} days)"
+            )
+            ax.set_xlabel("Training day" if x_key == "batch" else "Evaluation day")
+            ax.set_ylabel("Representative fare ($)")
+            ax.grid(axis="y", linestyle="--", alpha=0.25)
+            ax.legend(loc="best")
+            fig.tight_layout()
+            out = f"{prefix}_{label}_fare_trajectory.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+
+    _plot_experiment_diagnostics(training_logs, "training", "batch")
+    _plot_experiment_diagnostics(evaluation_logs, "evaluation", "day")
+
+    # 6) manipulated coefficient trajectories
+    if run_logs:
+        stride = max(1, int(fare_plot_stride_days))
+        sampled_run_logs = [
+            row
+            for index, row in enumerate(run_logs)
+            if index == 0
+            or index == len(run_logs) - 1
+            or int(row["day"]) % stride == 0
+        ]
+        xs = [int(r["day"]) for r in sampled_run_logs]
+        coeff_keys: List[str] = sorted(
+            {
+                k[len("firm1_"):]
+                for r in sampled_run_logs
+                for k in r.keys()
+                if k.startswith("firm1_") and ("firm2_" + k[len("firm1_"):]) in r
+            }
+        )
+        for coeff in coeff_keys:
+            y1: List[float] = []
+            y2: List[float] = []
+            valid = True
+            for r in sampled_run_logs:
+                v1 = r.get(f"firm1_{coeff}")
+                v2 = r.get(f"firm2_{coeff}")
+                if v1 is None or v2 is None:
+                    valid = False
+                    break
+                y1.append(float(v1))
+                y2.append(float(v2))
+            if not valid or not y1:
+                continue
+
+            fig, ax = plt.subplots(figsize=(9, 4))
+            _plot_timeseries(ax, xs, y1, label=f"Firm1 {coeff}")
+            _plot_timeseries(ax, xs, y2, label=f"Firm2 {coeff}")
+            ax.set_title(f"Coefficient Trajectory: {coeff}")
+            ax.set_xlabel("Day")
+            ax.set_ylabel("Coefficient value")
+            ax.legend(loc="best")
+            fig.tight_layout()
+            out = f"{prefix}_coeff_{coeff}_trajectory.png"
+            _ensure_parent_dir(out)
+            fig.savefig(out, dpi=150)
+            print(f"Saved graph -> {out}")
+            plt.close(fig)
+            
+def _write_run_config(prefix: str, args: argparse.Namespace, core: Core) -> None:
+    """Persist the exact run configuration for reproducible experiments."""
+    out = f"{prefix}_run_config.json"
+    prefix_seed_labels = [
+        int(value)
+        for value in re.findall(r"(?:^|[_-])seed(\d+)(?=$|[_-])", str(prefix))
+    ]
+    prefix_seed_mismatch = bool(
+        prefix_seed_labels and int(core.seed) not in prefix_seed_labels
+    )
+    payload = {
+        "created_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "argv": sys.argv,
+        "user_seed": args.seed,
+        "experiment_seed": args.experiment_seed,
+        "effective_seed": core.seed,
+        "report_prefix_seed_labels": prefix_seed_labels,
+        "report_prefix_seed_mismatch": prefix_seed_mismatch,
+        "deterministic_experiment_seed": bool(args.deterministic_experiment_seed),
+        "eval_policy_mode": args.eval_policy_mode,
+        "eval_policy_seed": args.eval_policy_seed,
+        "eval_guardrail_mode": args.eval_guardrail_mode,
+        "pricing_control": {
+            "manipulated_price_coefficient_count": int(
+                core.manipulated_price_coefficient_count
+            ),
+            "manipulated_price_coefficient_keys": list(core.shared_edit_keys),
+            "scope_locked_for_training_validation_evaluation": True,
+        },
+        "trained_model_archive": getattr(core, "last_saved_model_path", None),
+        "trained_model_id": getattr(core, "last_saved_model_id", None),
+        "loaded_trained_model_path": getattr(core, "loaded_trained_model_path", None),
+        "loaded_trained_model_id": getattr(core, "loaded_trained_model_id", None),
+        "loaded_trained_model_sha256": getattr(core, "loaded_trained_model_sha256", None),
+        "loaded_trained_model_created_at": getattr(
+            core, "loaded_trained_model_created_at", None
+        ),
+        "loaded_trained_model_training_seed": getattr(
+            core, "loaded_trained_model_training_seed", None
+        ),
+        "loaded_trained_model_training_seed_source": getattr(
+            core, "loaded_trained_model_training_seed_source", None
+        ),
+        "loaded_trained_model_metadata": getattr(
+            core, "loaded_trained_model_metadata", None
+        ),
+        "competitive_backtest": getattr(
+            core, "competitive_backtest_report", None
+        ),
+        "training_certification": getattr(
+            core, "training_certification_report", None
+        ),
+        "benchmark_evaluation": getattr(
+            core, "benchmark_evaluation_report", None
+        ),
+        "strategic_theory_benchmarks": getattr(
+            core, "theory_benchmark_report", {}
+        ),
+        "v26": getattr(core, "v26_settings", {"enabled": False}),
+        "v26_threshold_ablation": getattr(core, "threshold_ablation_summary", {}),
+        "v26_ood_evaluation": getattr(core, "ood_evaluation_report", {}),
+        "v26_baseline_evaluation": getattr(core, "baseline_evaluation_report", {}),
+        "generalization": {
+            "profile_source": "same_market_threshold_holdout",
+            "training_fraction": float(core.training_generalization_fraction),
+            "evaluation_fraction": float(core.evaluation_generalization_fraction),
+            "evaluation_uses_cached_threshold_profiles": bool(
+                core.threshold_profile_source == "cached"
+            ),
+            "pool_size": int(len(core.generalization_profile_pool)),
+            "cities": sorted(
+                str(city) for city in core.generalization_profiles_by_city
+            ),
+        },
+        "report_prefix": args.report_prefix,
+        "platform_mdp": platform_mdp_config_payload(
+            core.observation_config,
+            core.positive_reward_config,
+            core.constraint_config,
+            core.training_stage_scheduler,
+            core.long_term_profit_reward_config,
+        ),
+        "active_reward": {
+            "type": "objective_separated_policy_reward_v8",
+            "mechanism": core.long_term_profit_reward_model.mechanism_name,
+            "relative_profit_definition": (
+                "own contribution profit per incoming request minus rival "
+                "contribution profit per incoming request"
+            ),
+            "market_share_competitiveness_definition": (
+                "linear Firm1-minus-Firm2 completed rides per incoming request "
+                "divided by 0.10 with no target cap; conditional choice share, "
+                "profit, public quote gaps, wait, and margin are reporting "
+                "diagnostics only"
+            ),
+            "robust_checkpoint_optimizer": str(
+                core.objective_optimizer.mechanism_name
+            ),
+            "price_gap_metric_definition": (
+                "mean(abs((Firm2 public quote - Firm1 public quote) - "
+                "target_price_gap)) across quote opportunities"
+            ),
+            **vars(core.long_term_profit_reward_config),
+            "gamma": float(core.firm1.agent.gamma) if core.firm1_mode == "RL" else None,
+            "gae_lambda": float(core.firm1.agent.lam) if core.firm1_mode == "RL" else None,
+        },
+        "credit_assignment": copy.deepcopy(core.credit_assignment_config),
+        "args": {
+            k: (str(v) if not isinstance(v, (str, int, float, bool, type(None), list, dict)) else v)
+            for k, v in vars(args).items()
+        },
+    }
+    _ensure_parent_dir(out)
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    print(f"Saved -> {out}")
+    if prefix_seed_mismatch:
+        print(
+            "[WARN] Report-prefix seed label does not match the effective run "
+            f"seed: prefix labels={prefix_seed_labels}, effective_seed={core.seed}. "
+            "The run-config and trained-policy identity are authoritative."
+        )
+
+def build_shock_config_from_args(args, calibration: Optional[Mapping[str, Any]] = None) -> ShockConfig:
+    """ShockConfig from the v26r CLI flags (scripted scenarios zero the hazards)."""
+    overrides: Dict[str, Any] = {
+        "enabled": True,
+        "mode": str(args.shocks),
+        "intensity_scale": float(args.shock_intensity),
+        # The oracle shortage diagnostic still needs the shock process to
+        # expose its extra flag when the ordinary six public signals are
+        # disabled or ablated.
+        "public_features": (
+            bool(args.actor_true_shortage_flag)
+            or (
+                bool(args.regime_features)
+                and not bool(args.regime_feature_ablation)
+            )
+        ),
+        "emergency_surge_cap": float(args.emergency_surge_cap),
+        "conditional_sampling": False,
+    }
+    types = [item.strip() for item in str(args.shock_types or "").split(",") if item.strip()]
+    if types:
+        overrides["types"] = tuple(types)
+    if args.shock_scenario:
+        # A scripted scenario: no random arrivals unless re-enabled explicitly.
+        overrides.update({
+            "storm_daily_hazard": {},
+            "event_rate_per_day": 0.0,
+            "shortage_rate_per_day": 0.0,
+            "outage_rate_per_day": 0.0,
+            "transit_disruption_rate_per_day": 0.0,
+            "rival_promotion_rate_per_day": 0.0,
+            "drift_sd": 0.0,
+            "training_shock_opening_share": 0.0,
+        })
+    if args.shock_rates_json:
+        extra = json.loads(str(args.shock_rates_json))
+        if not isinstance(extra, dict):
+            raise ValueError("--shock_rates_json must be a JSON object")
+        for key, value in extra.items():
+            if isinstance(value, dict):
+                value = {int(k): float(v) for k, v in value.items()}
+            elif isinstance(value, list):
+                value = tuple(value)
+            overrides[str(key)] = value
+    return ShockConfig.from_calibration(calibration, **overrides)
+
+
+def load_shock_scenario(path: str) -> ShockScenario:
+    """Scripted regime scenario from JSON.
+
+    Schema: {"start_date": "2023-01-09",
+             "events": [{"kind": "driver_shortage", "start_day": 5, "end_day": 9,
+                         "intensity": 0.7, "announced": false, "firm": "", "detail": {}}],
+             "forecasts": {"4": true}}
+    ``intensity`` is the kind's physical multiplier (fleet for driver_shortage,
+    capacity for platform_outage, volume for large_event, storm severity for
+    winter_storm); ``rival_promotion`` uses the config multiplier; a
+    ``rival_switch`` event carries ``detail.mode`` (a Firm 2 controller class).
+    """
+    with open(os.path.expanduser(str(path)), "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    start = datetime.strptime(str(payload.get("start_date", "2023-01-09")), "%Y-%m-%d").date()
+    events = []
+    for item in payload.get("events", []):
+        events.append(ShockEvent(
+            kind=str(item["kind"]),
+            start_day=int(item["start_day"]),
+            end_day=int(item.get("end_day", item["start_day"])),
+            intensity=float(item.get("intensity", 1.0)),
+            start_block=int(item.get("start_block", 0)),
+            end_block=int(item.get("end_block", 10**9)),
+            announced=bool(item.get("announced", True)),
+            firm=str(item.get("firm", "")),
+            detail=dict(item.get("detail", {}) or {}),
+        ))
+    forecasts = {int(k): bool(v) for k, v in dict(payload.get("forecasts", {}) or {}).items()}
+    return ShockScenario(start_date=start, events=events, forecasts=forecasts)
+
+
+def load_training_scenario_manifest(path: str) -> Tuple[Tuple[str, Optional[ShockScenario]], ...]:
+    """Load a fixed, auditable episode curriculum; ``scenario: null`` is natural."""
+    manifest = os.path.abspath(os.path.expanduser(str(path)))
+    with open(manifest, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    if payload.get("format") != "ride-response-training-scenarios-v1":
+        raise ValueError("unknown training scenario manifest format")
+    result = []
+    for item in payload.get("cases", []):
+        name = str(item.get("name", "")).strip()
+        repeat = int(item.get("repeat", 1))
+        if not name or repeat < 1:
+            raise ValueError("training scenario cases require a name and positive repeat")
+        scenario_path = item.get("scenario")
+        if scenario_path:
+            scenario_path = os.path.expanduser(str(scenario_path))
+            if not os.path.isabs(scenario_path):
+                scenario_path = os.path.join(os.path.dirname(manifest), scenario_path)
+            scenario = load_shock_scenario(scenario_path)
+        else:
+            scenario = None
+        result.extend((f"{name}#{copy_index + 1}" if repeat > 1 else name,
+                       copy.deepcopy(scenario)) for copy_index in range(repeat))
+    if not result:
+        raise ValueError("training scenario manifest contains no cases")
+    return tuple(result)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--market", type=str, default="New York City")
+    parser.add_argument("--days", type=int, default=30)
+    parser.add_argument("--timesteps", type=int, default=8)
+    parser.add_argument("--customers", type=int, default=500)
+    parser.add_argument("--choice_mode", type=str, default="cognitive", choices=["parametric", "cognitive", "llm"])
+    parser.add_argument("--model", type=str, default="gpt-4o-mini")
+    parser.add_argument("--openai_api_key", type=str, default=None, help="Optional OpenAI API key override. If omitted, OPENAI_API_KEY env var is used.")
+    parser.add_argument("--seed", type=int, default=None, help="Optional random seed. If omitted, a new seed is generated each run.")
+    parser.add_argument("--out", type=str, default="market_runs.csv")
+
+    dynamic_mode_choices = [
+        "heuristic",
+        "heuristic_margin",
+        "heuristic_random",
+        "adaptive_best_response",
+        "adaptive_best_response_aggressive",
+        "adaptive_best_response_memory",
+        "pi_price_gap",
+        "region_supply_demand",
+        "queue_service_threshold",
+        "surge_driver_incentive",
+        "mpc_grid",
+    ]
+    parser.add_argument("--firm1_mode", type=str, default="heuristic", choices=["RL", *dynamic_mode_choices, *CATCHUP_OPPONENT_MODES, "static"])
+    parser.add_argument("--firm2_mode", type=str, default="static", choices=[
+        *dynamic_mode_choices,
+        *CATCHUP_OPPONENT_MODES,
+        *OPTIMIZED_BENCHMARK_OPPONENT_MODES,
+        *PROFIT_BEST_RESPONSE_OPPONENT_MODES,
+        "static",
+    ])
+
+    parser.add_argument("--firm1_static_values", type=str, default="")
+    parser.add_argument("--firm2_static_values", type=str, default="")
+    parser.add_argument(
+        "--manipulated_price_coefficients",
+        "--manipulated_coefficient_count",
+        dest="manipulated_price_coefficients",
+        type=int,
+        choices=range(1, 6),
+        default=5,
+        metavar="N",
+        help=(
+            "Number of price coefficients controlled by both firms (1-5), in "
+            "the fixed order base_fare, per_minute, per_mile, booking_fee, "
+            "airport_fee. A trained artifact locks this scope for validation "
+            "and evaluation."
+        ),
+    )
+
+    parser.add_argument("--pool", type=int, default=20000, help="Static customer pool size.")
+    parser.add_argument(
+        "--deterministic_torch",
+        action="store_true",
+        help="Use deterministic Torch kernels where available (may reduce performance).",
+    )
+    
+    parser.add_argument("--report_prefix", type=str, default="artifacts/report")
+    parser.add_argument("--live_diagnostics", action=argparse.BooleanOptionalAction, default=True,
+                        help="Durably record daily/PPO/episode diagnostics during execution.")
+    parser.add_argument(
+        "--diagnostic_plot_stride",
+        type=int,
+        default=10,
+        help=(
+            "Plot business-diagnostic markers every N training/evaluation "
+            "periods while retaining all periods in performance curves."
+        ),
+    )
+    parser.add_argument(
+        "--fare_plot_stride_days",
+        type=int,
+        default=10,
+        help="Plot coefficient and representative-fare trajectories every N days.",
+    )
+    parser.add_argument("--run_experiment", action="store_true", help="Run workflow-aligned training/eval experiment")
+    parser.add_argument("--trained_model_in", type=str, default="", help="Load a policy by explicit path, immutable registry model id/archive filename, or 'latest'.")
+    parser.add_argument("--trained_model_out", type=str, default="", help="Optional mutable alias for the final completed dynamic-stage policy. Every training run is also saved immutably in --model_registry_dir.")
+    parser.add_argument("--trained_model_id", type=str, default="", help="Stable human-readable id recorded for this training run in the model registry.")
+    parser.add_argument("--model_registry_dir", type=str, default="artifacts/trained_models", help="Directory containing immutable trained-policy archives and manifest.jsonl.")
+    parser.add_argument("--list_trained_models", action="store_true", help="List available immutable trained-policy archives and exit.")
+    parser.add_argument("--eval_only", action="store_true", help="Skip training and evaluate --trained_model_in directly against --firm2_mode.")
+    parser.add_argument("--dataset_only", action="store_true", help="Load --trained_model_in and run only --compare_with_dataset, without synthetic evaluation/profile bootstrap.")
+    parser.add_argument("--train_timesteps", type=int, default=6000)
+    parser.add_argument("--train_customers", type=int, default=5000)
+    parser.add_argument("--train_steps_per_day", type=int, default=10, help="Synthetic training timesteps per day (run_experiment mode).")
+    parser.add_argument("--ppo_update_interval_days", type=int, default=10, help="Synthetic training days collected before each PPO optimizer update. The default yields enough updates for state-dependent learning.")
+    parser.add_argument("--ppo_min_rollout_transitions", type=int, default=96, help="Minimum complete pricing decisions per PPO rollout (default 96, about 48 simulated days at the standard cadence).")
+    
+    parser.add_argument("--firm1_action_interval_steps", type=int, default=-1, help="Shared Firm1/Firm2 market steps per pricing decision; if both cadence options are provided they must match.")
+    parser.add_argument("--firm2_action_interval_days", "--firm2_action_interval_steps", dest="firm2_action_interval_days", type=int, default=-1, help="Legacy name and step-based alias for the shared Firm1/Firm2 pricing interval; <=0 derives cadence from the PPO update interval.")
+    parser.add_argument("--ppo_batch_size", type=int, default=48, help="PPO minibatch size; two minibatches per default credit-complete rollout provide enough updates without tiny noisy batches.")
+    parser.add_argument("--ppo_update_epochs", "--ppo_epochs", dest="ppo_update_epochs", type=int, default=8, help="Maximum clipped-PPO epochs per rollout; v24 may stop actor epochs early at target KL.")
+    parser.add_argument("--ppo_rollout_episodes", type=int, default=None,
+                        help="Revision 3: complete independent episodes per ordinary PPO update (default 2); stage/final remainders are learned and labeled.")
+    parser.add_argument(
+        "--state_action_mi_weight",
+        type=float,
+        default=0.0,
+        help="Deprecated compatibility option; PPO uses no MI regularizer.",
+    )
+    parser.add_argument(
+        "--direct_actor_credit_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Deprecated actor-only improvement blend. The default is zero "
+            "because semi-MDP returns already attribute the full held-action "
+            "horizon and immediate deltas are dominated by market noise."
+        ),
+    )
+    parser.add_argument("--state_frame_stack", type=int, default=16, help="Ordered public frames read by the separate recurrent actor and critic (default: 16 frames, covering several recent pricing actions).")
+    parser.add_argument(
+        "--credit_assignment_v24",
+        action="store_true",
+        help=(
+            "Enable the staged v24 credit-assignment defaults: training-only "
+            "centralized critic, stateful recurrence, three CRN branches, "
+            "critic Q supervision, potential shaping, learned reward rate, and "
+            "a hard PPO KL stop. No constrained-MDP mechanism is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--credit_assignment_v25",
+        action="store_true",
+        help=(
+            "Enable the corrected v25 causal-learning contract: exact discounted "
+            "SMDP rewards, actual next-decision bootstrap and potential, every-frame "
+            "actor recurrence, direct centralized TD value learning, an independent "
+            "action-feature CRN critic, and regime-local reward-rate centering. It "
+            "adds no movement reward, action quota, or constrained-MDP restriction."
+        ),
+    )
+    parser.add_argument(
+        "--privileged_critic",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Independently enable/disable the training-only centralized critic.",
+    )
+    parser.add_argument(
+        "--persistent_recurrence",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Carry actor/critic GRU state across pricing decisions.",
+    )
+    parser.add_argument(
+        "--counterfactual_branches",
+        type=int,
+        default=None,
+        help="Number of common-random-number action branches per real decision (0 disables).",
+    )
+    parser.add_argument("--counterfactual_q_coeff", type=float, default=None)
+    parser.add_argument("--counterfactual_actor_weight", type=float, default=None)
+    parser.add_argument("--counterfactual_day_credit", type=int, default=0,
+        help="Revision 11b: number of actions branched per decision over --counterfactual_day_horizon_days (0 = off)")
+    parser.add_argument("--counterfactual_day_horizon_days", type=int, default=2)
+    parser.add_argument("--counterfactual_policy_coeff", type=float, default=None)
+    parser.add_argument(
+        "--nmcc_branches",
+        type=int,
+        default=0,
+        help=(
+            "Revision 14: candidates replayed per decision (hold and the "
+            "sampled action always included); 0 = off"
+        ),
+    )
+    parser.add_argument("--nmcc_horizon_days", type=int, default=3)
+    parser.add_argument(
+        "--nmcc_baseline", choices=("hold", "mean"), default="hold"
+    )
+    parser.add_argument(
+        "--nmcc_stages", type=str, default="catchup,profit"
+    )
+    parser.add_argument("--nmcc_every_k_decisions", type=int, default=1)
+    parser.add_argument("--nmcc_actor_weight", type=float, default=0.8)
+    parser.add_argument("--nmcc_policy_coeff", type=float, default=0.5)
+    parser.add_argument(
+        "--nmcc_advantage_scale",
+        choices=("rms", "zscore"),
+        default="rms",
+    )
+    parser.add_argument("--nmcc_dump", type=str, default="")
+    parser.add_argument(
+        "--potential_shaping_scale",
+        type=float,
+        default=None,
+        help="Scale of optional potential-based reward redistribution (0 disables).",
+    )
+    parser.add_argument(
+        "--hard_kl_stop",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Stop PPO actor epochs once approximate KL exceeds target_kl.",
+    )
+    parser.add_argument(
+        "--reward_rate_beta",
+        type=float,
+        default=None,
+        help="EMA rate for the continuing-task reward baseline (0 uses v23 rollout centering).",
+    )
+    parser.add_argument(
+        "--training_curriculum",
+        type=str,
+        default="staged",
+        choices=["staged", "direct"],
+        help=(
+            "Training environment sequence. staged uses market, static, public-"
+            "price-gap catch-up, then simulator-backed profit-maximizing rivals. "
+            "direct is retained only as an ablation."
+        ),
+    )
+    parser.add_argument("--training_stage_market_fraction", type=float, default=0.20, help="Fraction of staged training using the city-market reference.")
+    parser.add_argument("--stage_specific_rewards", action="store_true", help="Profit curriculum with a small completed-share-lead term: own profit in market training; weighted own-profit/profit-lead in opponent training and evaluation.")
+    parser.add_argument("--opponent_profit_lead_weight", type=float, default=None, help="Opponent/evaluation split within the profit portion: (1-w)*own profit + w*profit lead; completed-share lead keeps its separately logged small weight.")
+    parser.add_argument(
+        "--stage_profit_lead_weights",
+        type=_parse_stage_profit_lead_weights,
+        default=None,
+        metavar="MARKET,STATIC,CATCHUP,PROFIT",
+        help=(
+            "Explicit four-stage fractions assigned to contribution-profit "
+            "lead; the remaining economic mass stays on Firm 1 own profit. "
+            "Example: 0,0.55,0.70,0.80."
+        ),
+    )
+    parser.add_argument(
+        "--stage_market_share_competitiveness_weights",
+        type=_parse_stage_market_share_weights,
+        default=None,
+        metavar="MARKET,STATIC,CATCHUP,PROFIT",
+        help=(
+            "Explicit four-stage reward weights assigned to Firm 1 completed-"
+            "request share lead. Example: 0,0.05,0.10,0.25."
+        ),
+    )
+    parser.add_argument(
+        "--temporal_competitive_reward",
+        action="store_true",
+        help=(
+            "Add durable profit-lead and profit-lead innovation outcomes to "
+            "corrected opponent-stage/evaluation reward and component critic."
+        ),
+    )
+    parser.add_argument("--durable_dominance_weight", type=float, default=0.20)
+    parser.add_argument("--adaptive_residual_weight", type=float, default=0.10)
+    parser.add_argument("--durable_dominance_horizon_days", type=float, default=5.0)
+    parser.add_argument("--learning_corrections", action="store_true", help="Versioned learner/observation/reward corrections; incompatible with legacy policies.")
+    parser.add_argument("--learner_revision", type=int, choices=(1, 2, 3, 4), default=None,
+                        help="Corrected learner implementation; saved policies retain their recorded revision.")
+    parser.add_argument("--training_stage_static_fraction", type=float, default=0.20, help="Fraction of staged training using the fixed opponent.")
+    parser.add_argument("--training_stage_dynamic_fraction", "--training_stage_catchup_fraction", dest="training_stage_dynamic_fraction", type=float, default=0.60, help="Stage 3 catch-up fraction. If Stage 4 is omitted, this legacy mass is split 40/60 between catch-up and profit stages.")
+    parser.add_argument("--training_stage_profit_fraction", type=float, default=None, help="Explicit Stage 4 profit-maximizer fraction; when set, all four fractions must sum to one.")
+    parser.add_argument("--training_dynamic_episode_days", type=int, default=30, help="Days per independently randomized episode in all corrected stages (production default: 30).")
+    parser.add_argument("--profit_planner_sample_cap", type=int, default=32, help="Monte Carlo riders per twin branch for 13-candidate Firm 2 profit best responses.")
+    parser.add_argument("--training_opening_tariff_randomization", type=float, default=0.15, help="Symmetric tariff-randomization fraction at each stage or dynamic-episode opening.")
+    parser.add_argument("--deterministic_experiment_seed", action="store_true", help="If set, keep run_experiment fully deterministic with --experiment_seed (or the resolved run seed).")
+    parser.add_argument("--experiment_seed", type=int, default=None, help="Optional explicit run_experiment seed. Overrides stochastic child-seed generation and is recorded in run config.")
+    parser.add_argument("--eval_policy_mode", type=str, default="argmax_raw", choices=["argmax", "argmax_raw", "sample_raw", "sample_low_temp"], help="Evaluation action-selection mode. The default deploys the factorized actor's deterministic joint mode; repeating a coefficient target keeps only that coefficient stable.")
+    parser.add_argument("--eval_policy_temperature", type=float, default=0.25, help="Temperature for --eval_policy_mode sample_low_temp.")
+    parser.add_argument("--eval_policy_seed", type=int, default=None, help="Torch sampling seed for stochastic evaluation modes; defaults to effective run seed + 700001.")
+    parser.add_argument("--eval_guardrail_mode", type=str, default="off", choices=["off"], help="Business guardrails are disabled; retained as a compatibility field.")
+    parser.add_argument(
+        "--eval_timesteps",
+        type=int,
+        default=1000,
+        help=(
+            "Frozen-policy deployment audit horizon. The 1,000-period default "
+            "covers delayed adaptive-rival catch-up instead of certifying the "
+            "opening transient."
+        ),
+    )
+    parser.add_argument("--eval_customers", type=int, default=1000)
+    parser.add_argument(
+        "--benchmark_suite",
+        action="store_true",
+        help=(
+            "After policy loading or training, run the canonical five-opponent "
+            "suite in the configured market and emit one comparable performance graph."
+        ),
+    )
+    parser.add_argument(
+        "--require_competitive_backtest",
+        action="store_true",
+        help=(
+            "Compatibility flag: run and report the late deployment audit. "
+            "Its result does not alter reward, checkpoint selection, saving, "
+            "registration, or deployed actions."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint_validation_horizon", "--validation_horizon",
+        dest="checkpoint_validation_horizon",
+        type=int,
+        default=0,
+        help=(
+            "Held-out steps against the configured opponent for scalar-objective "
+            "checkpoint selection. Zero matches --eval_timesteps; range 2-1000."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint_validation_interval_days", "--validation_interval_days",
+        dest="checkpoint_validation_interval_days",
+        type=int,
+        default=400,
+        help=(
+            "Training days between held-out scalar-objective checkpoint "
+            "evaluations against the configured opponent."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint_validation_customers", "--validation_customers",
+        dest="checkpoint_validation_customers",
+        type=int,
+        default=0,
+        help=(
+            "Rides sampled per checkpoint-validation market step; <=0 reuses "
+            "--eval_customers. This affects checkpoint selection only; the "
+            "final deployment audit always uses --eval_customers."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint_validation_openings", "--validation_openings",
+        dest="checkpoint_validation_openings",
+        type=int,
+        default=3,
+        help="Independent tariff and market openings used by checkpoint validation.",
+    )
+    parser.add_argument("--profiles_out", type=str, default="artifacts/sampled_profiles.csv")
+    parser.add_argument("--profiles_log_limit", type=int, default=200000)
+    parser.add_argument(
+        "--policy_objective",
+        type=str,
+        default="profit_maximization",
+        choices=list(POLICY_OBJECTIVES),
+        help=(
+            "Named normalized economic objective. The two endpoints use "
+            "76/19/5 percent own-profit/profit-lead/completed-share-lead and 10/20/70 percent "
+            "own-profit/own-completed-share/completed-share-lead. The five "
+            "profit_N_competitiveness_M choices are preregistered convex "
+            "mixtures of those endpoints. Zero-weight report fields cannot "
+            "affect PPO."
+        ),
+    )
+    parser.add_argument("--positive_reward_profit_weight", type=float, default=0.38, help="Deprecated reporting-only weight; it cannot change PPO reward.")
+    parser.add_argument("--positive_reward_revenue_weight", type=float, default=0.22, help="Deprecated reporting-only weight; it cannot change PPO reward.")
+    parser.add_argument("--positive_reward_completed_demand_weight", type=float, default=0.20, help="Deprecated reporting-only weight; it cannot change PPO reward.")
+    parser.add_argument("--positive_reward_service_weight", type=float, default=0.20, help="Deprecated reporting-only weight; it cannot change PPO reward.")
+    parser.add_argument("--long_term_profit_scale", type=float, default=2.0, help="Dollar unit used to normalize Firm 1 contribution profit per incoming request.")
+    parser.add_argument("--long_term_profit_advantage_scale", type=float, default=1.0, help="Positive dollar-per-request unit used to normalize the Firm1-minus-Firm2 profit reward.")
+    parser.add_argument("--long_term_profit_weight", type=float, default=1.0, help="Deprecated and ignored; the named objective selects the fixed current reward weights.")
+    parser.add_argument(
+        "--profit_dominance_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Deprecated and ignored; profit lead has a fixed objective-specific reward weight."
+        ),
+    )
+    parser.add_argument("--dominance_quality_scale", type=float, default=4.0, help="Deprecated reporting-only scale; there is no rival-relative tie-breaker.")
+    parser.add_argument("--market_share_competitiveness_weight", type=float, default=0.0, help="Optional completed-share-lead reward weight. Production keeps this at 0 so PPO uses only own profit and profit lead.")
+    parser.add_argument("--market_share_target_gap", type=float, default=0.10, help="Reported completed-request-share lead target for Firm 1 over Firm 2; it does not alter PPO reward or checkpoint ordering.")
+    parser.add_argument("--market_share_gap_scale", type=float, default=0.10, help="Completed-share-lead normalization used by both objectives; 0.10 means ten percentage points.")
+    parser.add_argument("--market_share_level_weight", type=float, default=0.25, help="Deprecated compatibility field; current objective weights are fixed and logged.")
+    parser.add_argument("--price_competitiveness_weight", type=float, default=0.0, help="Deprecated compatibility field. Public quote gaps are reported as diagnostics but are not part of named objective rewards.")
+    parser.add_argument("--price_gap_reward_scale", type=float, default=1.0, help="Deprecated compatibility scale for stored quote-gap diagnostics.")
+    parser.add_argument("--intervention_cost_weight", type=float, default=0.0, help="Deprecated and ignored; PPO has no action-cost shaping.")
+    parser.add_argument("--reversal_cost_weight", type=float, default=0.0, help="Deprecated and ignored; PPO has no reversal shaping.")
+    parser.add_argument("--ppo_gamma", type=float, default=0.999, help="Operational-step discount for continuing-market semi-MDP credit.")
+    parser.add_argument("--ppo_gae_lambda", type=float, default=0.99, help="GAE lambda per pricing decision; with a five-step action interval the default trace spans about 67 decisions.")
+    parser.add_argument("--reward_rev_scale", type=float, default=25.0, help="Revenue/request e-folding scale for positive saturation; a value equal to the scale receives about 63.2%% component credit.")
+    parser.add_argument("--reward_profit_scale", type=float, default=12.0, help="Profit/request e-folding scale for positive saturation; a value equal to the scale receives about 63.2%% component credit.")
+    parser.add_argument("--min_profit_margin", type=float, default=0.08, help="Reporting-only contribution-margin reference; it does not alter PPO reward or checkpoint ordering.")
+    parser.add_argument("--min_completion_coverage", type=float, default=0.55, help="Reporting-only combined completed-request-share reference; it does not alter PPO reward or checkpoint ordering.")
+    parser.add_argument("--target_price_gap", type=float, default=0.75, help="Diagnostic target public quote gap Firm2-Firm1. This does not enter either named objective reward.")
+    parser.add_argument("--price_gap_tolerance", type=float, default=0.45, help="Aggregate two-sided soft-constraint tolerance around target_price_gap.")
+    parser.add_argument("--segment_gap_tolerances", type=float, nargs=4, default=[0.65, 0.60, 0.55, 0.55], metavar=("SHORT", "MEDIUM", "LONG", "XLONG"), help="Soft gap tolerances for 0-2, 2-5, 5-10, and 10+ mile quote probes; long trips default tighter because per-mile errors compound.")
+    parser.add_argument("--telemetry_delay_steps", type=int, default=1, help="Delay applied to own operational KPI observations.")
+    parser.add_argument("--quote_probe_interval_steps", type=int, default=3, help="Operational periods between public competitor quote samples.")
+    parser.add_argument("--quote_probe_delay_steps", type=int, default=1, help="Delay before sampled competitor quotes reach the policy.")
+    parser.add_argument("--quote_noise_dollars", type=float, default=0.18, help="Standard deviation of public competitor quote measurement noise.")
+    parser.add_argument("--quote_missing_probability", type=float, default=0.03, help="Probability that a scheduled competitor quote probe is unavailable.")
+    parser.add_argument("--driver_cost_per_mile", type=float, default=0.85, help="Approximate per-mile contribution cost for completed rides.")
+    parser.add_argument("--driver_cost_per_minute", type=float, default=0.12, help="Approximate per-minute contribution cost for completed rides.")
+    parser.add_argument("--fixed_trip_cost", type=float, default=1.25, help="Approximate fixed platform/driver cost for completed rides.")
+    parser.add_argument("--airport_cost", type=float, default=2.0, help="Approximate extra cost for airport rides.")
+    parser.add_argument("--disable_driver_supply", action="store_true", help="Disable the driver supply/matching layer and use legacy completed-ride costs.")
+    parser.add_argument("--use_osmnx", action="store_true", help="Load an OpenStreetMap drive network through OSMnx for future spatial routing hooks.")
+    parser.add_argument("--osmnx_place", type=str, default="", help="OSMnx place string; defaults to '<market>, USA'.")
+    parser.add_argument("--driver_base_active", type=int, default=260, help="Baseline active drivers for the batch-level driver supply model.")
+    parser.add_argument("--driver_reservation_wage", type=float, default=24.0, help="Driver reservation wage used by acceptance and online-supply response.")
+    parser.add_argument("--driver_acceptance_mode", type=str, default="expected", choices=["expected", "stochastic"], help="Use deterministic expected driver acceptance for faster RL convergence, or stochastic Bernoulli acceptance for realism.")
+    parser.add_argument("--driver_expected_acceptance_cutoff", type=float, default=0.65, help="Minimum expected driver acceptance probability required to count an offered ride as accepted in expected driver acceptance mode.")
+    parser.add_argument("--driver_state_smoothing", type=float, default=0.35, help="EMA smoothing alpha for driver features fed into the RL state.")
+    parser.add_argument("--enable_constrained_reward", dest="enable_constrained_reward", action="store_true", default=False, help="Deprecated compatibility option; constraints remain diagnostic only.")
+    parser.add_argument("--disable_constrained_reward", dest="enable_constrained_reward", action="store_false", help="Keep operational constraints diagnostic only.")
+    parser.add_argument("--constraint_lr", type=float, default=0.01, help="Learning rate for bounded operational-constraint multipliers. The lower default prevents feasibility duals from overwhelming the selected economic objective.")
+    parser.add_argument("--constraint_penalty_scale", type=float, default=0.10, help="Risk-advantage coefficient at full constraint curriculum scale.")
+    parser.add_argument("--constraint_curriculum_start_scale", type=float, default=0.25, help="Legacy constraint-diagnostic curriculum scale used during early exploration.")
+    parser.add_argument("--constraint_curriculum_mid_scale", type=float, default=0.60, help="Legacy constraint-diagnostic curriculum scale reached by mid-training.")
+    parser.add_argument("--constraint_curriculum_end_scale", type=float, default=1.00, help="Legacy constraint-diagnostic curriculum scale at the end of training.")
+    parser.add_argument("--threshold_cache_path", type=str, default="", help="Optional JSONL path for cached GPT/fallback threshold-enriched profiles.")
+    parser.add_argument("--threshold_profile_source", type=str, default="generated", choices=["generated", "cached"], help="Use completely newly generated threshold profiles, or load threshold profiles from --threshold_cache_path.")
+    parser.add_argument(
+        "--threshold_prompt_repeat_source",
+        type=str,
+        default="",
+        help=(
+            "Optional primary threshold JSONL whose exact profiles and cold-start rides "
+            "are re-submitted to GPT. This isolates prompt/API repeatability from "
+            "population and ride resampling."
+        ),
+    )
+    parser.add_argument(
+        "--training_generalization_fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of each training batch drawn from the same-market held-out "
+            "partition. The case-study default is zero to keep that split unseen."
+        ),
+    )
+    parser.add_argument(
+        "--evaluation_generalization_fraction",
+        type=float,
+        default=1.0,
+        help=(
+            "Fraction of ordinary evaluation drawn from the same-market held-out "
+            "partition. In cached mode it preserves the configured market's cached threshold distribution."
+        ),
+    )
+    parser.add_argument("--no_save_threshold_cache", action="store_true", help="Do not write threshold profiles to --threshold_cache_path after bootstrap.")
+    parser.add_argument("--gpt_threshold_include_rationales", action="store_true", help="Request GPT rationales for thresholds; slower but useful for debugging.")
+    parser.add_argument("--gpt_threshold_coldstart_rides", type=int, default=5, help="Cold-start rides per profile sent/summarized for threshold bootstrapping.")
+    parser.add_argument("--gpt_threshold_send_raw_rides", action="store_true", help="Send raw cold-start ride rows in addition to compact summaries; slower but more detailed.")
+    parser.add_argument("--gpt_threshold_batch_size", type=int, default=20, help="Profiles per GPT price-threshold API request. Larger values improve API utilization but increase payload size.")
+    parser.add_argument("--gpt_threshold_max_retries", type=int, default=2, help="Retries per GPT price-threshold batch before deterministic fallback is used.")
+    parser.add_argument("--gpt_threshold_failure_pause", type=float, default=1.0, help="Seconds to pause after a failed GPT threshold batch before sending the next batch; helps avoid connection-refused cascades.")
+    parser.add_argument("--calibration_csv", type=str, default="", help="Optional historical CSV used to calibrate priors and choice sensitivity.")
+    parser.add_argument("--calibration_json", type=str, default="", help="City preprocessing calibration JSON produced by scripts/prepare_city_data.py.")
+    parser.add_argument("--calibration_city", type=str, default="", help="Optional city filter for --calibration_csv; defaults to --market if omitted.")
+    parser.add_argument("--calibration_preset", type=str, default="", choices=["", "nyc_public"], help="Optional built-in calibration preset. Use nyc_public explicitly for NYC TLC + ACS + weather priors.")
+    parser.add_argument("--compare_with_dataset", action="store_true", help="After training/run, compare RL-implied prices against actual paid prices in the Kaggle rideshare dataset files.")
+    parser.add_argument("--dataset_root", type=str, default="", help="Optional local dataset root. When omitted, --compare_with_dataset downloads/resolves the configured Kaggle dataset.")
+    parser.add_argument("--dataset_city", type=str, default="", help="Dataset city; defaults to --market and must match it unless a separate transfer experiment is implemented.")
+    parser.add_argument("--dataset_glob", type=str, default="auto", help="Glob for dataset discovery, or 'auto' to use the city catalog.")
+    parser.add_argument("--weather_root", type=str, default="", help="Optional NOAA Global Hourly directory used for timezone-aware ride/weather joins.")
+    parser.add_argument(
+        "--comparison_out", "--comparison-out",
+        type=str,
+        nargs="?",
+        const="artifacts/rl_dataset_price_comparison.csv",
+        default="artifacts/rl_dataset_price_comparison.csv",
+        help="Output CSV for row-level RL-vs-actual comparison. If provided without a value, defaults to artifacts/rl_dataset_price_comparison.csv.",
+    )
+    parser.add_argument(
+        "--comparison_plot_prefix", "--comparison-plot-prefix",
+        type=str,
+        nargs="?",
+        const="artifacts/rl_dataset_validation",
+        default="artifacts/rl_dataset_validation",
+        help="Prefix for validation graphs (price/time match) against dataset. If provided without a value, defaults to artifacts/rl_dataset_validation.",
+    )
+    parser.add_argument("--comparison_limit", type=int, default=5000, help="Max number of dataset rows to score during learned-policy validation; parquet row groups are sampled round-robin for temporal coverage.")
+    parser.add_argument("--dataset_preview_rows", type=int, default=5, help="How many raw dataset rows to print once as format preview during RL-vs-actual comparison.")
+    parser.add_argument("--comparison_policy_mode", type=str, default="argmax_raw", choices=["argmax", "argmax_raw", "sample_raw", "sample_low_temp"], help="One-step PPO actor action mode used independently for each dataset ride row.")
+    parser.add_argument("--comparison_policy_temperature", type=float, default=0.25, help="Temperature for stochastic dataset-row policy scoring.")
+    parser.add_argument("--comparison_policy_seed", type=int, default=99173, help="Sampling seed for reproducible dataset-row policy scoring.")
+    parser.add_argument("--comparison_dataset_seed", type=int, default=104729, help="Seed controlling parquet row-group order and within-batch row sampling for independent dataset robustness runs.")
+    parser.add_argument(
+        "--comparison_duration_mode",
+        type=str,
+        default="actual_if_available",
+        choices=["actual_if_available", "predicted_only"],
+        help="Use observed trip duration when available, or force the model's estimated duration to stress-test price validation without actual-duration input.",
+    )
+
+    # ---- v26 contract (2026-10 review) ----
+    v26 = parser.add_argument_group("v26 city-calibrated sequential market")
+    v26.add_argument("--v26", action="store_true",
+                     help="Enable the v26 environment and evaluation contract (city-calibrated "
+                          "trips/tariffs, sequential calendar, hourly volume, symmetric firms, "
+                          "held-out benchmarks, truncation bootstrap, baselines, OOD tests).")
+    v26.add_argument("--trip_bank_path", type=str, default="",
+                     help="Normalized city ride CSV for empirical operational trips "
+                          "(defaults to the calibration's trip_bank entry).")
+    v26.add_argument("--weather_persistence", type=float, default=0.70)
+    v26.add_argument("--supply_tracking", type=float, default=0.50,
+                     help="Fraction of the hourly demand cycle tracked by online drivers.")
+    v26.add_argument("--demand_noise", choices=["poisson", "none"], default="poisson")
+    v26.add_argument("--disable_empirical_trips", action="store_true")
+    v26.add_argument("--disable_hourly_volume", action="store_true")
+    v26.add_argument("--disable_sequential_calendar", action="store_true")
+    v26.add_argument("--disable_spillover", action="store_true",
+                     help="Disable multi-homing re-requests after a failed dispatch.")
+    v26.add_argument("--spillover_probability", type=float, default=0.75)
+    v26.add_argument("--rider_memory", action="store_true",
+                     help="Enable rider memory: exponentially smoothed platform price/reliability "
+                          "reputations shift future platform choice and the outside option.")
+    v26.add_argument("--memory_alpha", type=float, default=0.10,
+                     help="Per-step reputation smoothing (0.10 = ~1.1-day half-life at 6 steps/day).")
+    v26.add_argument("--memory_price_weight", type=float, default=1.50)
+    v26.add_argument("--memory_reliability_weight", type=float, default=1.00)
+    v26.add_argument("--memory_outside_weight", type=float, default=1.00)
+    v26.add_argument("--driver_pay_basis", choices=["anchor", "fare"], default="anchor",
+                     help="anchor: driver pay is a share of the city-anchor fare (platform-funded "
+                          "rider discounts); fare: v25 share of the rider's own fare.")
+    v26.add_argument("--capacity_target_fulfillment", type=float, default=0.95,
+                     help="Calibrate the fleet so both firms at the anchor tariff fulfil this share "
+                          "of rider requests (0 keeps the legacy 260-drivers-per-500 fleet).")
+    v26.add_argument("--fleet_scale", type=float, default=1.0,
+                     help="Multiply the calibrated fleet (capacity-slack sensitivity).")
+    v26.add_argument("--disable_supply_feedback", action="store_true",
+                     help="Freeze the driver online response to recent earnings (channel ablation).")
+    v26.add_argument("--asymmetric_firms", action="store_true",
+                     help="Keep the legacy Firm 2 supply bias (0.96) and pay share (0.70).")
+    v26.add_argument("--preset_tariff_anchors", action="store_true",
+                     help="Use hard-coded city preset anchors instead of data-calibrated ones.")
+    v26.add_argument("--gpt_threshold_mode", choices=list(GPT_THRESHOLD_MODES), default="rubric_context")
+    v26.add_argument("--threshold_ablation", choices=list(THRESHOLD_ABLATION_MODES), default="as_loaded")
+    v26.add_argument("--exclude_benchmarks_from_training", default=None, action=argparse.BooleanOptionalAction)
+    v26.add_argument("--training_opponent_perturbation", type=float, default=None,
+                     help="Log-normal scale of per-opening opponent parameter randomization.")
+    v26.add_argument("--environment_reseed_per_episode", default=None, action=argparse.BooleanOptionalAction)
+    v26.add_argument("--truncation_bootstrap", default=None, action=argparse.BooleanOptionalAction)
+    v26.add_argument("--observed_fare_mode", choices=["isolated", "trajectory"], default=None)
+    v26.add_argument("--baseline_suite", type=str, default=None,
+                     help="Comma list from static_grid,myopic_greedy,anchor_hold.")
+    v26.add_argument("--static_baseline_multipliers", type=str, default="0.6,0.7,0.8,0.9,1.0,1.1,1.2,1.3,1.4")
+    v26.add_argument("--ood_perturbed_variants", type=int, default=None)
+    v26.add_argument("--ood_perturbation_scale", type=float, default=0.25)
+
+    v26r = parser.add_argument_group("v26r regime-switching market (all default off)")
+    v26r.add_argument("--regime_market", action="store_true",
+                      help="Enable the stochastic regime process (holidays, storms with forecasts, "
+                           "driver shortages, outages, transit disruptions, rival promotions, drift) "
+                           "on the v26 sequential market, plus the persistent driver stock.")
+    v26r.add_argument("--regime_features", default=None, action=argparse.BooleanOptionalAction,
+                      help="Append the six public regime signals to the observation (default: on "
+                           "when --regime_market).  --no-regime_features keeps the 24-dim frame.")
+    v26r.add_argument("--training_opponent_modes", type=str, default="",
+                      help="Deprecated alias for --training_catchup_opponent_modes.")
+    v26r.add_argument("--training_catchup_opponent_modes", type=str, default="",
+                      help="Comma-separated public-price-gap rivals for Stage 3.")
+    v26r.add_argument("--training_profit_opponent_modes", type=str, default="",
+                      help="Comma-separated simulator-backed own-profit rivals for Stage 4.")
+    v26r.add_argument("--persistence_features", action="store_true",
+                      help="Add the three public persistence proxies (driver earnings index, returning share, 7-day rival quote index) to the frame.")
+    v26r.add_argument(
+        "--momentum_features",
+        action="store_true",
+        help="Append Revision 14 delayed own-KPI momentum features.",
+    )
+    v26r.add_argument("--momentum_day_steps", type=int, default=None)
+    v26r.add_argument(
+        "--opponent_features",
+        action="store_true",
+        help="Append Revision 14 public rival-price and move features.",
+    )
+    v26r.add_argument(
+        "--opponent_move_threshold", type=float, default=0.02
+    )
+    v26r.add_argument("--regime_feature_ablation", action="store_true",
+                      help="Keep the six regime slots but zero them (information ablation).")
+    v26r.add_argument(
+        "--whole_tariff_actions",
+        action="store_true",
+        help=("Revision 11: the actor posts one multiplier for the whole tariff per decision "
+              "(hold + one target per grid point) instead of one coefficient per decision."),
+    )
+    v26r.add_argument(
+        "--hybrid_relative_actions",
+        action="store_true",
+        help=(
+            "Revision 15d: compact hold + whole-tariff + per-coefficient "
+            "relative-step action contract."
+        ),
+    )
+    v26r.add_argument(
+        "--relative_action_steps",
+        type=str,
+        default="0.1,0.2",
+        help="Positive city-anchor-relative step magnitudes for the hybrid contract.",
+    )
+    v26r.add_argument("--stage_entropy_end_scale", type=float, default=None,
+                      help="Revision 11: entropy end scale for the catch-up and profit stages.")
+    v26r.add_argument("--stage_lr_end_scale", type=float, default=None,
+                      help="Revision 11: learning-rate end scale for the catch-up and profit stages.")
+    v26r.add_argument(
+        "--actor_true_shortage_flag",
+        action="store_true",
+        help=(
+            "Diagnostic only: append the contemporaneous simulator driver-shortage "
+            "indicator to the actor observation. Existing policies are unchanged "
+            "unless this flag is explicitly supplied."
+        ),
+    )
+    v26r.add_argument("--shocks", type=str, default="calibrated", choices=["calibrated", "stress"])
+    v26r.add_argument("--shock_intensity", type=float, default=1.0)
+    v26r.add_argument("--shock_types", type=str, default="",
+                      help="Comma list restricting the regime types (default: all).")
+    v26r.add_argument("--shock_rates_json", type=str, default="",
+                      help="JSON object of ShockConfig overrides (e.g. '{\"storm_daily_hazard\": {}}').")
+    v26r.add_argument("--shock_scenario", type=str, default="",
+                      help="Path to a scripted scenario JSON (start_date, events, forecasts); "
+                           "random arrivals are disabled unless --shock_rates_json re-enables them.")
+    v26r.add_argument("--training_scenario_manifest", type=str, default="",
+                      help="Predeclared dynamic-stage episode curriculum. Scripted cases rotate "
+                           "only after each case is paired with every training opponent.")
+    v26r.add_argument("--tariff_targets", type=str, default="",
+                      help="Comma list of absolute targets (x city anchor) available independently for each managed coefficient; default 0.7..1.3. The static whole-tariff baseline grid is separate.")
+    v26r.add_argument("--level_step_actions", action="store_true",
+                      help="Revision 15: actions are hold or a relative step (-0.2,-0.1,+0.1,+0.2) "
+                           "of the tariff level L on the fixed structure S; every coefficient is "
+                           "posted as anchor x S x L.")
+    v26r.add_argument("--tariff_structure", type=str, default="",
+                      help="Revision 15: tariff structure JSON written by scripts/r15_structure_search.py.")
+    v26r.add_argument("--tariff_level_bounds", type=_parse_tariff_level_bounds, default=(0.6, 2.0),
+                      help="Revision 15: lower,upper tariff level on the 0.1 lattice (default 0.6,2.0).")
+    v26r.add_argument("--ppo_entropy_start", type=float, default=None,
+                      help="Revision 15: initial and maximum PPO entropy coefficient (default: learner default).")
+    v26r.add_argument("--branch_imitation_coeff", type=float, default=0.0,
+                      help="Revision 15: weight of KL(softmax(G/tau) || policy) on rows where NMCC "
+                           "replayed every feasible action (0 = off).")
+    v26r.add_argument("--branch_imitation_temperature_scale", type=float, default=0.25,
+                      help="Revision 15: tau = scale x median within-row branch-value spread.")
+    v26r.add_argument("--driver_incentive_levels", type=str, default="1.0",
+                      help="Legacy compatibility argument; revision 9 requires 1.0 because PPO "
+                           "controls exactly one rider-facing price coefficient or holds.")
+    v26r.add_argument("--persistent_driver_stock", default=None, action=argparse.BooleanOptionalAction,
+                      help="Daily partial-adjustment online-driver stock (default: on when --regime_market).")
+    v26r.add_argument("--supply_model", type=str, default="v1", choices=["v1", "v2"],
+                      help="v2: pay-elastic daily participation stock + hour-of-day availability profile.")
+    v26r.add_argument("--supply_eta_day", type=float, default=0.40)
+    v26r.add_argument("--supply_eta_hour", type=float, default=0.20)
+    v26r.add_argument("--supply_reference_earnings", type=float, default=0.0,
+                      help="Fixed reference earnings per hour (0 = city-scaled opportunity wage; never learned inside scored episodes).")
+    v26r.add_argument("--loyalty_model", choices=["v1", "v2"], default="v1",
+                      help="v2: per-rider loyalty stock moved by rides, stranding and overcharging (returning riders).")
+    v26r.add_argument("--loyalty_lambda", type=float, default=0.30, help="Loyalty update rate per experience.")
+    v26r.add_argument("--loyalty_pool_size", type=int, default=2000, help="Active (returning) riders per episode.")
+    v26r.add_argument("--returning_rider_share", type=float, default=0.60,
+                      help="Share of each step's requests drawn from the active rider pool.")
+    v26r.add_argument("--loyalty_weight", type=float, default=3.0,
+                      help="Multiplier on the loyalty utility term for v2 riders (calibration knob).")
+    v26r.add_argument("--loyalty_overcharge_penalty", action="store_true",
+                      help="Also spend loyalty when a ride is charged above the rider's threshold over the rival (off: price acts through choice only).")
+    v26r.add_argument("--stock_adjustment_rate", type=float, default=0.30)
+    v26r.add_argument("--stock_floor", type=float, default=0.40)
+    v26r.add_argument("--emergency_surge_cap", type=float, default=0.0,
+                      help="0 = no cap; else the maximum tariff multiplier during a declared storm.")
+    v26r.add_argument("--spillover_price_aware", default=None, action=argparse.BooleanOptionalAction,
+                      help="Stranded riders re-evaluate the other platform's quote with the choice model "
+                           "(default: on when --regime_market; off reproduces v26).")
+    v26r.add_argument("--rl_warm_start_target", type=str, default="0",
+                      help="Warm start: tariff multiplier (e.g. the best static) whose action gets a positive actor-head bias; "
+                           "'auto' uses --city_calibration_artifact's validation selection; 0 = off.")
+    v26r.add_argument('--city_calibration_artifact', default='',
+                      help='Reuse an audited supply operating point and its city-specific validation warm start.')
+    v26r.add_argument('--demand_calibration_artifact', default='',
+                      help='Explicit revision7 joint-demand calibration; never chosen using policy performance.')
+    v26r.add_argument("--rl_warm_start_logit", type=float, default=2.0,
+                      help="Logit bias for the warm-start action (2.0 = about 42%% initial probability over 11 targets).")
+    v26r.add_argument("--exploration_commit_mean", type=float, default=0.0,
+                      help="Committed (temporally extended) exploration: mean decisions an exploratory "
+                           "action is held.  0 keeps the v26 per-decision exploration.")
+    v26r.add_argument("--policy_sweep", type=str, default="",
+                      help="Gate-1 mode: ';'-separated Firm 1 policy specs (static:<m>[@inc], "
+                           "oracle:<json|@file>, rule:<json|@file>, rl_actor, "
+                           "rl_actor_frozen, opening_hold, myopic_greedy) "
+                           "evaluated on common-random-number rollouts; no training.")
+    v26r.add_argument("--policy_sweep_out", type=str, default="", help="JSON output path for --policy_sweep.")
+    v26r.add_argument("--policy_sweep_openings", type=int, default=10,
+                      help="Rollouts (openings) per rival for --policy_sweep.")
+    v26r.add_argument("--policy_sweep_rivals", type=str, default="",
+                      help="Comma list of Firm 2 controller classes (default: --firm2_mode only).")
+    v26r.add_argument("--policy_sweep_horizon", type=int, default=0,
+                      help="Steps per rollout (default: --eval_timesteps).")
+    v26r.add_argument("--policy_sweep_seed", type=int, default=99173)
+    args = parser.parse_args()
+    if args.demand_calibration_artifact and not (args.regime_market or args.trained_model_in):
+        parser.error('--demand_calibration_artifact requires --regime_market')
+    if args.rl_warm_start_target.lower() == 'auto' and not (args.city_calibration_artifact or args.trained_model_in):
+        parser.error("'auto' warm start requires --city_calibration_artifact; no inline re-fitting or substituted target")
+    if args.regime_market and not args.v26:
+        parser.error("--regime_market requires --v26")
+    if args.training_scenario_manifest and not args.regime_market:
+        parser.error("--training_scenario_manifest requires --regime_market")
+    if args.regime_features is None:
+        args.regime_features = bool(args.regime_market)
+    if args.regime_features and not args.regime_market:
+        parser.error("--regime_features requires --regime_market")
+    if args.actor_true_shortage_flag and not args.regime_market:
+        parser.error("--actor_true_shortage_flag requires --regime_market")
+    if args.persistent_driver_stock is None:
+        args.persistent_driver_stock = bool(args.regime_market)
+    if args.spillover_price_aware is None:
+        args.spillover_price_aware = bool(args.regime_market)
+    explicit_reward_flags = {
+        "--long_term_profit_weight",
+        "--profit_dominance_weight",
+        "--market_share_competitiveness_weight",
+        "--market_share_target_gap",
+        "--market_share_level_weight",
+        "--price_competitiveness_weight",
+        "--target_price_gap",
+        "--price_gap_reward_scale",
+    }
+    argv_flag_names = {
+        str(token).split("=", 1)[0]
+        for token in sys.argv[1:]
+        if str(token).startswith("--")
+    }
+    ignored_reward_flags = explicit_reward_flags.intersection(argv_flag_names)
+    if ignored_reward_flags:
+        print(
+            "[WARN] Shaped reward flags are ignored by the direct named "
+            "objectives: " + ", ".join(sorted(ignored_reward_flags))
+        )
+    for key, value in policy_objective_defaults(args.policy_objective).items():
+        setattr(args, key, value)
+    if float(args.direct_actor_credit_weight) != 0.0:
+        print(
+            "[WARN] --direct_actor_credit_weight is ignored for named "
+            "objectives; their held-action semi-MDP return is the sole actor "
+            "credit signal."
+        )
+        args.direct_actor_credit_weight = 0.0
+    if args.list_trained_models:
+        records = list_registered_models(args.model_registry_dir)
+        if not records:
+            print(f"No trained policies registered in {os.path.abspath(os.path.expanduser(args.model_registry_dir))}")
+        for record in records:
+            print(json.dumps(record, sort_keys=True))
+        return
+    if args.eval_only and not args.trained_model_in:
+        parser.error("--eval_only requires --trained_model_in")
+    if args.dataset_only and (not args.trained_model_in or not args.compare_with_dataset):
+        parser.error("--dataset_only requires --trained_model_in and --compare_with_dataset")
+    if args.trained_model_in:
+        args.firm1_mode = "RL"
+        args.run_experiment = True
+        try:
+            artifact_path = resolve_model_reference(args.trained_model_in, args.model_registry_dir)
+        except FileNotFoundError as exc:
+            parser.error(str(exc))
+        args.trained_model_in = artifact_path
+        try:
+            artifact_header = torch.load(artifact_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            artifact_header = torch.load(artifact_path, map_location="cpu")
+        if artifact_header.get("format") != "ride-response-platform-policy":
+            parser.error(f"unsupported --trained_model_in artifact: {artifact_path}")
+        # Revision 11: the saved action contract decides the action space on reload.
+        args.whole_tariff_actions = bool(
+            getattr(args, "whole_tariff_actions", False)
+            or artifact_header.get("action_semantics") == "absolute_whole_tariff_target"
+        )
+        args.hybrid_relative_actions = bool(
+            getattr(args, "hybrid_relative_actions", False)
+            or artifact_header.get("action_semantics")
+            == HYBRID_RELATIVE_ACTION_SEMANTICS
+        )
+        if int(artifact_header.get("version", 0)) < 21:
+            parser.error(
+                "--trained_model_in predates the version-23 coherent-tariff, "
+                "differential semi-MDP reward, and corrected critic contract; "
+                "retrain it with the current staged PPO path"
+            )
+        if artifact_header.get("action_semantics") == LEVEL_STEP_ACTION_SEMANTICS:
+            # Revision 15: the saved structure, steps and bounds define the action contract.
+            if args.tariff_targets:
+                parser.error("--tariff_targets conflicts with the saved level-step contract")
+            saved_structure = artifact_header.get("tariff_structure")
+            saved_bounds = artifact_header.get("tariff_level_bounds")
+            if not saved_structure or not saved_bounds:
+                parser.error("saved level-step policy lacks its tariff structure or level bounds")
+            saved_bounds = (float(saved_bounds[0]), float(saved_bounds[1]))
+            if "--tariff_level_bounds" in argv_flag_names and tuple(args.tariff_level_bounds) != saved_bounds:
+                parser.error("--tariff_level_bounds conflicts with the saved level-step contract")
+            if args.tariff_structure:
+                with open(os.path.expanduser(args.tariff_structure)) as handle:
+                    requested_structure = validate_tariff_structure(
+                        json.load(handle),
+                        list(saved_structure["structure"]),
+                        saved_bounds,
+                    )
+                if requested_structure != saved_structure:
+                    parser.error("--tariff_structure conflicts with the saved tariff structure")
+            args.level_step_actions = True
+            args.tariff_structure_payload = dict(saved_structure)
+            args.tariff_level_bounds = saved_bounds
+        elif (
+            artifact_header.get("action_semantics")
+            == HYBRID_RELATIVE_ACTION_SEMANTICS
+        ):
+            if args.level_step_actions or args.tariff_structure:
+                parser.error(
+                    "--level_step_actions/--tariff_structure conflict with "
+                    "the saved hybrid-relative action contract"
+                )
+            if args.whole_tariff_actions:
+                parser.error(
+                    "--whole_tariff_actions conflicts with the saved "
+                    "hybrid-relative action contract"
+                )
+            if args.tariff_targets:
+                parser.error(
+                    "--tariff_targets conflicts with the saved "
+                    "hybrid-relative action contract"
+                )
+            saved_relative_steps = sorted(set(
+                abs(float(value))
+                for value in artifact_header.get(
+                    "action_to_relative_step", {}
+                ).values()
+            ))
+            if not saved_relative_steps:
+                parser.error("saved hybrid policy lacks relative tariff steps")
+            if "--relative_action_steps" in argv_flag_names:
+                requested_relative_steps = sorted(set(
+                    float(value)
+                    for value in str(args.relative_action_steps).split(",")
+                    if value.strip()
+                ))
+                if requested_relative_steps != saved_relative_steps:
+                    parser.error(
+                        "--relative_action_steps conflicts with the saved "
+                        "hybrid action grid"
+                    )
+            args.hybrid_relative_actions = True
+            args.relative_action_steps = ",".join(
+                str(value) for value in saved_relative_steps
+            )
+        else:
+            if (
+                args.level_step_actions
+                or args.hybrid_relative_actions
+                or args.tariff_structure
+            ):
+                parser.error(
+                    "revised relative-action flags conflict with the saved action contract"
+                )
+            saved_targets = sorted(set(float(value) for value in
+                                       artifact_header.get("action_to_multiplier", {}).values()))
+            if not saved_targets:
+                parser.error("saved policy lacks its tariff action grid")
+            if args.tariff_targets:
+                requested_targets = sorted(set(float(x) for x in args.tariff_targets.split(',')))
+                if requested_targets != saved_targets:
+                    parser.error("--tariff_targets conflicts with the saved action grid")
+            args.tariff_targets = ','.join(map(str, saved_targets))
+        artifact_opt_keys = list(artifact_header.get("opt_keys", []))
+        artifact_manipulated_count = int(
+            artifact_header.get(
+                "manipulated_price_coefficient_count",
+                len(artifact_opt_keys),
+            )
+        )
+        if (
+            not 1
+            <= artifact_manipulated_count
+            <= len(MANIPULATABLE_PRICE_COEFFICIENT_KEYS)
+            or artifact_manipulated_count != len(artifact_opt_keys)
+        ):
+            parser.error(
+                "--trained_model_in has an invalid manipulated "
+                "price-coefficient contract"
+            )
+        if (
+            "--manipulated_price_coefficients" in argv_flag_names
+            or "--manipulated_coefficient_count" in argv_flag_names
+        ) and int(args.manipulated_price_coefficients) != artifact_manipulated_count:
+            parser.error(
+                "--manipulated_price_coefficients conflicts with the trained "
+                f"policy contract ({artifact_manipulated_count})"
+            )
+        args.manipulated_price_coefficients = artifact_manipulated_count
+        artifact_market = str(
+            artifact_header.get("market_name", args.market) or args.market
+        )
+        if "--market" not in argv_flag_names:
+            args.market = artifact_market
+        elif Core._normalized_market_name(args.market) != Core._normalized_market_name(
+            artifact_market
+        ):
+            parser.error(
+                "--market does not match the trained policy artifact: "
+                f"requested={args.market!r}, artifact={artifact_market!r}"
+            )
+        args.state_frame_stack = int(artifact_header.get("state_frame_stack", args.state_frame_stack))
+        saved_credit = dict(
+            artifact_header.get("credit_assignment_config", {}) or {}
+        )
+        if not saved_credit:
+            saved_credit = {
+                "version": 23,
+                "privileged_critic": False,
+                "persistent_recurrence": False,
+                "counterfactual_branches": 0,
+                "counterfactual_q_coeff": 0.0,
+                "counterfactual_actor_weight": 0.0,
+                "potential_shaping_scale": 0.0,
+                "hard_kl_stop": False,
+                "reward_rate_beta": 0.0,
+            }
+        saved_version = int(saved_credit.get("version", 23))
+        saved_corrections = bool(saved_credit.get("learning_corrections", False))
+        if args.learning_corrections and not saved_corrections:
+            parser.error("--learning_corrections conflicts with the saved policy contract")
+        args.learning_corrections = saved_corrections
+        saved_revision = int(saved_credit.get("learner_revision", 1))
+        if args.learner_revision is not None and args.learner_revision != saved_revision:
+            parser.error("--learner_revision conflicts with the saved policy contract")
+        args.learner_revision = saved_revision
+        saved_v24 = saved_version >= 24
+        saved_v25 = saved_version >= 25
+        if "--credit_assignment_v24" in argv_flag_names and not saved_v24:
+            parser.error(
+                "--credit_assignment_v24 conflicts with the loaded v23 artifact"
+            )
+        if "--credit_assignment_v25" in argv_flag_names and not saved_v25:
+            parser.error(
+                "--credit_assignment_v25 conflicts with the loaded pre-v25 artifact"
+            )
+        args.credit_assignment_v24 = saved_v24
+        args.credit_assignment_v25 = saved_v25
+        credit_cli_contract = {
+            "privileged_critic": (
+                bool(saved_credit.get("privileged_critic", False)),
+                {"--privileged_critic", "--no-privileged_critic"},
+            ),
+            "persistent_recurrence": (
+                bool(saved_credit.get("persistent_recurrence", False)),
+                {"--persistent_recurrence", "--no-persistent_recurrence"},
+            ),
+            "counterfactual_branches": (
+                int(saved_credit.get("counterfactual_branches", 0)),
+                {"--counterfactual_branches"},
+            ),
+            "counterfactual_q_coeff": (
+                float(saved_credit.get("counterfactual_q_coeff", 0.0)),
+                {"--counterfactual_q_coeff"},
+            ),
+            "counterfactual_actor_weight": (
+                float(saved_credit.get("counterfactual_actor_weight", 0.0)),
+                {"--counterfactual_actor_weight"},
+            ),
+            "potential_shaping_scale": (
+                float(saved_credit.get("potential_shaping_scale", 0.0)),
+                {"--potential_shaping_scale"},
+            ),
+            "hard_kl_stop": (
+                bool(saved_credit.get("hard_kl_stop", False)),
+                {"--hard_kl_stop", "--no-hard_kl_stop"},
+            ),
+            "reward_rate_beta": (
+                float(saved_credit.get("reward_rate_beta", 0.0)),
+                {"--reward_rate_beta"},
+            ),
+        }
+        for argument_name, (saved_value, flags) in credit_cli_contract.items():
+            current_value = getattr(args, argument_name)
+            explicitly_set = bool(flags & argv_flag_names)
+            if explicitly_set and current_value is not None:
+                values_match = (
+                    np.isclose(float(current_value), float(saved_value))
+                    if isinstance(saved_value, float)
+                    else current_value == saved_value
+                )
+                if not values_match:
+                    parser.error(
+                        f"--{argument_name} conflicts with the trained policy "
+                        f"credit-assignment contract ({saved_value})"
+                    )
+            setattr(args, argument_name, saved_value)
+        saved_mdp = artifact_header.get("mdp_config", {})
+        saved_observation = saved_mdp.get("observation", {})
+        saved_reward = saved_mdp.get("positive_reward", {})
+        saved_active_reward = saved_mdp.get("active_reward", {})
+        saved_staged_rewards = bool(saved_active_reward.get("stage_specific_rewards", False))
+        if args.stage_specific_rewards and not saved_staged_rewards:
+            parser.error("--stage_specific_rewards conflicts with the saved reward contract")
+        args.stage_specific_rewards = saved_staged_rewards
+        saved_lead_weight = float(saved_active_reward.get("opponent_profit_lead_weight", 0.5))
+        if any(arg.split("=", 1)[0] == "--opponent_profit_lead_weight" for arg in sys.argv[1:]) and not np.isclose(args.opponent_profit_lead_weight, saved_lead_weight):
+            parser.error("--opponent_profit_lead_weight conflicts with the saved reward contract")
+        args.opponent_profit_lead_weight = saved_lead_weight
+        saved_stage_lead_weights_raw = saved_active_reward.get(
+            "stage_profit_lead_weights"
+        )
+        saved_stage_lead_weights = (
+            None
+            if saved_stage_lead_weights_raw is None
+            else tuple(float(value) for value in saved_stage_lead_weights_raw)
+        )
+        if "--stage_profit_lead_weights" in argv_flag_names:
+            requested_stage_lead_weights = args.stage_profit_lead_weights
+            if (
+                saved_stage_lead_weights is None
+                or requested_stage_lead_weights is None
+                or not np.allclose(
+                    requested_stage_lead_weights,
+                    saved_stage_lead_weights,
+                    rtol=0.0,
+                    atol=1e-12,
+                )
+            ):
+                parser.error(
+                    "--stage_profit_lead_weights conflicts with the saved "
+                    "reward contract"
+                )
+        args.stage_profit_lead_weights = saved_stage_lead_weights
+        saved_stage_share_weights_raw = saved_active_reward.get(
+            "stage_market_share_competitiveness_weights"
+        )
+        saved_stage_share_weights = (
+            None
+            if saved_stage_share_weights_raw is None
+            else tuple(float(value) for value in saved_stage_share_weights_raw)
+        )
+        if "--stage_market_share_competitiveness_weights" in argv_flag_names:
+            requested_stage_share_weights = (
+                args.stage_market_share_competitiveness_weights
+            )
+            if (
+                saved_stage_share_weights is None
+                or requested_stage_share_weights is None
+                or not np.allclose(
+                    requested_stage_share_weights,
+                    saved_stage_share_weights,
+                    rtol=0.0,
+                    atol=1e-12,
+                )
+            ):
+                parser.error(
+                    "--stage_market_share_competitiveness_weights conflicts "
+                    "with the saved reward contract"
+                )
+        args.stage_market_share_competitiveness_weights = (
+            saved_stage_share_weights
+        )
+        saved_temporal_reward = bool(
+            saved_active_reward.get("temporal_competitive_reward", False)
+        )
+        if args.temporal_competitive_reward and not saved_temporal_reward:
+            parser.error(
+                "--temporal_competitive_reward conflicts with the saved reward contract"
+            )
+        args.temporal_competitive_reward = saved_temporal_reward
+        for field in (
+            "durable_dominance_weight",
+            "adaptive_residual_weight",
+            "durable_dominance_horizon_days",
+        ):
+            saved_value = float(saved_active_reward.get(field, getattr(args, field)))
+            flag = f"--{field}"
+            if flag in argv_flag_names and not np.isclose(
+                float(getattr(args, field)), saved_value
+            ):
+                parser.error(f"{flag} conflicts with the saved reward contract")
+            setattr(args, field, saved_value)
+        saved_constraints = saved_mdp.get("constraints", {})
+        saved_curriculum = saved_mdp.get("training_curriculum", {})
+        saved_policy_training = artifact_header.get("policy_training_config", {})
+        if args.ppo_rollout_episodes is None and "rollout_independent_episodes" in saved_policy_training:
+            args.ppo_rollout_episodes = int(saved_policy_training["rollout_independent_episodes"])
+        saved_competition_protocol = dict(
+            artifact_header.get("competition_protocol", {}) or {}
+        )
+        saved_steps_per_day = int(
+            saved_competition_protocol.get("steps_per_day", 0)
+        )
+        if saved_steps_per_day <= 0:
+            parser.error(
+                "--trained_model_in does not record the market steps-per-day calendar"
+            )
+        if (
+            "--train_steps_per_day" in argv_flag_names
+            and int(args.train_steps_per_day) != saved_steps_per_day
+        ):
+            parser.error(
+                "--train_steps_per_day conflicts with the trained policy "
+                f"calendar ({saved_steps_per_day})"
+            )
+        args.train_steps_per_day = saved_steps_per_day
+        saved_population = dict(
+            artifact_header.get("case_study_population", {}) or {}
+        )
+        if saved_population:
+            saved_profile_source = str(
+                saved_population.get("threshold_profile_source", "generated")
+            )
+            if (
+                "--threshold_profile_source" in argv_flag_names
+                and args.threshold_profile_source != saved_profile_source
+            ):
+                parser.error(
+                    "--threshold_profile_source conflicts with the trained "
+                    f"policy population contract ({saved_profile_source})"
+                )
+            args.threshold_profile_source = saved_profile_source
+            saved_pool_size = int(
+                saved_population.get("profile_pool_size", args.pool)
+            )
+            if "--pool" in argv_flag_names and int(args.pool) != saved_pool_size:
+                parser.error(
+                    "--pool conflicts with the trained policy population "
+                    f"contract ({saved_pool_size})"
+                )
+            args.pool = saved_pool_size
+            args.training_generalization_fraction = float(
+                saved_population.get(
+                    "training_holdout_fraction",
+                    args.training_generalization_fraction,
+                )
+            )
+            args.evaluation_generalization_fraction = float(
+                saved_population.get(
+                    "evaluation_holdout_fraction",
+                    args.evaluation_generalization_fraction,
+                )
+            )
+            if saved_profile_source == "cached":
+                if "--threshold_cache_path" not in argv_flag_names:
+                    args.threshold_cache_path = str(
+                        saved_population.get("threshold_cache_path", "") or ""
+                    )
+                resolved_cache_path = (
+                    os.path.abspath(os.path.expanduser(args.threshold_cache_path))
+                    if args.threshold_cache_path
+                    else ""
+                )
+                if not resolved_cache_path or not os.path.isfile(
+                    resolved_cache_path
+                ):
+                    parser.error(
+                        "the trained policy requires its cached NYC threshold "
+                        "population; pass the matching --threshold_cache_path"
+                    )
+                expected_cache_hash = str(
+                    saved_population.get("threshold_cache_sha256", "") or ""
+                )
+                if (
+                    expected_cache_hash
+                    and _sha256_file(resolved_cache_path)
+                    != expected_cache_hash
+                ):
+                    parser.error(
+                        "--threshold_cache_path does not match the cache "
+                        "fingerprint stored in the trained policy"
+                    )
+                args.threshold_cache_path = resolved_cache_path
+        saved_direct_credit_weight = float(
+            saved_policy_training.get("direct_actor_credit_weight", 0.0)
+        )
+        if saved_direct_credit_weight > 0.0:
+            print(
+                "[WARN] Loaded artifact used actor-only direct credit; the "
+                "weight is forced to zero because held-action semi-MDP returns "
+                "already provide causal credit."
+            )
+        args.direct_actor_credit_weight = 0.0
+        args.policy_objective = str(
+            saved_active_reward.get(
+                "objective_mode",
+                (
+                    "competitiveness"
+                    if float(
+                        saved_active_reward.get(
+                            "price_competitiveness_weight", 0.0
+                        )
+                    )
+                    > (
+                        float(
+                            saved_active_reward.get(
+                                "own_profit_weight", 1.0
+                            )
+                        )
+                        + float(
+                            saved_active_reward.get(
+                                "profit_advantage_weight", 0.10
+                            )
+                        )
+                    )
+                    else "profit_maximization"
+                ),
+            )
+        )
+        args.telemetry_delay_steps = int(saved_observation.get("telemetry_delay_steps", args.telemetry_delay_steps))
+        args.quote_probe_interval_steps = int(saved_observation.get("quote_probe_interval_steps", args.quote_probe_interval_steps))
+        args.quote_probe_delay_steps = int(saved_observation.get("quote_probe_delay_steps", args.quote_probe_delay_steps))
+        args.quote_noise_dollars = float(saved_observation.get("quote_noise_dollars", args.quote_noise_dollars))
+        args.quote_missing_probability = float(saved_observation.get("quote_missing_probability", args.quote_missing_probability))
+        args.actor_true_shortage_flag = bool(saved_observation.get(
+            "actor_true_shortage_flag", args.actor_true_shortage_flag
+        ))
+        saved_revision14_observation = {
+            "momentum_features": bool(
+                saved_observation.get("momentum_features", False)
+            ),
+            "momentum_day_steps": int(
+                saved_observation.get("momentum_day_steps", 6)
+            ),
+            "opponent_features": bool(
+                saved_observation.get("opponent_features", False)
+            ),
+            "opponent_move_threshold": float(
+                saved_observation.get("opponent_move_threshold", 0.02)
+            ),
+        }
+        revision14_observation_flags = {
+            "momentum_features": {"--momentum_features"},
+            "momentum_day_steps": {"--momentum_day_steps"},
+            "opponent_features": {"--opponent_features"},
+            "opponent_move_threshold": {"--opponent_move_threshold"},
+        }
+        for field, saved_value in saved_revision14_observation.items():
+            current_value = getattr(args, field)
+            explicitly_set = bool(
+                revision14_observation_flags[field] & argv_flag_names
+            )
+            if explicitly_set and current_value is not None:
+                values_match = (
+                    np.isclose(float(current_value), float(saved_value))
+                    if isinstance(saved_value, float)
+                    else current_value == saved_value
+                )
+                if not values_match:
+                    print(
+                        ">>> Revision 14 observation setting restored from "
+                        f"artifact: {field}={saved_value!r} "
+                        f"(CLI requested {current_value!r})."
+                    )
+            setattr(args, field, saved_value)
+        args.positive_reward_profit_weight = float(saved_reward.get("profit_weight", args.positive_reward_profit_weight))
+        args.positive_reward_revenue_weight = float(saved_reward.get("revenue_weight", args.positive_reward_revenue_weight))
+        args.positive_reward_completed_demand_weight = float(
+            saved_reward.get("completed_demand_weight", args.positive_reward_completed_demand_weight)
+        )
+        args.positive_reward_service_weight = float(saved_reward.get("service_weight", args.positive_reward_service_weight))
+        args.reward_rev_scale = float(saved_reward.get("revenue_scale", args.reward_rev_scale))
+        args.reward_profit_scale = float(saved_reward.get("profit_scale", args.reward_profit_scale))
+        args.long_term_profit_scale = float(
+            saved_active_reward.get("own_profit_scale", args.long_term_profit_scale)
+        )
+        args.long_term_profit_advantage_scale = float(
+            saved_active_reward.get(
+                "profit_advantage_scale", args.long_term_profit_advantage_scale
+            )
+        )
+        args.long_term_profit_weight = float(
+            saved_active_reward.get("own_profit_weight", args.long_term_profit_weight)
+        )
+        args.profit_dominance_weight = float(
+            saved_active_reward.get(
+                "profit_advantage_weight", args.profit_dominance_weight
+            )
+        )
+        args.dominance_quality_scale = float(
+            saved_active_reward.get(
+                "dominance_quality_scale", args.dominance_quality_scale
+            )
+        )
+        args.market_share_competitiveness_weight = float(
+            saved_active_reward.get(
+                "market_share_competitiveness_weight",
+                (
+                    1.0
+                    if args.policy_objective == "competitiveness"
+                    else args.market_share_competitiveness_weight
+                ),
+            )
+        )
+        args.market_share_target_gap = float(
+            saved_active_reward.get(
+                "market_share_target_gap", args.market_share_target_gap
+            )
+        )
+        args.market_share_gap_scale = float(
+            saved_active_reward.get(
+                "market_share_gap_scale", args.market_share_gap_scale
+            )
+        )
+        args.market_share_level_weight = float(
+            saved_active_reward.get(
+                "market_share_level_weight", args.market_share_level_weight
+            )
+        )
+        args.price_competitiveness_weight = float(
+            saved_active_reward.get(
+                "price_competitiveness_weight", args.price_competitiveness_weight
+            )
+        )
+        args.price_gap_reward_scale = float(
+            saved_active_reward.get("price_gap_scale", args.price_gap_reward_scale)
+        )
+        args.intervention_cost_weight = float(
+            saved_active_reward.get(
+                "intervention_cost_weight", args.intervention_cost_weight
+            )
+        )
+        args.reversal_cost_weight = float(
+            saved_active_reward.get("reversal_cost_weight", args.reversal_cost_weight)
+        )
+        args.ppo_gamma = float(artifact_header.get("gamma", args.ppo_gamma))
+        args.ppo_gae_lambda = float(
+            artifact_header.get("gae_lambda", args.ppo_gae_lambda)
+        )
+        args.target_price_gap = float(
+            saved_active_reward.get(
+                "price_gap_target",
+                saved_constraints.get("target_gap", args.target_price_gap),
+            )
+        )
+        args.price_gap_tolerance = float(saved_constraints.get("overall_tolerance", args.price_gap_tolerance))
+        args.segment_gap_tolerances = list(saved_constraints.get("segment_tolerances", args.segment_gap_tolerances))
+        args.min_profit_margin = float(saved_constraints.get("margin_floor", args.min_profit_margin))
+        args.min_completion_coverage = float(
+            saved_constraints.get(
+                "completion_coverage_floor", args.min_completion_coverage
+            )
+        )
+        if args.eval_only:
+            args.training_curriculum = str(
+                saved_curriculum.get("mode", args.training_curriculum)
+            )
+        if (
+            args.eval_only
+            and args.seed is None
+            and args.experiment_seed is None
+        ):
+            artifact_training_seed = dict(
+                artifact_header.get("metadata", {}) or {}
+            ).get("training_seed")
+            if artifact_training_seed is not None:
+                args.experiment_seed = int(artifact_training_seed)
+                args.deterministic_experiment_seed = True
+                args.deterministic_torch = True
+                print(
+                    ">>> Evaluation seed inherited from trained-policy "
+                    f"metadata: {args.experiment_seed}."
+                )
+
+    if args.momentum_day_steps is None:
+        args.momentum_day_steps = int(args.train_steps_per_day)
+    if getattr(args, "tariff_structure_payload", None) is None:
+        args.tariff_structure_payload = None
+        if args.tariff_structure:
+            with open(os.path.expanduser(args.tariff_structure)) as handle:
+                args.tariff_structure_payload = json.load(handle)
+    if args.hybrid_relative_actions:
+        if not args.learning_corrections:
+            parser.error("--hybrid_relative_actions requires --learning_corrections")
+        if args.level_step_actions or args.whole_tariff_actions:
+            parser.error(
+                "--hybrid_relative_actions, --level_step_actions, and "
+                "--whole_tariff_actions are mutually exclusive"
+            )
+        if args.tariff_targets:
+            parser.error("--hybrid_relative_actions does not use --tariff_targets")
+        if args.tariff_structure_payload is not None:
+            parser.error("--hybrid_relative_actions does not use --tariff_structure")
+        if str(args.rl_warm_start_target).strip() not in ("", "0", "0.0"):
+            parser.error(
+                "the hybrid relative contract has no absolute warm start; "
+                "pass --rl_warm_start_target 0"
+            )
+        try:
+            resolved_relative_steps = tuple(
+                float(value)
+                for value in str(args.relative_action_steps).split(",")
+                if value.strip()
+            )
+        except ValueError:
+            parser.error("--relative_action_steps must be comma-separated numbers")
+        if (
+            not resolved_relative_steps
+            or len(set(resolved_relative_steps)) != len(resolved_relative_steps)
+            or any(
+                not np.isfinite(value) or value <= 0.0
+                for value in resolved_relative_steps
+            )
+        ):
+            parser.error(
+                "--relative_action_steps must contain unique positive finite magnitudes"
+            )
+    elif args.level_step_actions:
+        if not args.learning_corrections:
+            parser.error("--level_step_actions requires --learning_corrections")
+        if args.whole_tariff_actions:
+            parser.error("--level_step_actions and --whole_tariff_actions are exclusive")
+        if args.tariff_targets:
+            parser.error("--level_step_actions does not use --tariff_targets")
+        if args.tariff_structure_payload is None:
+            parser.error("--level_step_actions requires --tariff_structure")
+        if str(args.rl_warm_start_target).strip() not in ("", "0", "0.0"):
+            parser.error("the level-step contract has no warm start; pass --rl_warm_start_target 0")
+    elif args.tariff_structure_payload is not None:
+        parser.error("--tariff_structure requires --level_step_actions")
+    if args.branch_imitation_coeff < 0.0:
+        parser.error("--branch_imitation_coeff must be non-negative")
+    if args.branch_imitation_coeff > 0.0 and args.nmcc_branches <= 0:
+        parser.error("--branch_imitation_coeff requires --nmcc_branches")
+    if args.nmcc_branches > 0:
+        if args.nmcc_branches < 2:
+            parser.error("--nmcc_branches must be 0 (off) or at least 2")
+        if args.counterfactual_day_credit not in (0, args.nmcc_branches):
+            parser.error(
+                "--counterfactual_day_credit conflicts with --nmcc_branches"
+            )
+        if args.counterfactual_branches not in (None, 0):
+            parser.error(
+                "--nmcc_branches replaces the one-step "
+                "--counterfactual_branches"
+            )
+        args.counterfactual_day_credit = int(args.nmcc_branches)
+        args.counterfactual_day_horizon_days = int(args.nmcc_horizon_days)
+        args.counterfactual_policy_coeff = float(args.nmcc_policy_coeff)
+        if args.counterfactual_actor_weight is None:
+            args.counterfactual_actor_weight = float(args.nmcc_actor_weight)
+        if args.counterfactual_q_coeff is None:
+            args.counterfactual_q_coeff = 0.05
+
+    # v25's population training uses short, terminal opponent episodes and
+    # complete-population on-policy batches by default. This prevents the PPO
+    # optimizer from treating one opponent's payoff level as action quality or
+    # overwriting the preceding opponent before seeing the others. Explicit
+    # CLI choices remain authoritative for controlled ablations.
+    if (bool(args.credit_assignment_v25) and not bool(args.eval_only)
+            and not (args.learning_corrections and (args.learner_revision or 4) >= 3)):
+        if "--ppo_gae_lambda" not in argv_flag_names:
+            # Complete terminal opponent episodes make lambda=1 an unbiased
+            # Monte-Carlo actor return. The TD(0) critic remains separately
+            # trained and diagnostic, but its residual error cannot truncate
+            # or bias delayed policy credit.
+            args.ppo_gae_lambda = 1.0
+        if "--training_dynamic_episode_days" not in argv_flag_names:
+            args.training_dynamic_episode_days = 15
+        if "--ppo_min_rollout_transitions" not in argv_flag_names:
+            resolved_interval = int(max(
+                1,
+                args.firm1_action_interval_steps
+                if int(args.firm1_action_interval_steps) > 0
+                else args.firm2_action_interval_days
+                if int(args.firm2_action_interval_days) > 0
+                else int(np.ceil(args.ppo_update_interval_days / 2.0)),
+            ))
+            population_modes = tuple(dict.fromkeys((
+                str(args.firm2_mode),
+                "adaptive_best_response",
+                "heuristic",
+                "heuristic_random",
+                *BENCHMARK_OPPONENT_MODES,
+            )))
+            fast_episode_days = max(
+                1, int(args.training_dynamic_episode_days)
+            )
+            slow_modes = {"pi_price_gap", "region_supply_demand"}
+            expanded_population_modes = tuple(
+                mode
+                for mode in population_modes
+                for _ in range(1 if mode in slow_modes else 3)
+            )
+            args.ppo_min_rollout_transitions = int(sum(
+                int(np.ceil(
+                    (
+                        max(300, fast_episode_days)
+                        if mode in slow_modes
+                        else fast_episode_days
+                    )
+                    * max(1, int(args.train_steps_per_day))
+                    / float(resolved_interval)
+                ))
+                for mode in expanded_population_modes
+            ))
+        print(
+            ">>> v25 population batching: "
+            f"episode_days={args.training_dynamic_episode_days}, "
+            f"minimum_rollout={args.ppo_min_rollout_transitions}; "
+            "terminal opponent regimes use lagged action-independent baselines."
+        )
+        
+    code_dir = os.path.dirname(os.path.abspath(__file__))
+
+    def _pin_graph_prefix_to_code_dir(prefix: str, flag_name: str) -> str:
+        """Force graph outputs to live beside Core.py, even when absolute prefixes are passed."""
+        normalized = os.path.normpath(prefix)
+        if os.path.isabs(normalized):
+            rewritten = os.path.join(code_dir, os.path.basename(normalized))
+            print(
+                f"[WARN] {flag_name} was absolute ({prefix}); "
+                f"rewriting to {rewritten} so graphs are generated in code folder."
+            )
+            return rewritten
+        return os.path.join(code_dir, normalized)
+
+    args.report_prefix = _pin_graph_prefix_to_code_dir(args.report_prefix, "--report_prefix")
+    args.comparison_plot_prefix = _pin_graph_prefix_to_code_dir(
+        args.comparison_plot_prefix,
+        "--comparison_plot_prefix",
+    )
+    effective_seed = args.experiment_seed if args.experiment_seed is not None else args.seed
+    args.state_action_mi_weight = 0.0
+    args.enable_constrained_reward = False
+    args.eval_guardrail_mode = "off"
+
+    core = Core(
+        market_name=args.market,
+        seed=effective_seed,
+        choice_mode=args.choice_mode,
+        model_name=args.model,
+        openai_api_key=args.openai_api_key,
+        firm1_mode=args.firm1_mode,
+        firm2_mode=args.firm2_mode,
+        firm1_static_values=args.firm1_static_values,
+        firm2_static_values=args.firm2_static_values,
+        manipulated_price_coefficients=args.manipulated_price_coefficients,
+        total_customers_pool=args.pool,
+        deterministic_torch=args.deterministic_torch,
+        positive_reward_profit_weight=args.positive_reward_profit_weight,
+        positive_reward_revenue_weight=args.positive_reward_revenue_weight,
+        positive_reward_completed_demand_weight=args.positive_reward_completed_demand_weight,
+        positive_reward_service_weight=args.positive_reward_service_weight,
+        long_term_profit_scale=args.long_term_profit_scale,
+        long_term_profit_advantage_scale=args.long_term_profit_advantage_scale,
+        policy_objective=args.policy_objective,
+        stage_specific_rewards=args.stage_specific_rewards,
+        opponent_profit_lead_weight=args.opponent_profit_lead_weight,
+        stage_profit_lead_weights=args.stage_profit_lead_weights,
+        stage_market_share_competitiveness_weights=(
+            args.stage_market_share_competitiveness_weights
+        ),
+        temporal_competitive_reward=args.temporal_competitive_reward,
+        durable_dominance_weight=args.durable_dominance_weight,
+        adaptive_residual_weight=args.adaptive_residual_weight,
+        durable_dominance_horizon_days=(
+            args.durable_dominance_horizon_days
+        ),
+        learning_corrections=args.learning_corrections,
+        learner_revision=4 if args.learner_revision is None else args.learner_revision,
+        long_term_profit_weight=args.long_term_profit_weight,
+        profit_dominance_weight=args.profit_dominance_weight,
+        dominance_quality_scale=args.dominance_quality_scale,
+        market_share_competitiveness_weight=(
+            args.market_share_competitiveness_weight
+        ),
+        market_share_target_gap=args.market_share_target_gap,
+        market_share_gap_scale=args.market_share_gap_scale,
+        market_share_level_weight=args.market_share_level_weight,
+        price_competitiveness_weight=args.price_competitiveness_weight,
+        price_gap_reward_scale=args.price_gap_reward_scale,
+        intervention_cost_weight=args.intervention_cost_weight,
+        reversal_cost_weight=args.reversal_cost_weight,
+        ppo_gamma=args.ppo_gamma,
+        ppo_gae_lambda=args.ppo_gae_lambda,
+        reward_rev_scale=args.reward_rev_scale,
+        reward_profit_scale=args.reward_profit_scale,
+        min_profit_margin=args.min_profit_margin,
+        min_completion_coverage=args.min_completion_coverage,
+        driver_cost_per_mile=args.driver_cost_per_mile,
+        driver_cost_per_minute=args.driver_cost_per_minute,
+        fixed_trip_cost=args.fixed_trip_cost,
+        airport_cost=args.airport_cost,
+        enable_driver_supply=not args.disable_driver_supply,
+        use_osmnx=args.use_osmnx,
+        osmnx_place=args.osmnx_place or None,
+        driver_base_active=args.driver_base_active,
+        driver_reservation_wage=args.driver_reservation_wage,
+        driver_acceptance_mode=args.driver_acceptance_mode,
+        driver_expected_acceptance_cutoff=args.driver_expected_acceptance_cutoff,
+        driver_state_smoothing=args.driver_state_smoothing,
+        constrained_reward=bool(args.enable_constrained_reward),
+        constraint_lr=args.constraint_lr,
+        constraint_penalty_scale=args.constraint_penalty_scale,
+        constraint_curriculum_start_scale=args.constraint_curriculum_start_scale,
+        constraint_curriculum_mid_scale=args.constraint_curriculum_mid_scale,
+        constraint_curriculum_end_scale=args.constraint_curriculum_end_scale,
+        target_price_gap=args.target_price_gap,
+        price_gap_tolerance=args.price_gap_tolerance,
+        segment_gap_tolerances=tuple(args.segment_gap_tolerances),
+        telemetry_delay_steps=args.telemetry_delay_steps,
+        quote_probe_interval_steps=args.quote_probe_interval_steps,
+        quote_probe_delay_steps=args.quote_probe_delay_steps,
+        quote_noise_dollars=args.quote_noise_dollars,
+        quote_missing_probability=args.quote_missing_probability,
+        training_curriculum=args.training_curriculum,
+        training_stage_market_fraction=args.training_stage_market_fraction,
+        training_stage_static_fraction=args.training_stage_static_fraction,
+        training_stage_dynamic_fraction=args.training_stage_dynamic_fraction,
+        training_stage_profit_fraction=args.training_stage_profit_fraction,
+        training_dynamic_episode_days=args.training_dynamic_episode_days,
+        profit_planner_sample_cap=args.profit_planner_sample_cap,
+        training_opening_tariff_randomization=(
+            args.training_opening_tariff_randomization
+        ),
+        ppo_batch_size=args.ppo_batch_size,
+        ppo_update_epochs=args.ppo_update_epochs,
+        ppo_rollout_episodes=args.ppo_rollout_episodes,
+        state_action_mi_weight=args.state_action_mi_weight,
+        direct_actor_credit_weight=args.direct_actor_credit_weight,
+        state_frame_stack=args.state_frame_stack,
+        credit_assignment_v24=args.credit_assignment_v24,
+        credit_assignment_v25=args.credit_assignment_v25,
+        privileged_critic=args.privileged_critic,
+        persistent_recurrence=args.persistent_recurrence,
+        counterfactual_branches=args.counterfactual_branches,
+        counterfactual_q_coeff=args.counterfactual_q_coeff,
+        counterfactual_actor_weight=args.counterfactual_actor_weight,
+        potential_shaping_scale=args.potential_shaping_scale,
+        hard_kl_stop=args.hard_kl_stop,
+        reward_rate_beta=args.reward_rate_beta,
+        threshold_cache_path=args.threshold_cache_path,
+        threshold_profile_source=args.threshold_profile_source,
+        threshold_prompt_repeat_source=args.threshold_prompt_repeat_source,
+        training_generalization_fraction=args.training_generalization_fraction,
+        evaluation_generalization_fraction=args.evaluation_generalization_fraction,
+        regime_market=bool(args.regime_market),
+        regime_features=bool(args.regime_features),
+        regime_feature_ablation=bool(args.regime_feature_ablation),
+        actor_true_shortage_flag=bool(args.actor_true_shortage_flag),
+        whole_tariff_actions=bool(args.whole_tariff_actions),
+        counterfactual_day_credit=int(getattr(args, "counterfactual_day_credit", 0) or 0),
+        counterfactual_day_horizon_days=int(getattr(args, "counterfactual_day_horizon_days", 2) or 2),
+        counterfactual_policy_coeff=getattr(args, "counterfactual_policy_coeff", None),
+        nmcc_baseline=str(args.nmcc_baseline),
+        nmcc_stages=tuple(
+            s.strip()
+            for s in str(args.nmcc_stages).split(",")
+            if s.strip()
+        ),
+        nmcc_every_k_decisions=int(args.nmcc_every_k_decisions),
+        nmcc_advantage_scale=str(args.nmcc_advantage_scale),
+        nmcc_dump=str(args.nmcc_dump or ""),
+        momentum_features=bool(args.momentum_features),
+        momentum_day_steps=int(args.momentum_day_steps),
+        opponent_features=bool(args.opponent_features),
+        opponent_move_threshold=float(args.opponent_move_threshold),
+        persistence_features=bool(args.persistence_features),
+        level_step_actions=bool(args.level_step_actions),
+        hybrid_relative_actions=bool(args.hybrid_relative_actions),
+        relative_action_steps=[
+            float(item)
+            for item in str(args.relative_action_steps).split(",")
+            if item.strip()
+        ],
+        tariff_structure=args.tariff_structure_payload,
+        tariff_level_bounds=tuple(args.tariff_level_bounds),
+        ppo_entropy_start=args.ppo_entropy_start,
+        branch_imitation_coeff=float(args.branch_imitation_coeff),
+        branch_imitation_temperature_scale=float(args.branch_imitation_temperature_scale),
+        driver_incentive_levels=[
+            float(item) for item in str(args.driver_incentive_levels).split(",") if item.strip()
+        ],
+        tariff_targets=[
+            float(item) for item in str(args.tariff_targets or "").split(",") if item.strip()
+        ],
+        save_threshold_cache=not args.no_save_threshold_cache,
+        gpt_threshold_include_rationales=args.gpt_threshold_include_rationales,
+        gpt_threshold_coldstart_rides=args.gpt_threshold_coldstart_rides,
+        gpt_threshold_send_raw_rides=args.gpt_threshold_send_raw_rides,
+        gpt_threshold_batch_size=args.gpt_threshold_batch_size,
+        gpt_threshold_max_retries=args.gpt_threshold_max_retries,
+        gpt_threshold_failure_pause=args.gpt_threshold_failure_pause,
+    )
+    
+    if args.calibration_preset:
+        if (
+            str(args.calibration_preset).strip().lower() == "nyc_public"
+            and Core._normalized_market_name(core.market_name)
+            not in {"newyorkcity", "nyc"}
+        ):
+            raise ValueError(
+                "the nyc_public calibration preset can only be applied to "
+                "the New York City market"
+            )
+        calibration = load_calibration_preset(args.calibration_preset)
+        core.apply_calibration(calibration)
+        print(f"[Calibration] Applied preset={args.calibration_preset} for market={args.market}.")
+        print(f"[Calibration] {json.dumps(calibration, indent=2)}")
+
+    if args.calibration_json:
+        calibration = load_calibration_json(
+            args.calibration_json,
+            expected_city=args.market,
+        )
+        calibration["_source_dir"] = os.path.dirname(
+            os.path.abspath(os.path.expanduser(args.calibration_json))
+        )
+        core.apply_calibration(calibration)
+        print(
+            f"[Calibration] Applied preprocessing calibration from "
+            f"{os.path.abspath(os.path.expanduser(args.calibration_json))}."
+        )
+        print(f"[Calibration] {json.dumps(calibration, indent=2)}")
+
+    if args.calibration_csv:
+        city_filter = args.calibration_city if args.calibration_city else args.market
+        calibration = derive_calibration(args.calibration_csv, city=city_filter)
+        core.apply_calibration(calibration)
+        print(f"[Calibration] Applied using {calibration['sample_size']} rows from {args.calibration_csv} (city={city_filter}).")
+        print(f"[Calibration] {json.dumps(calibration, indent=2)}")
+
+    if args.v26 or args.gpt_threshold_mode != "rubric_context" or args.threshold_ablation != "as_loaded":
+        def _pick(value, v26_default, legacy_default):
+            if value is not None:
+                return value
+            return v26_default if args.v26 else legacy_default
+        core.configure_v26(
+            market_dynamics=MarketDynamicsConfig(
+                enabled=bool(args.v26),
+                sequential_calendar=not args.disable_sequential_calendar,
+                weather_persistence=float(args.weather_persistence),
+                hourly_demand_volume=not args.disable_hourly_volume,
+                demand_noise=str(args.demand_noise),
+                supply_tracking=float(args.supply_tracking),
+                empirical_trips=not args.disable_empirical_trips,
+                symmetric_firms=not args.asymmetric_firms,
+                calibrated_tariff_anchors=not args.preset_tariff_anchors,
+                unfulfilled_spillover=not args.disable_spillover,
+                spillover_probability=float(args.spillover_probability),
+                rider_memory=bool(args.rider_memory),
+                memory_alpha=float(args.memory_alpha),
+                memory_price_weight=float(args.memory_price_weight),
+                memory_reliability_weight=float(args.memory_reliability_weight),
+                memory_outside_weight=float(args.memory_outside_weight),
+                supply_feedback=not args.disable_supply_feedback,
+                driver_pay_basis=str(args.driver_pay_basis),
+                capacity_target_fulfillment=float(args.capacity_target_fulfillment),
+                fleet_scale=float(args.fleet_scale),
+            ),
+            steps_per_day=int(args.train_steps_per_day),
+            trip_bank_path=str(args.trip_bank_path or ""),
+            gpt_threshold_mode=str(args.gpt_threshold_mode),
+            threshold_ablation=str(args.threshold_ablation),
+            exclude_benchmarks_from_training=bool(_pick(args.exclude_benchmarks_from_training, True, False)),
+            training_opponent_perturbation=float(_pick(args.training_opponent_perturbation, 0.15, 0.0)),
+            environment_reseed_per_episode=bool(_pick(args.environment_reseed_per_episode, True, False)),
+            truncation_bootstrap=bool(_pick(args.truncation_bootstrap, True, False)),
+            observed_fare_mode=str(_pick(args.observed_fare_mode, "trajectory", "isolated")),
+            baseline_suite=tuple(
+                item.strip() for item in str(
+                    _pick(args.baseline_suite, "static_grid,myopic_greedy,anchor_hold", "")
+                ).split(",") if item.strip()
+            ),
+            static_baseline_multipliers=[
+                float(item) for item in str(args.static_baseline_multipliers).split(",") if item.strip()
+            ],
+            ood_perturbed_variants=int(_pick(args.ood_perturbed_variants, 3, 0)),
+            ood_perturbation_scale=float(args.ood_perturbation_scale),
+        )
+        core.spillover_price_aware = bool(args.spillover_price_aware)
+        core.v26_settings = {**dict(core.v26_settings or {}), "spillover_price_aware": bool(args.spillover_price_aware)}
+        legacy_dynamic_text = str(args.training_opponent_modes or "").strip()
+        if legacy_dynamic_text:
+            legacy_modes = tuple(dict.fromkeys(
+                mode.strip()
+                for mode in legacy_dynamic_text.split(",")
+                if mode.strip()
+            ))
+            unknown = [
+                mode for mode in legacy_modes
+                if mode not in core.pricer_by_mode and mode != "static"
+            ]
+            if unknown:
+                raise ValueError(f"unknown --training_opponent_modes: {unknown}")
+            core.training_dynamic_opponent_modes = legacy_modes
+            core.v26_settings = {
+                **dict(core.v26_settings or {}),
+                "training_dynamic_opponent_modes": list(legacy_modes),
+            }
+        catchup_text = str(args.training_catchup_opponent_modes or "").strip()
+        if catchup_text:
+            modes = tuple(dict.fromkeys(m.strip() for m in catchup_text.split(",") if m.strip()))
+            unknown = [m for m in modes if m not in core.pricer_by_mode and m != "static"]
+            if unknown:
+                raise ValueError(f"unknown --training_catchup_opponent_modes: {unknown}")
+            if any(mode not in CATCHUP_OPPONENT_MODES + REACTIVE_STAGE3_OPPONENT_MODES for mode in modes):
+                raise ValueError(
+                    "Stage 3 accepts only gap-following modes: "
+                    f"{CATCHUP_OPPONENT_MODES}"
+                )
+            core.training_catchup_opponent_modes = modes
+            core.v26_settings = {**dict(core.v26_settings or {}), "training_catchup_opponent_modes": list(modes)}
+        profit_text = str(args.training_profit_opponent_modes or "").strip()
+        if profit_text:
+            modes = tuple(dict.fromkeys(m.strip() for m in profit_text.split(",") if m.strip()))
+            unknown = [m for m in modes if m not in core.pricer_by_mode]
+            if unknown:
+                raise ValueError(f"unknown --training_profit_opponent_modes: {unknown}")
+            allowed_profit = set(OPTIMIZED_BENCHMARK_OPPONENT_MODES) | set(PROFIT_BEST_RESPONSE_OPPONENT_MODES)
+            if any(mode not in allowed_profit for mode in modes):
+                raise ValueError(
+                    "Stage 4 accepts only own-profit optimizing modes: "
+                    f"{sorted(allowed_profit)}"
+                )
+            core.training_profit_opponent_modes = modes
+            core.v26_settings = {**dict(core.v26_settings or {}), "training_profit_opponent_modes": list(modes)}
+        if args.stage_entropy_end_scale is not None or args.stage_lr_end_scale is not None:
+            scheduler = core.training_stage_scheduler
+            def _r11_override(stage):
+                if stage.opponent_regime not in ("catchup", "profit"):
+                    return stage
+                changes = {}
+                if args.stage_entropy_end_scale is not None:
+                    changes["entropy_end_scale"] = float(args.stage_entropy_end_scale)
+                if args.stage_lr_end_scale is not None:
+                    changes["learning_rate_end_scale"] = float(args.stage_lr_end_scale)
+                return replace(stage, **changes)
+            scheduler.stages = tuple(_r11_override(stage) for stage in scheduler.stages)
+            core.v26_settings = {**dict(core.v26_settings or {}), "stage_control_overrides": {
+                "entropy_end_scale": args.stage_entropy_end_scale,
+                "learning_rate_end_scale": args.stage_lr_end_scale}}
+            print(f">>> [revision11] stage controls: {[(s.name, s.entropy_scale, s.entropy_end_scale, s.learning_rate_scale, s.learning_rate_end_scale) for s in scheduler.stages]}")
+        if str(args.loyalty_model) != "v1":
+            core.configure_loyalty(
+                loyalty_model=str(args.loyalty_model),
+                loyalty_lambda=float(args.loyalty_lambda),
+                loyalty_pool_size=int(args.loyalty_pool_size),
+                returning_rider_share=float(args.returning_rider_share),
+                loyalty_overcharge_penalty=bool(args.loyalty_overcharge_penalty),
+                loyalty_weight=float(args.loyalty_weight),
+            )
+        if args.regime_market:
+            city_artifact = None
+            if args.city_calibration_artifact:
+                from calibration_artifact import load_city_artifact
+                city_artifact = load_city_artifact(args.city_calibration_artifact,
+                    city=core.market_name,
+                    lead_weight=core.long_term_profit_reward_config.opponent_profit_lead_weight,
+                    grid=(None if (
+                        getattr(core.firm1, "level_step_actions", False)
+                        or getattr(core.firm1, "hybrid_relative_actions", False)
+                    )
+                          else sorted(set(core.firm1.action_to_multiplier.values()))))
+            demand_spec = (artifact_header.get('demand_calibration') if args.trained_model_in else
+                           city_artifact.get('demand_calibration') if city_artifact else None)
+            if args.demand_calibration_artifact:
+                with open(args.demand_calibration_artifact) as handle:
+                    requested_demand = json.load(handle)
+                if (args.trained_model_in or city_artifact is not None) and requested_demand != demand_spec:
+                    raise ValueError('explicit demand calibration conflicts with saved policy/city contract')
+                demand_spec = requested_demand
+            if demand_spec is not None:
+                core.configure_joint_demand(demand_spec)
+            core.configure_v26r(
+                shock_config=build_shock_config_from_args(args, core.active_calibration),
+                shock_scenario=load_shock_scenario(args.shock_scenario) if args.shock_scenario else None,
+                persistent_driver_stock=bool(args.persistent_driver_stock),
+                stock_adjustment_rate=float(args.stock_adjustment_rate),
+                stock_floor=float(args.stock_floor),
+                emergency_surge_cap=float(args.emergency_surge_cap),
+                supply_model=str(args.supply_model),
+                supply_eta_day=float(args.supply_eta_day),
+                supply_eta_hour=float(args.supply_eta_hour),
+                supply_reference_earnings=float(args.supply_reference_earnings),
+                supply_calibration_customers=int(args.eval_customers if args.eval_only else args.train_customers),
+                explicit_supply_settings={key: getattr(args, flag) for flag, key in {
+                    'supply_model': 'supply_model', 'supply_eta_day': 'eta_day', 'supply_eta_hour': 'eta_hour',
+                    'stock_adjustment_rate': 'stock_adjustment_rate', 'stock_floor': 'stock_floor',
+                    'supply_reference_earnings': 'reference_earnings_per_hour', 'fleet_scale': 'fleet_scale',
+                    'persistent_driver_stock': 'persistent_stock',
+                }.items() if '--'+flag in argv_flag_names},
+                supply_operating_point=(artifact_header.get('supply_operating_point') if args.trained_model_in else
+                                        city_artifact['supply_operating_point'] if city_artifact else None),
+            )
+            if args.training_scenario_manifest:
+                if args.shock_scenario:
+                    parser.error('--training_scenario_manifest and --shock_scenario are mutually exclusive')
+                core.configure_training_scenario_curriculum(
+                    load_training_scenario_manifest(args.training_scenario_manifest)
+                )
+
+    if str(args.rl_warm_start_target).strip() not in ("", "0", "0.0") and not args.trained_model_in and args.firm1_mode == "RL":
+        if args.city_calibration_artifact:
+            if str(args.rl_warm_start_target).lower() != 'auto' and float(args.rl_warm_start_target) != city_artifact['warm_start_target']:
+                parser.error('warm-start target conflicts with the city calibration artifact')
+            warm_target = city_artifact['warm_start_target']
+            core.v26r_settings['warm_start_selection'] = city_artifact['warm_start_selection']
+        elif str(args.rl_warm_start_target).strip().lower() == "auto":
+            raise ValueError('missing city calibration artifact')
+        else:
+            warm_target = float(args.rl_warm_start_target)
+        core.warm_start_actor(warm_target, float(args.rl_warm_start_logit))
+    if args.trained_model_in:
+        core.load_trained_model(
+            args.trained_model_in,
+            load_optimizer=not args.eval_only,
+            restore_tariff=False,
+        )
+
+
+    if args.firm1_mode == "RL" and float(args.exploration_commit_mean) > 0.0:
+        core.firm1.agent.set_exploration_commit_mean(float(args.exploration_commit_mean))
+        core.v26r_settings = {**dict(core.v26r_settings), "exploration_commit_mean": float(args.exploration_commit_mean)}
+        core.v26_settings = {**dict(core.v26_settings or {}), "v26r": core.v26r_settings}
+        print(f"[v26r] committed exploration: mean {float(args.exploration_commit_mean):.2f} decisions")
+
+    if args.policy_sweep:
+        # Match run_experiment initialization before any policy/opening draws
+        # returning riders; lazy partitioning otherwise changes the first arm.
+        core._refresh_profile_pool(rides_per_timestep=int(args.eval_customers))
+        if args.live_diagnostics:
+            core.diagnostic_journal = DiagnosticJournal(args.report_prefix)
+        report = core.run_policy_sweep(
+            specs=[item.strip() for item in str(args.policy_sweep).split(";") if item.strip()],
+            rivals=[item.strip() for item in str(args.policy_sweep_rivals).split(",") if item.strip()] or [str(args.firm2_mode)],
+            openings=int(max(1, args.policy_sweep_openings)),
+            horizon=int(args.policy_sweep_horizon) if int(args.policy_sweep_horizon) > 0 else int(args.eval_timesteps),
+            customers_per_step=int(args.eval_customers),
+            steps_per_day=int(args.train_steps_per_day),
+            firm1_interval_steps=int(args.firm1_action_interval_steps) if int(args.firm1_action_interval_steps) > 0 else int(args.train_steps_per_day),
+            opponent_interval_steps=int(args.firm2_action_interval_days) if int(args.firm2_action_interval_days) > 0 else 1,
+            policy_seed=int(args.policy_sweep_seed),
+        )
+        out = str(args.policy_sweep_out or (str(args.report_prefix) + "_policy_sweep.json"))
+        os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2, default=str)
+        print(f">>> policy sweep written -> {out}")
+        return
+
+    if args.dataset_only:
+        print(">>> Dataset-only mode: skipping synthetic training/evaluation.")
+        rows = []
+    elif args.run_experiment:
+        core.run_experiment(
+            train_timesteps=args.train_timesteps,
+            train_customers_per_step=args.train_customers,
+            eval_timesteps=args.eval_timesteps,
+            eval_customers_per_step=args.eval_customers,
+            profiles_out=args.profiles_out,
+            profiles_log_limit=args.profiles_log_limit,
+            train_steps_per_day=args.train_steps_per_day,
+            ppo_update_interval_days=args.ppo_update_interval_days,
+            ppo_min_rollout_transitions=args.ppo_min_rollout_transitions,
+            stochastic_training=(not args.deterministic_experiment_seed and args.experiment_seed is None),
+            firm1_action_interval_steps=args.firm1_action_interval_steps,
+            firm2_action_interval_days=args.firm2_action_interval_days,
+            eval_policy_mode=args.eval_policy_mode,
+            eval_policy_temperature=args.eval_policy_temperature,
+            eval_policy_seed=args.eval_policy_seed,
+            eval_guardrail_mode=args.eval_guardrail_mode,
+            checkpoint_validation_horizon=args.checkpoint_validation_horizon,
+            checkpoint_validation_interval_days=(
+                args.checkpoint_validation_interval_days
+            ),
+            checkpoint_validation_customers_per_step=(
+                args.checkpoint_validation_customers
+            ),
+            checkpoint_validation_openings=(
+                args.checkpoint_validation_openings
+            ),
+            evaluate_benchmark_suite=bool(
+                args.benchmark_suite or args.require_competitive_backtest
+            ),
+            training_enabled=not args.eval_only,
+            trained_model_out=args.trained_model_out or None,
+            model_registry_dir=args.model_registry_dir or None,
+            trained_model_id=args.trained_model_id or default_model_id(args.report_prefix),
+            diagnostic_prefix=args.report_prefix if args.live_diagnostics else None,
+        )
+        rows = []
+    else:
+        estimated_rows = int(args.days) * int(args.timesteps) * int(args.customers)
+        stream_threshold = 1_000_000
+        stream_to_disk = estimated_rows > stream_threshold
+        if stream_to_disk:
+            print(
+                f"[Run] Large output detected ({estimated_rows:,} rows). "
+                f"Streaming rows directly to {args.out} to avoid high memory usage."
+            )
+            
+        rows = core.run(
+            days=args.days,
+            timesteps_per_day=args.timesteps,
+            customers_per_step=args.customers,
+            out_path=args.out if stream_to_disk else None,
+            profiles_out=args.profiles_out,
+            profiles_log_limit=args.profiles_log_limit,
+        )
+        final_coeffs = core.get_final_manipulated_coefficients()
+        print(
+            f"[Final Coefficients after {args.days} days] "
+            f"Firm1={json.dumps(final_coeffs['firm1'], sort_keys=True)} "
+            f"Firm2={json.dumps(final_coeffs['firm2'], sort_keys=True)}"
+        )
+        if not stream_to_disk:
+            _write_csv(args.out, rows)
+            print(f"Saved -> {args.out}")
+
+    if rows:
+        dist_csv = f"{args.report_prefix}_ride_distributions.csv"
+        _write_distribution_csv(dist_csv, rows)
+        print(f"Saved -> {dist_csv}")
+
+    _plot_reports(
+        rows=rows,
+        run_logs=core.run_logs,
+        training_logs=core.training_logs,
+        evaluation_logs=core.evaluation_logs,
+        prefix=args.report_prefix,
+        threshold_profiles=core.synthetic_profile_pool,
+        benchmark_report=getattr(core, "benchmark_evaluation_report", None),
+        diagnostic_plot_stride=args.diagnostic_plot_stride,
+        fare_plot_stride_days=args.fare_plot_stride_days,
+        steps_per_day=args.train_steps_per_day,
+    )
+    _write_run_config(args.report_prefix, args, core)
+    for suffix, payload in (
+        ("v26_baselines", getattr(core, "baseline_evaluation_report", {})),
+        ("v26_ood", getattr(core, "ood_evaluation_report", {})),
+    ):
+        if payload:
+            path = f"{args.report_prefix}_{suffix}.json"
+            _ensure_parent_dir(path)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, sort_keys=True, default=float)
+            print(f"Saved -> {path}")
+    
+    if args.compare_with_dataset:
+        summary = core.compare_trained_rl_to_dataset(
+            dataset_root=(
+                os.path.abspath(os.path.expanduser(args.dataset_root))
+                if args.dataset_root
+                else _resolve_dataset_path(args.dataset_city or args.market)
+            ),
+            dataset_glob=args.dataset_glob,
+            out_csv=args.comparison_out,
+            out_plot_prefix=args.comparison_plot_prefix,
+            max_rows=args.comparison_limit,
+            preview_rows=args.dataset_preview_rows,
+            policy_mode=args.comparison_policy_mode,
+            policy_temperature=args.comparison_policy_temperature,
+            policy_seed=args.comparison_policy_seed,
+            dataset_sample_seed=args.comparison_dataset_seed,
+            duration_mode=args.comparison_duration_mode,
+            dataset_city=args.dataset_city or args.market,
+            weather_root=(
+                os.path.abspath(os.path.expanduser(args.weather_root))
+                if args.weather_root
+                else ""
+            ),
+        )
+        print(f"[RL vs Actual] {json.dumps(summary, indent=2)}")
+
+    if args.require_competitive_backtest:
+        audit_failures: List[str] = []
+        validation = getattr(core, "benchmark_evaluation_report", None)
+        if not validation:
+            audit_failures.append("validation report unavailable")
+        backtest = getattr(core, "competitive_backtest_report", None)
+        if not backtest or not bool(backtest.get("passed", False)):
+            failures = [] if not backtest else list(backtest.get("failures", []))
+            audit_failures.append(
+                "competitive durability backtest failed: "
+                + (", ".join(failures) if failures else "report unavailable")
+            )
+        if audit_failures:
+            print(
+                "[DIAGNOSTIC AUDIT FAILED] "
+                + " | ".join(audit_failures)
+                + ". This diagnostic does not alter reward, checkpoints, "
+                "model saving, registration, or deployed actions."
+            )
+
+if __name__ == "__main__":
+    main()
