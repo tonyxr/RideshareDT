@@ -2750,8 +2750,12 @@ class PPOAgent:
         bootstrap_value: Optional[torch.Tensor | float] = None,
         bootstrap_constraint_values: Optional[torch.Tensor] = None,
         bootstrap_risk_value: Optional[torch.Tensor | float] = None,
+        actor_loss_weight: float = 1.0,
     ) -> Dict[str, object]:
         del bootstrap_constraint_values, bootstrap_risk_value
+        actor_loss_weight = float(actor_loss_weight)
+        if not math.isfinite(actor_loss_weight) or actor_loss_weight < 0.0:
+            raise ValueError("actor_loss_weight must be finite and nonnegative")
         if not self.buf:
             return self._empty_update_metrics()
 
@@ -3107,7 +3111,9 @@ class PPOAgent:
         counterfactual_policy_loss_sum = 0.0
         critic_parameters = self.net.critic_parameters()
         actor_epoch_count = (
-            max(1, int(math.ceil(float(epochs) / 2.0)))
+            0
+            if actor_loss_weight == 0.0
+            else max(1, int(math.ceil(float(epochs) / 2.0)))
             if self.td_value_targets and not self.learning_corrections
             else max(1, int(epochs))
         )
@@ -3471,11 +3477,12 @@ class PPOAgent:
             torch.log(masks.sum(dim=-1).float().clamp(min=1.0)).mean().item()
         )
         discrete_entropy = entropy_sum / max(1, actor_steps)
-        self.last_policy_entropy_fraction = float(
-            np.clip(discrete_entropy / max_entropy, 0.0, 1.0)
-            if max_entropy > 1e-8
-            else 0.0
-        )
+        if actor_steps > 0:
+            self.last_policy_entropy_fraction = float(
+                np.clip(discrete_entropy / max_entropy, 0.0, 1.0)
+                if max_entropy > 1e-8
+                else 0.0
+            )
         self.last_raw_argmax_concentration = raw_argmax_concentration
         self.last_state_action_sensitivity = state_action_sensitivity
         self.last_state_action_mutual_information = 0.0
@@ -3506,7 +3513,10 @@ class PPOAgent:
                 "state_action_sensitivity": state_action_sensitivity,
                 "approx_kl": kl_sum / max(1, actor_steps),
                 "clipfrac": clipfrac_sum / max(1, actor_steps),
-                "update_performed": bool(actor_steps and critic_steps),
+                "update_performed": bool(
+                    critic_steps
+                    and (actor_steps or actor_loss_weight == 0.0)
+                ),
                 **({"behavior_replay_max_logp_error": behavior_replay_error} if self.learning_corrections else {}),
                 "run_mode": "training_update",
                 "explained_variance": explained_variance,
@@ -3579,7 +3589,10 @@ class PPOAgent:
                 "continuous_magnitude_std": float(
                     magnitudes.std(unbiased=False).item()
                 ),
-                "learning_signal_ok": bool(actor_steps and critic_steps),
+                "learning_signal_ok": bool(
+                    critic_steps
+                    and (actor_steps or actor_loss_weight == 0.0)
+                ),
                 "optimizer_steps": int(actor_steps + critic_steps),
                 "actor_optimizer_steps": int(actor_steps),
                 "actor_epochs_requested": int(actor_epoch_count),

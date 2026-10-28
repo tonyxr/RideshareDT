@@ -815,6 +815,7 @@ class Core:
         v16_tau_start: float = 0.10,
         v16_tau_end: float = 0.03,
         v16_policy_epsilon: float = 0.05,
+        v16_action_credit_scale: float = 1.0,
         momentum_features: bool = False,
         momentum_day_steps: int = 6,
         opponent_features: bool = False,
@@ -885,6 +886,7 @@ class Core:
         self.v16_tau_start = float(v16_tau_start)
         self.v16_tau_end = float(v16_tau_end)
         self.v16_policy_epsilon = float(v16_policy_epsilon)
+        self.v16_action_credit_scale = float(v16_action_credit_scale)
         if not (
             np.isfinite(self.v16_tau_start)
             and np.isfinite(self.v16_tau_end)
@@ -898,6 +900,11 @@ class Core:
             raise ValueError("v16_policy_epsilon must be in [0, 1]")
         if self.v16_policy_mode == "q" and self.v16_value_head != "concave2d":
             raise ValueError("V17 Q policy requires the concave2d value head")
+        if not (
+            np.isfinite(self.v16_action_credit_scale)
+            and self.v16_action_credit_scale > 0.0
+        ):
+            raise ValueError("v16_action_credit_scale must be positive")
         # Revision 11b: common-random-number day-branch credit for the actor.
         self.counterfactual_day_credit = int(max(0, counterfactual_day_credit))
         self.counterfactual_day_horizon_days = int(max(1, counterfactual_day_horizon_days))
@@ -1699,7 +1706,19 @@ class Core:
         )
         self.v16_value_model = None
         self.v16_value_target_model = None
+        self.v16_value_optimizer = None
         self.v16_value_cells = np.empty((0, 2), dtype=np.float32)
+        self.v16_value_fit_steps = 50
+        self.v16_value_fit_batch_size = 64
+        self.v16_value_lr_start = 3e-4
+        self.v16_value_lr_end = 5e-5
+        self.v16_value_weight_decay = 1e-4
+        self.v16_value_grad_clip = 1.0
+        self.v16_value_aux_weight = 0.25
+        self.v16_value_polyak = 0.99
+        self.v16_value_fit_calls = 0
+        self.v16_value_optimizer_steps = 0
+        self.v16_value_last_fit: Dict[str, Any] = {}
         if self.v16_value_head == "concave2d":
             if self.firm1_mode != "RL":
                 raise ValueError("concave2d value head requires firm1_mode='RL'")
@@ -1719,11 +1738,23 @@ class Core:
                 ],
                 dtype=np.float32,
             )
+            self.v16_value_optimizer = torch.optim.Adam(
+                self.v16_value_model.parameters(),
+                lr=self.v16_value_lr_start,
+                weight_decay=self.v16_value_weight_decay,
+            )
             if self.v16_policy_mode == "q":
                 self.v16_value_target_model = copy.deepcopy(
                     self.v16_value_model
                 ).eval()
                 self.v16_value_target_model.requires_grad_(False)
+                # Mode Q learns only through the registered value surface.
+                # The inherited PPO actor remains a recurrent-state/critic
+                # scaffold and receives no policy or entropy update.
+                self.firm1.agent.ent_coeff = 0.0
+                self.firm1.agent.action_q_coeff = 0.0
+                self.firm1.agent.counterfactual_actor_weight = 0.0
+                self.firm1.agent.branch_imitation_coeff = 0.0
         if self.firm1_mode == "RL" and self.counterfactual_policy_coeff is not None:
             self.firm1.agent.counterfactual_policy_coeff_override = float(self.counterfactual_policy_coeff)
         if self.firm1_mode == "RL" and self.counterfactual_day_credit > 0:
@@ -2872,6 +2903,21 @@ class Core:
             "v16_tau_start": float(self.v16_tau_start),
             "v16_tau_end": float(self.v16_tau_end),
             "v16_policy_epsilon": float(self.v16_policy_epsilon),
+            "v16_action_credit_scale": float(
+                self.v16_action_credit_scale
+            ),
+            "v16_value_fit_steps": int(self.v16_value_fit_steps),
+            "v16_value_fit_batch_size": int(
+                self.v16_value_fit_batch_size
+            ),
+            "v16_value_lr_start": float(self.v16_value_lr_start),
+            "v16_value_lr_end": float(self.v16_value_lr_end),
+            "v16_value_weight_decay": float(
+                self.v16_value_weight_decay
+            ),
+            "v16_value_grad_clip": float(self.v16_value_grad_clip),
+            "v16_value_aux_weight": float(self.v16_value_aux_weight),
+            "v16_value_polyak": float(self.v16_value_polyak),
             "momentum_features": bool(self.momentum_features),
             "momentum_day_steps": int(self.momentum_day_steps),
             "opponent_features": bool(self.opponent_features),
@@ -6617,6 +6663,27 @@ class Core:
                 "curvature_floor": float(
                     self.v16_value_model.curvature_floor
                 ),
+                "action_credit_scale": float(
+                    self.v16_action_credit_scale
+                ),
+                "fit_steps": int(self.v16_value_fit_steps),
+                "fit_batch_size": int(self.v16_value_fit_batch_size),
+                "lr_start": float(self.v16_value_lr_start),
+                "lr_end": float(self.v16_value_lr_end),
+                "weight_decay": float(self.v16_value_weight_decay),
+                "grad_clip": float(self.v16_value_grad_clip),
+                "auxiliary_weight": float(self.v16_value_aux_weight),
+                "polyak": float(self.v16_value_polyak),
+                "sampling": "regime_balanced",
+            }
+            if self.v16_value_optimizer is not None:
+                artifact["v16_value_optimizer_state"] = (
+                    self.v16_value_optimizer.state_dict()
+                )
+            artifact["v16_value_fit_state"] = {
+                "fit_calls": int(self.v16_value_fit_calls),
+                "optimizer_steps": int(self.v16_value_optimizer_steps),
+                "last_fit": copy.deepcopy(self.v16_value_last_fit),
             }
         if self.v16_value_target_model is not None:
             artifact["v16_value_target_model_state"] = {
@@ -7108,6 +7175,18 @@ class Core:
                 "curvature_floor": float(
                     self.v16_value_model.curvature_floor
                 ),
+                "action_credit_scale": float(
+                    self.v16_action_credit_scale
+                ),
+                "fit_steps": int(self.v16_value_fit_steps),
+                "fit_batch_size": int(self.v16_value_fit_batch_size),
+                "lr_start": float(self.v16_value_lr_start),
+                "lr_end": float(self.v16_value_lr_end),
+                "weight_decay": float(self.v16_value_weight_decay),
+                "grad_clip": float(self.v16_value_grad_clip),
+                "auxiliary_weight": float(self.v16_value_aux_weight),
+                "polyak": float(self.v16_value_polyak),
+                "sampling": "regime_balanced",
             }
             if saved_value_config != expected_value_config:
                 raise ValueError(
@@ -7116,6 +7195,36 @@ class Core:
             if saved_value_state is None:
                 raise ValueError("trained policy lacks the V17 value model")
             self.v16_value_model.load_state_dict(saved_value_state)
+            saved_value_optimizer = artifact.get(
+                "v16_value_optimizer_state"
+            )
+            if load_optimizer:
+                if (
+                    self.v16_value_optimizer is None
+                    or saved_value_optimizer is None
+                ):
+                    raise ValueError(
+                        "training resume requires the V17 value optimizer"
+                    )
+                self.v16_value_optimizer.load_state_dict(
+                    saved_value_optimizer
+                )
+            saved_fit_state = dict(
+                artifact.get("v16_value_fit_state", {}) or {}
+            )
+            if load_optimizer and not saved_fit_state:
+                raise ValueError(
+                    "training resume requires the V17 value-fit state"
+                )
+            self.v16_value_fit_calls = int(
+                saved_fit_state.get("fit_calls", 0)
+            )
+            self.v16_value_optimizer_steps = int(
+                saved_fit_state.get("optimizer_steps", 0)
+            )
+            self.v16_value_last_fit = copy.deepcopy(
+                saved_fit_state.get("last_fit", {})
+            )
         elif load_optimizer and saved_value_state is not None:
             raise ValueError(
                 "training resume must configure the saved V17 value model"
@@ -9002,6 +9111,214 @@ class Core:
             }
         )
 
+    def _v16_value_learning_rate(self, training_progress: float) -> float:
+        """Registered absolute cosine schedule for the V17 value fit."""
+        progress = float(np.clip(training_progress, 0.0, 1.0))
+        cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+        return float(
+            self.v16_value_lr_end
+            + (self.v16_value_lr_start - self.v16_value_lr_end) * cosine
+        )
+
+    def _v16_value_fit_batch(
+        self, rows: Sequence[Mapping[str, Any]]
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Convert branch-store rows into the registered supervised targets."""
+        if self.v16_value_model is None:
+            raise RuntimeError("V17 value fit requires the concave value model")
+        if not rows:
+            raise ValueError("V17 value fit received an empty batch")
+        device = next(self.v16_value_model.parameters()).device
+        observations: List[List[float]] = []
+        incumbents: List[int] = []
+        action_credits: List[List[float]] = []
+        action_masks: List[List[bool]] = []
+        component_credits: List[List[List[float]]] = []
+        component_masks: List[List[List[bool]]] = []
+        expected_names = list(self.v16_value_auxiliary_names)
+        action_count = int(self.v16_value_cells.shape[0])
+        flat_observation_dim = int(
+            self.firm1.state_frame_stack * self.platform_observation_dim
+        )
+        for row in rows:
+            observation = np.asarray(
+                row.get("observation_window", []), dtype=np.float32
+            ).reshape(-1)
+            if observation.size != flat_observation_dim:
+                raise ValueError("V17 branch row has the wrong observation size")
+            incumbent = int(row.get("incumbent_action", -1))
+            if not 0 <= incumbent < action_count:
+                raise ValueError("V17 branch row has an invalid incumbent")
+            credits = np.asarray(
+                row.get("action_credits", []), dtype=np.float32
+            ).reshape(-1)
+            mask = np.asarray(
+                row.get("action_credit_mask", []), dtype=bool
+            ).reshape(-1)
+            if credits.size != action_count or mask.size != action_count:
+                raise ValueError("V17 branch row has the wrong action dimension")
+            if not bool(mask[incumbent]):
+                raise ValueError("V17 branch row omits its incumbent target")
+            names = list(row.get("component_credit_names", []))
+            if names != expected_names:
+                raise ValueError("V17 branch row has incompatible component names")
+            matrix = list(row.get("component_credit_matrix", []))
+            if len(matrix) != action_count:
+                raise ValueError("V17 branch row has the wrong component matrix")
+            row_components = np.full(
+                (action_count, len(expected_names)), np.nan, dtype=np.float32
+            )
+            row_component_mask = np.zeros_like(row_components, dtype=bool)
+            for action_index, values in enumerate(matrix):
+                if values is None:
+                    continue
+                vector = np.asarray(values, dtype=np.float32).reshape(-1)
+                if vector.size != len(expected_names):
+                    raise ValueError(
+                        "V17 branch row has an incompatible component target"
+                    )
+                finite = np.isfinite(vector)
+                row_components[action_index, finite] = vector[finite]
+                row_component_mask[action_index, finite] = True
+            observations.append(observation.tolist())
+            incumbents.append(incumbent)
+            action_credits.append(np.nan_to_num(credits, nan=0.0).tolist())
+            action_masks.append(mask.tolist())
+            component_credits.append(
+                np.nan_to_num(row_components, nan=0.0).tolist()
+            )
+            component_masks.append(row_component_mask.tolist())
+        return (
+            torch.as_tensor(observations, dtype=torch.float32, device=device),
+            torch.as_tensor(incumbents, dtype=torch.long, device=device),
+            torch.as_tensor(action_credits, dtype=torch.float32, device=device),
+            torch.as_tensor(action_masks, dtype=torch.bool, device=device),
+            torch.as_tensor(component_credits, dtype=torch.float32, device=device),
+            torch.as_tensor(component_masks, dtype=torch.bool, device=device),
+        )
+
+    def _v16_fit_value_model(
+        self, *, training_progress: float
+    ) -> Dict[str, Any]:
+        """Run exactly one registered 50-step daily V17 value-model fit."""
+        if (
+            self.v16_value_model is None
+            or self.v16_value_optimizer is None
+            or self.v16_branch_store is None
+            or len(self.v16_branch_store) == 0
+        ):
+            return {"performed": False, "reason": "value_fit_not_ready"}
+        learning_rate = self._v16_value_learning_rate(training_progress)
+        for group in self.v16_value_optimizer.param_groups:
+            group["lr"] = learning_rate
+        self.v16_value_model.train()
+        cells = torch.as_tensor(
+            self.v16_value_cells,
+            dtype=torch.float32,
+            device=next(self.v16_value_model.parameters()).device,
+        )
+        main_losses: List[float] = []
+        auxiliary_losses: List[float] = []
+        total_losses: List[float] = []
+        grad_norms: List[float] = []
+        target_count = 0
+        auxiliary_target_count = 0
+        huber_delta = 0.5 * float(self.v16_action_credit_scale)
+        for _ in range(self.v16_value_fit_steps):
+            rows = self.v16_branch_store.sample(
+                self.v16_value_fit_batch_size, regime_balanced=True
+            )
+            (
+                observations,
+                incumbents,
+                credits,
+                credit_mask,
+                component_credits,
+                component_mask,
+            ) = self._v16_value_fit_batch(rows)
+            output = self.v16_value_model(observations, cells)
+            q_values = output["q"]
+            row_indices = torch.arange(
+                q_values.shape[0], device=q_values.device
+            )
+            q_differences = q_values - q_values[
+                row_indices, incumbents
+            ].unsqueeze(-1)
+            main_loss = torch.nn.functional.huber_loss(
+                q_differences[credit_mask],
+                credits[credit_mask],
+                reduction="mean",
+                delta=huber_delta,
+            )
+            auxiliary_values = output["auxiliary"]
+            auxiliary_differences = auxiliary_values - auxiliary_values[
+                row_indices, incumbents, :
+            ].unsqueeze(1)
+            auxiliary_loss = main_loss.new_zeros(())
+            for component_index in range(len(self.v16_value_auxiliary_names)):
+                valid = component_mask[:, :, component_index]
+                if bool(valid.any()):
+                    auxiliary_loss = auxiliary_loss + torch.nn.functional.huber_loss(
+                        auxiliary_differences[:, :, component_index][valid],
+                        component_credits[:, :, component_index][valid],
+                        reduction="mean",
+                        delta=1.0,
+                    )
+            total_loss = main_loss + self.v16_value_aux_weight * auxiliary_loss
+            if not torch.isfinite(total_loss):
+                raise RuntimeError("V17 value fit produced a non-finite loss")
+            self.v16_value_optimizer.zero_grad(set_to_none=True)
+            total_loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.v16_value_model.parameters(), self.v16_value_grad_clip
+            )
+            self.v16_value_optimizer.step()
+            main_losses.append(float(main_loss.detach().item()))
+            auxiliary_losses.append(float(auxiliary_loss.detach().item()))
+            total_losses.append(float(total_loss.detach().item()))
+            grad_norms.append(float(grad_norm.detach().item()))
+            target_count += int(credit_mask.sum().item())
+            auxiliary_target_count += int(component_mask.sum().item())
+        if self.v16_value_target_model is not None:
+            with torch.no_grad():
+                online_state = self.v16_value_model.state_dict()
+                target_state = self.v16_value_target_model.state_dict()
+                for key, target_value in target_state.items():
+                    target_value.mul_(self.v16_value_polyak).add_(
+                        online_state[key], alpha=1.0 - self.v16_value_polyak
+                    )
+            self.v16_value_target_model.eval()
+        self.v16_value_fit_calls += 1
+        self.v16_value_optimizer_steps += int(self.v16_value_fit_steps)
+        metrics: Dict[str, Any] = {
+            "performed": True,
+            "fit_call": int(self.v16_value_fit_calls),
+            "optimizer_steps": int(self.v16_value_fit_steps),
+            "optimizer_steps_total": int(self.v16_value_optimizer_steps),
+            "batch_size": int(self.v16_value_fit_batch_size),
+            "store_rows": int(len(self.v16_branch_store)),
+            "learning_rate": float(learning_rate),
+            "huber_delta": float(huber_delta),
+            "main_loss": float(np.mean(main_losses)),
+            "auxiliary_loss": float(np.mean(auxiliary_losses)),
+            "total_loss": float(np.mean(total_losses)),
+            "grad_norm": float(np.mean(grad_norms)),
+            "target_count": int(target_count),
+            "auxiliary_target_count": int(auxiliary_target_count),
+            "auxiliary_weight": float(self.v16_value_aux_weight),
+            "polyak": float(self.v16_value_polyak),
+            "regime_balanced_sampling": True,
+        }
+        self.v16_value_last_fit = copy.deepcopy(metrics)
+        return metrics
+
     def _v16_q_temperature(self, training_progress: float) -> float:
         progress = float(np.clip(training_progress, 0.0, 1.0))
         cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
@@ -10428,7 +10745,10 @@ class Core:
             f"eval timesteps={eval_timesteps} x {eval_customers_per_step} rides, "
             f"mc_samples(train/eval)={train_profile_sample_size}/{eval_profile_sample_size}"
         )
-        update_every = int(max(1, ppo_update_interval_days))
+        requested_update_every = int(max(1, ppo_update_interval_days))
+        update_every = (
+            7 if self.v16_policy_mode == "q" else requested_update_every
+        )
         self.ppo_update_interval_days = update_every
         requested_firm1_interval = int(firm1_action_interval_steps)
         requested_firm2_interval = int(firm2_action_interval_days)
@@ -10523,7 +10843,7 @@ class Core:
         benchmark_opponent = copy.deepcopy(self.firm2)
         training_clock = OperationalClock()
         
-        update_every = int(max(1, ppo_update_interval_days))
+        update_every = int(self.ppo_update_interval_days)
         best_checkpoint: Optional[Dict[str, Any]] = None
         best_validation_selection_key: Optional[Tuple[float, ...]] = None
         latest_checkpoint: Optional[Dict[str, Any]] = None
@@ -10861,6 +11181,8 @@ class Core:
             )
             inline_ppo_metrics: Optional[Dict[str, Any]] = None
             boundary_flush_transitions = 0
+            v16_value_fit_calls_today = 0
+            v16_value_fit_steps_today = 0
             for t, hour in enumerate(hours):
                 self._set_v16_tape_position(d, t)
                 base = self.market.curr_market
@@ -10969,6 +11291,11 @@ class Core:
                                     epochs=self.ppo_update_epochs,
                                     batch_size=self.ppo_batch_size,
                                     bootstrap_value=next_v,
+                                    actor_loss_weight=(
+                                        0.0
+                                        if self.v16_policy_mode == "q"
+                                        else 1.0
+                                    ),
                                 )
                                 last_ppo_metrics = dict(inline_ppo_metrics)
                                 last_ppo_update_day = int(d + 1)
@@ -11061,6 +11388,17 @@ class Core:
                                 counterfactual_values=counterfactual_values,
                                 counterfactual_mask=counterfactual_mask,
                             )
+                            fit_metrics = self._v16_fit_value_model(
+                                training_progress=(
+                                    float(d)
+                                    / max(1.0, float(train_timesteps - 1))
+                                )
+                            )
+                            if fit_metrics.get("performed", False):
+                                v16_value_fit_calls_today += 1
+                                v16_value_fit_steps_today += int(
+                                    fit_metrics["optimizer_steps"]
+                                )
                         # Branch restoration replaces the copied market object.
                         # Refresh this local reference before the real action.
                         base = self.market.curr_market
@@ -11511,6 +11849,9 @@ class Core:
                         bootstrap_value=bootstrap_v,
                         bootstrap_constraint_values=bootstrap_constraint_v,
                         bootstrap_risk_value=bootstrap_risk_v,
+                        actor_loss_weight=(
+                            0.0 if self.v16_policy_mode == "q" else 1.0
+                        ),
                     )
                     last_ppo_metrics = dict(inline_ppo_metrics)
                     last_ppo_update_day = int(d + 1)
@@ -11590,6 +11931,9 @@ class Core:
                         bootstrap_value=bootstrap_v,
                         bootstrap_constraint_values=bootstrap_constraint_v,
                         bootstrap_risk_value=bootstrap_risk_v,
+                        actor_loss_weight=(
+                            0.0 if self.v16_policy_mode == "q" else 1.0
+                        ),
                     )
                     last_ppo_metrics = dict(ppo_metrics)
                     last_ppo_update_day = int(d + 1)
@@ -11834,6 +12178,46 @@ class Core:
                 ),
                 "v16_q_epsilon": float(
                     avg_policy_diag.get("v16_q_epsilon", 0.0)
+                ),
+                "v16_value_fit_calls_today": int(
+                    v16_value_fit_calls_today
+                ),
+                "v16_value_fit_steps_today": int(
+                    v16_value_fit_steps_today
+                ),
+                "v16_value_fit_calls_total": int(
+                    self.v16_value_fit_calls
+                ),
+                "v16_value_optimizer_steps_total": int(
+                    self.v16_value_optimizer_steps
+                ),
+                "v16_value_fit_store_rows": int(
+                    len(self.v16_branch_store)
+                    if self.v16_branch_store is not None
+                    else 0
+                ),
+                "v16_value_fit_lr": float(
+                    self.v16_value_last_fit.get("learning_rate", 0.0)
+                ),
+                "v16_value_fit_main_loss": float(
+                    self.v16_value_last_fit.get("main_loss", 0.0)
+                ),
+                "v16_value_fit_auxiliary_loss": float(
+                    self.v16_value_last_fit.get("auxiliary_loss", 0.0)
+                ),
+                "v16_value_fit_total_loss": float(
+                    self.v16_value_last_fit.get("total_loss", 0.0)
+                ),
+                "v16_value_fit_grad_norm": float(
+                    self.v16_value_last_fit.get("grad_norm", 0.0)
+                ),
+                "v16_value_fit_target_count": int(
+                    self.v16_value_last_fit.get("target_count", 0)
+                ),
+                "v16_value_fit_auxiliary_target_count": int(
+                    self.v16_value_last_fit.get(
+                        "auxiliary_target_count", 0
+                    )
                 ),
                 "objective_optimizer_ready": bool(
                     avg_policy_diag.get("optimizer_ready", 0.0) >= 0.5
@@ -18494,6 +18878,15 @@ def main():
     v17.add_argument("--v16_tau_start", type=float, default=0.10)
     v17.add_argument("--v16_tau_end", type=float, default=0.03)
     v17.add_argument("--v16_policy_epsilon", type=float, default=0.05)
+    v17.add_argument(
+        "--v16_action_credit_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Frozen per-city branch-credit scale s_A; the registered main "
+            "Huber delta is exactly 0.5*s_A."
+        ),
+    )
 
     v26r = parser.add_argument_group("v26r regime-switching market (all default off)")
     v26r.add_argument("--regime_market", action="store_true",
@@ -19573,6 +19966,7 @@ def main():
         v16_tau_start=args.v16_tau_start,
         v16_tau_end=args.v16_tau_end,
         v16_policy_epsilon=args.v16_policy_epsilon,
+        v16_action_credit_scale=args.v16_action_credit_scale,
         enable_driver_supply=not args.disable_driver_supply,
         use_osmnx=args.use_osmnx,
         osmnx_place=args.osmnx_place or None,
