@@ -9895,6 +9895,7 @@ class Core:
                     "rival_profit": float(summary["rival_profit_per_request"]),
                     "profit_lead": float(summary["own_profit_per_request"] - summary["rival_profit_per_request"]),
                     "own_share": float(summary["own_completed_share"]),
+                    "rival_share": float(summary["rival_completed_share"]),
                     "fulfillment": float(summary["fulfillment"]),
                     "steps": int(summary["steps"]),
                 }

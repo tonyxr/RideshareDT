@@ -110,6 +110,7 @@ def test_t0_12_replay_labels_use_the_current_stage_objective():
 
     market = core.training_stage_scheduler.stage_at(0.0)
     core.current_training_stage = market
+    row["stage"] = market.opponent_regime
     market_weights = core._v17_current_component_weights()
     stored = components @ market_weights
     row["action_credits"] = stored.tolist()

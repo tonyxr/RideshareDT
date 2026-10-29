@@ -9,16 +9,24 @@ COMPETITOR_PROFIT_WEIGHT = 0.75
 OBJECTIVE_NAME = "own_profit_minus_0.75_competitor_profit"
 
 
+def objective(
+    own_profit: float,
+    competitor_profit: float,
+    *,
+    w: float = COMPETITOR_PROFIT_WEIGHT,
+) -> float:
+    """Return the registered V17 policy-ranking objective."""
+    return float(own_profit) - float(w) * float(competitor_profit)
+
+
 def final_objective(
     own_profit: float,
     competitor_profit: float,
     *,
     competitor_weight: float = COMPETITOR_PROFIT_WEIGHT,
 ) -> float:
-    """Return the registered V17 policy-ranking objective."""
-    return float(own_profit) - float(competitor_weight) * float(
-        competitor_profit
-    )
+    """Descriptive alias retained for existing report code."""
+    return objective(own_profit, competitor_profit, w=competitor_weight)
 
 
 def profit_report(own_profit: float, competitor_profit: float) -> dict[str, float]:
@@ -28,7 +36,7 @@ def profit_report(own_profit: float, competitor_profit: float) -> dict[str, floa
     return {
         "own_profit": own,
         "competitor_profit": competitor,
-        "final_objective": final_objective(own, competitor),
+        "final_objective": objective(own, competitor),
     }
 
 

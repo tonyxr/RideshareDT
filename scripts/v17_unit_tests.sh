@@ -5,6 +5,37 @@ set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON:-$BASE/../.venv/bin/python}"
+RUN_DIR="$BASE/runs/v17_t0"
+
+# The public entry point owns its durable log and status.  The guarded inner
+# invocation runs the actual gates so tee cannot recursively wrap itself.
+if [[ "${V17_T0_CAPTURED:-0}" != "1" ]]; then
+  mkdir -p "$RUN_DIR"
+  started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  commit="$(git -C "$BASE" rev-parse HEAD)"
+  tmp_status="$RUN_DIR/status.json.tmp"
+  printf '{\n  "phase": "T0",\n  "state": "running",\n  "pass": false,\n  "commit": "%s",\n  "started_at": "%s",\n  "log": "runs/v17_t0/log.txt"\n}\n' \
+    "$commit" "$started" > "$tmp_status"
+  mv "$tmp_status" "$RUN_DIR/status.json"
+  set +e
+  V17_T0_CAPTURED=1 "$0" "$@" 2>&1 | tee "$RUN_DIR/log.txt"
+  returncode="${PIPESTATUS[0]}"
+  set -e
+  finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ "$returncode" -eq 0 ]]; then
+    state="passed"
+    passed="true"
+  else
+    state="failed"
+    passed="false"
+  fi
+  printf '{\n  "phase": "T0",\n  "state": "%s",\n  "pass": %s,\n  "commit": "%s",\n  "started_at": "%s",\n  "finished_at": "%s",\n  "returncode": %s,\n  "log": "runs/v17_t0/log.txt",\n  "terminal_marker": "%s"\n}\n' \
+    "$state" "$passed" "$commit" "$started" "$finished" "$returncode" \
+    "$([[ "$returncode" -eq 0 ]] && printf 'V17 T0 PASS' || printf 'V17 T0 FAIL')" \
+    > "$tmp_status"
+  mv "$tmp_status" "$RUN_DIR/status.json"
+  exit "$returncode"
+fi
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
   PYTHON_BIN="$(command -v python3)"

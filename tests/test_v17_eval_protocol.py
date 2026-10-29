@@ -2,7 +2,7 @@ from scripts import eval_protocol_v1 as protocol
 from Core import CATCHUP_OPPONENT_MODES, REACTIVE_STAGE3_OPPONENT_MODES
 from Core import OPTIMIZED_BENCHMARK_OPPONENT_MODES
 from Core import PROFIT_BEST_RESPONSE_OPPONENT_MODES
-from v17_objective import final_objective, profit_report, rank_profit_rows
+from v17_objective import objective, final_objective, profit_report, rank_profit_rows
 
 
 def test_registered_contract_is_internally_consistent():
@@ -49,6 +49,7 @@ def test_t0_13_corrected_competitor_groups_are_disjoint_from_training_pools():
 
 
 def test_final_objective_ranks_and_reports_both_profit_components():
+    assert objective(4.0, 2.0, w=0.75) == 2.5
     assert final_objective(4.0, 2.0) == 2.5
     assert profit_report(4.0, 2.0) == {
         "own_profit": 4.0,
