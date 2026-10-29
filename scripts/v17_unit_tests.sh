@@ -40,6 +40,13 @@ run_gate T0.10 \
   tests/test_v17_value_model.py::test_t0_10_recovers_two_regime_argmax_from_300_noisy_rows
 run_gate T0.11 \
   tests/test_v17_value_fit.py::test_value_fit_resume_reproduces_exact_next_update
+run_gate T0.12 \
+  tests/test_v17_value_fit.py::test_t0_12_replay_labels_use_the_current_stage_objective
+run_gate T0.13 tests/test_v17_eval_protocol.py
+run_gate T0.14 \
+  tests/test_v17_two_lever_action.py::test_t0_14_v2_grid_has_36_cells_and_v1_mapping_is_unchanged \
+  tests/test_v17_two_lever_action.py::test_t0_14_v2_core_value_surface_and_artifact_are_36_cells \
+  tests/test_v17_config.py::test_t0_14_config_switch_accepts_only_the_registered_six_level_grid
 
 # User-approved V17 extensions that must remain wired into the same release.
 run_gate V17.extensions tests/test_v17_progressive_competition.py

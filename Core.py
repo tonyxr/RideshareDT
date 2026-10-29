@@ -85,7 +85,8 @@ from pricing_models import (
     HYBRID_RELATIVE_ACTION_SEMANTICS,
     LEVEL_STEP_ACTION_SEMANTICS,
     TWO_LEVER_ACTION_SEMANTICS,
-    TWO_LEVER_LEVELS,
+    TWO_LEVER_V2_ACTION_SEMANTICS,
+    TWO_LEVER_CONTRACT_LEVELS,
     LEVEL_STEP_EXPOSURE,
     TARIFF_LEVEL_GRID_STEP,
     snap_tariff_level,
@@ -1012,8 +1013,12 @@ class Core:
         self.level_step_actions = bool(level_step_actions)
         self.hybrid_relative_actions = bool(hybrid_relative_actions)
         self.action_contract = str(action_contract)
-        if self.action_contract not in ("legacy", "two_lever_v1"):
-            raise ValueError("action_contract must be legacy or two_lever_v1")
+        if self.action_contract not in (
+            "legacy", "two_lever_v1", "two_lever_v2"
+        ):
+            raise ValueError(
+                "action_contract must be legacy, two_lever_v1, or two_lever_v2"
+            )
         self.rivals_two_lever = bool(rivals_two_lever)
         self.v16_crn_tape = bool(v16_crn_tape)
         self.exogenous_tape = (
@@ -1021,9 +1026,10 @@ class Core:
         )
         self._v16_tape_position: Optional[Tuple[int, int, int]] = None
         if self.v16_branch_mode == "one_day_deviation":
-            if self.action_contract != "two_lever_v1":
+            if self.action_contract not in TWO_LEVER_CONTRACT_LEVELS:
                 raise ValueError(
-                    "one_day_deviation requires action_contract='two_lever_v1'"
+                    "one_day_deviation requires action_contract="
+                    "'two_lever_v1' or 'two_lever_v2'"
                 )
             if not self.v16_crn_tape:
                 raise ValueError(
@@ -1053,16 +1059,19 @@ class Core:
             or self.branch_imitation_temperature_scale <= 0.0
         ):
             raise ValueError("branch_imitation_temperature_scale must be positive")
-        if self.action_contract == "two_lever_v1":
+        if self.action_contract in TWO_LEVER_CONTRACT_LEVELS:
             if self.level_step_actions or self.hybrid_relative_actions or self.whole_tariff_actions:
                 raise ValueError(
-                    "two_lever_v1 conflicts with legacy revised action flags"
+                    f"{self.action_contract} conflicts with legacy revised action flags"
                 )
             if self.tariff_targets or self.tariff_structure_payload is not None:
-                raise ValueError("two_lever_v1 has a fixed 25-cell grid")
+                raise ValueError(
+                    f"{self.action_contract} has a fixed "
+                    f"{len(TWO_LEVER_CONTRACT_LEVELS[self.action_contract]) ** 2}-cell grid"
+                )
             if tuple(self.driver_incentive_levels) != (1.0,):
                 raise ValueError(
-                    "two_lever_v1 requires driver_incentive_levels=(1.0,)"
+                    f"{self.action_contract} requires driver_incentive_levels=(1.0,)"
                 )
         elif self.hybrid_relative_actions:
             if self.level_step_actions or self.whole_tariff_actions:
@@ -1088,9 +1097,12 @@ class Core:
                 raise ValueError("level-step actions require driver_incentive_levels=(1.0,)")
         elif self.tariff_structure_payload is not None:
             raise ValueError("a tariff structure requires level-step actions")
-        if self.rivals_two_lever and self.action_contract != "two_lever_v1":
+        if (
+            self.rivals_two_lever
+            and self.action_contract not in TWO_LEVER_CONTRACT_LEVELS
+        ):
             raise ValueError(
-                "rivals_two_lever requires action_contract='two_lever_v1'"
+                "rivals_two_lever requires a two-lever action contract"
             )
         self.shock_config: ShockConfig = ShockConfig(enabled=False)
         self.shock_scenario: Optional[ShockScenario] = None
@@ -1786,9 +1798,9 @@ class Core:
         if self.v16_value_head == "concave2d":
             if self.firm1_mode != "RL":
                 raise ValueError("concave2d value head requires firm1_mode='RL'")
-            if self.action_contract != "two_lever_v1":
+            if self.action_contract not in TWO_LEVER_CONTRACT_LEVELS:
                 raise ValueError(
-                    "concave2d value head requires action_contract='two_lever_v1'"
+                    "concave2d value head requires a two-lever action contract"
                 )
             self.v16_value_model = V17ConcaveValueModel(
                 observation_dim=self.platform_observation_dim,
@@ -6459,7 +6471,11 @@ class Core:
             getattr(self.firm1, "two_lever_actions", False)
         )
         action_semantics = (
-            TWO_LEVER_ACTION_SEMANTICS
+            getattr(
+                self.firm1,
+                "two_lever_action_semantics",
+                TWO_LEVER_ACTION_SEMANTICS,
+            )
             if two_lever_actions
             else LEVEL_STEP_ACTION_SEMANTICS
             if level_actions
@@ -7129,7 +7145,11 @@ class Core:
         if artifact.get("action_to_target_key") != self.firm1.action_to_target_key:
             raise ValueError("trained model coefficient targets do not match runtime")
         expected_action_semantics = (
-            TWO_LEVER_ACTION_SEMANTICS
+            getattr(
+                self.firm1,
+                "two_lever_action_semantics",
+                TWO_LEVER_ACTION_SEMANTICS,
+            )
             if getattr(self.firm1, "two_lever_actions", False)
             else LEVEL_STEP_ACTION_SEMANTICS
             if getattr(self.firm1, "level_step_actions", False)
@@ -8832,20 +8852,21 @@ class Core:
             for action, cell in mapping.items()
         }
         center = mapping[int(incumbent)]
-        distance_index = TWO_LEVER_LEVELS.index(float(center[0]))
-        time_index = TWO_LEVER_LEVELS.index(float(center[1]))
+        levels = tuple(self.firm1.two_lever_levels)
+        distance_index = levels.index(float(center[0]))
+        time_index = levels.index(float(center[1]))
         candidates: List[int] = []
         for di in (-1, 0, 1):
             for dt in (-1, 0, 1):
                 i, j = distance_index + di, time_index + dt
                 if not (
-                    0 <= i < len(TWO_LEVER_LEVELS)
-                    and 0 <= j < len(TWO_LEVER_LEVELS)
+                    0 <= i < len(levels)
+                    and 0 <= j < len(levels)
                 ):
                     continue
                 action = reverse[(
-                    float(TWO_LEVER_LEVELS[i]),
-                    float(TWO_LEVER_LEVELS[j]),
+                    float(levels[i]),
+                    float(levels[j]),
                 )]
                 if action in feasible and action not in candidates:
                     candidates.append(action)
@@ -9105,7 +9126,9 @@ class Core:
                 else int(self._v16_tape_position[2])
             ),
             "branch_mode": "one_day_deviation",
-            "branch_design": "all25" if audit else "stencil11",
+            "branch_design": (
+                f"all{self.firm1.agent.action_dim}" if audit else "stencil11"
+            ),
             "audit": bool(audit),
             "horizon_days": int(horizon_days),
             "incumbent_action": int(incumbent),
@@ -9235,6 +9258,24 @@ class Core:
             + (self.v16_value_lr_start - self.v16_value_lr_end) * cosine
         )
 
+    def _v17_current_component_weights(self) -> np.ndarray:
+        """Return the active stage's linear reward weights for replay labels."""
+        regime = str(self.current_training_stage.opponent_regime)
+        weights = np.asarray(
+            self.long_term_profit_reward_config.critic_component_weights(regime),
+            dtype=np.float32,
+        ).reshape(-1)
+        if weights.size == 2 and len(self.v16_value_auxiliary_names) == 4:
+            weights = np.concatenate(
+                (weights, np.zeros(2, dtype=np.float32))
+            )
+        if weights.size != len(self.v16_value_auxiliary_names):
+            raise RuntimeError(
+                "V17 branch relabeling requires exactly the four stored "
+                "economic primitives"
+            )
+        return weights
+
     def _v16_value_fit_batch(
         self, rows: Sequence[Mapping[str, Any]]
     ) -> Tuple[
@@ -9271,13 +9312,13 @@ class Core:
             incumbent = int(row.get("incumbent_action", -1))
             if not 0 <= incumbent < action_count:
                 raise ValueError("V17 branch row has an invalid incumbent")
-            credits = np.asarray(
+            stored_credits = np.asarray(
                 row.get("action_credits", []), dtype=np.float32
             ).reshape(-1)
             mask = np.asarray(
                 row.get("action_credit_mask", []), dtype=bool
             ).reshape(-1)
-            if credits.size != action_count or mask.size != action_count:
+            if stored_credits.size != action_count or mask.size != action_count:
                 raise ValueError("V17 branch row has the wrong action dimension")
             if not bool(mask[incumbent]):
                 raise ValueError("V17 branch row omits its incumbent target")
@@ -9302,6 +9343,15 @@ class Core:
                 finite = np.isfinite(vector)
                 row_components[action_index, finite] = vector[finite]
                 row_component_mask[action_index, finite] = True
+            if not bool(np.all(row_component_mask[mask])):
+                raise ValueError(
+                    "V17 branch row lacks primitive credits for a labeled action"
+                )
+            # RevB F1: the scalar stored when the branch was recorded is audit
+            # evidence only.  Always rescalarize the raw primitives with the
+            # stage active at sampling time so replay never mixes objectives.
+            weights = self._v17_current_component_weights()
+            credits = np.matmul(row_components, weights)
             observations.append(observation.tolist())
             incumbents.append(incumbent)
             action_credits.append(np.nan_to_num(credits, nan=0.0).tolist())
@@ -9451,7 +9501,7 @@ class Core:
         deterministic: bool,
         training_progress: float,
     ) -> Tuple[int, torch.Tensor, Dict[str, float]]:
-        """Select from the frozen Polyak target surface over all 25 cells."""
+        """Select from the frozen Polyak target surface over every card cell."""
         if self.v16_value_target_model is None:
             raise RuntimeError("V17 Q policy has no target value model")
         device = next(self.v16_value_target_model.parameters()).device
@@ -9465,8 +9515,11 @@ class Core:
         mask_t = torch.as_tensor(
             action_mask, dtype=torch.bool, device=device
         ).reshape(-1)
-        if q_values.numel() != 25 or mask_t.numel() != 25:
-            raise ValueError("V17 Q policy requires exactly 25 action cells")
+        action_count = int(self.firm1.agent.action_dim)
+        if q_values.numel() != action_count or mask_t.numel() != action_count:
+            raise ValueError(
+                f"V17 Q policy requires exactly {action_count} action cells"
+            )
         if not torch.any(mask_t):
             raise ValueError("V17 Q policy has no feasible action cell")
         masked_q = q_values.masked_fill(~mask_t, float("-inf"))
@@ -18946,11 +18999,12 @@ def main():
     )
     v17.add_argument(
         "--action_contract",
-        choices=("legacy", "two_lever_v1"),
+        choices=("legacy", "two_lever_v1", "two_lever_v2"),
         default="legacy",
         help=(
-            "V17 M5 absolute distance/time card: 25 cells over "
-            "{0.8,0.9,1.0,1.2,1.5}; legacy preserves 15d."
+            "V17 M5 absolute distance/time card: V1 has 25 cells over "
+            "{0.8,0.9,1.0,1.2,1.5}; RevB V2 adds the 0.7 level behind "
+            "an explicit switch; legacy preserves 15d."
         ),
     )
     v17.add_argument(
@@ -19000,7 +19054,7 @@ def main():
         type=int,
         default=0,
         help=(
-            "Branch all 25 cells every Nth V17 decision (10 production, "
+            "Branch all card cells every Nth V17 decision (10 production, "
             "4 in T3; 0 disables audits)."
         ),
     )
@@ -19295,15 +19349,19 @@ def main():
             or artifact_header.get("action_semantics")
             == HYBRID_RELATIVE_ACTION_SEMANTICS
         )
-        if artifact_header.get("action_semantics") == TWO_LEVER_ACTION_SEMANTICS:
-            args.action_contract = "two_lever_v1"
+        saved_two_lever_contract = {
+            TWO_LEVER_ACTION_SEMANTICS: "two_lever_v1",
+            TWO_LEVER_V2_ACTION_SEMANTICS: "two_lever_v2",
+        }.get(artifact_header.get("action_semantics"))
+        if saved_two_lever_contract is not None:
+            args.action_contract = saved_two_lever_contract
         if int(artifact_header.get("version", 0)) < 21:
             parser.error(
                 "--trained_model_in predates the version-23 coherent-tariff, "
                 "differential semi-MDP reward, and corrected critic contract; "
                 "retrain it with the current staged PPO path"
             )
-        if artifact_header.get("action_semantics") == TWO_LEVER_ACTION_SEMANTICS:
+        if saved_two_lever_contract is not None:
             if (
                 args.level_step_actions
                 or args.hybrid_relative_actions
@@ -19315,9 +19373,15 @@ def main():
                     "legacy action flags conflict with the saved two-lever contract"
                 )
             saved_cells = artifact_header.get("action_to_two_lever_cell", {})
-            if len(saved_cells) != 25:
-                parser.error("saved two-lever policy lacks its 25-cell grid")
-            args.action_contract = "two_lever_v1"
+            expected_cells = len(
+                TWO_LEVER_CONTRACT_LEVELS[saved_two_lever_contract]
+            ) ** 2
+            if len(saved_cells) != expected_cells:
+                parser.error(
+                    "saved two-lever policy lacks its "
+                    f"{expected_cells}-cell grid"
+                )
+            args.action_contract = saved_two_lever_contract
         elif artifact_header.get("action_semantics") == LEVEL_STEP_ACTION_SEMANTICS:
             # Revision 15: the saved structure, steps and bounds define the action contract.
             if args.tariff_targets:
@@ -19922,14 +19986,15 @@ def main():
         if args.tariff_structure:
             with open(os.path.expanduser(args.tariff_structure)) as handle:
                 args.tariff_structure_payload = json.load(handle)
-    if args.action_contract == "two_lever_v1":
+    if args.action_contract in TWO_LEVER_CONTRACT_LEVELS:
         if args.level_step_actions or args.hybrid_relative_actions or args.whole_tariff_actions:
             parser.error(
-                "--action_contract two_lever_v1 conflicts with legacy action flags"
+                f"--action_contract {args.action_contract} conflicts with legacy action flags"
             )
         if args.tariff_targets or args.tariff_structure_payload is not None:
             parser.error(
-                "--action_contract two_lever_v1 uses its fixed 25-cell grid"
+                f"--action_contract {args.action_contract} uses its fixed "
+                f"{len(TWO_LEVER_CONTRACT_LEVELS[args.action_contract]) ** 2}-cell grid"
             )
         if str(args.rl_warm_start_target).strip() not in ("", "0", "0.0"):
             parser.error("the two-lever contract has no scalar warm start")

@@ -4,7 +4,11 @@ import copy
 import pytest
 
 from MarketInteraction import MarketInteraction, RideContext
-from pricing_models import FirmRLPricer, TWO_LEVER_LEVELS
+from pricing_models import (
+    FirmRLPricer,
+    TWO_LEVER_LEVELS,
+    TWO_LEVER_V2_LEVELS,
+)
 
 
 KEYS = ["base_fare", "per_minute", "per_mile", "booking_fee", "airport_fee"]
@@ -130,4 +134,60 @@ def test_core_flag_wires_and_persists_the_25_cell_contract(tmp_path):
     artifact = torch.load(artifact_path, weights_only=False, map_location="cpu")
     assert artifact["action_semantics"] == "two_lever_absolute_card_v1"
     assert len(artifact["action_to_two_lever_cell"]) == 25
+    core.load_trained_model(str(artifact_path))
+
+
+def test_t0_14_v2_grid_has_36_cells_and_v1_mapping_is_unchanged():
+    v1 = make_pricer()
+    v2 = FirmRLPricer(
+        seed=23,
+        opt_keys=KEYS,
+        independent_coefficient_actions=False,
+        action_contract="two_lever_v2",
+    )
+    assert v1.agent.action_dim == 25
+    assert tuple(v1.two_lever_levels) == TWO_LEVER_LEVELS
+    assert list(v1.action_to_two_lever_cell.values()) == [
+        (distance, time)
+        for distance in TWO_LEVER_LEVELS
+        for time in TWO_LEVER_LEVELS
+    ]
+    assert v2.agent.action_dim == 36
+    assert tuple(v2.two_lever_levels) == TWO_LEVER_V2_LEVELS
+    assert list(v2.action_to_two_lever_cell.values()) == [
+        (distance, time)
+        for distance in TWO_LEVER_V2_LEVELS
+        for time in TWO_LEVER_V2_LEVELS
+    ]
+    assert v1.action_label(0) == "cell:distance=0.8,time=0.8"
+    assert v2.action_label(0) == "cell:distance=0.7,time=0.7"
+
+
+def test_t0_14_v2_core_value_surface_and_artifact_are_36_cells(tmp_path):
+    from Core import Core
+    import torch
+
+    core = Core(
+        "Chicago",
+        seed=24,
+        firm1_mode="RL",
+        firm2_mode="static",
+        total_customers_pool=8,
+        simulation_sample_cap=3,
+        enable_driver_supply=False,
+        openai_api_key="",
+        action_contract="two_lever_v2",
+        v16_crn_tape=True,
+        v16_branch_mode="one_day_deviation",
+        v16_branch_design="stencil11",
+        v16_store_cap=20,
+        v16_value_head="concave2d",
+        v16_policy_mode="q",
+    )
+    assert core.v16_value_cells.shape == (36, 2)
+    artifact_path = tmp_path / "two-lever-v2-policy.pt"
+    core.save_trained_model(str(artifact_path))
+    artifact = torch.load(artifact_path, weights_only=False, map_location="cpu")
+    assert artifact["action_semantics"] == "two_lever_absolute_card_v2"
+    assert len(artifact["action_to_two_lever_cell"]) == 36
     core.load_trained_model(str(artifact_path))

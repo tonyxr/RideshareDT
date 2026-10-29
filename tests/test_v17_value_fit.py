@@ -20,6 +20,7 @@ def _core(*, seed: int = 1761, scale: float = 2.0) -> Core:
         simulation_sample_cap=3,
         enable_driver_supply=False,
         openai_api_key="",
+        training_curriculum="v17_progressive",
         action_contract="two_lever_v1",
         v16_crn_tape=True,
         v16_branch_mode="one_day_deviation",
@@ -100,6 +101,31 @@ def test_value_learning_rate_is_registered_absolute_cosine():
     assert core._v16_value_learning_rate(0.0) == pytest.approx(3e-4)
     assert core._v16_value_learning_rate(0.5) == pytest.approx(1.75e-4)
     assert core._v16_value_learning_rate(1.0) == pytest.approx(5e-5)
+
+
+def test_t0_12_replay_labels_use_the_current_stage_objective():
+    core = _core(seed=1766)
+    row = _branch_row(core, 0, "calm")
+    components = np.asarray(row["component_credit_matrix"], dtype=np.float32)
+
+    market = core.training_stage_scheduler.stage_at(0.0)
+    core.current_training_stage = market
+    market_weights = core._v17_current_component_weights()
+    stored = components @ market_weights
+    row["action_credits"] = stored.tolist()
+    original_audit_values = list(row["action_credits"])
+    market_batch = core._v16_value_fit_batch([row])[2][0].cpu().numpy()
+    assert market_batch == pytest.approx(stored, abs=1e-6)
+
+    profit = core.training_stage_scheduler.stage_at(0.999999)
+    assert profit.opponent_regime == "profit"
+    core.current_training_stage = profit
+    profit_weights = core._v17_current_component_weights()
+    relabeled = core._v16_value_fit_batch([row])[2][0].cpu().numpy()
+    expected = components @ profit_weights
+    assert relabeled == pytest.approx(expected, abs=1e-6)
+    assert not np.allclose(relabeled, stored, rtol=0.0, atol=1e-6)
+    assert row["action_credits"] == original_audit_values
 
 
 def test_daily_fit_runs_exact_steps_losses_and_polyak_update():

@@ -69,6 +69,24 @@ def test_market_command_rejects_config_drift(tmp_path):
         )
 
 
+def test_revb_chicago_t11_command_uses_chicago_inputs_and_card_only_can_be_set(
+    tmp_path,
+):
+    command = checks.market_command(
+        v17_config.load_config(),
+        city="chicago",
+        job="calm_static",
+        output=tmp_path,
+        openings=6,
+        customers=500,
+        pool=2000,
+    )
+    assert command[command.index("--market") + 1] == "Chicago"
+    card_only = checks._replace_command_value(command, "--policy_sweep", checks.CARD)
+    assert card_only[card_only.index("--policy_sweep") + 1] == checks.CARD
+    assert card_only[card_only.index("--fleet_scale") + 1] == "1.1"
+
+
 def test_two_lever_direct_post_comparator_returns_no_action_sentinel():
     from types import SimpleNamespace
 

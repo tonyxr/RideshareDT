@@ -11,7 +11,14 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import sys
 from typing import Any
+
+BASE = Path(__file__).resolve().parents[1]
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
+from v17_objective import COMPETITOR_PROFIT_WEIGHT, OBJECTIVE_NAME
 
 
 PROTOCOL_VERSION = "v1"
@@ -23,17 +30,26 @@ CASES = (
     "S1_promotion_bait",
     "S6_shortage_during_promotion",
 )
-COMPETITORS = (
+TRAINING_EXPOSED_COMPETITORS = (
     "adaptive_best_response_memory",
-    "profit_opt_pi_price_gap",
-    "profit_opt_region_supply_demand",
-    "profit_opt_pi_price_gap_p0",
-    "profit_opt_queue_service_threshold_p0",
     "profit_best_response_myopic",
     "profit_best_response_forward",
     "profit_best_response_anticipating",
     "profit_opt_mpc_grid",
-    "profit_opt_surge_driver_incentive",
+)
+HELD_OUT_COMPETITORS = (
+    "pi_price_gap",
+    "region_supply_demand",
+    "queue_service_threshold",
+)
+PERTURBED_HELD_OUT_COMPETITORS = (
+    "pi_price_gap@perturbed0",
+    "queue_service_threshold@perturbed0",
+)
+COMPETITORS = (
+    *TRAINING_EXPOSED_COMPETITORS,
+    *HELD_OUT_COMPETITORS,
+    *PERTURBED_HELD_OUT_COMPETITORS,
 )
 POLICY_CLASSES = (
     "rl_seed_101",
@@ -58,6 +74,20 @@ def protocol() -> dict[str, Any]:
             "required": True,
             "must_differ_from": ["training", "T2_validation"],
             "common_random_numbers_across_policies": True,
+        },
+        "ranking_objective": {
+            "name": OBJECTIVE_NAME,
+            "own_profit_weight": 1.0,
+            "competitor_profit_weight": -COMPETITOR_PROFIT_WEIGHT,
+            "always_report_components": [
+                "own_profit",
+                "competitor_profit",
+            ],
+        },
+        "competitor_groups": {
+            "training_exposed": list(TRAINING_EXPOSED_COMPETITORS),
+            "held_out_canonical": list(HELD_OUT_COMPETITORS),
+            "held_out_perturbed": list(PERTURBED_HELD_OUT_COMPETITORS),
         },
         "step_A": {
             "role": "comparator_selection_validation_only",
@@ -131,6 +161,27 @@ def validate(value: dict[str, Any] | None = None) -> None:
     c = spec["step_C"]
     if spec["entry_point"] != "scripts/eval_protocol_v1.py":
         raise ValueError("M7 requires eval_protocol_v1.py as the sole entry point")
+    groups = spec["competitor_groups"]
+    if tuple(groups["training_exposed"]) != TRAINING_EXPOSED_COMPETITORS:
+        raise ValueError("training-exposed competitor group drifted")
+    if tuple(groups["held_out_canonical"]) != HELD_OUT_COMPETITORS:
+        raise ValueError("canonical held-out competitor group drifted")
+    if tuple(groups["held_out_perturbed"]) != PERTURBED_HELD_OUT_COMPETITORS:
+        raise ValueError("perturbed held-out competitor group drifted")
+    if len(set(COMPETITORS)) != 10:
+        raise ValueError("competitor groups must be disjoint and contain ten entries")
+    if tuple(b["competitors"]) != COMPETITORS:
+        raise ValueError("Step B competitor order drifted")
+    objective = spec["ranking_objective"]
+    if (
+        objective["name"] != OBJECTIVE_NAME
+        or float(objective["own_profit_weight"]) != 1.0
+        or float(objective["competitor_profit_weight"])
+        != -COMPETITOR_PROFIT_WEIGHT
+        or objective["always_report_components"]
+        != ["own_profit", "competitor_profit"]
+    ):
+        raise ValueError("final policy-ranking objective drifted")
     if a["fixed_cells"] * a["competitors"] * len(a["cases"]) * a["openings"] != 900:
         raise ValueError("Step A fixed-cell rollout count drifted")
     if a["reactive_rule_candidates"] * a["competitors"] * len(a["cases"]) * a["openings"] != 864:

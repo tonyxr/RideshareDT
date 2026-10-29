@@ -22,8 +22,8 @@ sys.path.insert(0, str(BASE))
 from diagnostic_logging import atomic_json
 from scripts.v17_config import DEFAULT_CONFIG, canonical_hash, load_config
 from scripts.v17_market_checks import (
+    CALIBRATION_CITIES,
     CARD,
-    T1_CITIES,
     _read_raw,
     _run_job,
     _t11,
@@ -95,7 +95,7 @@ def select_candidate(candidates: Sequence[dict]) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--city", choices=T1_CITIES, default="nyc")
+    parser.add_argument("--city", choices=CALIBRATION_CITIES, default="nyc")
     parser.add_argument("--candidates", default="1.0,1.1,1.2,1.3,1.4")
     parser.add_argument("--openings", type=int, default=2)
     parser.add_argument("--customers", type=int, default=500)

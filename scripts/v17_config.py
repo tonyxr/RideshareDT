@@ -23,6 +23,10 @@ EXPECTED_STAGE_NAMES = (
 EXPECTED_STAGE_FRACTIONS = (0.05, 0.05, 0.30, 0.60)
 EXPECTED_LEAD_WEIGHTS = (0.0, 0.50, 0.625, 0.75)
 CITY_SLUGS = ("nyc", "boston", "chicago")
+ACTION_LEVELS = {
+    "two_lever_v1": (0.8, 0.9, 1.0, 1.2, 1.5),
+    "two_lever_v2": (0.7, 0.8, 0.9, 1.0, 1.2, 1.5),
+}
 
 
 def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
@@ -76,9 +80,10 @@ def validate_config(
     }:
         raise ValueError("active-driver observation must be exact and own-only")
     action = config["action"]
-    levels = (0.8, 0.9, 1.0, 1.2, 1.5)
+    contract = str(action.get("contract"))
+    levels = ACTION_LEVELS.get(contract)
     if (
-        action.get("contract") != "two_lever_v1"
+        levels is None
         or _tuple(action.get("distance_levels")) != levels
         or _tuple(action.get("time_levels")) != levels
     ):
@@ -211,7 +216,7 @@ def core_args(
         "--shortage_willingness_share", "0.5",
         "--fleet_scale", str(float(inputs.get("fleet_scale", 1.0))),
         "--price_sensitivity_units", "relative",
-        "--action_contract", "two_lever_v1",
+        "--action_contract", str(config["action"]["contract"]),
         "--rivals_two_lever",
         "--v16_crn_tape",
         "--v16_branch_mode", "one_day_deviation",

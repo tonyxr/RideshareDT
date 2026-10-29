@@ -42,6 +42,7 @@ PYTHON = ROOT / ".venv/bin/python"
 STEPS_PER_DAY = 6
 T1_CITIES = ("nyc", "boston")
 REALITY_CITIES = ("nyc", "boston", "chicago")
+CALIBRATION_CITIES = REALITY_CITIES
 CARD = "static:1"
 
 
@@ -128,8 +129,10 @@ def market_command(
     seed: int = 17_101,
 ) -> list[str]:
     validate_config(config)
-    if city not in T1_CITIES:
-        raise ValueError(f"T1 market sweeps are only declared for {T1_CITIES}")
+    if city not in CALIBRATION_CITIES:
+        raise ValueError(
+            f"T1 market sweeps are only declared for {CALIBRATION_CITIES}"
+        )
     if job not in JOBS:
         raise ValueError(f"unknown T1 job: {job}")
     inputs = config["city_inputs"][city]
@@ -233,6 +236,15 @@ def _run_job(
             + (proc.stdout + proc.stderr)[-4000:]
         )
     atomic_json(manifest, identity)
+
+
+def _replace_command_value(
+    command: Sequence[str], flag: str, value: str
+) -> list[str]:
+    result = list(command)
+    index = result.index(flag)
+    result[index + 1] = str(value)
+    return result
 
 
 def _rows_by_rollout(
@@ -540,6 +552,26 @@ def summarize_city(
     }
 
 
+def summarize_calibration_city(
+    config: Mapping[str, Any], output: Path, city: str, *, customers: int
+) -> dict[str, Any]:
+    """Summarize the RevB calibration-only T1.1 extension for Chicago."""
+    calm = _read_raw(output, city, "calm_static")
+    reality = quote_reality_gap(config, city, rows=1000)
+    t11 = _t11(city, calm, customers)
+    fare_gap = abs(float(reality["v17_vs_v15d_relative_gap"]))
+    t11.update(
+        v15d_card_mean_fare=float(reality["v15d_card_mean"]),
+        fare_relative_gap=fare_gap,
+        fare_pass=fare_gap <= 0.03,
+    )
+    return {
+        "T1.1": t11,
+        "T1.6": reality,
+        "required_pass": bool(t11["fulfillment_pass"] and t11["fare_pass"]),
+    }
+
+
 def render_markdown(report: Mapping[str, Any]) -> str:
     lines = [
         "# V17 T1 market checks",
@@ -585,6 +617,11 @@ def main() -> int:
     parser.add_argument("--pool", type=int, default=2000)
     parser.add_argument("--force", action="store_true")
     parser.add_argument(
+        "--chicago-t11",
+        action="store_true",
+        help="Run only RevB's six-opening Chicago calm/static T1.1 extension.",
+    )
+    parser.add_argument(
         "--smoke",
         action="store_true",
         help="Run one opening with 12 customers and a 200-rider pool.",
@@ -598,7 +635,7 @@ def main() -> int:
     customers = 12 if args.smoke else max(1, int(args.customers))
     pool = 200 if args.smoke else max(1, int(args.pool))
     manifest = {
-        "phase": "T1",
+        "phase": "T1.Chicago-T1.1" if args.chicago_t11 else "T1",
         "config": str(args.config.resolve()),
         "config_hash": canonical_hash(config),
         "openings": openings,
@@ -607,6 +644,64 @@ def main() -> int:
         "smoke": bool(args.smoke),
         "jobs": JOBS,
     }
+    if args.chicago_t11:
+        city = "chicago"
+        atomic_json(output / "manifest.json", manifest)
+        _write_status(output, state="running", completed_jobs=0, total_jobs=1)
+        try:
+            command = market_command(
+                config,
+                city=city,
+                job="calm_static",
+                output=output,
+                openings=openings,
+                customers=customers,
+                pool=pool,
+            )
+            # RevB adds only Chicago T1.1.  The fare-rise arm belongs to T1.4
+            # and is intentionally omitted from this calibration-only job.
+            command = _replace_command_value(command, "--policy_sweep", CARD)
+            raw = output / "raw" / city / "calm_static.json"
+            command_manifest = output / "commands" / city / "calm_static.json"
+            _run_job(
+                command,
+                raw,
+                command_manifest,
+                force=bool(args.force),
+                config_hash=manifest["config_hash"],
+            )
+            result = summarize_calibration_city(
+                config, output, city, customers=customers
+            )
+            report = {**manifest, "city": city, **result, "passed": result["required_pass"]}
+            atomic_json(output / "report.json", report)
+            summary = (
+                "# V17 T1 Chicago calibration\n\n"
+                f"Overall required checks: **{'PASS' if report['passed'] else 'FAIL'}**\n\n"
+                f"Fulfillment gap: {result['T1.1']['fulfillment_absolute_gap']:.3f} "
+                f"({'PASS' if result['T1.1']['fulfillment_pass'] else 'FAIL'})\n\n"
+                f"Fare gap: {result['T1.1']['fare_relative_gap']:.1%} "
+                f"({'PASS' if result['T1.1']['fare_pass'] else 'FAIL'})\n"
+            )
+            (output / "report.md").write_text(summary, encoding="utf-8")
+            _write_status(
+                output,
+                state="passed" if report["passed"] else "failed",
+                completed_jobs=1,
+                total_jobs=1,
+                report=str(output / "report.json"),
+            )
+            print(summary)
+            return 0 if report["passed"] else 1
+        except Exception as exc:
+            _write_status(
+                output,
+                state="error",
+                completed_jobs=0,
+                total_jobs=1,
+                error=repr(exc),
+            )
+            raise
     atomic_json(output / "manifest.json", manifest)
     _write_status(output, state="running", completed_jobs=0, total_jobs=8)
     completed = 0

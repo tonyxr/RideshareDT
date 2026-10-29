@@ -219,25 +219,45 @@ def build_independent_coefficient_action_space(
 
 
 # V17 M5: one absolute card cell controls distance and time components only.
+# Keep the V1 names as aliases so existing policies remain byte-for-byte
+# compatible.  RevB prepares the lower 0.7 edge behind an explicit V2
+# contract; production stays on V1 until T2 actually triggers the switch.
 TWO_LEVER_ACTION_SEMANTICS = "two_lever_absolute_card_v1"
+TWO_LEVER_V2_ACTION_SEMANTICS = "two_lever_absolute_card_v2"
 TWO_LEVER_LEVELS: Tuple[float, ...] = (0.8, 0.9, 1.0, 1.2, 1.5)
+TWO_LEVER_V2_LEVELS: Tuple[float, ...] = (0.7, 0.8, 0.9, 1.0, 1.2, 1.5)
+TWO_LEVER_CONTRACT_LEVELS: Dict[str, Tuple[float, ...]] = {
+    "two_lever_v1": TWO_LEVER_LEVELS,
+    "two_lever_v2": TWO_LEVER_V2_LEVELS,
+}
+TWO_LEVER_CONTRACT_SEMANTICS: Dict[str, str] = {
+    "two_lever_v1": TWO_LEVER_ACTION_SEMANTICS,
+    "two_lever_v2": TWO_LEVER_V2_ACTION_SEMANTICS,
+}
 
 
 def build_two_lever_action_space(
     opt_keys: List[str],
-    levels: Sequence[float] = TWO_LEVER_LEVELS,
+    levels: Optional[Sequence[float]] = None,
+    *,
+    action_contract: str = "two_lever_v1",
 ) -> Tuple[Dict[int, Dict[str, int]], Dict[int, Tuple[float, float]], List[str]]:
-    """Return the 25 absolute (distance, time) cells registered for V17."""
+    """Return the registered absolute (distance, time) card cells."""
     required = ("per_mile", "per_minute")
     if not set(required).issubset(opt_keys):
-        raise ValueError("two_lever_v1 requires per_mile and per_minute")
-    resolved = tuple(float(value) for value in levels)
+        raise ValueError(f"{action_contract} requires per_mile and per_minute")
+    if action_contract not in TWO_LEVER_CONTRACT_LEVELS:
+        raise ValueError(f"unknown two-lever action contract: {action_contract}")
+    expected = TWO_LEVER_CONTRACT_LEVELS[action_contract]
+    resolved = tuple(
+        float(value) for value in (expected if levels is None else levels)
+    )
     if (
-        resolved != TWO_LEVER_LEVELS
+        resolved != expected
         or len(set(resolved)) != len(resolved)
         or not all(np.isfinite(value) and value > 0.0 for value in resolved)
     ):
-        raise ValueError(f"two_lever_v1 levels are fixed at {TWO_LEVER_LEVELS}")
+        raise ValueError(f"{action_contract} levels are fixed at {expected}")
     action_to_steps: Dict[int, Dict[str, int]] = {}
     action_to_cell: Dict[int, Tuple[float, float]] = {}
     for distance_multiplier in resolved:
@@ -1999,9 +2019,13 @@ class FirmRLPricer:
         )
         self.hybrid_relative_actions = bool(hybrid_relative_actions)
         self.action_contract = str(action_contract)
-        if self.action_contract not in ("legacy", "two_lever_v1"):
-            raise ValueError("action_contract must be legacy or two_lever_v1")
-        self.two_lever_actions = self.action_contract == "two_lever_v1"
+        if self.action_contract not in (
+            "legacy", "two_lever_v1", "two_lever_v2"
+        ):
+            raise ValueError(
+                "action_contract must be legacy, two_lever_v1, or two_lever_v2"
+            )
+        self.two_lever_actions = self.action_contract in TWO_LEVER_CONTRACT_LEVELS
         # Revision 15: hold or a relative step of the tariff level L on a fixed
         # structure S; every coefficient is posted as anchor * S * L.
         self.level_step_actions = bool(level_step_actions)
@@ -2065,14 +2089,27 @@ class FirmRLPricer:
         
         if self.two_lever_actions:
             if tariff_targets:
-                raise ValueError("two_lever_v1 does not use tariff_targets")
+                raise ValueError(
+                    f"{self.action_contract} does not use tariff_targets"
+                )
             if tariff_structure is not None or tariff_level_bounds is not None:
-                raise ValueError("two_lever_v1 does not use a tariff structure")
+                raise ValueError(
+                    f"{self.action_contract} does not use a tariff structure"
+                )
+            self.two_lever_levels = TWO_LEVER_CONTRACT_LEVELS[
+                self.action_contract
+            ]
+            self.two_lever_action_semantics = TWO_LEVER_CONTRACT_SEMANTICS[
+                self.action_contract
+            ]
             (
                 self.action_to_steps,
                 self.action_to_two_lever_cell,
                 self.action_keys,
-            ) = build_two_lever_action_space(self.opt_keys)
+            ) = build_two_lever_action_space(
+                self.opt_keys,
+                action_contract=self.action_contract,
+            )
             self.action_to_multiplier = {}
             self.action_to_target_key = {}
             self.action_to_level_step = {}

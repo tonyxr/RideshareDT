@@ -98,7 +98,10 @@ city_inputs:
     demand_calibration: artifacts/v17_relative_demand_post_fare_20261028/boston/demand_1.15.json
   chicago:
     market_name: Chicago
-    fleet_scale: 1.0
+    # RevB F8 N-only refit: the two-opening probe admitted 1.05 and 1.10,
+    # but 1.05 missed the six-opening band by 0.49 point.  Use the next
+    # predeclared passing candidate; eta_v3 remains fixed at 0.6.
+    fleet_scale: 1.1
     calibration_json: calibration_artifacts/v17/chicago/calibration.json
     threshold_cache: ../artifacts/v26_confirmatory/thresholds/chicago/llm_numeric_primary.jsonl
     demand_calibration: artifacts/v17_relative_demand_post_fare_20261028/chicago/demand_1.15.json

@@ -74,3 +74,27 @@ def test_config_rejects_invalid_city_fleet_scale():
     config["city_inputs"]["nyc"]["fleet_scale"] = 0.0
     with pytest.raises(ValueError, match="fleet_scale"):
         v17_config.validate_config(config)
+
+
+def test_t0_14_config_switch_accepts_only_the_registered_six_level_grid(tmp_path):
+    config = _config()
+    config["action"] = {
+        "contract": "two_lever_v2",
+        "distance_levels": [0.7, 0.8, 0.9, 1.0, 1.2, 1.5],
+        "time_levels": [0.7, 0.8, 0.9, 1.0, 1.2, 1.5],
+        "base_and_booking_fixed": True,
+    }
+    v17_config.validate_config(config)
+    command = v17_config.core_args(
+        config,
+        city="nyc",
+        seed=101,
+        output=tmp_path,
+        days=200,
+        branch_horizon_days=7,
+    )
+    assert command[command.index("--action_contract") + 1] == "two_lever_v2"
+
+    config["action"]["distance_levels"][0] = 0.6
+    with pytest.raises(ValueError, match="action grid"):
+        v17_config.validate_config(config)

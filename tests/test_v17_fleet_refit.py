@@ -1,6 +1,6 @@
 import pytest
 
-from scripts.refit_v17_fleet import _replace_flag, select_candidate
+from scripts.refit_v17_fleet import CALIBRATION_CITIES, _replace_flag, select_candidate
 
 
 def test_replace_flag_changes_only_requested_value():
@@ -17,3 +17,7 @@ def test_select_candidate_prefers_closest_passing_scale():
         {"fleet_scale": 1.3, "absolute_gap": 0.003, "within_two_points": False},
     ]
     assert select_candidate(candidates)["fleet_scale"] == pytest.approx(1.2)
+
+
+def test_revb_fleet_refit_includes_chicago():
+    assert "chicago" in CALIBRATION_CITIES
