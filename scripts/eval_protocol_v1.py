@@ -60,6 +60,7 @@ POLICY_CLASSES = (
     "frozen_seed_303",
     "published_card",
     "validation_best_fixed_cell",
+    "validation_own_profit_best_fixed_cell",
     "validation_tuned_surge_rule",
     "validation_regime_switch_table",
 )
@@ -91,15 +92,28 @@ def protocol() -> dict[str, Any]:
         },
         "step_A": {
             "role": "comparator_selection_validation_only",
+            "selection_objective": OBJECTIVE_NAME,
+            "selectors": [
+                "best_fixed_cell",
+                "tuned_surge_rule",
+                "regime_switch_table",
+            ],
+            "reference_comparator": "own_profit_best_fixed_cell",
+            "report_columns": [
+                "final_objective",
+                "own_profit",
+                "competitor_profit",
+                "profit_lead",
+            ],
             "cities_full": ["boston", "chicago"],
             "nyc_reuses_T2_cells": True,
             "nyc_runs_rule_only": True,
             "cases": ["C0_calm", "A1_shortage_severe"],
             "competitors": 6,
             "openings": 3,
-            "fixed_cells": 25,
+            "fixed_cells": 36,
             "reactive_rule_candidates": 24,
-            "fixed_rollouts_per_full_city": 900,
+            "fixed_rollouts_per_full_city": 1296,
             "rule_rollouts_per_city": 864,
         },
         "step_B": {
@@ -111,7 +125,7 @@ def protocol() -> dict[str, Any]:
             "competitors": list(COMPETITORS),
             "openings_per_case_competitor": 5,
             "policies": list(POLICY_CLASSES),
-            "rollouts_per_city": 3000,
+            "rollouts_per_city": 3300,
             "paired_by_opening": True,
             "holm_across_cases": True,
             "headline_pools_training_seeds": True,
@@ -141,6 +155,18 @@ def protocol() -> dict[str, Any]:
                 "supply_elasticity_vs_nyc_tlc_2019_2024",
                 "held_out_kaggle_fare_reality_gap_by_city",
             ],
+        },
+        "results_contract": {
+            "rank_by": OBJECTIVE_NAME,
+            "always_report": [
+                "final_objective",
+                "own_profit",
+                "competitor_profit",
+                "profit_lead",
+            ],
+            "cost_of_competing_for_lead": (
+                "rl_own_profit_minus_own_profit_best_fixed_cell"
+            ),
         },
     }
 
@@ -182,7 +208,21 @@ def validate(value: dict[str, Any] | None = None) -> None:
         != ["own_profit", "competitor_profit"]
     ):
         raise ValueError("final policy-ranking objective drifted")
-    if a["fixed_cells"] * a["competitors"] * len(a["cases"]) * a["openings"] != 900:
+    if (
+        a["selection_objective"] != OBJECTIVE_NAME
+        or a["selectors"]
+        != ["best_fixed_cell", "tuned_surge_rule", "regime_switch_table"]
+        or a["reference_comparator"] != "own_profit_best_fixed_cell"
+        or spec["results_contract"]["rank_by"] != OBJECTIVE_NAME
+        or spec["results_contract"]["always_report"]
+        != ["final_objective", "own_profit", "competitor_profit", "profit_lead"]
+    ):
+        raise ValueError("F3 selector or results contract drifted")
+    if (
+        a["fixed_cells"] * a["competitors"] * len(a["cases"]) * a["openings"]
+        != a["fixed_rollouts_per_full_city"]
+        or a["fixed_rollouts_per_full_city"] != 1296
+    ):
         raise ValueError("Step A fixed-cell rollout count drifted")
     if a["reactive_rule_candidates"] * a["competitors"] * len(a["cases"]) * a["openings"] != 864:
         raise ValueError("Step A rule rollout count drifted")
@@ -192,7 +232,7 @@ def validate(value: dict[str, Any] | None = None) -> None:
         * b["openings_per_case_competitor"]
         * len(b["policies"])
     )
-    if expected_b != b["rollouts_per_city"] or expected_b != 3000:
+    if expected_b != b["rollouts_per_city"] or expected_b != 3300:
         raise ValueError("Step B rollout count drifted")
     expected_c = (
         sum(c["seeds_by_city"].values())

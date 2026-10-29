@@ -1061,11 +1061,9 @@ class Core:
         self.level_step_actions = bool(level_step_actions)
         self.hybrid_relative_actions = bool(hybrid_relative_actions)
         self.action_contract = str(action_contract)
-        if self.action_contract not in (
-            "legacy", "two_lever_v1", "two_lever_v2"
-        ):
+        if self.action_contract not in ("legacy", *TWO_LEVER_CONTRACT_LEVELS):
             raise ValueError(
-                "action_contract must be legacy, two_lever_v1, or two_lever_v2"
+                "action_contract must be legacy or a registered two-lever contract"
             )
         self.rivals_two_lever = bool(rivals_two_lever)
         self.v16_crn_tape = bool(v16_crn_tape)
@@ -1076,8 +1074,8 @@ class Core:
         if self.v16_branch_mode == "one_day_deviation":
             if self.action_contract not in TWO_LEVER_CONTRACT_LEVELS:
                 raise ValueError(
-                    "one_day_deviation requires action_contract="
-                    "'two_lever_v1' or 'two_lever_v2'"
+                    "one_day_deviation requires action_contract to be a "
+                    "registered two-lever contract"
                 )
             if not self.v16_crn_tape:
                 raise ValueError(
@@ -19256,12 +19254,12 @@ def main():
     )
     v17.add_argument(
         "--action_contract",
-        choices=("legacy", "two_lever_v1", "two_lever_v2"),
+        choices=("legacy", *TWO_LEVER_CONTRACT_LEVELS),
         default="legacy",
         help=(
-            "V17 M5 absolute distance/time card: V1 has 25 cells over "
-            "{0.8,0.9,1.0,1.2,1.5}; RevB V2 adds the 0.7 level behind "
-            "an explicit switch; legacy preserves 15d."
+            "V17 M5 absolute distance/time card: V1 has 25 cells, RevB V2 "
+            "adds the 0.7 lower edge, and V3 uses the six-level empirical "
+            "surge range {0.8,1.0,1.25,1.5,2.0,2.5}; legacy preserves 15d."
         ),
     )
     v17.add_argument(

@@ -2,9 +2,10 @@
 """Run the RevB V17 T2 adaptation-value sweep on production market wiring.
 
 The sweep is content-addressed and resumable at the case/competitor boundary.
-Each worker evaluates every fixed distance/time cell on three common-random-
-number validation openings.  Analysis uses the registered final objective,
-while retaining both component profits and completed shares in every table.
+Each worker evaluates every fixed distance/time cell on common-random-number
+validation openings. Analysis uses the registered final objective, retains
+both component profits and completed shares, reports opening-level standard
+errors, and evaluates each regime table on an opening excluded from its fit.
 """
 
 from __future__ import annotations
@@ -37,15 +38,18 @@ from scripts.v17_config import (  # noqa: E402
     resolve_input,
     validate_config,
 )
-from v17_objective import final_objective, profit_report  # noqa: E402
+from v17_objective import OBJECTIVE_NAME, profit_report  # noqa: E402
 
 
 PYTHON = ROOT / ".venv/bin/python"
 STEPS_PER_DAY = 6
 HORIZON_DAYS = 40
 ONSET_DAY = 10
-OPENINGS = 3
+OPENINGS = 5
 VALIDATION_SEED = 20_231
+PRIOR_T2_ROLLOUTS = 1350
+PRIOR_T2_WORKERS = 4
+PRIOR_T2_WALL_HOURS = 6.0
 RIVALS = (
     "adaptive_best_response_memory",
     "profit_opt_pi_price_gap",
@@ -118,6 +122,17 @@ def fixed_specs(config: Mapping[str, Any]) -> tuple[str, ...]:
 
 def expected_rollouts(config: Mapping[str, Any], openings: int = OPENINGS) -> int:
     return len(fixed_specs(config)) * len(CASES) * len(RIVALS) * int(openings)
+
+
+def estimated_wall_hours(
+    config: Mapping[str, Any], *, openings: int, workers: int
+) -> float:
+    """Scale the completed V1 T2 wall time by rollouts and worker count."""
+    return (
+        PRIOR_T2_WALL_HOURS
+        * expected_rollouts(config, openings) / PRIOR_T2_ROLLOUTS
+        * PRIOR_T2_WORKERS / max(1, int(workers))
+    )
 
 
 def sweep_command(
@@ -253,34 +268,95 @@ def run_job(
     return "completed"
 
 
+def _sample_se(values: Sequence[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    average = mean(values)
+    variance = sum((value - average) ** 2 for value in values) / (len(values) - 1)
+    return math.sqrt(variance / len(values))
+
+
+def _metric_row(row: Mapping[str, Any]) -> dict[str, float]:
+    own = float(row["own_profit"])
+    competitor = float(row.get("competitor_profit", row.get("rival_profit")))
+    value = profit_report(own, competitor)
+    value.update(
+        profit_lead=own - competitor,
+        own_completed_share=float(
+            row["own_completed_share"]
+            if "own_completed_share" in row else row["own_share"]
+        ),
+        competitor_completed_share=float(
+            row["competitor_completed_share"]
+            if "competitor_completed_share" in row else row["rival_share"]
+        ),
+    )
+    return value
+
+
+METRIC_KEYS = (
+    "final_objective",
+    "own_profit",
+    "competitor_profit",
+    "profit_lead",
+    "own_completed_share",
+    "competitor_completed_share",
+)
+
+
 def _metric_mean(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
-    values = list(rows)
+    values = [_metric_row(row) for row in rows]
     if not values:
         raise ValueError("cannot summarize an empty T2 metric set")
-    own = mean(float(row["own_profit"]) for row in values)
-    competitor = mean(float(row["rival_profit"]) for row in values)
-    result = profit_report(own, competitor)
-    result.update(
-        profit_lead=own - competitor,
-        own_completed_share=mean(float(row["own_share"]) for row in values),
-        competitor_completed_share=mean(
-            float(row["rival_share"]) for row in values
-        ),
-        n=len(values),
-    )
+    result: dict[str, float] = {}
+    for key in METRIC_KEYS:
+        sample = [float(row[key]) for row in values]
+        result[key] = mean(sample)
+        result[f"{key}_se"] = _sample_se(sample)
+    result["n_openings"] = len(values)
+    return result
+
+
+def _trace_opening_metrics(
+    rows: Iterable[Mapping[str, Any]],
+) -> dict[str, dict[str, float]]:
+    grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row["rollout"])].append(row)
+    result = {}
+    for opening, opening_rows in grouped.items():
+        result[opening] = _metric_mean(
+            {
+                "own_profit": row["profit_per_request"],
+                "rival_profit": row["rival_profit_per_request"],
+                "own_share": row["own_share"],
+                "rival_share": row["rival_share"],
+            }
+            for row in opening_rows
+        )
     return result
 
 
 def _trace_metric_mean(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
-    return _metric_mean(
-        {
-            "own_profit": row["profit_per_request"],
-            "rival_profit": row["rival_profit_per_request"],
-            "own_share": row["own_share"],
-            "rival_share": row["rival_share"],
-        }
-        for row in rows
-    )
+    return _metric_mean(_trace_opening_metrics(rows).values())
+
+
+def _paired_difference(
+    first: Mapping[str, Mapping[str, Any]],
+    second: Mapping[str, Mapping[str, Any]],
+) -> dict[str, float]:
+    openings = sorted(set(first) & set(second))
+    if not openings:
+        raise ValueError("paired T2 comparison has no common openings")
+    result: dict[str, float] = {"n_openings": len(openings)}
+    for key in METRIC_KEYS:
+        differences = [
+            float(first[opening][key]) - float(second[opening][key])
+            for opening in openings
+        ]
+        result[key] = mean(differences)
+        result[f"{key}_se"] = _sample_se(differences)
+    return result
 
 
 def _best_spec(
@@ -310,6 +386,12 @@ def _labeled_cell(spec: str, metrics: Mapping[str, Any]) -> dict[str, Any]:
 def analyze_job(raw: Mapping[str, Any]) -> dict[str, Any]:
     results = dict(raw["results"])
     traces = dict(raw["traces"])
+    opening_sets = {tuple(sorted(dict(rows))) for rows in results.values()}
+    if len(opening_sets) != 1:
+        raise ValueError("T2 fixed cells do not share the same openings")
+    opening_names = list(next(iter(opening_sets)))
+    if len(opening_names) < 2:
+        raise ValueError("leave-one-opening-out analysis requires at least two openings")
     overall = {
         spec: _metric_mean(dict(openings).values())
         for spec, openings in results.items()
@@ -317,54 +399,94 @@ def analyze_job(raw: Mapping[str, Any]) -> dict[str, Any]:
     best_final_spec = _best_spec(overall, "final")
     best_own_spec = _best_spec(overall, "own")
 
-    regime_rows: dict[str, dict[str, list[Mapping[str, Any]]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
+    regime_rows: dict[
+        str, dict[str, dict[str, list[Mapping[str, Any]]]]
+    ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for spec, rows in traces.items():
         for row in rows:
-            regime_rows[str(row["regime"])][spec].append(row)
+            regime_rows[str(row["regime"])][spec][str(row["rollout"])].append(row)
 
     tables: dict[str, dict[str, dict[str, Any]]] = {
         "final": {},
         "own_profit": {},
     }
     selected_specs: dict[str, dict[str, str]] = {"final": {}, "own_profit": {}}
+    loo_specs: dict[str, dict[str, dict[str, str]]] = {
+        "final": defaultdict(dict),
+        "own_profit": defaultdict(dict),
+    }
     for regime, by_spec in sorted(regime_rows.items()):
         summaries = {
-            spec: _trace_metric_mean(rows) for spec, rows in by_spec.items()
+            spec: _trace_metric_mean(
+                row for opening_rows in rows.values() for row in opening_rows
+            )
+            for spec, rows in by_spec.items()
         }
         for objective in ("final", "own_profit"):
             chosen = _best_spec(
                 summaries, "final" if objective == "final" else "own"
             )
             selected_specs[objective][regime] = chosen
-            tables[objective][regime] = _labeled_cell(
-                chosen, summaries[chosen]
-            )
+            table = _labeled_cell(chosen, summaries[chosen])
+            table["selection_method"] = "all_openings_for_later_evaluation"
+            table["leave_one_opening_out"] = []
+            for held_out in opening_names:
+                fit_summaries = {}
+                for spec, rows_by_opening in by_spec.items():
+                    fit_rows = [
+                        row
+                        for opening, rows in rows_by_opening.items()
+                        if opening != held_out
+                        for row in rows
+                    ]
+                    if fit_rows:
+                        fit_summaries[spec] = _trace_metric_mean(fit_rows)
+                loo_chosen = _best_spec(
+                    fit_summaries, "final" if objective == "final" else "own"
+                )
+                loo_specs[objective][regime][held_out] = loo_chosen
+                held_out_rows = by_spec[loo_chosen].get(held_out, [])
+                if not held_out_rows:
+                    continue
+                table["leave_one_opening_out"].append({
+                    "held_out_opening": held_out,
+                    **_labeled_cell(
+                        loo_chosen,
+                        _trace_metric_mean(held_out_rows),
+                    ),
+                })
+            tables[objective][regime] = table
 
     adaptation: dict[str, Any] = {}
     for objective in ("final", "own_profit"):
-        switched_rows = []
-        for regime, chosen in selected_specs[objective].items():
-            switched_rows.extend(regime_rows[regime][chosen])
-        switch_metrics = _trace_metric_mean(switched_rows)
+        switch_by_opening = {}
+        for opening in opening_names:
+            switched_rows = []
+            for regime in selected_specs[objective]:
+                chosen = loo_specs[objective][regime][opening]
+                switched_rows.extend(regime_rows[regime][chosen].get(opening, []))
+            switch_by_opening[opening] = _trace_metric_mean(switched_rows)
+        switch_metrics = _metric_mean(switch_by_opening.values())
         fixed_spec = best_final_spec if objective == "final" else best_own_spec
-        fixed_metrics = _trace_metric_mean(traces[fixed_spec])
+        fixed_by_opening = _trace_opening_metrics(traces[fixed_spec])
+        fixed_metrics = _metric_mean(fixed_by_opening.values())
         adaptation[objective] = {
+            "selection_method": "leave_one_opening_out",
             "switch": switch_metrics,
             "fixed": _labeled_cell(fixed_spec, fixed_metrics),
-            "switch_minus_fixed": {
-                key: float(switch_metrics[key]) - float(fixed_metrics[key])
-                for key in (
-                    "final_objective",
-                    "own_profit",
-                    "competitor_profit",
-                    "profit_lead",
-                    "own_completed_share",
-                    "competitor_completed_share",
-                )
-            },
+            "switch_minus_fixed": _paired_difference(
+                switch_by_opening, fixed_by_opening
+            ),
         }
+
+    best_final_by_opening = {
+        opening: _metric_row(row)
+        for opening, row in dict(results[best_final_spec]).items()
+    }
+    best_own_by_opening = {
+        opening: _metric_row(row)
+        for opening, row in dict(results[best_own_spec]).items()
+    }
 
     return {
         "best_fixed": {
@@ -373,35 +495,59 @@ def analyze_job(raw: Mapping[str, Any]) -> dict[str, Any]:
         },
         "regime_table": tables,
         "adaptation_value": adaptation,
+        "cost_of_competing_for_lead": {
+            "definition": "final-objective-best fixed minus own-profit-best fixed",
+            **_paired_difference(best_final_by_opening, best_own_by_opening),
+        },
     }
 
 
 def analyze(config: Mapping[str, Any], output: Path, openings: int) -> dict[str, Any]:
     jobs: dict[str, Any] = {}
-    calm_edge = []
     levels = ACTION_LEVELS[str(config["action"]["contract"])]
     lower_edge = float(levels[0])
+    upper_edge = float(levels[-1])
+    edges: dict[str, dict[str, Any]] = {}
     for case in CASES:
         jobs[case] = {}
+        edges[case] = {
+            "lower_distance": [], "lower_time": [],
+            "upper_distance": [], "upper_time": [],
+            "lower_any": [], "upper_any": [],
+        }
         for rival in RIVALS:
             raw, _, _ = _job_paths(output, case, rival)
             report = analyze_job(json.loads(raw.read_text(encoding="utf-8")))
             jobs[case][rival] = report
-            if case == "C0_calm":
-                chosen = report["best_fixed"]["final"]
-                calm_edge.append(
-                    math.isclose(
-                        float(chosen["distance_level"]), lower_edge, abs_tol=1e-12
-                    )
-                    or math.isclose(
-                        float(chosen["time_level"]), lower_edge, abs_tol=1e-12
-                    )
-                )
-    edge_count = sum(calm_edge)
-    trigger = (
-        str(config["action"]["contract"]) == "two_lever_v1"
-        and edge_count > len(RIVALS) / 2.0
-    )
+            chosen = report["best_fixed"]["final"]
+            distance = float(chosen["distance_level"])
+            time = float(chosen["time_level"])
+            lower_distance = math.isclose(distance, lower_edge, abs_tol=1e-12)
+            lower_time = math.isclose(time, lower_edge, abs_tol=1e-12)
+            upper_distance = math.isclose(distance, upper_edge, abs_tol=1e-12)
+            upper_time = math.isclose(time, upper_edge, abs_tol=1e-12)
+            for key, hit in (
+                ("lower_distance", lower_distance), ("lower_time", lower_time),
+                ("upper_distance", upper_distance), ("upper_time", upper_time),
+                ("lower_any", lower_distance or lower_time),
+                ("upper_any", upper_distance or upper_time),
+            ):
+                if hit:
+                    edges[case][key].append(rival)
+    majority_hits = [
+        {"case": case, "edge": edge, "count": len(summary[edge])}
+        for case, summary in edges.items()
+        for edge in ("lower_any", "upper_any")
+        if len(summary[edge]) > len(RIVALS) / 2.0
+    ]
+    edge_checks = {
+        "lower_level": lower_edge,
+        "upper_level": upper_edge,
+        "competitors_total": len(RIVALS),
+        "by_case": edges,
+        "majority_hits": majority_hits,
+        "requires_grid_review": bool(majority_hits),
+    }
     return {
         "phase": "T2",
         "omega": 0.5,
@@ -414,14 +560,16 @@ def analyze(config: Mapping[str, Any], output: Path, openings: int) -> dict[str,
         "action_contract": str(config["action"]["contract"]),
         "levels": list(levels),
         "rollouts": expected_rollouts(config, openings),
-        "ranking_objective": "own_profit_minus_0.75_competitor_profit",
+        "ranking_objective": OBJECTIVE_NAME,
         "jobs": jobs,
+        "edge_checks": edge_checks,
         "lower_edge_check": {
             "level": lower_edge,
-            "competitors_on_edge": edge_count,
-            "competitors_total": len(RIVALS),
-            "most_competitors": edge_count > len(RIVALS) / 2.0,
-            "switch_to_v2_and_rerun": trigger,
+            "by_case": {case: data["lower_any"] for case, data in edges.items()},
+        },
+        "upper_edge_check": {
+            "level": upper_edge,
+            "by_case": {case: data["upper_any"] for case, data in edges.items()},
         },
     }
 
@@ -433,28 +581,43 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         f"Action contract: `{report['action_contract']}`",
         f"Rollouts: {report['rollouts']}",
         "",
-        "| Case | Competitor | Final-best cell | Own profit | Competitor profit | Final objective | Adaptation value |",
-        "|---|---|---:|---:|---:|---:|---:|",
+        "Regime tables are fitted leave-one-opening-out; every uncertainty below is an opening-level standard error.",
+        "",
+        "| Case | Competitor | Final-best cell | Own profit | Competitor profit | Final objective | Own-profit-best cell | Cost of competition | Adaptation value |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for case, rivals in report["jobs"].items():
         for rival, result in rivals.items():
             best = result["best_fixed"]["final"]
             adaptation = result["adaptation_value"]["final"][
                 "switch_minus_fixed"
-            ]["final_objective"]
+            ]
+            own_best = result["best_fixed"]["own_profit"]
+            cost = result["cost_of_competing_for_lead"]
             lines.append(
                 f"| {case} | {rival} | "
-                f"({best['distance_level']:.1f}, {best['time_level']:.1f}) | "
-                f"{best['own_profit']:.4f} | {best['competitor_profit']:.4f} | "
-                f"{best['final_objective']:.4f} | {adaptation:.4f} |"
+                f"({best['distance_level']:g}, {best['time_level']:g}) | "
+                f"{best['own_profit']:.4f} +/- {best['own_profit_se']:.4f} | "
+                f"{best['competitor_profit']:.4f} +/- {best['competitor_profit_se']:.4f} | "
+                f"{best['final_objective']:.4f} +/- {best['final_objective_se']:.4f} | "
+                f"({own_best['distance_level']:g}, {own_best['time_level']:g}) | "
+                f"{cost['own_profit']:.4f} +/- {cost['own_profit_se']:.4f} | "
+                f"{adaptation['final_objective']:.4f} +/- {adaptation['final_objective_se']:.4f} |"
             )
-    edge = report["lower_edge_check"]
-    lines.extend([
+    edge = report["edge_checks"]
+    lines.extend(("", "## Two-sided grid-edge check", ""))
+    for case, summary in edge["by_case"].items():
+        lines.append(
+            f"- {case}: lower {len(summary['lower_any'])}/{edge['competitors_total']} "
+            f"({', '.join(summary['lower_any']) or 'none'}); upper "
+            f"{len(summary['upper_any'])}/{edge['competitors_total']} "
+            f"({', '.join(summary['upper_any']) or 'none'})."
+        )
+    lines.extend((
         "",
-        f"Lower-edge count: {edge['competitors_on_edge']}/{edge['competitors_total']}.",
-        f"V2 rerun required: **{'YES' if edge['switch_to_v2_and_rerun'] else 'NO'}**.",
+        f"Grid review required: **{'YES' if edge['requires_grid_review'] else 'NO'}**.",
         "",
-    ])
+    ))
     return "\n".join(lines)
 
 
@@ -470,7 +633,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--output", type=Path, default=BASE / "runs/v17_t2")
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--openings", type=int, default=OPENINGS)
     parser.add_argument("--customers", type=int, default=100)
     parser.add_argument("--pool", type=int, default=2000)
@@ -505,6 +668,14 @@ def main() -> int:
         "rollouts": expected_rollouts(config, args.openings),
         "action_contract": config["action"]["contract"],
         "config_hash": config_hash,
+        "estimated_wall_hours": estimated_wall_hours(
+            config, openings=args.openings, workers=args.workers
+        ),
+        "runtime_basis": {
+            "prior_rollouts": PRIOR_T2_ROLLOUTS,
+            "prior_workers": PRIOR_T2_WORKERS,
+            "prior_wall_hours": PRIOR_T2_WALL_HOURS,
+        },
     }
     if args.plan_only:
         print(json.dumps(plan, indent=2))
@@ -571,20 +742,21 @@ def main() -> int:
         (output / "report.md").write_text(
             render_markdown(report), encoding="utf-8"
         )
-        rerun = bool(report["lower_edge_check"]["switch_to_v2_and_rerun"])
+        review = bool(report["edge_checks"]["requires_grid_review"])
         atomic_json(
             status_path,
             {
                 **plan,
-                "state": "requires_v2_rerun" if rerun else "passed",
-                "pass": not rerun,
+                "state": "requires_grid_review" if review else "passed",
+                "pass": not review,
                 "pid": os.getpid(),
                 "completed_jobs": completed,
                 "report": str(output / "report.json"),
                 "lower_edge_check": report["lower_edge_check"],
+                "upper_edge_check": report["upper_edge_check"],
             },
         )
-        return 2 if rerun else 0
+        return 2 if review else 0
     except BaseException as exc:
         atomic_json(
             status_path,

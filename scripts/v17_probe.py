@@ -31,20 +31,23 @@ from scripts.v17_config import (  # noqa: E402
     resolve_input,
     validate_config,
 )
+from v17_objective import OBJECTIVE_NAME, profit_report  # noqa: E402
 
 
 PYTHON = BASE.parent / ".venv/bin/python"
 CORE = BASE / "Core.py"
 DEFAULT_OUTPUT = BASE / "runs/v17_t3"
+SHORT_OUTPUT = BASE / "runs/v17_t3_short"
 T2_REPORT = BASE / "runs/v17_t2/report.json"
 HORIZONS = (5, 7)
 TRAINING_DAYS = 200
 CHECKPOINT_DAYS = (100, 150, 200)
+SHORT_TRAINING_DAYS = 60
+SHORT_CHECKPOINT_DAYS = (30, 45, 60)
 VALIDATION_DAYS = 28
 VALIDATION_OPENINGS = 3
 VALIDATION_SEED = 55101
 STEPS_PER_DAY = 6
-FINAL_WEIGHT = 0.75
 DRIVER_SLOT = 24
 VALIDATION_RIVALS = (
     "adaptive_best_response_memory",
@@ -90,7 +93,9 @@ def _report_prefix(path: Path) -> str:
 
 
 def training_command(
-    config: Mapping[str, Any], *, horizon: int, output: Path
+    config: Mapping[str, Any], *, horizon: int, output: Path,
+    training_days: int = TRAINING_DAYS,
+    checkpoint_days: Sequence[int] = CHECKPOINT_DAYS,
 ) -> list[str]:
     run_dir = output / f"h{horizon}"
     command = [
@@ -102,7 +107,7 @@ def training_command(
             city="nyc",
             seed=101,
             output=run_dir / "training",
-            days=TRAINING_DAYS,
+            days=training_days,
             branch_horizon_days=horizon,
         ),
     ]
@@ -118,7 +123,7 @@ def training_command(
             "--v17_probe_second_tape_fraction",
             "0.25",
             "--v17_probe_checkpoint_days",
-            "100,150,200",
+            ",".join(str(day) for day in checkpoint_days),
             "--v17_probe_checkpoint_dir",
             str((run_dir / "checkpoints").resolve()),
             "--checkpoint_validation_interval_days",
@@ -252,10 +257,13 @@ def _run_cached_job(
     return "completed"
 
 
-def _require_training_products(output: Path, horizon: int) -> None:
+def _require_training_products(
+    output: Path, horizon: int,
+    checkpoint_days: Sequence[int] = CHECKPOINT_DAYS,
+) -> None:
     required = [
         output / f"h{horizon}/checkpoints/day_{day}.pt"
-        for day in CHECKPOINT_DAYS
+        for day in checkpoint_days
     ]
     required.append(
         output / f"h{horizon}/training/nyc_training_diagnostics.csv"
@@ -427,7 +435,9 @@ def analyze_learning(path: Path, levels: Sequence[float]) -> dict[str, Any]:
     }
 
 
-def analyze_timing(csv_path: Path) -> dict[str, Any]:
+def analyze_timing(
+    csv_path: Path, expected_days: int = TRAINING_DAYS
+) -> dict[str, Any]:
     with csv_path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     stage_seconds: dict[str, list[float]] = {}
@@ -457,14 +467,17 @@ def analyze_timing(csv_path: Path) -> dict[str, Any]:
         ),
         "max_rss_mb": float(max(rss)) if rss else math.inf,
         "training_days": len(rows),
-        "no_nan": bool(finite and len(rows) == TRAINING_DAYS),
+        "no_nan": bool(finite and len(rows) == expected_days),
     }
 
 
-def analyze_validation(output: Path, horizon: int) -> dict[str, Any]:
+def analyze_validation(
+    output: Path, horizon: int,
+    checkpoint_days: Sequence[int] = CHECKPOINT_DAYS,
+) -> dict[str, Any]:
     scores: dict[int, dict[str, float]] = {}
     rollout_values: dict[int, dict[str, float]] = {}
-    for day in CHECKPOINT_DAYS:
+    for day in checkpoint_days:
         values: dict[str, float] = {}
         own: list[float] = []
         rival: list[float] = []
@@ -477,21 +490,21 @@ def analyze_validation(output: Path, horizon: int) -> dict[str, Any]:
                 key = f"{case}/{rollout}"
                 own_profit = float(row["own_profit"])
                 rival_profit = float(row["rival_profit"])
-                values[key] = own_profit - FINAL_WEIGHT * rival_profit
+                values[key] = profit_report(
+                    own_profit, rival_profit
+                )["final_objective"]
                 own.append(own_profit)
                 rival.append(rival_profit)
         array = np.asarray(list(values.values()), dtype=float)
         scores[day] = {
-            "final_objective": float(np.mean(array)),
-            "own_profit": float(np.mean(own)),
-            "competitor_profit": float(np.mean(rival)),
+            **profit_report(float(np.mean(own)), float(np.mean(rival))),
             "se": float(np.std(array, ddof=1) / np.sqrt(array.size)),
             "rollouts": int(array.size),
         }
         rollout_values[day] = values
     comparisons = []
     passed = True
-    for earlier, later in zip(CHECKPOINT_DAYS, CHECKPOINT_DAYS[1:]):
+    for earlier, later in zip(checkpoint_days, checkpoint_days[1:]):
         keys = sorted(rollout_values[earlier])
         differences = np.asarray([
             rollout_values[later][key] - rollout_values[earlier][key]
@@ -545,7 +558,13 @@ def _production_days(minutes_per_day: float) -> dict[str, Any]:
 
 
 def _render_report(report: Mapping[str, Any]) -> str:
-    lines = ["# V17 T3 learner probe", ""]
+    title = "# V17 T3 short learner probe" if report.get("short_probe") else "# V17 T3 learner probe"
+    lines = [title, ""]
+    if report.get("short_probe"):
+        lines.extend((
+            "This diagnostic run is not eligible to freeze the production configuration.",
+            "",
+        ))
     lines.append(f"Selected horizon: H={report['selected_horizon']} days")
     lines.append(f"Overall: {'PASS' if report['pass'] else 'FAIL'}")
     lines.append("")
@@ -570,14 +589,20 @@ def _render_report(report: Mapping[str, Any]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument(
+        "--short", action="store_true",
+        help="Run a 60-day diagnostic T3 with checkpoints at days 30, 45, and 60.",
+    )
     args = parser.parse_args()
     config = load_config(args.config)
     validate_config(config)
-    output = args.output.resolve()
+    training_days = SHORT_TRAINING_DAYS if args.short else TRAINING_DAYS
+    checkpoint_days = SHORT_CHECKPOINT_DAYS if args.short else CHECKPOINT_DAYS
+    output = (args.output or (SHORT_OUTPUT if args.short else DEFAULT_OUTPUT)).resolve()
     config_hash = canonical_hash(config)
     sources = {
         str(path.relative_to(BASE)): _sha256(path)
@@ -587,12 +612,16 @@ def main() -> int:
         )
     }
     plan = {
-        "phase": "T3", "state": "planned", "pass": False,
-        "horizons": list(HORIZONS), "training_days": TRAINING_DAYS,
-        "checkpoint_days": list(CHECKPOINT_DAYS),
+        "phase": "T3-short" if args.short else "T3",
+        "state": "planned", "pass": False,
+        "short_probe": bool(args.short),
+        "eligible_to_freeze_config": not args.short,
+        "ranking_objective": OBJECTIVE_NAME,
+        "horizons": list(HORIZONS), "training_days": training_days,
+        "checkpoint_days": list(checkpoint_days),
         "validation_cases": list(CASES),
         "validation_rivals": list(VALIDATION_RIVALS),
-        "validation_rollouts": len(HORIZONS) * len(CHECKPOINT_DAYS) * len(CASES) * len(VALIDATION_RIVALS) * VALIDATION_OPENINGS,
+        "validation_rollouts": len(HORIZONS) * len(checkpoint_days) * len(CASES) * len(VALIDATION_RIVALS) * VALIDATION_OPENINGS,
         "config_hash": config_hash,
     }
     if args.plan_only:
@@ -603,8 +632,12 @@ def main() -> int:
     try:
         training_jobs = []
         for horizon in HORIZONS:
-            command = training_command(config, horizon=horizon, output=output)
-            product = output / f"h{horizon}/checkpoints/day_200.pt"
+            command = training_command(
+                config, horizon=horizon, output=output,
+                training_days=training_days,
+                checkpoint_days=checkpoint_days,
+            )
+            product = output / f"h{horizon}/checkpoints/day_{training_days}.pt"
             identity = {
                 "command": command, "config_hash": config_hash,
                 "sources": sources,
@@ -624,7 +657,7 @@ def main() -> int:
             for future in as_completed(futures):
                 horizon = futures[future]
                 future.result()
-                _require_training_products(output, horizon)
+                _require_training_products(output, horizon, checkpoint_days)
                 completed_training.append(horizon)
                 _write_json(output / "status.json", {
                     **plan, "state": "running",
@@ -633,7 +666,7 @@ def main() -> int:
 
         validation_jobs = []
         for horizon in HORIZONS:
-            for day in CHECKPOINT_DAYS:
+            for day in checkpoint_days:
                 for case in CASES:
                     command = validation_command(
                         config, horizon=horizon, day=day, case=case, output=output
@@ -675,7 +708,7 @@ def main() -> int:
         horizons: dict[str, Any] = {}
         for horizon in HORIZONS:
             result = analyze_learning(
-                output / f"h{horizon}/checkpoints/day_200.pt", levels
+                output / f"h{horizon}/checkpoints/day_{training_days}.pt", levels
             )
             result["t3_3"].update(
                 adaptation_found_in_t2=adaptation_found,
@@ -686,9 +719,12 @@ def main() -> int:
                 ),
             )
             result["t3_3"]["pass"] = result["t3_3"].pop("pass_")
-            result["t3_4"] = analyze_validation(output, horizon)
+            result["t3_4"] = analyze_validation(
+                output, horizon, checkpoint_days
+            )
             result["t3_6"] = analyze_timing(
-                output / f"h{horizon}/training/nyc_training_diagnostics.csv"
+                output / f"h{horizon}/training/nyc_training_diagnostics.csv",
+                expected_days=training_days,
             )
             result["gate_pass"] = bool(
                 result["t3_1"]["pass"]
@@ -726,9 +762,12 @@ def main() -> int:
         _write_json(output / "report.json", report)
         (output / "report.md").write_text(_render_report(report), encoding="utf-8")
         _write_json(output / "status.json", {
-            "phase": "T3", "state": report["state"], "pass": report["pass"],
+            "phase": plan["phase"], "state": report["state"], "pass": report["pass"],
+            "short_probe": bool(args.short),
+            "eligible_to_freeze_config": not args.short,
             "selected_horizon": selected,
-            "training_days": production["training_days"],
+            "probe_training_days": training_days,
+            "recommended_production_days": production["training_days"],
             "report": str((output / "report.json").resolve()),
         })
         return 0 if report["pass"] else 2

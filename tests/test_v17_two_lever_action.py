@@ -8,6 +8,7 @@ from pricing_models import (
     FirmRLPricer,
     TWO_LEVER_LEVELS,
     TWO_LEVER_V2_LEVELS,
+    TWO_LEVER_V3_LEVELS,
 )
 
 
@@ -191,3 +192,21 @@ def test_t0_14_v2_core_value_surface_and_artifact_are_36_cells(tmp_path):
     assert artifact["action_semantics"] == "two_lever_absolute_card_v2"
     assert len(artifact["action_to_two_lever_cell"]) == 36
     core.load_trained_model(str(artifact_path))
+
+
+def test_v3_surge_range_has_exactly_the_requested_36_cells():
+    v3 = FirmRLPricer(
+        seed=25,
+        opt_keys=KEYS,
+        independent_coefficient_actions=False,
+        action_contract="two_lever_v3",
+    )
+    assert tuple(v3.two_lever_levels) == TWO_LEVER_V3_LEVELS
+    assert tuple(v3.two_lever_levels) == (0.8, 1.0, 1.25, 1.5, 2.0, 2.5)
+    assert v3.agent.action_dim == 36
+    assert list(v3.action_to_two_lever_cell.values()) == [
+        (distance, time)
+        for distance in TWO_LEVER_V3_LEVELS
+        for time in TWO_LEVER_V3_LEVELS
+    ]
+    assert v3.action_label(35) == "cell:distance=2.5,time=2.5"

@@ -26,6 +26,7 @@ CITY_SLUGS = ("nyc", "boston", "chicago")
 ACTION_LEVELS = {
     "two_lever_v1": (0.8, 0.9, 1.0, 1.2, 1.5),
     "two_lever_v2": (0.7, 0.8, 0.9, 1.0, 1.2, 1.5),
+    "two_lever_v3": (0.8, 1.0, 1.25, 1.5, 2.0, 2.5),
 }
 
 

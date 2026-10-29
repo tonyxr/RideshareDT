@@ -30,13 +30,14 @@ def final_objective(
 
 
 def profit_report(own_profit: float, competitor_profit: float) -> dict[str, float]:
-    """Report both auditable components alongside the scalar ranking value."""
+    """Report the objective, both auditable components, and their lead."""
     own = float(own_profit)
     competitor = float(competitor_profit)
     return {
         "own_profit": own,
         "competitor_profit": competitor,
         "final_objective": objective(own, competitor),
+        "profit_lead": own - competitor,
     }
 
 

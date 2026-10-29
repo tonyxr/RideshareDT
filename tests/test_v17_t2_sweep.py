@@ -15,12 +15,14 @@ def _result(own, rival, own_share=0.5, rival_share=0.5):
     }
 
 
-def test_t2_plan_is_exactly_1350_v1_rollouts():
+def test_t2_plan_is_3240_surge_range_rollouts_with_five_openings():
     config = load_config()
-    assert len(t2.fixed_specs(config)) == 25
+    assert len(t2.fixed_specs(config)) == 36
     assert len(t2.CASES) == 2
     assert len(t2.RIVALS) == 9
-    assert t2.expected_rollouts(config) == 1350
+    assert t2.OPENINGS == 5
+    assert t2.expected_rollouts(config) == 3240
+    assert t2.estimated_wall_hours(config, openings=5, workers=6) == pytest.approx(9.6)
 
 
 def test_t2_command_wires_production_market_and_live_driver_contract(tmp_path):
@@ -30,7 +32,7 @@ def test_t2_command_wires_production_market_and_live_driver_contract(tmp_path):
         case="A1_shortage_severe",
         rival="adaptive_best_response_memory",
         output=tmp_path,
-        openings=3,
+        openings=5,
         customers=100,
         pool=2000,
     )
@@ -38,8 +40,8 @@ def test_t2_command_wires_production_market_and_live_driver_contract(tmp_path):
     assert command[command.index("--supply_model") + 1] == "v3"
     assert command[command.index("--shortage_willingness_share") + 1] == "0.5"
     assert "--persistent_driver_stock" not in command
-    assert command[command.index("--action_contract") + 1] == "two_lever_v1"
-    assert command[command.index("--policy_sweep_openings") + 1] == "3"
+    assert command[command.index("--action_contract") + 1] == "two_lever_v3"
+    assert command[command.index("--policy_sweep_openings") + 1] == "5"
     assert command[command.index("--policy_sweep_horizon") + 1] == "240"
     assert command[command.index("--shock_scenario") + 1].endswith(
         "scenarios/v17_t2_shortage_severe.json"
@@ -56,43 +58,40 @@ def test_t2_v2_switch_expands_the_same_plan_to_36_cells():
         "base_and_booking_fixed": True,
     }
     assert len(t2.fixed_specs(config)) == 36
-    assert t2.expected_rollouts(config) == 1944
+    assert t2.expected_rollouts(config) == 3240
 
 
 def test_t2_analysis_uses_final_objective_and_reports_components():
     low = t2.cell_spec(0.8, 0.8)
     high = t2.cell_spec(1.0, 1.0)
+    openings = [f"r__opening_{index}" for index in range(1, 4)]
     raw = {
         "results": {
-            low: {
-                "r__opening_1": _result(4.0, 3.0),
-                "r__opening_2": _result(4.0, 3.0),
-                "r__opening_3": _result(4.0, 3.0),
-            },
-            high: {
-                "r__opening_1": _result(3.5, 1.0),
-                "r__opening_2": _result(3.5, 1.0),
-                "r__opening_3": _result(3.5, 1.0),
-            },
+            low: {opening: _result(4.0, 3.0) for opening in openings},
+            high: {opening: _result(3.5, 1.0) for opening in openings},
         },
         "traces": {
             low: [
                 {
+                    "rollout": opening,
                     "regime": "calm",
                     "profit_per_request": 4.0,
                     "rival_profit_per_request": 3.0,
                     "own_share": 0.5,
                     "rival_share": 0.5,
                 }
+                for opening in openings
             ],
             high: [
                 {
+                    "rollout": opening,
                     "regime": "calm",
                     "profit_per_request": 3.5,
                     "rival_profit_per_request": 1.0,
                     "own_share": 0.55,
                     "rival_share": 0.45,
                 }
+                for opening in openings
             ],
         },
     }
@@ -102,3 +101,48 @@ def test_t2_analysis_uses_final_objective_and_reports_components():
     assert report["best_fixed"]["final"]["final_objective"] == pytest.approx(2.75)
     assert report["best_fixed"]["final"]["own_profit"] == 3.5
     assert report["best_fixed"]["final"]["competitor_profit"] == 1.0
+    assert report["best_fixed"]["final"]["final_objective_se"] == 0.0
+    assert report["adaptation_value"]["final"]["selection_method"] == (
+        "leave_one_opening_out"
+    )
+    assert report["cost_of_competing_for_lead"]["own_profit"] == pytest.approx(-0.5)
+
+
+def test_regime_table_for_each_opening_is_fit_on_the_other_openings():
+    low = t2.cell_spec(0.8, 0.8)
+    high = t2.cell_spec(2.5, 2.5)
+    openings = [f"r__opening_{index}" for index in range(1, 4)]
+    own_by_spec = {
+        low: [10.0, 0.0, 0.0],
+        high: [0.0, 10.0, 10.0],
+    }
+    raw = {
+        "results": {
+            spec: {
+                opening: _result(values[index], 0.0)
+                for index, opening in enumerate(openings)
+            }
+            for spec, values in own_by_spec.items()
+        },
+        "traces": {
+            spec: [
+                {
+                    "rollout": opening,
+                    "regime": "calm",
+                    "profit_per_request": values[index],
+                    "rival_profit_per_request": 0.0,
+                    "own_share": 0.5,
+                    "rival_share": 0.5,
+                }
+                for index, opening in enumerate(openings)
+            ]
+            for spec, values in own_by_spec.items()
+        },
+    }
+    report = t2.analyze_job(raw)
+    loo = report["regime_table"]["final"]["calm"][
+        "leave_one_opening_out"
+    ]
+    assert [row["held_out_opening"] for row in loo] == openings
+    assert [row["spec"] for row in loo] == [high, low, low]
+    assert report["adaptation_value"]["final"]["switch"]["n_openings"] == 3

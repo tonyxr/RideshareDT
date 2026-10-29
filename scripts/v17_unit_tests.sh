@@ -78,6 +78,11 @@ run_gate T0.14 \
   tests/test_v17_two_lever_action.py::test_t0_14_v2_grid_has_36_cells_and_v1_mapping_is_unchanged \
   tests/test_v17_two_lever_action.py::test_t0_14_v2_core_value_surface_and_artifact_are_36_cells \
   tests/test_v17_config.py::test_t0_14_config_switch_accepts_only_the_registered_six_level_grid
+run_gate T0.15 \
+  tests/test_v17_two_lever_action.py::test_v3_surge_range_has_exactly_the_requested_36_cells \
+  tests/test_v17_config.py::test_surge_range_v3_is_the_production_grid \
+  tests/test_v17_t2_sweep.py \
+  tests/test_v17_probe.py
 
 # User-approved V17 extensions that must remain wired into the same release.
 run_gate V17.extensions tests/test_v17_progressive_competition.py

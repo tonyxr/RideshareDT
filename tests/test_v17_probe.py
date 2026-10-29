@@ -18,6 +18,17 @@ def test_t3_training_command_matches_revb_probe_contract(tmp_path):
     assert "--current_active_driver_observation" in command
     assert command[command.index("--supply_model") + 1] == "v3"
     assert command[command.index("--shortage_willingness_share") + 1] == "0.5"
+    assert command[command.index("--action_contract") + 1] == "two_lever_v3"
+
+
+def test_t3_short_command_uses_60_days_and_three_short_checkpoints(tmp_path):
+    command = t3.training_command(
+        load_config(), horizon=5, output=tmp_path,
+        training_days=t3.SHORT_TRAINING_DAYS,
+        checkpoint_days=t3.SHORT_CHECKPOINT_DAYS,
+    )
+    assert command[command.index("--train_timesteps") + 1] == "60"
+    assert command[command.index("--v17_probe_checkpoint_days") + 1] == "30,45,60"
 
 
 def test_t3_validation_command_uses_exact_cases_competitors_and_final_policy(tmp_path):
@@ -58,6 +69,7 @@ def test_t3_validation_ranks_on_final_objective_and_reports_components(tmp_path)
     assert report["scores"][100]["final_objective"] == pytest.approx(2.51)
     assert report["scores"][100]["own_profit"] == pytest.approx(4.01)
     assert report["scores"][100]["competitor_profit"] == pytest.approx(2.0)
+    assert report["scores"][100]["profit_lead"] == pytest.approx(2.01)
     assert all(row["pass"] for row in report["comparisons"])
 
 

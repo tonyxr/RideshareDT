@@ -10,8 +10,10 @@ def test_registered_contract_is_internally_consistent():
     protocol.validate(spec)
     assert len(protocol.CASES) == 6
     assert len(protocol.COMPETITORS) == 10
-    assert len(protocol.POLICY_CLASSES) == 10
-    assert spec["step_B"]["rollouts_per_city"] == 3000
+    assert len(protocol.POLICY_CLASSES) == 11
+    assert "validation_own_profit_best_fixed_cell" in protocol.POLICY_CLASSES
+    assert spec["step_A"]["fixed_cells"] == 36
+    assert spec["step_B"]["rollouts_per_city"] == 3300
     assert spec["step_C"]["rollouts_total"] == 1500
 
 
@@ -55,6 +57,7 @@ def test_final_objective_ranks_and_reports_both_profit_components():
         "own_profit": 4.0,
         "competitor_profit": 2.0,
         "final_objective": 2.5,
+        "profit_lead": 2.0,
     }
     ranked = rank_profit_rows([
         {"name": "high-own", "own_profit": 4.0, "competitor_profit": 3.0},

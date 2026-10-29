@@ -220,19 +220,23 @@ def build_independent_coefficient_action_space(
 
 # V17 M5: one absolute card cell controls distance and time components only.
 # Keep the V1 names as aliases so existing policies remain byte-for-byte
-# compatible.  RevB prepares the lower 0.7 edge behind an explicit V2
-# contract; production stays on V1 until T2 actually triggers the switch.
+# compatible. RevB's lower-edge V2 remains registered; V3 is the explicit
+# wider surge-range experiment and production candidate requested after T2.
 TWO_LEVER_ACTION_SEMANTICS = "two_lever_absolute_card_v1"
 TWO_LEVER_V2_ACTION_SEMANTICS = "two_lever_absolute_card_v2"
+TWO_LEVER_V3_ACTION_SEMANTICS = "two_lever_absolute_card_v3"
 TWO_LEVER_LEVELS: Tuple[float, ...] = (0.8, 0.9, 1.0, 1.2, 1.5)
 TWO_LEVER_V2_LEVELS: Tuple[float, ...] = (0.7, 0.8, 0.9, 1.0, 1.2, 1.5)
+TWO_LEVER_V3_LEVELS: Tuple[float, ...] = (0.8, 1.0, 1.25, 1.5, 2.0, 2.5)
 TWO_LEVER_CONTRACT_LEVELS: Dict[str, Tuple[float, ...]] = {
     "two_lever_v1": TWO_LEVER_LEVELS,
     "two_lever_v2": TWO_LEVER_V2_LEVELS,
+    "two_lever_v3": TWO_LEVER_V3_LEVELS,
 }
 TWO_LEVER_CONTRACT_SEMANTICS: Dict[str, str] = {
     "two_lever_v1": TWO_LEVER_ACTION_SEMANTICS,
     "two_lever_v2": TWO_LEVER_V2_ACTION_SEMANTICS,
+    "two_lever_v3": TWO_LEVER_V3_ACTION_SEMANTICS,
 }
 
 
@@ -2019,11 +2023,9 @@ class FirmRLPricer:
         )
         self.hybrid_relative_actions = bool(hybrid_relative_actions)
         self.action_contract = str(action_contract)
-        if self.action_contract not in (
-            "legacy", "two_lever_v1", "two_lever_v2"
-        ):
+        if self.action_contract not in ("legacy", *TWO_LEVER_CONTRACT_LEVELS):
             raise ValueError(
-                "action_contract must be legacy, two_lever_v1, or two_lever_v2"
+                "action_contract must be legacy or a registered two-lever contract"
             )
         self.two_lever_actions = self.action_contract in TWO_LEVER_CONTRACT_LEVELS
         # Revision 15: hold or a relative step of the tariff level L on a fixed

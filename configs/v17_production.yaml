@@ -26,9 +26,9 @@ observation:
   opponent_active_drivers: false
 
 action:
-  contract: two_lever_v1
-  distance_levels: [0.8, 0.9, 1.0, 1.2, 1.5]
-  time_levels: [0.8, 0.9, 1.0, 1.2, 1.5]
+  contract: two_lever_v3
+  distance_levels: [0.8, 1.0, 1.25, 1.5, 2.0, 2.5]
+  time_levels: [0.8, 1.0, 1.25, 1.5, 2.0, 2.5]
   base_and_booking_fixed: true
 
 rivals:

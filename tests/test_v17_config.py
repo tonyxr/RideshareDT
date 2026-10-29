@@ -32,7 +32,7 @@ def test_command_wires_manual_order_and_user_reward_without_fixed_reward(tmp_pat
     assert command[command.index("--supply_model") + 1] == "v3"
     assert command[command.index("--fleet_scale") + 1] == "1.2"
     assert "--persistent_driver_stock" not in command
-    assert command[command.index("--action_contract") + 1] == "two_lever_v1"
+    assert command[command.index("--action_contract") + 1] == "two_lever_v3"
     assert command[command.index("--v16_policy_mode") + 1] == "q"
     assert command[command.index("--v16_branch_design") + 1] == "stencil11"
     assert command[command.index("--v16_store_cap") + 1] == "20000"
@@ -98,3 +98,14 @@ def test_t0_14_config_switch_accepts_only_the_registered_six_level_grid(tmp_path
     config["action"]["distance_levels"][0] = 0.6
     with pytest.raises(ValueError, match="action grid"):
         v17_config.validate_config(config)
+
+
+def test_surge_range_v3_is_the_production_grid():
+    config = _config()
+    assert config["action"] == {
+        "contract": "two_lever_v3",
+        "distance_levels": [0.8, 1.0, 1.25, 1.5, 2.0, 2.5],
+        "time_levels": [0.8, 1.0, 1.25, 1.5, 2.0, 2.5],
+        "base_and_booking_fixed": True,
+    }
+    v17_config.validate_config(config)
