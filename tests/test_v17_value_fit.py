@@ -129,6 +129,19 @@ def test_t0_12_replay_labels_use_the_current_stage_objective():
     assert row["action_credits"] == original_audit_values
 
 
+def test_t3_audit_holdout_labels_are_not_used_for_value_fitting():
+    core = _core(seed=1767)
+    row = _branch_row(core, 0, "calm")
+    fit_mask = np.zeros(25, dtype=bool)
+    fit_mask[[6, 7, 8, 11, 12, 13, 16, 17, 18, 20, 24]] = True
+    row["action_fit_mask"] = fit_mask.tolist()
+    batch = core._v16_value_fit_batch([row])
+    assert batch[3][0].cpu().numpy().tolist() == fit_mask.tolist()
+    component_mask = batch[5][0].cpu().numpy()
+    assert np.all(component_mask[fit_mask])
+    assert not np.any(component_mask[~fit_mask])
+
+
 def test_daily_fit_runs_exact_steps_losses_and_polyak_update():
     core = _core(seed=1762)
     _populate(core)

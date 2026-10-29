@@ -26,6 +26,7 @@ import os
 import urllib.error
 import urllib.request
 import random
+import resource
 import time
 import re
 import sys
@@ -820,6 +821,10 @@ class Core:
         v16_action_credit_scale: float = 1.0,
         v16_reward: bool = False,
         current_active_driver_observation: bool = False,
+        v17_probe_mode: bool = False,
+        v17_probe_second_tape_fraction: float = 0.0,
+        v17_probe_checkpoint_days: Sequence[int] = (),
+        v17_probe_checkpoint_dir: str = "",
         momentum_features: bool = False,
         momentum_day_steps: int = 6,
         opponent_features: bool = False,
@@ -892,6 +897,45 @@ class Core:
         self.v16_policy_epsilon = float(v16_policy_epsilon)
         self.v16_action_credit_scale = float(v16_action_credit_scale)
         self.v16_reward = bool(v16_reward)
+        self.v17_probe_mode = bool(v17_probe_mode)
+        self.v17_probe_second_tape_fraction = float(
+            v17_probe_second_tape_fraction
+        )
+        self.v17_probe_checkpoint_days = tuple(sorted(set(
+            int(day) for day in v17_probe_checkpoint_days
+        )))
+        self.v17_probe_checkpoint_dir = str(
+            v17_probe_checkpoint_dir or ""
+        )
+        if not (
+            np.isfinite(self.v17_probe_second_tape_fraction)
+            and 0.0 <= self.v17_probe_second_tape_fraction <= 1.0
+        ):
+            raise ValueError(
+                "v17_probe_second_tape_fraction must be in [0, 1]"
+            )
+        if self.v17_probe_second_tape_fraction not in (0.0, 0.25):
+            raise ValueError(
+                "the registered T3 probe uses either no second tape or "
+                "exactly 25% of decisions"
+            )
+        if any(day <= 0 for day in self.v17_probe_checkpoint_days):
+            raise ValueError("V17 probe checkpoint days must be positive")
+        if self.v17_probe_mode:
+            if self.v16_branch_mode != "one_day_deviation":
+                raise ValueError(
+                    "V17 probe mode requires one-day-deviation branches"
+                )
+            if self.v16_audit_every != 4:
+                raise ValueError("T3 requires an all-cell audit every 4th decision")
+            if self.v17_probe_second_tape_fraction != 0.25:
+                raise ValueError("T3 requires a second tape on 25% of decisions")
+            if self.v17_probe_checkpoint_days != (100, 150, 200):
+                raise ValueError(
+                    "T3 requires checkpoints at days 100, 150, and 200"
+                )
+            if not self.v17_probe_checkpoint_dir:
+                raise ValueError("T3 requires a probe checkpoint directory")
         self.v17_progressive_competition = (
             str(training_curriculum).strip().lower() == "v17_progressive"
         )
@@ -987,6 +1031,10 @@ class Core:
             )
         self._nmcc_decision_counter = 0
         self._nmcc_last: Dict[str, Any] = {}
+        self._v17_probe_internal_second_tape = False
+        self._v17_probe_tape_id = 0
+        self._v17_probe_forced_candidates: Optional[Tuple[int, ...]] = None
+        self._v17_probe_internal_metadata: Dict[str, Any] = {}
         self.v16_branch_store = (
             BranchReplayStore(
                 self.v16_store_cap,
@@ -8912,22 +8960,34 @@ class Core:
         import time as _time
 
         started = _time.perf_counter()
+        probe_internal = bool(self._v17_probe_internal_second_tape)
+        probe_tape_id = int(self._v17_probe_tape_id)
         values = np.full(
             self.firm1.agent.action_dim, np.nan, dtype=np.float32
         )
         mask = np.asarray(action_mask, dtype=bool).reshape(-1)
-        candidates, incumbent, audit = self._v16_branch_candidates(
-            selected_action=int(selected_action),
-            action_mask=mask,
-            decision_count=int(self._nmcc_decision_counter),
-        )
+        forced_candidates = self._v17_probe_forced_candidates
+        if forced_candidates is None:
+            candidates, incumbent, audit = self._v16_branch_candidates(
+                selected_action=int(selected_action),
+                action_mask=mask,
+                decision_count=int(self._nmcc_decision_counter),
+            )
+        else:
+            incumbent = self._v16_incumbent_two_lever_action()
+            candidates = [
+                int(action) for action in forced_candidates
+                if 0 <= int(action) < mask.size and bool(mask[int(action)])
+            ]
+            audit = bool(len(candidates) == int(mask.sum()))
         horizon_days = int(self.v16_branch_horizon_days)
         if days_left is not None:
             horizon_days = int(min(horizon_days, max(0, int(days_left))))
         if horizon_days < 1 or len(candidates) < 2:
             return values, np.zeros_like(mask)
-        for action in candidates:
-            self.counterfactual_action_counts[int(action)] += 1
+        if not probe_internal:
+            for action in candidates:
+                self.counterfactual_action_counts[int(action)] += 1
 
         spd = int(max(1, len(hours)))
         gamma_day = float(self.firm1.agent.gamma) ** spd
@@ -8956,6 +9016,7 @@ class Core:
                             ctx, day_hours = self._sample_v16_day_and_hours(
                                 int(day_index) + k,
                                 spd,
+                                tape_id=probe_tape_id,
                             )
                         else:
                             ctx = self.market.sample_day_context()
@@ -8976,7 +9037,9 @@ class Core:
                     for t in range(start_t, len(day_hours)):
                         if self.v16_crn_tape:
                             self._set_v16_tape_position(
-                                int(day_index) + k, int(t)
+                                int(day_index) + k,
+                                int(t),
+                                tape_id=probe_tape_id,
                             )
                         hour = int(day_hours[t])
                         if offset > 0:
@@ -9000,8 +9063,21 @@ class Core:
                             profiles = self._sample_profiles_from_pool(
                                 self._effective_simulation_sample_size(count)
                             )
-                        else:
+                        elif probe_tape_id == 0:
                             count, profiles = presampled
+                        else:
+                            # T3's second tape conditions on the same observed
+                            # decision state while independently redrawing the
+                            # future rider/trip stream from that point onward.
+                            count = self._step_customers(
+                                customers_per_step,
+                                hour=hour,
+                                day_of_week=ctx.day_of_week,
+                                weather=ctx.weather,
+                            )
+                            profiles = self._sample_profiles_from_pool(
+                                self._effective_simulation_sample_size(count)
+                            )
                         _, own, rival, gap, _, _ = self.simulate_batch(
                             day_of_week=ctx.day_of_week,
                             hour=hour,
@@ -9103,7 +9179,22 @@ class Core:
         for action, credit in component_credits.items():
             component_credit_matrix[int(action)] = list(credit)
         best = max(candidates, key=lambda a: (float(values[a]), -int(a)))
-        self._nmcc_last = {
+        fit_candidates = list(candidates)
+        if self.v17_probe_mode and audit and not probe_internal:
+            non_audit_count = int(self._nmcc_decision_counter) + 1
+            while (
+                self.v16_audit_every > 0
+                and non_audit_count % self.v16_audit_every == 0
+            ):
+                non_audit_count += 1
+            fit_candidates, _, fit_is_audit = self._v16_branch_candidates(
+                selected_action=int(selected_action),
+                action_mask=mask,
+                decision_count=non_audit_count,
+            )
+            if fit_is_audit:
+                raise RuntimeError("T3 audit holdout failed to build a stencil")
+        metadata: Dict[str, Any] = {
             "day": int(day_index),
             "stage": str(self.current_training_stage.opponent_regime),
             "rival": str(self.firm2_mode),
@@ -9120,11 +9211,7 @@ class Core:
                 if self.exogenous_tape is None
                 else int(self.exogenous_tape.root_seed)
             ),
-            "tape_id": (
-                None
-                if self._v16_tape_position is None
-                else int(self._v16_tape_position[2])
-            ),
+            "tape_id": int(probe_tape_id),
             "branch_mode": "one_day_deviation",
             "branch_design": (
                 f"all{self.firm1.agent.action_dim}" if audit else "stencil11"
@@ -9140,6 +9227,9 @@ class Core:
             "best": self.firm1.action_label(int(best)),
             "candidate_action_indices": [
                 int(action) for action in candidates
+            ],
+            "fit_candidate_action_indices": [
+                int(action) for action in fit_candidates
             ],
             "candidate_actions": [
                 self.firm1.action_label(int(action))
@@ -9183,15 +9273,96 @@ class Core:
                 target_mask.sum() / max(1, int(mask.sum()))
             ),
         }
+        if (
+            self.v17_probe_mode
+            and not probe_internal
+            and self.v17_probe_second_tape_fraction > 0.0
+        ):
+            cadence = int(round(1.0 / self.v17_probe_second_tape_fraction))
+            second_tape_due = bool(
+                int(self._nmcc_decision_counter) > 0
+                and int(self._nmcc_decision_counter) % cadence == 0
+            )
+            if second_tape_due:
+                previous_internal = self._v17_probe_internal_second_tape
+                previous_tape_id = self._v17_probe_tape_id
+                previous_candidates = self._v17_probe_forced_candidates
+                previous_metadata = self._v17_probe_internal_metadata
+                try:
+                    self._v17_probe_internal_second_tape = True
+                    self._v17_probe_tape_id = 1
+                    self._v17_probe_forced_candidates = tuple(candidates)
+                    self._v17_probe_internal_metadata = {}
+                    second_values, second_mask = (
+                        self._v16_one_day_deviation_values(
+                            selected_action=selected_action,
+                            action_mask=action_mask,
+                            day_index=day_index,
+                            step_in_day=step_in_day,
+                            hours=hours,
+                            day_ctx=day_ctx,
+                            presampled=presampled,
+                            customers_per_step=customers_per_step,
+                            firm2_interval_steps=firm2_interval_steps,
+                            days_left=days_left,
+                        )
+                    )
+                    second_metadata = copy.deepcopy(
+                        self._v17_probe_internal_metadata
+                    )
+                finally:
+                    self._v17_probe_internal_second_tape = previous_internal
+                    self._v17_probe_tape_id = previous_tape_id
+                    self._v17_probe_forced_candidates = previous_candidates
+                    self._v17_probe_internal_metadata = previous_metadata
+                paired = target_mask & np.asarray(second_mask, dtype=bool)
+                paired_differences = (
+                    values[paired].astype(float)
+                    - np.asarray(second_values, dtype=float)[paired]
+                )
+                metadata.update(
+                    {
+                        "second_tape": True,
+                        "second_tape_id": 1,
+                        "second_tape_action_advantages": {
+                            self.firm1.action_label(int(action)): float(
+                                second_values[int(action)]
+                            )
+                            for action in candidates
+                            if bool(second_mask[int(action)])
+                        },
+                        "second_tape_action_credit_matrix": np.where(
+                            np.asarray(second_mask, dtype=bool),
+                            np.asarray(second_values, dtype=float),
+                            np.nan,
+                        ).tolist(),
+                        "second_tape_credit_mask": np.asarray(
+                            second_mask, dtype=bool
+                        ).tolist(),
+                        "label_noise_sd": float(
+                            np.std(paired_differences, ddof=1)
+                            / np.sqrt(2.0)
+                            if paired_differences.size > 1
+                            else 0.0
+                        ),
+                        "second_tape_seconds": float(
+                            second_metadata.get("seconds", 0.0)
+                        ),
+                    }
+                )
         elapsed = _time.perf_counter() - started
-        self._nmcc_last["seconds"] = float(elapsed)
+        metadata["seconds"] = float(elapsed)
+        if probe_internal:
+            self._v17_probe_internal_metadata = metadata
+            return values, target_mask
+        self._nmcc_last = metadata
         self.counterfactual_day_seconds += elapsed
         self.counterfactual_day_calls += 1
         dump_path = self.nmcc_dump or os.environ.get("R11B_CF_DUMP", "")
         if dump_path:
             try:
                 with open(dump_path, "a") as handle:
-                    handle.write(json.dumps(self._nmcc_last) + "\n")
+                    handle.write(json.dumps(metadata) + "\n")
             except Exception as exc:
                 print(f">>> [v17] branch dump failed: {exc!r}")
         return values, target_mask
@@ -9222,6 +9393,21 @@ class Core:
         component_matrix = metadata.get("component_credit_matrix")
         if not isinstance(component_matrix, list):
             raise RuntimeError("V17 branch metadata lacks component credits")
+        fit_actions = list(
+            metadata.get(
+                "fit_candidate_action_indices",
+                metadata["candidate_action_indices"],
+            )
+        )
+        fit_mask = np.zeros_like(mask, dtype=bool)
+        for action in fit_actions:
+            action_index = int(action)
+            if not 0 <= action_index < fit_mask.size:
+                raise RuntimeError("V17 branch metadata has an invalid fit cell")
+            fit_mask[action_index] = True
+        fit_mask &= mask
+        if not bool(fit_mask[int(metadata["incumbent_action"])]):
+            raise RuntimeError("V17 fit stencil must retain its incumbent")
         self.v16_branch_store.add(
             {
                 "observation_window": observation.reshape(-1).tolist(),
@@ -9233,6 +9419,7 @@ class Core:
                 ),
                 "action_credits": values.tolist(),
                 "action_credit_mask": mask.tolist(),
+                "action_fit_mask": fit_mask.tolist(),
                 "component_credit_names": list(
                     metadata["component_credit_names"]
                 ),
@@ -9246,6 +9433,16 @@ class Core:
                 "tape_id": metadata.get("tape_id"),
                 "audit": bool(metadata.get("audit", False)),
                 "horizon_days": int(metadata.get("horizon_days", 0)),
+                "second_tape": bool(metadata.get("second_tape", False)),
+                "second_tape_action_credits": copy.deepcopy(
+                    metadata.get("second_tape_action_credit_matrix")
+                ),
+                "second_tape_credit_mask": copy.deepcopy(
+                    metadata.get("second_tape_credit_mask")
+                ),
+                "label_noise_sd": float(
+                    metadata.get("label_noise_sd", np.nan)
+                ),
             }
         )
 
@@ -9315,13 +9512,24 @@ class Core:
             stored_credits = np.asarray(
                 row.get("action_credits", []), dtype=np.float32
             ).reshape(-1)
-            mask = np.asarray(
+            label_mask = np.asarray(
                 row.get("action_credit_mask", []), dtype=bool
             ).reshape(-1)
-            if stored_credits.size != action_count or mask.size != action_count:
+            fit_mask = np.asarray(
+                row.get("action_fit_mask", label_mask), dtype=bool
+            ).reshape(-1)
+            if (
+                stored_credits.size != action_count
+                or label_mask.size != action_count
+                or fit_mask.size != action_count
+            ):
                 raise ValueError("V17 branch row has the wrong action dimension")
-            if not bool(mask[incumbent]):
+            if not bool(label_mask[incumbent]):
                 raise ValueError("V17 branch row omits its incumbent target")
+            if not bool(fit_mask[incumbent]):
+                raise ValueError("V17 branch fit mask omits its incumbent target")
+            if bool(np.any(fit_mask & ~label_mask)):
+                raise ValueError("V17 branch fit mask includes an unlabeled cell")
             names = list(row.get("component_credit_names", []))
             if names != expected_names:
                 raise ValueError("V17 branch row has incompatible component names")
@@ -9343,7 +9551,7 @@ class Core:
                 finite = np.isfinite(vector)
                 row_components[action_index, finite] = vector[finite]
                 row_component_mask[action_index, finite] = True
-            if not bool(np.all(row_component_mask[mask])):
+            if not bool(np.all(row_component_mask[label_mask])):
                 raise ValueError(
                     "V17 branch row lacks primitive credits for a labeled action"
                 )
@@ -9355,10 +9563,11 @@ class Core:
             observations.append(observation.tolist())
             incumbents.append(incumbent)
             action_credits.append(np.nan_to_num(credits, nan=0.0).tolist())
-            action_masks.append(mask.tolist())
+            action_masks.append(fit_mask.tolist())
             component_credits.append(
                 np.nan_to_num(row_components, nan=0.0).tolist()
             )
+            row_component_mask &= fit_mask.reshape(-1, 1)
             component_masks.append(row_component_mask.tolist())
         return (
             torch.as_tensor(observations, dtype=torch.float32, device=device),
@@ -11139,6 +11348,9 @@ class Core:
         dynamic_episode_ordinal = 0
         active_episode_opponent_mode = opponent_mode
         for d in range(train_timesteps):
+            probe_day_started = (
+                time.perf_counter() if self.v17_probe_mode else 0.0
+            )
             # Elapsed progress (rather than completed progress) ensures day 1
             # belongs to the first stage and the final third belongs to the
             # configured dynamic opponent.
@@ -12676,6 +12888,18 @@ class Core:
             for k in self.shared_edit_keys:
                 log_row[f"firm1_{k}"] = float(get_coeff(self.market.curr_market, self.firm1.overrides, k))
                 log_row[f"firm2_{k}"] = float(get_coeff(self.market.curr_market, self.firm2.overrides, k))
+            if self.v17_probe_mode:
+                rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                if sys.platform == "darwin":
+                    rss_bytes = rss
+                else:
+                    rss_bytes = rss * 1024.0
+                log_row.update(
+                    v17_probe_simulated_day_seconds=float(
+                        time.perf_counter() - probe_day_started
+                    ),
+                    v17_probe_max_rss_mb=float(rss_bytes / (1024.0 ** 2)),
+                )
             validation_score = np.nan
             if self.firm1_mode == "RL" and ((d + 1) % validation_interval == 0 or (d + 1) == train_timesteps):
                 # Validate the same seeded actor distribution used for final
@@ -12994,6 +13218,38 @@ class Core:
             else:
                 log_row.pop('behavior_exploration_rate')
             self.training_logs.append(log_row)
+
+            if (
+                self.v17_probe_mode
+                and (d + 1) in self.v17_probe_checkpoint_days
+            ):
+                checkpoint_dir = os.path.abspath(os.path.expanduser(
+                    self.v17_probe_checkpoint_dir
+                ))
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                checkpoint_path = os.path.join(
+                    checkpoint_dir, f"day_{d + 1}.pt"
+                )
+                self.save_trained_model(
+                    checkpoint_path,
+                    registry_dir=None,
+                    model_id=(
+                        f"v17-t3-h{self.v16_branch_horizon_days}-"
+                        f"day{d + 1}"
+                    ),
+                    metadata={
+                        "training_days": int(d + 1),
+                        "training_seed": int(self.seed),
+                        "training_stage": str(
+                            self.current_training_stage.name
+                        ),
+                        "comparison_checkpoint_day": int(d + 1),
+                        "comparison_checkpoint_status": "v17_t3_probe",
+                        "branch_horizon_days": int(
+                            self.v16_branch_horizon_days
+                        ),
+                    },
+                )
             
             if self.firm1_mode == "RL":
                 # Keep the predeclared exploration schedule synchronized in
@@ -19115,6 +19371,32 @@ def main():
             "is never included. v17_progressive enables this automatically."
         ),
     )
+    v17.add_argument(
+        "--v17_probe_mode",
+        action="store_true",
+        help=(
+            "T3-only diagnostics: held-out audit cells, second-tape label "
+            "noise, day timing/memory, and immutable probe checkpoints."
+        ),
+    )
+    v17.add_argument(
+        "--v17_probe_second_tape_fraction",
+        type=float,
+        default=0.0,
+        help="T3 uses an independent second tape on exactly 0.25 of decisions.",
+    )
+    v17.add_argument(
+        "--v17_probe_checkpoint_days",
+        type=str,
+        default="",
+        help="Comma-separated T3 checkpoint days; registered value is 100,150,200.",
+    )
+    v17.add_argument(
+        "--v17_probe_checkpoint_dir",
+        type=str,
+        default="",
+        help="Directory for the day-100/150/200 T3 policy artifacts.",
+    )
 
     v26r = parser.add_argument_group("v26r regime-switching market (all default off)")
     v26r.add_argument("--regime_market", action="store_true",
@@ -20232,6 +20514,16 @@ def main():
         current_active_driver_observation=(
             args.current_active_driver_observation
         ),
+        v17_probe_mode=args.v17_probe_mode,
+        v17_probe_second_tape_fraction=(
+            args.v17_probe_second_tape_fraction
+        ),
+        v17_probe_checkpoint_days=tuple(
+            int(value)
+            for value in str(args.v17_probe_checkpoint_days).split(",")
+            if value.strip()
+        ),
+        v17_probe_checkpoint_dir=args.v17_probe_checkpoint_dir,
         enable_driver_supply=not args.disable_driver_supply,
         use_osmnx=args.use_osmnx,
         osmnx_place=args.osmnx_place or None,

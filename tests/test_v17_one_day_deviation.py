@@ -134,6 +134,37 @@ def test_every_branch_restores_incumbent_from_day_one():
     assert core._v16_incumbent_two_lever_action() == incumbent
 
 
+def test_t3_audit_uses_heldout_stencil_and_independent_second_tape():
+    core = _core(horizon=1, audit_every=4)
+    core.v17_probe_mode = True
+    core.v17_probe_second_tape_fraction = 0.25
+    core._nmcc_decision_counter = 4
+    incumbent = _action(core, 1.0, 1.0)
+    core.firm1.apply_action(incumbent, core.market)
+    core._set_v16_tape_position(3, 0)
+    profiles = core._sample_profiles_from_pool(3, generalization_fraction=0.0)
+    values, mask = core._counterfactual_day_values(
+        selected_action=incumbent,
+        action_mask=core.firm1.feasible_action_mask(core.market),
+        day_index=3,
+        step_in_day=0,
+        hours=[12],
+        day_ctx=DayContext(day_of_week=2, weather="clear"),
+        presampled=(3, profiles),
+        customers_per_step=3,
+        firm2_interval_steps=1,
+        days_left=None,
+    )
+    assert int(mask.sum()) == 25
+    assert np.isfinite(values).sum() == 25
+    assert core._nmcc_last["audit"] is True
+    assert core._nmcc_last["second_tape"] is True
+    assert core._nmcc_last["second_tape_id"] == 1
+    assert len(core._nmcc_last["fit_candidate_action_indices"]) == 11
+    assert len(core._nmcc_last["second_tape_action_advantages"]) == 25
+    assert np.isfinite(core._nmcc_last["label_noise_sd"])
+
+
 def test_unscaled_counterfactual_advantage_keeps_reward_units():
     values = torch.tensor([[0.0, 2.0, -1.0]], dtype=torch.float32)
     masks = torch.ones_like(values, dtype=torch.bool)
