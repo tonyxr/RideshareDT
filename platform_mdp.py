@@ -187,6 +187,10 @@ class ObservationConfig:
     momentum_day_steps: int = 6
     opponent_features: bool = False
     opponent_move_threshold: float = 0.02
+    # V17 production option: a platform directly observes its exact current
+    # own-platform online-driver count. It is neither delayed nor noised and
+    # never exposes the opponent's count. Default off preserves 15d identity.
+    current_active_driver_observation: bool = False
 
 
 # Public regime signal keys, in frame order (mirrors market_shocks.PUBLIC_SHOCK_FEATURE_KEYS).
@@ -233,9 +237,28 @@ MOMENTUM_SIGNAL_SCALES: Dict[str, float] = {
 }
 MOMENTUM_FEATURE_DIM = 2 * len(MOMENTUM_SIGNAL_KEYS) + 1
 OPPONENT_FEATURE_DIM = 11
+CURRENT_ACTIVE_DRIVER_FEATURE_KEY = "current_own_active_drivers"
+CURRENT_ACTIVE_DRIVER_FEATURE_DIM = 1
 RIVAL_INDEX_LEVEL_SCALE = 0.10
 RIVAL_INDEX_CHANGE_SCALE = 0.03
 GAP_CHANGE_SCALE_DOLLARS = 1.0
+
+# User-requested reward progression on the V17 manual's four-stage execution
+# order. The endpoints preserve the implemented pure-profit and 75%-competitive
+# objectives; catch-up interpolates between the fixed and profit-maximizing
+# rival stages.
+V17_PROGRESSIVE_PROFIT_LEAD_WEIGHTS: Tuple[float, float, float, float] = (
+    0.0,
+    0.50,
+    0.625,
+    0.75,
+)
+V17_EXECUTION_STAGE_FRACTIONS: Tuple[float, float, float, float] = (
+    0.05,
+    0.05,
+    0.30,
+    0.60,
+)
 
 
 def _window_delta(history, steps_per_day: int, scale: float) -> float:
@@ -1529,8 +1552,15 @@ class TrainingStageScheduler:
         tariff_reset_fraction: float = 0.15,
     ) -> None:
         requested = str(mode or "staged").strip().lower()
-        if requested not in {"staged", "direct"}:
-            raise ValueError("training curriculum must be 'staged' or 'direct'")
+        if requested not in {"staged", "v17_progressive", "direct"}:
+            raise ValueError(
+                "training curriculum must be 'staged', 'v17_progressive', "
+                "or 'direct'"
+            )
+        if requested == "v17_progressive":
+            # The Oct-28 V17 execution manual freezes this four-stage order
+            # and allocation: market, fixed, reactive/catch-up, profit BR.
+            stage_fractions = V17_EXECUTION_STAGE_FRACTIONS
         fractions = np.asarray(stage_fractions, dtype=float).reshape(-1)
         if (
             fractions.size not in (3, 4)
@@ -1588,6 +1618,8 @@ class TrainingStageScheduler:
             market_end = float(round(float(fractions[0]), 12))
             static_end = float(round(float(fractions[0] + fractions[1]), 12))
             catchup_end = float(round(float(fractions[0] + fractions[1] + fractions[2]), 12))
+            catchup_pool_size = 4 if requested == "v17_progressive" else 2
+            profit_pool_size = 8 if requested == "v17_progressive" else 5
             self.stages = (
                 TrainingStage(
                     "market", 0.0, market_end, "market", 1, True, 1, 0.0,
@@ -1602,12 +1634,12 @@ class TrainingStageScheduler:
                 TrainingStage(
                     "price_gap_catchup", static_end, catchup_end, "catchup", 1,
                     False, 1, 0.0, 0.12, 0.85, 0.60, 0.04, 0.45, 0.30,
-                    episode_days, 2, reset_fraction,
+                    episode_days, catchup_pool_size, reset_fraction,
                 ),
                 TrainingStage(
                     "profit_maximizers", catchup_end, 1.000001, "profit", 1,
                     False, 1, 0.0, 0.08, 0.65, 0.45, 0.01, 0.05, 0.15,
-                    episode_days, 5, reset_fraction,
+                    episode_days, profit_pool_size, reset_fraction,
                 ),
             )
 
@@ -1722,6 +1754,8 @@ class PlatformObservationModel:
     #   14:18  current demand conditions (including weather-driven intensity)
     #   18:22  public Firm2-minus-Firm1 quote gaps by trip segment
     #   22:24  previous action direction and time since intervention
+    #   24      optional exact current own-platform active-driver count
+    #           (invertible arcsinh encoding; opponent count is absent)
     # Temporal momentum is supplied by the ordered frame stack, so explicit
     # level duplicates, hand-built trend features, and static city constants
     # are not repeated inside every frame.
@@ -1750,8 +1784,13 @@ class PlatformObservationModel:
         self.seed = int(seed)
         self.rng = np.random.default_rng(self.seed)
         # v26r: instance dimension (the class default 24 is the v26 frame).
+        if bool(getattr(self.config, "current_active_driver_observation", False)):
+            self.observation_dim = (
+                int(type(self).observation_dim)
+                + CURRENT_ACTIVE_DRIVER_FEATURE_DIM
+            )
         if bool(getattr(self.config, "regime_features", False)):
-            self.observation_dim = int(type(self).observation_dim) + REGIME_FEATURE_DIM
+            self.observation_dim = int(self.observation_dim) + REGIME_FEATURE_DIM
         if bool(getattr(self.config, "actor_true_shortage_flag", False)):
             self.observation_dim = int(self.observation_dim) + ORACLE_SHORTAGE_FEATURE_DIM
         if bool(getattr(self.config, "persistence_features", False)):
@@ -2117,6 +2156,8 @@ class PlatformObservationModel:
         city_context: Optional[Mapping[str, float]] = None,
         regime_features: Optional[Mapping[str, float]] = None,
         persistence_features: Optional[Mapping[str, float]] = None,
+        current_own_active_drivers: float = 0.0,
+        active_driver_scale: float = 1.0,
     ) -> np.ndarray:
         hour_f = float(int(hour) % 24)
         day_f = float(int(day_of_week) % 7)
@@ -2184,6 +2225,21 @@ class PlatformObservationModel:
             float(np.clip(action.get("direction", 0.0), -1.0, 1.0)),
             float(np.clip(action.get("time_since_intervention", 1.0), 0.0, 1.0)),
         ]
+        current_driver_slot: List[float] = []
+        if bool(getattr(self.config, "current_active_driver_observation", False)):
+            active = float(current_own_active_drivers)
+            scale = float(active_driver_scale)
+            if not np.isfinite(active) or active < 0.0:
+                raise ValueError(
+                    f"current own active-driver count must be finite and non-negative: {active}"
+                )
+            if not np.isfinite(scale) or scale <= 0.0:
+                raise ValueError(
+                    f"active-driver scale must be finite and positive: {scale}"
+                )
+            # arcsinh is monotone and invertible, unlike clipping. Given the
+            # saved scale, the observation retains the exact current count.
+            current_driver_slot = [float(np.arcsinh(active / scale))]
         regime_slot: List[float] = []
         if bool(getattr(self.config, "regime_features", False)):
             public = {} if bool(getattr(self.config, "regime_feature_ablation", False)) else dict(regime_features or {})
@@ -2233,6 +2289,7 @@ class PlatformObservationModel:
             + demand_features
             + probe_features
             + action_features
+            + current_driver_slot
             + regime_slot
             + oracle_shortage_slot
             + persistence_slot

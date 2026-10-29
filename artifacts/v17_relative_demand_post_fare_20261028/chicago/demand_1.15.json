@@ -1,0 +1,34 @@
+{
+  "format": "revision7-joint-contextual-logit-v1",
+  "city": "Chicago",
+  "typical_fare": 12.97,
+  "threshold_reference": 1.8,
+  "beta": 2.1844297944238473,
+  "evidence": {
+    "type": "transferred_external_prior",
+    "source": {
+      "title": "List, Muir, Pope & Sun, Left-Digit Bias at Lyft (2023)",
+      "url": "https://s3.amazonaws.com/fieldexperiments-papers2/papers/00771.pdf",
+      "estimate": "Standard-product conversion elasticity about -0.9 to -1.4; Shared -1.7 to -3.3",
+      "context": "US Lyft price-offer experiments; other options held fixed, not total market demand"
+    },
+    "fit_partition": "training",
+    "heldout_partition": "evaluation",
+    "fit_seed": 70231,
+    "heldout_seed": 79173,
+    "records_per_partition": 2000,
+    "cache_sha256": "eb672ad9725a5c514e0579cf10f98b6d9de79b7e9f9124c179473cbe3531bc4c",
+    "city_calibration_sha256": "6671b9aee989cd54ad44df90beef8a711684e34e610a6e3063a62f8be14b7f39",
+    "limitations": [
+      "Transferred Lyft Standard conversion prior, not a city-specific causal estimate.",
+      "Anchor participation and non-price utilities retain existing contextual priors; they are not validated by fitting elasticity.",
+      "Relative inverse GPT thresholds are a heterogeneity prior, not observed willingness to pay.",
+      "Conditional logit substitution (IIA) is assumed, not identified by the single own-price moment.",
+      "Request opportunities are fixed: app-entry, long-run market expansion and equilibrium supply are not identified.",
+      "No reward, constant-tariff optimum or RL performance enters calibration or parameter selection."
+    ],
+    "fitting": "exact local own-price log derivative at parity",
+    "target_own_elasticity": -1.15
+  },
+  "price_sensitivity_units": "relative"
+}

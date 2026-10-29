@@ -74,10 +74,21 @@ class V17ConcaveValueModel(nn.Module):
                 nn.init.orthogonal_(parameter)
             else:
                 nn.init.zeros_(parameter)
-        # The registered warm start has b=0 and L=0, so the small curvature
-        # floor puts the initial maximum exactly at the published card (1,1).
+        # The registered warm start has b=0, so symmetric curvature puts the
+        # initial maximum exactly at the published card (1,1).
+        # Keep the diagonal Cholesky entries non-zero: C = L L^T has zero
+        # derivative at L=0, which would otherwise make curvature impossible
+        # to learn from the warm start.  The small symmetric diagonal retains
+        # the unique card argmax while giving both curvature directions a
+        # usable first gradient.
         nn.init.zeros_(self.surface_head.weight)
         nn.init.zeros_(self.surface_head.bias)
+        with torch.no_grad():
+            surface_bias = self.surface_head.bias.reshape(
+                self.surface_count, 6
+            )
+            surface_bias[:, 3] = 0.10
+            surface_bias[:, 5] = 0.10
 
     def _public_sequence(self, observations: torch.Tensor) -> torch.Tensor:
         values = torch.nan_to_num(

@@ -43,7 +43,8 @@ SOURCES = [dict(title='List, Muir, Pope & Sun, Left-Digit Bias at Lyft (2023)',
 
 
 def load_core(slug, output, *, integration=False, demand_artifact=None,
-              city_artifact=None, shock_scenario=None, before_supply=False):
+              city_artifact=None, shock_scenario=None, before_supply=False,
+              calibration_json=None):
     """Reuse production CLI configuration, stop at the requested sweep boundary."""
     import Core
     captured = []
@@ -54,6 +55,8 @@ def load_core(slug, output, *, integration=False, demand_artifact=None,
         raise Captured()
     argv = command(output, days=0, city=CITIES[slug], slug=slug, integration=integration)
     argv[argv.index('--rl_warm_start_target')+1] = '0'
+    if calibration_json is not None:
+        argv[argv.index('--calibration_json') + 1] = str(calibration_json)
     argv += ['--learning_corrections', '--learner_revision', '4', '--no-live_diagnostics',
              '--shock_scenario', str(shock_scenario or BASE/'scenarios/calm.json'),
              '--policy_sweep', 'static:1']

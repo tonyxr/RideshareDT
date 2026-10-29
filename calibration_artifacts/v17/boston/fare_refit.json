@@ -1,0 +1,19 @@
+{
+  "contract": "v17-realistic-fare-variable-rate-refit-v1",
+  "source_calibration": "/Users/huali/Desktop/RideResponse/data/processed/boston/calibration.json",
+  "source_calibration_sha256": "c6c029b231e28617d0990f528457e91b88a8c843f65f73f7ee8234b678224f7e",
+  "source_trip_bank_sha256": "cb7ea8843bdb4395fe0e8b39e34a8a8a2c8932d1faa251360ea4a9a3d1789a73",
+  "partition": {
+    "order": "trip_bank_file_order",
+    "fit_rows": 40000,
+    "heldout_rows": 10000,
+    "fit_fraction": 0.8
+  },
+  "method": "common scalar on per-mile and per-minute anchors",
+  "variable_rate_scale": 1.6638687344791405,
+  "fit_v15d_card_mean": 16.53903975,
+  "fit_v17_card_mean": 16.539039499999998,
+  "heldout_v15d_card_mean": 16.444503000000005,
+  "heldout_v17_card_mean": 16.462854,
+  "heldout_relative_gap": 0.001115935215554753
+}

@@ -1,0 +1,19 @@
+{
+  "contract": "v17-realistic-fare-variable-rate-refit-v1",
+  "source_calibration": "/Users/huali/Desktop/RideResponse/data/processed/chicago/calibration.json",
+  "source_calibration_sha256": "f7a461afd170255116acff051b879bab0b8f44fa238afc354a09581b362bf224",
+  "source_trip_bank_sha256": "6e71c60dda5d39ca405a681c4ee3646741c783dabebd7cc69c8de83a5bfb63bc",
+  "partition": {
+    "order": "trip_bank_file_order",
+    "fit_rows": 40000,
+    "heldout_rows": 10000,
+    "fit_fraction": 0.8
+  },
+  "method": "common scalar on per-mile and per-minute anchors",
+  "variable_rate_scale": 0.999628274325004,
+  "fit_v15d_card_mean": 14.962522750000002,
+  "fit_v17_card_mean": 14.9625225,
+  "heldout_v15d_card_mean": 14.995219,
+  "heldout_v17_card_mean": 14.995274000000002,
+  "heldout_relative_gap": 3.667835728249358e-06
+}

@@ -785,12 +785,48 @@ class DriverSupplyLayer:
             )
         return self.last_states
 
+    def active_driver_feature(self, active_drivers: float) -> float:
+        """Encode an active-driver count with the registered supply scale."""
+        active = float(active_drivers)
+        if not np.isfinite(active) or active < 0.0:
+            raise ValueError(
+                f"active-driver count must be finite and non-negative: {active}"
+            )
+        if self.supply_v2 or self.supply_v3:
+            reference = float(getattr(
+                self,
+                "_feature_capacity_reference",
+                self.config.base_active_drivers,
+            ))
+            if not np.isfinite(reference) or reference <= 0.0:
+                raise ValueError(
+                    f"active-driver feature reference must be positive: {reference}"
+                )
+            return float(np.arcsinh(active / reference))
+        return float(np.clip(active / 800.0, 0.0, 1.0))
+
+    def current_active_driver_feature(self, active_drivers: float) -> float:
+        """Invertibly encode the live own-platform count for V17 actors."""
+        active = float(active_drivers)
+        # Use the fixed, artifact-saved fleet reference. A demand-varying
+        # denominator would turn this into a supply ratio instead of an exact
+        # count channel.
+        reference = float(self.config.base_active_drivers)
+        if not np.isfinite(active) or active < 0.0:
+            raise ValueError(
+                f"active-driver count must be finite and non-negative: {active}"
+            )
+        if not np.isfinite(reference) or reference <= 0.0:
+            raise ValueError(
+                f"active-driver feature reference must be positive: {reference}"
+            )
+        return float(np.arcsinh(active / reference))
+
     def state_features_for_firm(self, firm: str, opponent: str = "Firm2") -> np.ndarray:
         own = self.smoothed_states.get(firm, self.last_states.get(firm, FirmDriverBatchState()))
         other = self.smoothed_states.get(opponent, self.last_states.get(opponent, FirmDriverBatchState()))
         features = [
-            (np.arcsinh(own.active_drivers / getattr(self, '_feature_capacity_reference', self.config.base_active_drivers))
-             if (self.supply_v2 or self.supply_v3) else np.clip(own.active_drivers / 800.0, 0.0, 1.0)),
+            self.active_driver_feature(own.active_drivers),
             np.clip(own.idle_driver_share, 0.0, 1.0),
             np.clip(own.utilization, 0.0, 1.0),
             np.clip(own.acceptance_rate, 0.0, 1.0),

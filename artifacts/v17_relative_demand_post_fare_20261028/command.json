@@ -1,0 +1,13 @@
+[
+  "scripts/audit_joint_demand.py",
+  "--output",
+  "artifacts/v17_relative_demand_post_fare_20261028",
+  "--elasticities",
+  "-1.15",
+  "--records",
+  "2000",
+  "--price-sensitivity-units",
+  "relative",
+  "--calibration-root",
+  "calibration_artifacts/v17"
+]

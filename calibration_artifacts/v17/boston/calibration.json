@@ -1,0 +1,223 @@
+{
+  "calibration": {
+    "agent": {
+      "age_mean": 42.32923423670075,
+      "age_std": 18.560900360113926,
+      "gender_probs": {
+        "Female": 0.5268599165225624,
+        "Male": 0.4731400834774376
+      },
+      "household_lambda": 2.16804412574284,
+      "income_probs": {
+        "100k-200k": 0.26113730361503606,
+        "200k+": 0.19223141312479708,
+        "50k-100k": 0.21549412080233757,
+        "<50k": 0.33113716245782926
+      },
+      "marital_probs": {
+        "Divorced": 0.09894178305404484,
+        "Married": 0.3169069189477533,
+        "Single": 0.548510000158971,
+        "Widowed": 0.03564129783923086
+      }
+    },
+    "choice": {
+      "outside_option_base_fare": 2.4,
+      "price_level_index": 0.5854547370392402,
+      "reference_fare": 23.16,
+      "reference_trip": {
+        "distance_miles": 4.0,
+        "duration_minutes": 15.0
+      }
+    },
+    "market": {
+      "airport_prob": null,
+      "day_of_week_probs": {
+        "0": 0.1781,
+        "1": 0.18285,
+        "2": 0.10845,
+        "3": 0.1408,
+        "4": 0.1282,
+        "5": 0.12955,
+        "6": 0.13205
+      },
+      "distance_mean_miles": 2.1879665000000648,
+      "distance_std_miles": 1.1439066744614785,
+      "duration_mean_minutes": null,
+      "duration_std_minutes": null,
+      "hour_probs": {
+        "0": 0.0486,
+        "1": 0.0411,
+        "10": 0.0461,
+        "11": 0.04245,
+        "12": 0.0453,
+        "13": 0.0435,
+        "14": 0.0434,
+        "15": 0.0443,
+        "16": 0.0424,
+        "17": 0.0443,
+        "18": 0.0444,
+        "19": 0.0394,
+        "2": 0.03695,
+        "20": 0.03655,
+        "21": 0.04075,
+        "22": 0.0417,
+        "23": 0.0474,
+        "3": 0.04125,
+        "4": 0.0401,
+        "5": 0.03645,
+        "6": 0.04105,
+        "7": 0.0357,
+        "8": 0.0336,
+        "9": 0.04325
+      },
+      "observed_price_mean": 16.44615,
+      "observed_price_std": 9.213924255033792,
+      "service_probs": {
+        "economy": 0.4197,
+        "premium": 0.5803
+      },
+      "shared_ride_prob": 0.16645,
+      "weather_demand_multiplier": {
+        "clear": 0.999407621229513,
+        "rain": 1.078254865440708,
+        "snow": 0.4996878206044971
+      },
+      "weather_probs": {
+        "clear": 0.8333333333333334,
+        "rain": 0.1449771689497717,
+        "snow": 0.021689497716894976
+      }
+    },
+    "supply": {
+      "driver_fare_share": 0.72,
+      "driver_fare_share_rows": 0,
+      "driver_fare_share_source": "reference_default"
+    },
+    "tariff": {
+      "airport_fee": 0.0,
+      "base_fare": 3.221104842136697,
+      "booking_fee": 2.9526794386253057,
+      "day_multiplier": {
+        "5": 0.9970466627029971,
+        "6": 0.9970466627029971
+      },
+      "fit": {
+        "airport_identified": false,
+        "duration_identified": false,
+        "duration_split": "template_split_at_22mph",
+        "mae": 4.331451833524505,
+        "note": "Observed prices include platform-specific surge and fees; anchors are the multiplicative tariff that best reproduces the city's typical fare, not a published rate card.",
+        "r2": 0.5593269883083868,
+        "rows": 41575,
+        "service_identified": true,
+        "shared_rows_excluded": 8405
+      },
+      "per_mile": 1.716740624480242,
+      "per_minute": 0.36141907883794555,
+      "service_multiplier": {
+        "economy": 1.0,
+        "premium": 2.1620609112666993
+      },
+      "surge_hours": [
+        [
+          0,
+          4,
+          0.996454418754968
+        ],
+        [
+          4,
+          8,
+          1.0032006497011368
+        ],
+        [
+          8,
+          12,
+          0.999110751145336
+        ],
+        [
+          12,
+          16,
+          1.0040435965506467
+        ],
+        [
+          16,
+          20,
+          0.996454418754968
+        ],
+        [
+          20,
+          24,
+          1.0008892488546641
+        ]
+      ],
+      "weather_multiplier": {
+        "clear": 1.0,
+        "rain": 0.9957396709494114,
+        "snow": 0.9909166649982105
+      }
+    },
+    "trip_bank": {
+      "airport_identified": false,
+      "duration_coverage": 0.0,
+      "duration_identified": false,
+      "path": "../../../../data/processed/boston/trip_bank.csv",
+      "rejections": {
+        "missing_price": 4362
+      },
+      "rows": 50000,
+      "sampling": "systematic_whole_source",
+      "service_identified": true
+    }
+  },
+  "city": "Boston",
+  "price_semantics": "posted_quote_excluding_tip",
+  "quality": {
+    "geography_note": "PUMS records are filtered to 2020 PUMAs whose official TIGER names match 'Boston City'; city-level ACS margins should be used for final raking when exact boundary equivalence is required.",
+    "household_sample_rows": 13123,
+    "identifiable_market_fields": {
+      "airport_probability": false,
+      "premium_service_probability": true,
+      "shared_ride_probability": true
+    },
+    "person_sample_rows": 27938,
+    "puma_codes": [
+      "00801",
+      "00802",
+      "00803",
+      "00804",
+      "00805"
+    ],
+    "ride_rejections": {
+      "missing_price": 1786
+    },
+    "ride_rows_accepted": 20000
+  },
+  "ride_semantics": "price_quote",
+  "sample_size": 20000,
+  "schema_version": 2,
+  "sources": {
+    "demographics": "https://www2.census.gov/programs-surveys/acs/data/pums/2024/5-Year/",
+    "rides": "https://www.kaggle.com/datasets/brllrb/uber-and-lyft-dataset-boston-ma",
+    "weather": "https://www.ncei.noaa.gov/data/global-hourly/access/"
+  },
+  "v17_fare_refit": {
+    "contract": "v17-realistic-fare-variable-rate-refit-v1",
+    "source_calibration": "/Users/huali/Desktop/RideResponse/data/processed/boston/calibration.json",
+    "source_calibration_sha256": "c6c029b231e28617d0990f528457e91b88a8c843f65f73f7ee8234b678224f7e",
+    "source_trip_bank_sha256": "cb7ea8843bdb4395fe0e8b39e34a8a8a2c8932d1faa251360ea4a9a3d1789a73",
+    "partition": {
+      "order": "trip_bank_file_order",
+      "fit_rows": 40000,
+      "heldout_rows": 10000,
+      "fit_fraction": 0.8
+    },
+    "method": "common scalar on per-mile and per-minute anchors",
+    "variable_rate_scale": 1.6638687344791405,
+    "fit_v15d_card_mean": 16.53903975,
+    "fit_v17_card_mean": 16.539039499999998,
+    "heldout_v15d_card_mean": 16.444503000000005,
+    "heldout_v17_card_mean": 16.462854,
+    "heldout_relative_gap": 0.001115935215554753
+  }
+}

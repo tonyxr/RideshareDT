@@ -1,0 +1,104 @@
+schema_version: v17-production-v1
+status: prefreeze
+tree: rideshare_v26r_v17
+execution_order:
+  - T0
+  - T1
+  - T2
+  - T3_T4
+  - production
+  - evaluation
+  - results
+
+market:
+  supply_model: v3
+  eta_v3: 0.6
+  persistent_driver_stock: false
+  shortage_willingness_share: 0.5
+  price_sensitivity_units: relative
+  fare_model: realistic
+  driver_pay_basis: fare
+  spillover_price_aware: true
+
+observation:
+  exact_current_active_drivers: true
+  scope: own_platform_only
+  opponent_active_drivers: false
+
+action:
+  contract: two_lever_v1
+  distance_levels: [0.8, 0.9, 1.0, 1.2, 1.5]
+  time_levels: [0.8, 0.9, 1.0, 1.2, 1.5]
+  base_and_booking_fixed: true
+
+rivals:
+  two_lever_mapping: true
+  catchup_pool_size: 4
+  profit_pool_size: 8
+
+# User-approved override of the manual's fixed 70/30 reward.  The manual
+# execution order and stage allocation are unchanged; direct profit
+# competitiveness rises only after the pure-profit market stage.
+reward:
+  mode: v17_progressive
+  stage_profit_lead_weights: [0.0, 0.5, 0.625, 0.75]
+  market_share_shaping: [0.0, 0.0, 0.0, 0.0]
+  common_dollar_scale_for_profit_and_lead: true
+
+credit:
+  mode: one_day_deviation
+  horizon_days: null
+  horizon_candidates_from_T3: [5, 7]
+  branch_design: stencil11
+  regular_cells: 11
+  audit_every_decisions: 10
+  crn_tape: true
+
+learner:
+  value_head: concave2d
+  policy_mode: q
+  tau: [0.10, 0.03]
+  epsilon: 0.05
+  fit_steps_per_day: 50
+  batch_size: 64
+  learning_rate: [0.0003, 0.00005]
+  polyak: 0.99
+  store_rows: 20000
+  critic_update_days: 7
+
+curriculum:
+  stages: [market, static_opponent, price_gap_catchup, profit_maximizers]
+  fractions: [0.05, 0.05, 0.30, 0.60]
+  episode_days: 30
+  shortage_episode_share: 0.70
+  expected_shortage_day_share: 0.35
+
+training:
+  days: null
+  days_source: T3.6
+  seeds: [101, 202, 303]
+  cities: [nyc, boston, chicago]
+  checkpoint_days: 50
+  final_policy: last_day_target_network
+
+city_inputs:
+  nyc:
+    market_name: New York City
+    # T1.1 N-only refit: two-opening CRN probe matched the 15d fulfillment
+    # target within 0.10 percentage point; eta_v3 remains fixed at 0.6.
+    fleet_scale: 1.2
+    calibration_json: calibration_artifacts/v17/nyc/calibration.json
+    threshold_cache: ../artifacts/v26_confirmatory/thresholds/nyc/llm_numeric_primary.jsonl
+    demand_calibration: artifacts/v17_relative_demand_post_fare_20261028/nyc/demand_1.15.json
+  boston:
+    market_name: Boston
+    fleet_scale: 1.0
+    calibration_json: calibration_artifacts/v17/boston/calibration.json
+    threshold_cache: ../artifacts/v26_confirmatory/thresholds/boston/llm_numeric_primary.jsonl
+    demand_calibration: artifacts/v17_relative_demand_post_fare_20261028/boston/demand_1.15.json
+  chicago:
+    market_name: Chicago
+    fleet_scale: 1.0
+    calibration_json: calibration_artifacts/v17/chicago/calibration.json
+    threshold_cache: ../artifacts/v26_confirmatory/thresholds/chicago/llm_numeric_primary.jsonl
+    demand_calibration: artifacts/v17_relative_demand_post_fare_20261028/chicago/demand_1.15.json

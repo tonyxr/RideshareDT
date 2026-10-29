@@ -146,6 +146,7 @@ from platform_mdp import (
     OperationalClock,
     TrainingStage,
     TrainingStageScheduler,
+    V17_PROGRESSIVE_PROFIT_LEAD_WEIGHTS,
     conditional_competitive_shares,
     config_payload as platform_mdp_config_payload,
     objective_profit_share,
@@ -817,6 +818,7 @@ class Core:
         v16_policy_epsilon: float = 0.05,
         v16_action_credit_scale: float = 1.0,
         v16_reward: bool = False,
+        current_active_driver_observation: bool = False,
         momentum_features: bool = False,
         momentum_day_steps: int = 6,
         opponent_features: bool = False,
@@ -889,6 +891,49 @@ class Core:
         self.v16_policy_epsilon = float(v16_policy_epsilon)
         self.v16_action_credit_scale = float(v16_action_credit_scale)
         self.v16_reward = bool(v16_reward)
+        self.v17_progressive_competition = (
+            str(training_curriculum).strip().lower() == "v17_progressive"
+        )
+        if self.v17_progressive_competition:
+            if self.v16_reward:
+                raise ValueError(
+                    "v17_progressive preserves the fixed V17 reward as a "
+                    "separate implementation; do not combine it with --v16_reward"
+                )
+            if temporal_competitive_reward:
+                raise ValueError(
+                    "v17_progressive uses direct profit competitiveness, not "
+                    "the legacy temporal reward"
+                )
+            requested_weights = (
+                V17_PROGRESSIVE_PROFIT_LEAD_WEIGHTS
+                if stage_profit_lead_weights is None
+                else tuple(float(value) for value in stage_profit_lead_weights)
+            )
+            if not np.allclose(
+                requested_weights,
+                V17_PROGRESSIVE_PROFIT_LEAD_WEIGHTS,
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                raise ValueError(
+                    "v17_progressive fixes market/static/catchup/profit "
+                    "profit-lead weights at 0,0.5,0.625,0.75"
+                )
+            if (
+                stage_market_share_competitiveness_weights is not None
+                and any(
+                    not np.isclose(float(value), 0.0)
+                    for value in stage_market_share_competitiveness_weights
+                )
+            ):
+                raise ValueError(
+                    "v17_progressive reward contains no market-share shaping"
+                )
+            stage_specific_rewards = True
+            stage_profit_lead_weights = V17_PROGRESSIVE_PROFIT_LEAD_WEIGHTS
+            stage_market_share_competitiveness_weights = (0.0, 0.0, 0.0, 0.0)
+            current_active_driver_observation = True
         if not (
             np.isfinite(self.v16_tau_start)
             and np.isfinite(self.v16_tau_end)
@@ -1244,7 +1289,14 @@ class Core:
             "heuristic_random",
             *(BENCHMARK_OPPONENT_MODES if v25 else ()),
         )))
-        self.training_catchup_opponent_modes = CATCHUP_OPPONENT_MODES
+        self.training_catchup_opponent_modes = tuple(dict.fromkeys((
+            *CATCHUP_OPPONENT_MODES,
+            *(
+                REACTIVE_STAGE3_OPPONENT_MODES
+                if self.v17_progressive_competition
+                else ()
+            ),
+        )))
         self.training_profit_opponent_modes = tuple(dict.fromkeys((
             *OPTIMIZED_BENCHMARK_OPPONENT_MODES,
             *PROFIT_BEST_RESPONSE_OPPONENT_MODES,
@@ -1446,6 +1498,9 @@ class Core:
             momentum_day_steps=int(self.momentum_day_steps),
             opponent_features=bool(self.opponent_features),
             opponent_move_threshold=float(self.opponent_move_threshold),
+            current_active_driver_observation=bool(
+                current_active_driver_observation
+            ),
         )
         self.positive_reward_config = PositiveRewardConfig(
             profit_weight=float(positive_reward_profit_weight),
@@ -1465,7 +1520,7 @@ class Core:
             fixed_economic_reward_v16=self.v16_reward,
             stage_specific_rewards=bool(stage_specific_rewards),
             four_stage_curriculum_rewards=(
-                str(training_curriculum) == "staged"
+                str(training_curriculum) in {"staged", "v17_progressive"}
                 and bool(stage_specific_rewards)
             ),
             opponent_profit_lead_weight=float(opponent_profit_lead_weight),
@@ -1485,7 +1540,7 @@ class Core:
                 long_term_profit_advantage_scale
                 if self.v16_reward
                 else long_term_profit_scale
-                if self.learning_corrections
+                if self.learning_corrections or self.v17_progressive_competition
                 else long_term_profit_advantage_scale
             ),
             own_profit_weight=float(
@@ -3325,7 +3380,7 @@ class Core:
         setattr(
             pricer,
             "rivals_two_lever",
-            bool(self.rivals_two_lever and cls is not None),
+            bool(getattr(self, "rivals_two_lever", False) and cls is not None),
         )
         return pricer
 
@@ -3692,8 +3747,20 @@ class Core:
             firm,
             self.driver_supply.last_states.get(firm, FirmDriverBatchState()),
         )
+        current_state = self.driver_supply.last_states.get(
+            firm, FirmDriverBatchState()
+        )
+        live_driver_count = bool(
+            self.observation_config.current_active_driver_observation
+        )
         context = {
-            "active_drivers": float(state.active_drivers),
+            # Driver availability is an own-platform live operational count;
+            # service and earnings KPIs keep their registered smoothing.
+            "active_drivers": float(
+                current_state.active_drivers
+                if live_driver_count
+                else state.active_drivers
+            ),
             "idle_driver_share": float(state.idle_driver_share),
             "utilization": float(state.utilization),
             "acceptance_rate": float(state.acceptance_rate),
@@ -3704,7 +3771,16 @@ class Core:
             "driver_earnings_per_online_hour": float(state.driver_earnings_per_online_hour),
             "online_minutes": float(state.total_online_minutes),
         }
-        return context, self.driver_supply.state_features_for_firm(firm, opponent=opponent)
+        supply_vector = self.driver_supply.state_features_for_firm(
+            firm, opponent=opponent
+        ).copy()
+        if live_driver_count:
+            supply_vector[0] = (
+                self.driver_supply.current_active_driver_feature(
+                    current_state.active_drivers
+                )
+            )
+        return context, supply_vector
     
     @staticmethod
     def _smooth_positive_penalty(value: float, scale: float) -> float:
@@ -4378,7 +4454,7 @@ class Core:
             hour=hour,
             weather=weather,
         )
-        if self.rivals_two_lever:
+        if bool(getattr(self, "rivals_two_lever", False)):
             self._map_firm2_to_two_lever_diagonal()
         after = self._pricer_coeff_snapshot(self.firm2)
         target = self._opponent_action_target(before, after, self.firm2)
@@ -6294,7 +6370,10 @@ class Core:
                 )
         sample_rng = (
             self._v16_tape_rng("profiles")
-            if self.v16_crn_tape and self._v16_tape_position is not None
+            if (
+                bool(getattr(self, "v16_crn_tape", False))
+                and getattr(self, "_v16_tape_position", None) is not None
+            )
             else self.rng
         )
         sampled: List[Dict[str, Any]] = []
@@ -8562,8 +8641,16 @@ class Core:
           not an observation-matched measure of foresight.
         """
         name = str(spec)
+        # Legacy action 0 is hold.  In V17's 25-cell contract action 0 is the
+        # (0.8, 0.8) cell, so direct-posting comparators must use the existing
+        # negative no-action sentinel after setting their tariff.
+        posted_action = (
+            -1
+            if getattr(getattr(self, "firm1", None), "two_lever_actions", False)
+            else 0
+        )
         if name in {"opening_hold", "rl_actor_frozen"}:
-            return 0
+            return posted_action
         if name.startswith("static:"):
             if step_index == 0:
                 target = name.split(":", 1)[1]
@@ -8572,7 +8659,7 @@ class Core:
                     target, inc_text = target.split("@", 1)
                     incentive = float(inc_text)
                 self._post_firm1_target(float(target), incentive)
-            return 0
+            return posted_action
         if name.startswith("static_tariff:"):
             # Fixed differentiated tariff, e.g. static_tariff:@/path/tariff.json
             # with {"base_fare": 2.0, "per_minute": 1.6, ...}.
@@ -8588,14 +8675,14 @@ class Core:
                 self._post_firm1_coefficient_targets(
                     table
                 )
-            return 0
+            return posted_action
         if name.startswith("schedule:"):
             # Open-loop daily schedule: {"default": [m, inc], "days": {"3": [m, inc], ...}}
             table = self._parse_policy_table(name.split(":", 1)[1])
             day = int(step_index) // int(max(1, self.shared_steps_per_day))
             entry = dict(table.get("days", {})).get(str(day), table.get("default", [1.0, 1.0]))
             self._post_firm1_target(float(entry[0]), float(entry[1]) if len(entry) > 1 else 1.0)
-            return 0
+            return posted_action
         if name.startswith("oracle:"):
             # Regime-oracle static policy: told the true regime, posts the
             # table's (multiplier, incentive) for it; no foresight beyond the
@@ -8606,14 +8693,14 @@ class Core:
                 raise ValueError(f"Oracle table has no target for regime {key!r}")
             entry = table[key]
             self._post_firm1_target(float(entry[0]), float(entry[1]) if len(entry) > 1 else 1.0)
-            return 0
+            return posted_action
         if name.startswith("rule:"):
             # Tuned reactive rule on the same public information as the actor
             # (delayed own KPIs, public quote gaps, public regime signals).
             params = self._parse_policy_table(name.split(":", 1)[1])
             multiplier, incentive = self._reactive_rule(params, int(hour))
             self._post_firm1_target(multiplier, incentive)
-            return 0
+            return posted_action
         if name == "myopic_greedy":
             feasible = np.flatnonzero(np.asarray(action_mask, dtype=bool))
             if feasible.size == 0:
@@ -9804,6 +9891,10 @@ class Core:
     def _trace_row(self, *, rollout: str, step: int, hour: int, m1, m2, reward: float = float("nan")) -> Dict[str, float]:
         supply = self.driver_supply if self.enable_driver_supply else None
         base = self.market.curr_market
+        welfare = dict(getattr(self, "last_welfare_stats", {}) or {})
+        fare_buckets = list(dict(welfare.get("by_income", {}) or {}).values())
+        fare_served = float(sum(float(values[1]) for values in fare_buckets))
+        fare_paid = float(sum(float(values[2]) for values in fare_buckets))
         ratios = [
             float(get_coeff(base, self.firm1.overrides, key)) / max(1e-6, float(getattr(base, key)))
             for key in self.shared_edit_keys if float(getattr(base, key)) > 0.0
@@ -9828,6 +9919,7 @@ class Core:
             "rival_wait": float(m2.avg_wait_minutes),
             "revenue_per_request": float(m1.rev_per_request),
             "rival_revenue_per_request": float(m2.rev_per_request),
+            "mean_fare_paid": fare_paid / max(1.0, fare_served),
             "profit_per_request": float(m1.profit_per_request),
             "rival_profit_per_request": float(m2.profit_per_request),
             "reward": float(reward),
@@ -9898,11 +9990,16 @@ class Core:
         return float(np.mean(values)) if values else 0.0
 
     def _post_firm1_target(self, multiplier: float, incentive: float = 1.0) -> None:
-        """Post ``multiplier`` x every controlled anchor and the incentive level."""
+        """Post a legacy scalar or a V17 distance/time diagonal level."""
         if hasattr(self.firm1, "release_tariff_level"):
             self.firm1.release_tariff_level()
         base = self.market.curr_market
-        for key in self.firm1.opt_keys:
+        keys = (
+            ("per_mile", "per_minute")
+            if getattr(self.firm1, "two_lever_actions", False)
+            else tuple(self.firm1.opt_keys)
+        )
+        for key in keys:
             lb, ub = self.firm1.config.bounds[key]
             value = float(np.clip(float(getattr(base, key)) * float(multiplier), lb, ub))
             setattr(self.firm1.overrides, key, value)
@@ -10718,12 +10815,15 @@ class Core:
         if (
             training_enabled
             and self.firm1_mode == "RL"
-            and self.training_stage_scheduler.mode == "staged"
+            and self.training_stage_scheduler.mode in {
+                "staged", "v17_progressive"
+            }
         ):
             if int(train_timesteps) < len(self.training_stage_scheduler.stages):
                 raise ValueError(
-                    "staged training requires at least three --train_timesteps "
-                    "so market, static_opponent, and dynamic_opponent each run"
+                    "four-stage training requires at least four "
+                    "--train_timesteps so market, static, catch-up, and "
+                    "profit-maximizer stages each run"
                 )
             if str(self.firm2_mode) == "static":
                 raise ValueError(
@@ -10859,7 +10959,12 @@ class Core:
         print(
             ">>> Training curriculum: "
             + " -> ".join(
-                f"{stage.name}({stage_day_counts.get(stage.name, 0)} day(s))"
+                (
+                    f"{stage.name}({stage_day_counts.get(stage.name, 0)} day(s), "
+                    "reward="
+                    f"{self.long_term_profit_reward_config.economic_weights(stage.opponent_regime)['own_profit']:.1%} own/"
+                    f"{self.long_term_profit_reward_config.economic_weights(stage.opponent_regime)['profit_lead']:.1%} lead)"
+                )
                 for stage in self.training_stage_scheduler.stages
             )
             + "; catch-up population="
@@ -13748,6 +13853,13 @@ class Core:
                     sort_keys=True,
                 ),
             }
+            # T0.1 requires the flags-off trace schema, not only its values,
+            # to remain byte-identical to 15d.  Q-policy diagnostics therefore
+            # exist only when the Q policy is actually active.
+            if self.v16_policy_mode != "q":
+                for key in tuple(log_row):
+                    if key.startswith("v16_q_"):
+                        log_row.pop(key)
             # Revision 15b corrected-learning diagnostics are intentionally
             # absent from the flags-off path.  That path is the frozen v26
             # compatibility surface and its evaluation CSV must remain
@@ -14920,6 +15032,17 @@ class Core:
                 "recent_intervention_rate": 0.0,
                 "time_since_intervention": 1.0,
             }
+        current_active_drivers = 0.0
+        active_driver_scale = 1.0
+        if self.enable_driver_supply:
+            current_active_drivers = float(
+                self.driver_supply.last_states.get(
+                    firm_name, FirmDriverBatchState()
+                ).active_drivers
+            )
+            active_driver_scale = float(
+                self.driver_supply.config.base_active_drivers
+            )
         return self.platform_observers[firm_name].build_observation(
             hour=hour,
             day_of_week=day_of_week,
@@ -14939,6 +15062,8 @@ class Core:
                 self._persistence_public_features(firm_name)
                 if self.persistence_features else None
             ),
+            current_own_active_drivers=current_active_drivers,
+            active_driver_scale=active_driver_scale,
         )
 
     def _build_privileged_critic_state(
@@ -18459,10 +18584,13 @@ def main():
         "--training_curriculum",
         type=str,
         default="staged",
-        choices=["staged", "direct"],
+        choices=["staged", "v17_progressive", "direct"],
         help=(
             "Training environment sequence. staged uses market, static, public-"
             "price-gap catch-up, then simulator-backed profit-maximizing rivals. "
+            "v17_progressive fixes the Oct-28 manual's 5/5/30/60 allocation, "
+            "ramps direct profit competitiveness 0/50/62.5/75%%, and exposes "
+            "each platform's exact current own active-driver count. "
             "direct is retained only as an ablation."
         ),
     )
@@ -18921,6 +19049,15 @@ def main():
         help=(
             "Use the fixed every-stage V17 economic reward: 0.7 scaled own "
             "profit plus 0.3 scaled own-minus-competitor profit."
+        ),
+    )
+    v17.add_argument(
+        "--current_active_driver_observation",
+        action="store_true",
+        help=(
+            "Append the exact current own-platform active-driver count to each "
+            "firm's observation using an invertible scale; the opponent count "
+            "is never included. v17_progressive enables this automatically."
         ),
     )
 
@@ -19617,6 +19754,20 @@ def main():
         args.actor_true_shortage_flag = bool(saved_observation.get(
             "actor_true_shortage_flag", args.actor_true_shortage_flag
         ))
+        saved_current_driver_observation = bool(saved_observation.get(
+            "current_active_driver_observation", False
+        ))
+        if (
+            "--current_active_driver_observation" in argv_flag_names
+            and not saved_current_driver_observation
+        ):
+            parser.error(
+                "--current_active_driver_observation conflicts with the saved "
+                "observation contract"
+            )
+        args.current_active_driver_observation = (
+            saved_current_driver_observation
+        )
         saved_revision14_observation = {
             "momentum_features": bool(
                 saved_observation.get("momentum_features", False)
@@ -20012,6 +20163,9 @@ def main():
         v16_policy_epsilon=args.v16_policy_epsilon,
         v16_action_credit_scale=args.v16_action_credit_scale,
         v16_reward=args.v16_reward,
+        current_active_driver_observation=(
+            args.current_active_driver_observation
+        ),
         enable_driver_supply=not args.disable_driver_supply,
         use_osmnx=args.use_osmnx,
         osmnx_place=args.osmnx_place or None,

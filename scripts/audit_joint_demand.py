@@ -71,11 +71,22 @@ def responses(model, rows, grid):
     return dict(n=len(rows), curves=curves, elasticities=elasticities)
 
 
-def audit(slug, out, targets, n, *, price_sensitivity_units='legacy'):
+def audit(slug, out, targets, n, *, price_sensitivity_units='legacy',
+          calibration_root=None):
     import numpy as np
     city_out = out/slug
     city_out.mkdir()
-    core = load_core(slug, city_out/'setup', before_supply=True)
+    calibration = (
+        Path(calibration_root).resolve()/slug/'calibration.json'
+        if calibration_root is not None
+        else BASE.parent/f'data/processed/{slug}/calibration.json'
+    )
+    core = load_core(
+        slug,
+        city_out/'setup',
+        before_supply=True,
+        calibration_json=calibration,
+    )
     legacy = copy.deepcopy(core.choice_model)
     legacy.reputation = None
     provisional = dict(format=CONTRACT, city=core.market_name, typical_fare=core.city_reference_fare,
@@ -92,7 +103,6 @@ def audit(slug, out, targets, n, *, price_sensitivity_units='legacy'):
     base['typical_fare'] = float(np.median([row[2] for row in fit]))
     base['threshold_reference'] = float(np.median([row[0]['PriceThreshold'] for row in fit]))
     cache = Path(core.threshold_cache_path)
-    calibration = BASE.parent/f'data/processed/{slug}/calibration.json'
     base['evidence'] = dict(type='transferred_external_prior', source=SOURCES[0],
         fit_partition='training', heldout_partition='evaluation', fit_seed=70231, heldout_seed=79173,
         records_per_partition=n, cache_sha256=hashlib.sha256(cache.read_bytes()).hexdigest(),
@@ -159,6 +169,7 @@ def main():
     parser.add_argument('--elasticities', nargs='+', type=float, required=True)
     parser.add_argument('--records', type=int, default=2000)
     parser.add_argument('--price-sensitivity-units', choices=('legacy', 'relative'), default='legacy')
+    parser.add_argument('--calibration-root', type=Path)
     args = parser.parse_args()
     if args.records < 1 or any(not (-float('inf') < v < 0) for v in args.elasticities):
         parser.error('positive record count and negative finite elasticity targets are required')
@@ -172,7 +183,8 @@ def main():
         for slug in CITIES:
             (out/'status.txt').write_text(f'{slug}: demand-only calibration and held-out diagnostics\n')
             audit(slug, out, args.elasticities, args.records,
-                  price_sensitivity_units=args.price_sensitivity_units)
+                  price_sensitivity_units=args.price_sensitivity_units,
+                  calibration_root=args.calibration_root)
         if json.loads((out/'sources.json').read_text()) != source_hashes():
             raise RuntimeError('source changed during the demand audit')
         (out/'status.txt').write_text('completed: all prior arms retained; no RL/supply inference\n')

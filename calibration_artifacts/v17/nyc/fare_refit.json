@@ -1,0 +1,19 @@
+{
+  "contract": "v17-realistic-fare-variable-rate-refit-v1",
+  "source_calibration": "/Users/huali/Desktop/RideResponse/data/processed/nyc/calibration.json",
+  "source_calibration_sha256": "be6b694b8b5f5ce54ef47f0a77b3d7bbda7557397eb56be2aebe4bdc4ca3a3d8",
+  "source_trip_bank_sha256": "a838c819b8e77bc8c76ecc83c14fbf3fbc71ed29a4c5d8b90371b695c02c9058",
+  "partition": {
+    "order": "trip_bank_file_order",
+    "fit_rows": 40000,
+    "heldout_rows": 10000,
+    "fit_fraction": 0.8
+  },
+  "method": "common scalar on per-mile and per-minute anchors",
+  "variable_rate_scale": 1.002399513891224,
+  "fit_v15d_card_mean": 28.731363,
+  "fit_v17_card_mean": 28.731363,
+  "heldout_v15d_card_mean": 28.899559999999997,
+  "heldout_v17_card_mean": 28.901887,
+  "heldout_relative_gap": 8.052025705596044e-05
+}

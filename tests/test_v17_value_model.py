@@ -2,6 +2,7 @@
 
 import itertools
 
+import numpy as np
 import pytest
 import torch
 
@@ -76,6 +77,77 @@ def test_warm_start_has_unique_card_argmax():
     best = int(torch.argmax(q).item())
     assert tuple(_cells()[best].tolist()) == pytest.approx((1.0, 1.0))
     assert int((q == q.max()).sum().item()) == 1
+
+
+def test_t0_10_recovers_two_regime_argmax_from_300_noisy_rows():
+    """Registered synthetic recovery gate with observation noise SD 1.0."""
+    torch.manual_seed(1710)
+    rng = np.random.default_rng(1710)
+    cells = _cells()
+    model = V17ConcaveValueModel(
+        observation_dim=2,
+        frame_stack=2,
+        hidden_dim=16,
+    )
+    regimes = np.repeat(np.asarray([-1.0, 1.0], dtype=np.float32), 150)
+    observations = np.zeros((300, 2, 2), dtype=np.float32)
+    observations[:, :, 0] = regimes[:, None]
+    observations[:, :, 1] = rng.normal(0.0, 1.0, size=(300, 2))
+
+    clean_optima = np.asarray(
+        [(0.9, 1.2) if regime < 0.0 else (1.2, 0.9) for regime in regimes],
+        dtype=np.float32,
+    )
+    cell_array = cells.numpy()
+    offsets = cell_array[None, :, :] - clean_optima[:, None, :]
+    clean_values = -0.5 * (
+        80.0 * offsets[:, :, 0] ** 2
+        + 60.0 * offsets[:, :, 1] ** 2
+    )
+    noisy_values = clean_values + rng.normal(
+        0.0, 1.0, size=clean_values.shape
+    )
+    incumbent = list(itertools.product(TWO_LEVER_LEVELS, repeat=2)).index(
+        (1.0, 1.0)
+    )
+    targets = noisy_values - noisy_values[:, incumbent : incumbent + 1]
+
+    observation_tensor = torch.as_tensor(observations)
+    target_tensor = torch.as_tensor(targets, dtype=torch.float32)
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
+    batch_rng = np.random.default_rng(1711)
+    for _ in range(1200):
+        indices = torch.as_tensor(
+            batch_rng.integers(0, 300, size=64), dtype=torch.long
+        )
+        prediction = model(observation_tensor[indices], cells)["q"]
+        prediction = prediction - prediction[:, incumbent : incumbent + 1]
+        loss = torch.nn.functional.huber_loss(
+            prediction,
+            target_tensor[indices],
+            delta=0.5,
+        )
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+    evaluation_observations = torch.tensor(
+        [[[-1.0, 0.0], [-1.0, 0.0]], [[1.0, 0.0], [1.0, 0.0]]]
+    )
+    recovered = torch.argmax(
+        model(evaluation_observations, cells)["q"], dim=1
+    ).tolist()
+    expected_cells = [(0.9, 1.2), (1.2, 0.9)]
+    levels = list(TWO_LEVER_LEVELS)
+    expected_indices = [
+        list(itertools.product(TWO_LEVER_LEVELS, repeat=2)).index(cell)
+        for cell in expected_cells
+    ]
+    for actual_index, expected_index in zip(recovered, expected_indices):
+        actual_grid = divmod(actual_index, len(levels))
+        expected_grid = divmod(expected_index, len(levels))
+        assert abs(actual_grid[0] - expected_grid[0]) <= 1
+        assert abs(actual_grid[1] - expected_grid[1]) <= 1
 
 
 def test_public_encoder_receives_value_gradients():

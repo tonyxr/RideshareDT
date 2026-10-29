@@ -1,0 +1,59 @@
+{
+  "nyc": {
+    "contract": "v17-realistic-fare-variable-rate-refit-v1",
+    "source_calibration": "/Users/huali/Desktop/RideResponse/data/processed/nyc/calibration.json",
+    "source_calibration_sha256": "be6b694b8b5f5ce54ef47f0a77b3d7bbda7557397eb56be2aebe4bdc4ca3a3d8",
+    "source_trip_bank_sha256": "a838c819b8e77bc8c76ecc83c14fbf3fbc71ed29a4c5d8b90371b695c02c9058",
+    "partition": {
+      "order": "trip_bank_file_order",
+      "fit_rows": 40000,
+      "heldout_rows": 10000,
+      "fit_fraction": 0.8
+    },
+    "method": "common scalar on per-mile and per-minute anchors",
+    "variable_rate_scale": 1.002399513891224,
+    "fit_v15d_card_mean": 28.731363,
+    "fit_v17_card_mean": 28.731363,
+    "heldout_v15d_card_mean": 28.899559999999997,
+    "heldout_v17_card_mean": 28.901887,
+    "heldout_relative_gap": 8.052025705596044e-05
+  },
+  "boston": {
+    "contract": "v17-realistic-fare-variable-rate-refit-v1",
+    "source_calibration": "/Users/huali/Desktop/RideResponse/data/processed/boston/calibration.json",
+    "source_calibration_sha256": "c6c029b231e28617d0990f528457e91b88a8c843f65f73f7ee8234b678224f7e",
+    "source_trip_bank_sha256": "cb7ea8843bdb4395fe0e8b39e34a8a8a2c8932d1faa251360ea4a9a3d1789a73",
+    "partition": {
+      "order": "trip_bank_file_order",
+      "fit_rows": 40000,
+      "heldout_rows": 10000,
+      "fit_fraction": 0.8
+    },
+    "method": "common scalar on per-mile and per-minute anchors",
+    "variable_rate_scale": 1.6638687344791405,
+    "fit_v15d_card_mean": 16.53903975,
+    "fit_v17_card_mean": 16.539039499999998,
+    "heldout_v15d_card_mean": 16.444503000000005,
+    "heldout_v17_card_mean": 16.462854,
+    "heldout_relative_gap": 0.001115935215554753
+  },
+  "chicago": {
+    "contract": "v17-realistic-fare-variable-rate-refit-v1",
+    "source_calibration": "/Users/huali/Desktop/RideResponse/data/processed/chicago/calibration.json",
+    "source_calibration_sha256": "f7a461afd170255116acff051b879bab0b8f44fa238afc354a09581b362bf224",
+    "source_trip_bank_sha256": "6e71c60dda5d39ca405a681c4ee3646741c783dabebd7cc69c8de83a5bfb63bc",
+    "partition": {
+      "order": "trip_bank_file_order",
+      "fit_rows": 40000,
+      "heldout_rows": 10000,
+      "fit_fraction": 0.8
+    },
+    "method": "common scalar on per-mile and per-minute anchors",
+    "variable_rate_scale": 0.999628274325004,
+    "fit_v15d_card_mean": 14.962522750000002,
+    "fit_v17_card_mean": 14.9625225,
+    "heldout_v15d_card_mean": 14.995219,
+    "heldout_v17_card_mean": 14.995274000000002,
+    "heldout_relative_gap": 3.667835728249358e-06
+  }
+}

@@ -1,0 +1,235 @@
+{
+  "calibration": {
+    "agent": {
+      "age_mean": 44.98843643401808,
+      "age_std": 18.084008986610485,
+      "gender_probs": {
+        "Female": 0.5181769721594978,
+        "Male": 0.48182302784050224
+      },
+      "household_lambda": 2.23768912370063,
+      "income_probs": {
+        "100k-200k": 0.23474573860084888,
+        "200k+": 0.12408256307284576,
+        "50k-100k": 0.2649374207359497,
+        "<50k": 0.3762342775903556
+      },
+      "marital_probs": {
+        "Divorced": 0.10477262484071041,
+        "Married": 0.3686042228612871,
+        "Single": 0.4773022921685576,
+        "Widowed": 0.04932086012944495
+      }
+    },
+    "choice": {
+      "outside_option_base_fare": 2.5,
+      "price_level_index": 0.5308889301782603,
+      "reference_fare": 23.16,
+      "reference_trip": {
+        "distance_miles": 4.0,
+        "duration_minutes": 15.0
+      }
+    },
+    "market": {
+      "airport_prob": 0.10735,
+      "day_of_week_probs": {
+        "0": 0.11485,
+        "1": 0.13,
+        "2": 0.1305,
+        "3": 0.14275,
+        "4": 0.17175,
+        "5": 0.17275,
+        "6": 0.1374
+      },
+      "distance_mean_miles": 5.872934999999983,
+      "distance_std_miles": 6.46721524195494,
+      "duration_mean_minutes": 17.57780805706946,
+      "duration_std_minutes": 12.461061218079946,
+      "hour_probs": {
+        "0": 0.03135,
+        "1": 0.0227,
+        "10": 0.0402,
+        "11": 0.0424,
+        "12": 0.04305,
+        "13": 0.0453,
+        "14": 0.04675,
+        "15": 0.046,
+        "16": 0.05425,
+        "17": 0.06615,
+        "18": 0.0692,
+        "19": 0.0681,
+        "2": 0.01715,
+        "20": 0.0555,
+        "21": 0.05565,
+        "22": 0.04985,
+        "23": 0.04315,
+        "3": 0.01105,
+        "4": 0.0125,
+        "5": 0.0148,
+        "6": 0.0229,
+        "7": 0.0435,
+        "8": 0.0518,
+        "9": 0.0467
+      },
+      "observed_price_mean": 13.62881549999665,
+      "observed_price_std": 10.175116809260622,
+      "service_probs": null,
+      "shared_ride_prob": 0.2793,
+      "weather_demand_multiplier": {
+        "clear": 0.9665602305796828,
+        "rain": 0.8516201400881288,
+        "snow": 2.069998616751198
+      },
+      "weather_probs": {
+        "clear": 0.8565169769989047,
+        "rain": 0.1025009127418766,
+        "snow": 0.04098211025921869
+      }
+    },
+    "supply": {
+      "driver_fare_share": 0.72,
+      "driver_fare_share_rows": 0,
+      "driver_fare_share_source": "reference_default"
+    },
+    "tariff": {
+      "airport_fee": 3.6591110964666314,
+      "base_fare": 2.4637304670750915,
+      "booking_fee": 2.258419594818834,
+      "day_multiplier": {
+        "5": 0.9995879127761782,
+        "6": 0.9995879127761782
+      },
+      "fit": {
+        "airport_identified": true,
+        "duration_identified": true,
+        "duration_split": "estimated",
+        "mae": 1.635970449761037,
+        "note": "Observed prices include platform-specific surge and fees; anchors are the multiplicative tariff that best reproduces the city's typical fare, not a published rate card.",
+        "r2": 0.8832035396153747,
+        "rows": 36025,
+        "service_identified": false,
+        "shared_rows_excluded": 13951
+      },
+      "per_mile": 0.9274362699862932,
+      "per_minute": 0.25737848761634197,
+      "service_multiplier": {
+        "economy": 1.0,
+        "premium": 1.7
+      },
+      "surge_hours": [
+        [
+          0,
+          4,
+          0.9818703404144808
+        ],
+        [
+          4,
+          8,
+          1.002381471504504
+        ],
+        [
+          8,
+          12,
+          0.9994901867757394
+        ],
+        [
+          12,
+          16,
+          1.0005098132242605
+        ],
+        [
+          16,
+          20,
+          1.0055928818850768
+        ],
+        [
+          20,
+          24,
+          0.9929076104496956
+        ]
+      ],
+      "weather_multiplier": {
+        "clear": 1.0,
+        "rain": 1.0061703859321738,
+        "snow": 1.002299561414231
+      }
+    },
+    "trip_bank": {
+      "airport_identified": true,
+      "duration_coverage": 0.99996,
+      "duration_identified": true,
+      "path": "../../../../data/processed/chicago/trip_bank.csv",
+      "rejections": {
+        "invalid_distance": 17,
+        "invalid_duration": 1
+      },
+      "rows": 50000,
+      "sampling": "systematic_whole_source",
+      "service_identified": false
+    }
+  },
+  "city": "Chicago",
+  "price_semantics": "realized_fare_plus_mandatory_charges_excluding_tip",
+  "quality": {
+    "geography_note": "PUMS records are filtered to 2020 PUMAs whose official TIGER names match 'Chicago City'; city-level ACS margins should be used for final raking when exact boundary equivalence is required.",
+    "household_sample_rows": 40217,
+    "identifiable_market_fields": {
+      "airport_probability": true,
+      "premium_service_probability": false,
+      "shared_ride_probability": true
+    },
+    "person_sample_rows": 80015,
+    "puma_codes": [
+      "03151",
+      "03152",
+      "03153",
+      "03154",
+      "03155",
+      "03156",
+      "03157",
+      "03158",
+      "03159",
+      "03160",
+      "03161",
+      "03162",
+      "03163",
+      "03164",
+      "03165",
+      "03166",
+      "03167",
+      "03168"
+    ],
+    "ride_rejections": {
+      "invalid_distance": 4,
+      "missing_distance": 1
+    },
+    "ride_rows_accepted": 20000
+  },
+  "ride_semantics": "realized_trip",
+  "sample_size": 20000,
+  "schema_version": 2,
+  "sources": {
+    "demographics": "https://www2.census.gov/programs-surveys/acs/data/pums/2024/5-Year/",
+    "rides": "https://www.kaggle.com/datasets/esaihuamanmeza/transportation-network-providers-trips-18-2022",
+    "weather": "https://www.ncei.noaa.gov/data/global-hourly/access/"
+  },
+  "v17_fare_refit": {
+    "contract": "v17-realistic-fare-variable-rate-refit-v1",
+    "source_calibration": "/Users/huali/Desktop/RideResponse/data/processed/chicago/calibration.json",
+    "source_calibration_sha256": "f7a461afd170255116acff051b879bab0b8f44fa238afc354a09581b362bf224",
+    "source_trip_bank_sha256": "6e71c60dda5d39ca405a681c4ee3646741c783dabebd7cc69c8de83a5bfb63bc",
+    "partition": {
+      "order": "trip_bank_file_order",
+      "fit_rows": 40000,
+      "heldout_rows": 10000,
+      "fit_fraction": 0.8
+    },
+    "method": "common scalar on per-mile and per-minute anchors",
+    "variable_rate_scale": 0.999628274325004,
+    "fit_v15d_card_mean": 14.962522750000002,
+    "fit_v17_card_mean": 14.9625225,
+    "heldout_v15d_card_mean": 14.995219,
+    "heldout_v17_card_mean": 14.995274000000002,
+    "heldout_relative_gap": 3.667835728249358e-06
+  }
+}
