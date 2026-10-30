@@ -106,6 +106,15 @@ def validate_t2_dependency(
         raise ValueError("T3 T2 report uses the wrong ranking objective")
 
 
+def load_t2_dependency(
+    config: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    status = json.loads(T2_STATUS.read_text(encoding="utf-8"))
+    report = json.loads(T2_REPORT.read_text(encoding="utf-8"))
+    validate_t2_dependency(config, status, report)
+    return status, report
+
+
 def _set_option(command: list[str], flag: str, value: str) -> None:
     if flag not in command:
         command.extend((flag, value))
@@ -661,6 +670,9 @@ def main() -> int:
     output.mkdir(parents=True, exist_ok=True)
     _write_json(output / "status.json", {**plan, "state": "running"})
     try:
+        # T3's adaptation gate depends on T2. Validate that dependency before
+        # launching either expensive training horizon.
+        _, t2 = load_t2_dependency(config)
         training_jobs = []
         for horizon in HORIZONS:
             command = training_command(
@@ -733,9 +745,6 @@ def main() -> int:
                     "validation_jobs": len(validation_jobs),
                 })
 
-        t2_status = json.loads(T2_STATUS.read_text(encoding="utf-8"))
-        t2 = json.loads(T2_REPORT.read_text(encoding="utf-8"))
-        validate_t2_dependency(config, t2_status, t2)
         adaptation_found, adaptation_mean = _adaptation_found(t2)
         levels = ACTION_LEVELS[str(config["action"]["contract"])]
         horizons: dict[str, Any] = {}

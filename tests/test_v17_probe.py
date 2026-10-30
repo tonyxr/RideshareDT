@@ -1,4 +1,5 @@
 import json
+import sys
 
 import pytest
 
@@ -123,3 +124,28 @@ def test_t3_rejects_failed_or_stale_t2(target, key, value):
     (status if target == "status" else report)[key] = value
     with pytest.raises(ValueError):
         t3.validate_t2_dependency(config, status, report)
+
+
+def test_t3_rejects_stale_t2_before_starting_training(monkeypatch, tmp_path):
+    config, status, report = _valid_t2_dependency()
+    status["config_hash"] = "stale"
+    status_path = tmp_path / "t2_status.json"
+    report_path = tmp_path / "t2_report.json"
+    status_path.write_text(json.dumps(status))
+    report_path.write_text(json.dumps(report))
+    monkeypatch.setattr(t3, "T2_STATUS", status_path)
+    monkeypatch.setattr(t3, "T2_REPORT", report_path)
+    monkeypatch.setattr(
+        t3,
+        "_run_cached_job",
+        lambda *args, **kwargs: pytest.fail("training must not start"),
+    )
+    output = tmp_path / "t3"
+    monkeypatch.setattr(
+        sys, "argv", ["v17_probe.py", "--output", str(output)]
+    )
+    with pytest.raises(ValueError, match="stale configuration hash"):
+        t3.main()
+    saved = json.loads((output / "status.json").read_text())
+    assert saved["state"] == "failed"
+    assert "stale configuration hash" in saved["error"]
