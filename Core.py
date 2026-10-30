@@ -11265,6 +11265,11 @@ class Core:
         )
         resolved_checkpoint_openings = int(max(1, checkpoint_validation_openings))
         if training_enabled and self.firm1_mode == "RL":
+            # Validate this independently from the train/eval volumes. A
+            # checkpoint-only mismatch must fail before an expensive run.
+            self._check_supply_calibration_volume(
+                resolved_checkpoint_customers
+            )
             print(
                 ">>> Checkpoint validation: "
                 f"horizon={resolved_checkpoint_horizon}, "
@@ -12898,6 +12903,40 @@ class Core:
                     ),
                     v17_probe_max_rss_mb=float(rss_bytes / (1024.0 ** 2)),
                 )
+            if (
+                self.v17_probe_mode
+                and (d + 1) in self.v17_probe_checkpoint_days
+            ):
+                # Persist the completed training day before running optional
+                # validation so a validation/configuration failure cannot
+                # discard the expensive probe checkpoint.
+                checkpoint_dir = os.path.abspath(os.path.expanduser(
+                    self.v17_probe_checkpoint_dir
+                ))
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                checkpoint_path = os.path.join(
+                    checkpoint_dir, f"day_{d + 1}.pt"
+                )
+                self.save_trained_model(
+                    checkpoint_path,
+                    registry_dir=None,
+                    model_id=(
+                        f"v17-t3-h{self.v16_branch_horizon_days}-"
+                        f"day{d + 1}"
+                    ),
+                    metadata={
+                        "training_days": int(d + 1),
+                        "training_seed": int(self.seed),
+                        "training_stage": str(
+                            self.current_training_stage.name
+                        ),
+                        "comparison_checkpoint_day": int(d + 1),
+                        "comparison_checkpoint_status": "v17_t3_probe",
+                        "branch_horizon_days": int(
+                            self.v16_branch_horizon_days
+                        ),
+                    },
+                )
             validation_score = np.nan
             if self.firm1_mode == "RL" and ((d + 1) % validation_interval == 0 or (d + 1) == train_timesteps):
                 # Validate the same seeded actor distribution used for final
@@ -13217,38 +13256,6 @@ class Core:
                 log_row.pop('behavior_exploration_rate')
             self.training_logs.append(log_row)
 
-            if (
-                self.v17_probe_mode
-                and (d + 1) in self.v17_probe_checkpoint_days
-            ):
-                checkpoint_dir = os.path.abspath(os.path.expanduser(
-                    self.v17_probe_checkpoint_dir
-                ))
-                os.makedirs(checkpoint_dir, exist_ok=True)
-                checkpoint_path = os.path.join(
-                    checkpoint_dir, f"day_{d + 1}.pt"
-                )
-                self.save_trained_model(
-                    checkpoint_path,
-                    registry_dir=None,
-                    model_id=(
-                        f"v17-t3-h{self.v16_branch_horizon_days}-"
-                        f"day{d + 1}"
-                    ),
-                    metadata={
-                        "training_days": int(d + 1),
-                        "training_seed": int(self.seed),
-                        "training_stage": str(
-                            self.current_training_stage.name
-                        ),
-                        "comparison_checkpoint_day": int(d + 1),
-                        "comparison_checkpoint_status": "v17_t3_probe",
-                        "branch_horizon_days": int(
-                            self.v16_branch_horizon_days
-                        ),
-                    },
-                )
-            
             if self.firm1_mode == "RL":
                 # Keep the predeclared exploration schedule synchronized in
                 # the primary experiment workflow as well as in ``run``.

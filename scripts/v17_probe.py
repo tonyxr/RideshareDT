@@ -39,6 +39,7 @@ CORE = BASE / "Core.py"
 DEFAULT_OUTPUT = BASE / "runs/v17_t3"
 SHORT_OUTPUT = BASE / "runs/v17_t3_short"
 T2_REPORT = BASE / "runs/v17_t2/report.json"
+T2_STATUS = BASE / "runs/v17_t2/status.json"
 HORIZONS = (5, 7)
 TRAINING_DAYS = 200
 CHECKPOINT_DAYS = (100, 150, 200)
@@ -46,6 +47,7 @@ SHORT_TRAINING_DAYS = 60
 SHORT_CHECKPOINT_DAYS = (30, 45, 60)
 VALIDATION_DAYS = 28
 VALIDATION_OPENINGS = 3
+REQUIRED_T2_OPENINGS = 5
 VALIDATION_SEED = 55101
 STEPS_PER_DAY = 6
 DRIVER_SLOT = 24
@@ -73,6 +75,35 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validate_t2_dependency(
+    config: Mapping[str, Any],
+    status: Mapping[str, Any],
+    report: Mapping[str, Any],
+) -> None:
+    """Reject missing, failed, or stale T2 evidence before scoring T3."""
+    validate_config(config)
+    expected_hash = canonical_hash(config)
+    contract = str(config["action"]["contract"])
+    expected_levels = tuple(float(value) for value in ACTION_LEVELS[contract])
+    report_levels = tuple(float(value) for value in report.get("levels", ()))
+    if status.get("state") != "passed" or status.get("pass") is not True:
+        raise ValueError("T3 requires a passed T2 status")
+    if status.get("config_hash") != expected_hash:
+        raise ValueError("T3 T2 dependency uses a stale configuration hash")
+    if status.get("action_contract") != contract:
+        raise ValueError("T3 T2 status uses a stale action contract")
+    if report.get("action_contract") != contract:
+        raise ValueError("T3 T2 report uses a stale action contract")
+    if report_levels != expected_levels:
+        raise ValueError("T3 T2 report uses stale action levels")
+    if int(report.get("openings", 0)) != REQUIRED_T2_OPENINGS:
+        raise ValueError(
+            f"T3 requires T2 with {REQUIRED_T2_OPENINGS} openings"
+        )
+    if report.get("ranking_objective") != OBJECTIVE_NAME:
+        raise ValueError("T3 T2 report uses the wrong ranking objective")
 
 
 def _set_option(command: list[str], flag: str, value: str) -> None:
@@ -131,7 +162,7 @@ def training_command(
             "--checkpoint_validation_horizon",
             "2",
             "--checkpoint_validation_customers",
-            "20",
+            "50",
             "--checkpoint_validation_openings",
             "1",
             "--eval_timesteps",
@@ -702,7 +733,9 @@ def main() -> int:
                     "validation_jobs": len(validation_jobs),
                 })
 
+        t2_status = json.loads(T2_STATUS.read_text(encoding="utf-8"))
         t2 = json.loads(T2_REPORT.read_text(encoding="utf-8"))
+        validate_t2_dependency(config, t2_status, t2)
         adaptation_found, adaptation_mean = _adaptation_found(t2)
         levels = ACTION_LEVELS[str(config["action"]["contract"])]
         horizons: dict[str, Any] = {}
