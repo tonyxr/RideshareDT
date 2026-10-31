@@ -22,6 +22,10 @@ def test_t3_training_command_matches_revb_probe_contract(tmp_path):
     assert command[command.index("--shortage_willingness_share") + 1] == "0.5"
     assert command[command.index("--action_contract") + 1] == "two_lever_v3"
     assert command[command.index("--checkpoint_validation_customers") + 1] == "50"
+    assert command[command.index("--training_resume_state") + 1].endswith(
+        "h5/resume/training_state.pt"
+    )
+    assert command[command.index("--training_resume_every_days") + 1] == "1"
 
 
 def test_t3_short_command_uses_60_days_and_three_short_checkpoints(tmp_path):

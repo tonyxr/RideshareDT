@@ -178,6 +178,10 @@ def training_command(
             "2",
             "--eval_customers",
             "50",
+            "--training_resume_state",
+            str((run_dir / "resume/training_state.pt").resolve()),
+            "--training_resume_every_days",
+            "1",
         )
     )
     return command
@@ -259,7 +263,17 @@ def _run(
     command: Sequence[str], *, log: Path, env: Mapping[str, str]
 ) -> None:
     log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("w", encoding="utf-8") as handle:
+    resume_state = _training_resume_path(command)
+    append = bool(
+        resume_state is not None and resume_state.is_file() and log.is_file()
+    )
+    with log.open("a" if append else "w", encoding="utf-8") as handle:
+        if append:
+            handle.write(
+                "\n>>> V17 runner restart: resuming from exact saved "
+                f"training state {resume_state}\n"
+            )
+            handle.flush()
         completed = subprocess.run(
             list(command), cwd=BASE, env=dict(env), stdout=handle,
             stderr=subprocess.STDOUT, text=True, check=False,
@@ -268,6 +282,16 @@ def _run(
         raise RuntimeError(
             f"command failed with exit {completed.returncode}; see {log}"
         )
+
+
+def _training_resume_path(command: Sequence[str]) -> Path | None:
+    try:
+        index = list(command).index("--training_resume_state")
+    except ValueError:
+        return None
+    if index + 1 >= len(command):
+        raise ValueError("--training_resume_state has no path")
+    return Path(command[index + 1]).expanduser().resolve()
 
 
 def _run_cached_job(
@@ -284,7 +308,12 @@ def _run_cached_job(
             raise ValueError(f"stale T3 cache identity: {product}")
         return "cached"
     if (product.exists() or manifest.exists()) and not force:
-        raise ValueError(f"partial T3 cache requires --force: {product}")
+        # Training checkpoints are written before the Core subprocess exits.
+        # If the parent disappeared in that window, the exact run state is the
+        # authority and can finish the same job without replaying prior days.
+        resume_state = _training_resume_path(command)
+        if resume_state is None or not resume_state.is_file():
+            raise ValueError(f"partial T3 cache requires --force: {product}")
     env = dict(os.environ)
     env.update(
         OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",

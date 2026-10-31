@@ -425,6 +425,104 @@ def _sha256_file(path: str) -> str:
             digest.update(chunk)
     return digest.hexdigest()
 
+
+TRAINING_RESUME_FORMAT = "ride-response-training-resume-v1"
+
+
+def _atomic_write_training_resume_state(
+    path: str, payload: Mapping[str, Any]
+) -> None:
+    """Atomically persist an exact training-process continuation point.
+
+    Policy artifacts intentionally omit the live market, rollout buffer, and
+    curriculum episode state.  This file is different: it is an internal run
+    checkpoint whose only job is to resume the same experiment after a process
+    interruption without replaying completed days.
+    """
+    resolved = os.path.abspath(os.path.expanduser(str(path)))
+    os.makedirs(os.path.dirname(resolved) or ".", exist_ok=True)
+    temporary = f"{resolved}.tmp.{os.getpid()}"
+    try:
+        with open(temporary, "wb") as handle:
+            torch.save(dict(payload), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, resolved)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+    # A small sidecar lets monitors report progress without unpickling the
+    # entire simulator state.  The state file is replaced first, so a stale
+    # sidecar can only under-report progress after an abrupt interruption.
+    progress = {
+        "format": TRAINING_RESUME_FORMAT,
+        "completed_days": int(payload.get("completed_days", 0)),
+        "training_days": int(payload.get("contract", {}).get(
+            "train_timesteps", 0
+        )),
+        "saved_at_utc": str(payload.get("saved_at_utc", "")),
+    }
+    progress_path = resolved + ".progress.json"
+    progress_temporary = f"{progress_path}.tmp.{os.getpid()}"
+    try:
+        with open(progress_temporary, "w", encoding="utf-8") as handle:
+            json.dump(progress, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(progress_temporary, progress_path)
+    finally:
+        if os.path.exists(progress_temporary):
+            os.unlink(progress_temporary)
+
+
+def _load_training_resume_state(path: str) -> Dict[str, Any]:
+    resolved = os.path.abspath(os.path.expanduser(str(path)))
+    try:
+        payload = torch.load(resolved, weights_only=False)
+    except TypeError:
+        payload = torch.load(resolved)
+    if not isinstance(payload, dict):
+        raise ValueError("training resume state must be a mapping")
+    if payload.get("format") != TRAINING_RESUME_FORMAT:
+        raise ValueError(
+            f"unsupported training resume format in {resolved}: "
+            f"{payload.get('format')!r}"
+        )
+    if "core" not in payload or "loop_state" not in payload:
+        raise ValueError("training resume state is incomplete")
+    return payload
+
+
+def _validate_training_resume_contract(
+    payload: Mapping[str, Any], expected: Mapping[str, Any]
+) -> int:
+    saved = payload.get("contract")
+    if not isinstance(saved, Mapping):
+        raise ValueError("training resume state has no contract")
+    differing = sorted(
+        key
+        for key in set(saved) | set(expected)
+        if saved.get(key) != expected.get(key)
+    )
+    if differing:
+        details = ", ".join(
+            f"{key}: saved={saved.get(key)!r}, requested={expected.get(key)!r}"
+            for key in differing[:8]
+        )
+        raise ValueError(
+            "training resume contract changed; refusing to mix experiments "
+            f"({details})"
+        )
+    completed_days = int(payload.get("completed_days", -1))
+    total_days = int(expected.get("train_timesteps", 0))
+    if completed_days < 0 or completed_days > total_days:
+        raise ValueError(
+            "training resume completed-day count is outside the requested run: "
+            f"{completed_days}/{total_days}"
+        )
+    return completed_days
+
 def _discover_dataset_files(dataset_root: str, dataset_glob: str) -> List[str]:
     """Discover tabular files for dataset comparison; tolerate compressed variants."""
     base_patterns = [dataset_glob]
@@ -11043,14 +11141,98 @@ class Core:
         model_registry_dir: Optional[str] = "artifacts/trained_models",
         trained_model_id: Optional[str] = None,
         diagnostic_prefix: Optional[str] = None,
+        training_resume_state: Optional[str] = None,
+        training_resume_payload: Optional[Mapping[str, Any]] = None,
+        training_resume_every_days: int = 1,
     ):
         """Run workflow: synthetic-data RL training (day/timestep cadence), then held-out evaluation."""
-        self.diagnostic_journal = DiagnosticJournal(diagnostic_prefix) if diagnostic_prefix else None
-        journal = self.diagnostic_journal
         training_enabled = bool(training_enabled)
         if not training_enabled:
             train_timesteps = 0
             stochastic_training = False
+        def resume_path(value: Optional[str]) -> str:
+            return (
+                os.path.abspath(os.path.expanduser(str(value)))
+                if value else ""
+            )
+
+        training_resume_contract = {
+            "core_source_sha256": _sha256_file(__file__),
+            "market_name": str(self.market_name),
+            "seed": int(self.seed),
+            "firm1_mode": str(self.firm1_mode),
+            "firm2_mode": str(self.firm2_mode),
+            "learner_revision": int(self.learner_revision),
+            "action_semantics": str(getattr(
+                self.firm1, "action_semantics", ""
+            )),
+            "policy_objective": str(self._configured_primary_objective()),
+            "v17_probe_mode": bool(self.v17_probe_mode),
+            "v16_branch_horizon_days": int(self.v16_branch_horizon_days),
+            "train_timesteps": int(train_timesteps),
+            "train_customers_per_step": int(train_customers_per_step),
+            "eval_timesteps": int(eval_timesteps),
+            "eval_customers_per_step": int(eval_customers_per_step),
+            "profiles_out": resume_path(profiles_out),
+            "profiles_log_limit": int(profiles_log_limit),
+            "train_steps_per_day": int(train_steps_per_day),
+            "ppo_update_interval_days": int(ppo_update_interval_days),
+            "ppo_min_rollout_transitions": int(
+                ppo_min_rollout_transitions
+            ),
+            "stochastic_training": bool(stochastic_training),
+            "firm1_action_interval_steps": int(
+                firm1_action_interval_steps
+            ),
+            "firm2_action_interval_days": int(
+                firm2_action_interval_days
+            ),
+            "eval_policy_mode": str(eval_policy_mode),
+            "eval_policy_temperature": float(eval_policy_temperature),
+            "eval_policy_seed": (
+                None if eval_policy_seed is None else int(eval_policy_seed)
+            ),
+            "eval_guardrail_mode": str(eval_guardrail_mode),
+            "checkpoint_validation_horizon": int(
+                checkpoint_validation_horizon
+            ),
+            "checkpoint_validation_interval_days": int(
+                checkpoint_validation_interval_days
+            ),
+            "checkpoint_validation_customers_per_step": int(
+                checkpoint_validation_customers_per_step
+            ),
+            "checkpoint_validation_openings": int(
+                checkpoint_validation_openings
+            ),
+            "evaluate_benchmark_suite": bool(evaluate_benchmark_suite),
+            "training_enabled": bool(training_enabled),
+            "trained_model_out": resume_path(trained_model_out),
+            "model_registry_dir": resume_path(model_registry_dir),
+            "trained_model_id": str(trained_model_id or ""),
+            "diagnostic_prefix": resume_path(diagnostic_prefix),
+        }
+        resuming_training = training_resume_payload is not None
+        resume_completed_days = 0
+        if resuming_training:
+            resume_completed_days = _validate_training_resume_contract(
+                training_resume_payload, training_resume_contract
+            )
+            journal = getattr(self, "diagnostic_journal", None)
+            if diagnostic_prefix and (
+                journal is None
+                or resume_path(journal.prefix) != resume_path(diagnostic_prefix)
+            ):
+                raise ValueError(
+                    "training resume diagnostic prefix does not match the "
+                    "saved journal"
+                )
+        else:
+            self.diagnostic_journal = (
+                DiagnosticJournal(diagnostic_prefix)
+                if diagnostic_prefix else None
+            )
+            journal = self.diagnostic_journal
         if train_timesteps > 0:
             self._check_supply_calibration_volume(train_customers_per_step)
         self._check_supply_calibration_volume(eval_customers_per_step)
@@ -11072,7 +11254,8 @@ class Core:
             # The v26 calendar partitions each day into exactly this many
             # ordered blocks; validation and evaluation reuse the same value.
             self.market.dynamics_steps_per_day = int(train_steps_per_day)
-            self.market.calendar.day_index = -1
+            if not resuming_training:
+                self.market.calendar.day_index = -1
         if (
             training_enabled
             and self.firm1_mode == "RL"
@@ -11092,14 +11275,15 @@ class Core:
                     "final stage; use --training_curriculum direct only for a "
                     "static-opponent ablation"
                 )
-        self._initialize_run_distributions()
-        for observer in self.platform_observers.values():
-            observer.reset()
-        self.action_stability.reset()
-        if self.firm1_mode == "RL":
-            self.firm1.reset_state_history()
+        if not resuming_training:
+            self._initialize_run_distributions()
+            for observer in self.platform_observers.values():
+                observer.reset()
+            self.action_stability.reset()
+            if self.firm1_mode == "RL":
+                self.firm1.reset_state_history()
         
-        if stochastic_training:
+        if stochastic_training and not resuming_training:
             exp_seed = int(np.random.SeedSequence().generate_state(1)[0])
             self._seed_all_rngs(exp_seed)
             self.rng = np.random.default_rng(exp_seed)
@@ -11121,7 +11305,10 @@ class Core:
             if training_enabled
             else eval_customers_per_step
         )
-        self._refresh_profile_pool(rides_per_timestep=profile_demand_per_step)
+        if not resuming_training:
+            self._refresh_profile_pool(
+                rides_per_timestep=profile_demand_per_step
+            )
         train_profile_sample_size = self._effective_simulation_sample_size(train_customers_per_step, collect_rows=False)
         eval_profile_sample_size = self._effective_simulation_sample_size(eval_customers_per_step, collect_rows=False)
         self._profit_planner_reference_customers = int(
@@ -11350,7 +11537,105 @@ class Core:
         active_episode_days = 0
         dynamic_episode_ordinal = 0
         active_episode_opponent_mode = opponent_mode
-        for d in range(train_timesteps):
+        training_start_day = 0
+        if resuming_training:
+            loop_state = training_resume_payload.get("loop_state")
+            if not isinstance(loop_state, Mapping):
+                raise ValueError("training resume loop state is invalid")
+            required_loop_keys = (
+                "reward_history", "sampled_profile_rows",
+                "profile_limit_reached", "benchmark_opponent",
+                "training_clock", "best_checkpoint",
+                "best_validation_selection_key", "latest_checkpoint",
+                "latest_validation", "last_ppo_metrics",
+                "active_stage_name", "training_reward_stability_seen",
+                "pending_rl_step", "pending_reward_sum",
+                "pending_component_sum", "pending_discount",
+                "pending_reward_weight", "pending_count",
+                "previous_firm2_metrics", "last_ppo_update_day",
+                "active_episode_end_day", "active_episode_days",
+                "dynamic_episode_ordinal",
+                "active_episode_opponent_mode",
+            )
+            missing_loop_keys = [
+                key for key in required_loop_keys if key not in loop_state
+            ]
+            if missing_loop_keys:
+                raise ValueError(
+                    "training resume loop state is missing: "
+                    + ", ".join(missing_loop_keys)
+                )
+            reward_history = loop_state["reward_history"]
+            sampled_profile_rows = loop_state["sampled_profile_rows"]
+            profile_limit_reached = bool(
+                loop_state["profile_limit_reached"]
+            )
+            benchmark_opponent = loop_state["benchmark_opponent"]
+            training_clock = loop_state["training_clock"]
+            best_checkpoint = loop_state["best_checkpoint"]
+            best_validation_selection_key = loop_state[
+                "best_validation_selection_key"
+            ]
+            latest_checkpoint = loop_state["latest_checkpoint"]
+            latest_validation = loop_state["latest_validation"]
+            last_ppo_metrics = loop_state["last_ppo_metrics"]
+            active_stage_name = loop_state["active_stage_name"]
+            training_reward_stability_seen = bool(
+                loop_state["training_reward_stability_seen"]
+            )
+            pending_rl_step = loop_state["pending_rl_step"]
+            pending_reward_sum = float(loop_state["pending_reward_sum"])
+            pending_component_sum = loop_state["pending_component_sum"]
+            pending_discount = float(loop_state["pending_discount"])
+            pending_reward_weight = float(
+                loop_state["pending_reward_weight"]
+            )
+            pending_count = int(loop_state["pending_count"])
+            previous_firm2_metrics = loop_state[
+                "previous_firm2_metrics"
+            ]
+            last_ppo_update_day = int(loop_state["last_ppo_update_day"])
+            active_episode_end_day = int(
+                loop_state["active_episode_end_day"]
+            )
+            active_episode_days = int(loop_state["active_episode_days"])
+            dynamic_episode_ordinal = int(
+                loop_state["dynamic_episode_ordinal"]
+            )
+            active_episode_opponent_mode = str(
+                loop_state["active_episode_opponent_mode"]
+            )
+            rng_state = training_resume_payload.get("global_rng_state")
+            if not isinstance(rng_state, Mapping):
+                raise ValueError("training resume global RNG state is invalid")
+            random.setstate(rng_state["python"])
+            np.random.set_state(rng_state["numpy"])
+            torch.random.set_rng_state(rng_state["torch"])
+            if (
+                torch.cuda.is_available()
+                and rng_state.get("cuda") is not None
+            ):
+                torch.cuda.set_rng_state_all(rng_state["cuda"])
+            training_start_day = int(resume_completed_days)
+            if len(self.training_logs) != training_start_day:
+                raise ValueError(
+                    "training resume log/day mismatch: "
+                    f"logs={len(self.training_logs)}, "
+                    f"completed_days={training_start_day}"
+                )
+            print(
+                ">>> Exact training resume: continuing at day "
+                f"{training_start_day + 1}/{train_timesteps}; market, rider, "
+                "opponent, PPO buffer, curriculum, diagnostics, and RNG state "
+                "were restored."
+            )
+            if journal:
+                journal.event("training_resumed", {
+                    "completed_days": training_start_day,
+                    "training_days": int(train_timesteps),
+                    "resume_state": resume_path(training_resume_state),
+                })
+        for d in range(training_start_day, train_timesteps):
             probe_day_started = (
                 time.perf_counter() if self.v17_probe_mode else 0.0
             )
@@ -13339,6 +13624,69 @@ class Core:
                 segment_line = self._format_distance_segment_diagnostics(getattr(self, "last_crowd_response_stats", {}) or {})
                 if segment_line:
                     print(f"    [train segments] {segment_line}")
+            resume_stride = int(max(1, training_resume_every_days))
+            if (
+                training_resume_state
+                and training_enabled
+                and (
+                    (d + 1) % resume_stride == 0
+                    or (d + 1) == train_timesteps
+                )
+            ):
+                resume_payload = {
+                    "format": TRAINING_RESUME_FORMAT,
+                    "saved_at_utc": datetime.utcnow().isoformat() + "Z",
+                    "completed_days": int(d + 1),
+                    "contract": dict(training_resume_contract),
+                    # The full object is deliberate. Policy checkpoints omit
+                    # the live world and therefore cannot continue an exact
+                    # semi-MDP trajectory after interruption.
+                    "core": self,
+                    "loop_state": {
+                        "reward_history": reward_history,
+                        "sampled_profile_rows": sampled_profile_rows,
+                        "profile_limit_reached": profile_limit_reached,
+                        "benchmark_opponent": benchmark_opponent,
+                        "training_clock": training_clock,
+                        "best_checkpoint": best_checkpoint,
+                        "best_validation_selection_key": (
+                            best_validation_selection_key
+                        ),
+                        "latest_checkpoint": latest_checkpoint,
+                        "latest_validation": latest_validation,
+                        "last_ppo_metrics": last_ppo_metrics,
+                        "active_stage_name": active_stage_name,
+                        "training_reward_stability_seen": (
+                            training_reward_stability_seen
+                        ),
+                        "pending_rl_step": pending_rl_step,
+                        "pending_reward_sum": pending_reward_sum,
+                        "pending_component_sum": pending_component_sum,
+                        "pending_discount": pending_discount,
+                        "pending_reward_weight": pending_reward_weight,
+                        "pending_count": pending_count,
+                        "previous_firm2_metrics": previous_firm2_metrics,
+                        "last_ppo_update_day": last_ppo_update_day,
+                        "active_episode_end_day": active_episode_end_day,
+                        "active_episode_days": active_episode_days,
+                        "dynamic_episode_ordinal": dynamic_episode_ordinal,
+                        "active_episode_opponent_mode": (
+                            active_episode_opponent_mode
+                        ),
+                    },
+                    "global_rng_state": {
+                        "python": random.getstate(),
+                        "numpy": np.random.get_state(),
+                        "torch": torch.random.get_rng_state(),
+                        "cuda": (
+                            torch.cuda.get_rng_state_all()
+                            if torch.cuda.is_available() else None
+                        ),
+                    },
+                }
+                _atomic_write_training_resume_state(
+                    training_resume_state, resume_payload
+                )
         self.incomplete_population_rollout_transitions = 0
         if (
             self.firm1_mode == "RL"
@@ -18771,6 +19119,22 @@ def main():
         help="Plot coefficient and representative-fare trajectories every N days.",
     )
     parser.add_argument("--run_experiment", action="store_true", help="Run workflow-aligned training/eval experiment")
+    parser.add_argument(
+        "--training_resume_state",
+        type=str,
+        default="",
+        help=(
+            "Exact internal continuation state for --run_experiment. If the "
+            "file exists, resume after its last completed training day; "
+            "otherwise create it atomically after each completed day."
+        ),
+    )
+    parser.add_argument(
+        "--training_resume_every_days",
+        type=int,
+        default=1,
+        help="Write exact continuation state every N completed training days.",
+    )
     parser.add_argument("--trained_model_in", type=str, default="", help="Load a policy by explicit path, immutable registry model id/archive filename, or 'latest'.")
     parser.add_argument("--trained_model_out", type=str, default="", help="Optional mutable alias for the final completed dynamic-stage policy. Every training run is also saved immutably in --model_registry_dir.")
     parser.add_argument("--trained_model_id", type=str, default="", help="Stable human-readable id recorded for this training run in the model registry.")
@@ -19613,6 +19977,15 @@ def main():
         parser.error("--eval_only requires --trained_model_in")
     if args.dataset_only and (not args.trained_model_in or not args.compare_with_dataset):
         parser.error("--dataset_only requires --trained_model_in and --compare_with_dataset")
+    if args.training_resume_state and not args.run_experiment:
+        parser.error("--training_resume_state requires --run_experiment")
+    if args.training_resume_state and args.trained_model_in:
+        parser.error(
+            "--training_resume_state and --trained_model_in are mutually "
+            "exclusive; the former already contains the complete live run"
+        )
+    if int(args.training_resume_every_days) < 1:
+        parser.error("--training_resume_every_days must be positive")
     if args.trained_model_in:
         args.firm1_mode = "RL"
         args.run_experiment = True
@@ -20840,7 +21213,29 @@ def main():
                     load_training_scenario_manifest(args.training_scenario_manifest)
                 )
 
-    if str(args.rl_warm_start_target).strip() not in ("", "0", "0.0") and not args.trained_model_in and args.firm1_mode == "RL":
+    training_resume_payload = None
+    if args.training_resume_state:
+        args.training_resume_state = os.path.abspath(
+            os.path.expanduser(args.training_resume_state)
+        )
+        if os.path.isfile(args.training_resume_state):
+            training_resume_payload = _load_training_resume_state(
+                args.training_resume_state
+            )
+            core = training_resume_payload["core"]
+            print(
+                ">>> Loaded exact training continuation state from "
+                f"{args.training_resume_state} "
+                f"({int(training_resume_payload['completed_days'])}/"
+                f"{int(args.train_timesteps)} days complete)."
+            )
+
+    if (
+        training_resume_payload is None
+        and str(args.rl_warm_start_target).strip() not in ("", "0", "0.0")
+        and not args.trained_model_in
+        and args.firm1_mode == "RL"
+    ):
         if args.city_calibration_artifact:
             if str(args.rl_warm_start_target).lower() != 'auto' and float(args.rl_warm_start_target) != city_artifact['warm_start_target']:
                 parser.error('warm-start target conflicts with the city calibration artifact')
@@ -20851,7 +21246,7 @@ def main():
         else:
             warm_target = float(args.rl_warm_start_target)
         core.warm_start_actor(warm_target, float(args.rl_warm_start_logit))
-    if args.trained_model_in:
+    if args.trained_model_in and training_resume_payload is None:
         core.load_trained_model(
             args.trained_model_in,
             load_optimizer=not args.eval_only,
@@ -20859,7 +21254,11 @@ def main():
         )
 
 
-    if args.firm1_mode == "RL" and float(args.exploration_commit_mean) > 0.0:
+    if (
+        training_resume_payload is None
+        and args.firm1_mode == "RL"
+        and float(args.exploration_commit_mean) > 0.0
+    ):
         core.firm1.agent.set_exploration_commit_mean(float(args.exploration_commit_mean))
         core.v26r_settings = {**dict(core.v26r_settings), "exploration_commit_mean": float(args.exploration_commit_mean)}
         core.v26_settings = {**dict(core.v26_settings or {}), "v26r": core.v26r_settings}
@@ -20928,6 +21327,9 @@ def main():
             model_registry_dir=args.model_registry_dir or None,
             trained_model_id=args.trained_model_id or default_model_id(args.report_prefix),
             diagnostic_prefix=args.report_prefix if args.live_diagnostics else None,
+            training_resume_state=args.training_resume_state or None,
+            training_resume_payload=training_resume_payload,
+            training_resume_every_days=args.training_resume_every_days,
         )
         rows = []
     else:

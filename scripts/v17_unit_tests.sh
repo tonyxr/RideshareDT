@@ -82,7 +82,8 @@ run_gate T0.15 \
   tests/test_v17_two_lever_action.py::test_v3_surge_range_has_exactly_the_requested_36_cells \
   tests/test_v17_config.py::test_surge_range_v3_is_the_production_grid \
   tests/test_v17_t2_sweep.py \
-  tests/test_v17_probe.py
+  tests/test_v17_probe.py \
+  tests/test_training_resume.py
 
 # User-approved V17 extensions that must remain wired into the same release.
 run_gate V17.extensions tests/test_v17_progressive_competition.py
