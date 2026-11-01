@@ -126,7 +126,35 @@ def test_t3_partial_product_can_finish_from_exact_resume(
 
     assert result == "completed"
     assert calls == [command]
-    assert json.loads(manifest.read_text()) == {"command": command}
+    saved_manifest = json.loads(manifest.read_text())
+    assert saved_manifest["state"] == "completed"
+    assert saved_manifest["identity"] == {"command": command}
+    assert saved_manifest["product_sha256"] == v17_probe._sha256(product)
+
+
+def test_t3_resume_rejects_changed_prelaunch_source_identity(tmp_path):
+    product = tmp_path / "day_200.pt"
+    product.write_bytes(b"partial-product")
+    resume = tmp_path / "resume/training_state.pt"
+    resume.parent.mkdir(parents=True)
+    resume.write_bytes(b"exact-state")
+    manifest = tmp_path / "training_manifest.json"
+    manifest.write_text(json.dumps({
+        "state": "running",
+        "identity": {"sources": {"Core.py": "old"}},
+    }))
+    command = [
+        "python", "Core.py", "--training_resume_state", str(resume)
+    ]
+    with pytest.raises(ValueError, match="stale T3 cache identity"):
+        v17_probe._run_cached_job(
+            command,
+            product=product,
+            manifest=manifest,
+            log=tmp_path / "training.log",
+            identity={"sources": {"Core.py": "new"}},
+            force=False,
+        )
 
 
 def test_interrupted_training_continues_after_last_completed_day(
@@ -197,3 +225,55 @@ def test_interrupted_training_continues_after_last_completed_day(
     )
 
     assert [row["batch"] for row in resumed.training_logs] == [0, 1, 2, 3]
+
+
+def test_external_evaluation_only_suppresses_legacy_end_of_run_scoring(
+    monkeypatch, tmp_path
+):
+    core = Core(
+        "Chicago",
+        seed=1883,
+        firm1_mode="RL",
+        firm2_mode="heuristic",
+        total_customers_pool=10,
+        simulation_sample_cap=2,
+        enable_driver_supply=False,
+        openai_api_key="",
+        training_curriculum="direct",
+    )
+    core.active_calibration = {}
+    monkeypatch.setattr(
+        core,
+        "_adaptive_policy_validation",
+        lambda *args, **kwargs: pytest.fail(
+            "legacy embedded evaluation must remain disabled"
+        ),
+    )
+    training, evaluation = core.run_experiment(
+        train_timesteps=1,
+        train_customers_per_step=3,
+        eval_timesteps=2,
+        eval_customers_per_step=3,
+        train_steps_per_day=1,
+        ppo_update_interval_days=2,
+        ppo_min_rollout_transitions=1,
+        stochastic_training=False,
+        firm1_action_interval_steps=1,
+        firm2_action_interval_days=1,
+        checkpoint_validation_horizon=2,
+        checkpoint_validation_interval_days=1,
+        checkpoint_validation_customers_per_step=3,
+        checkpoint_validation_openings=1,
+        evaluate_benchmark_suite=False,
+        model_registry_dir=None,
+        diagnostic_prefix=str(tmp_path / "external-only"),
+        external_evaluation_only=True,
+    )
+    assert len(training) == 1
+    assert evaluation == []
+    assert core.competitive_backtest_report == {
+        "passed": None,
+        "status": "deferred_to_external_checkpoint_scoring",
+        "failures": [],
+        "evaluation_steps": 0,
+    }

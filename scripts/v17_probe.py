@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hashlib
 import json
@@ -47,6 +48,7 @@ SHORT_TRAINING_DAYS = 60
 SHORT_CHECKPOINT_DAYS = (30, 45, 60)
 VALIDATION_DAYS = 28
 VALIDATION_OPENINGS = 3
+MIN_EXTERNAL_EVALUATION_STEPS = 100
 REQUIRED_T2_OPENINGS = 5
 VALIDATION_SEED = 55101
 STEPS_PER_DAY = 6
@@ -92,6 +94,8 @@ def validate_t2_dependency(
         raise ValueError("T3 requires a passed T2 status")
     if status.get("config_hash") != expected_hash:
         raise ValueError("T3 T2 dependency uses a stale configuration hash")
+    if report.get("config_hash") != expected_hash:
+        raise ValueError("T3 T2 report uses a stale configuration hash")
     if status.get("action_contract") != contract:
         raise ValueError("T3 T2 status uses a stale action contract")
     if report.get("action_contract") != contract:
@@ -111,6 +115,8 @@ def load_t2_dependency(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     status = json.loads(T2_STATUS.read_text(encoding="utf-8"))
     report = json.loads(T2_REPORT.read_text(encoding="utf-8"))
+    if status.get("report_sha256") != _sha256(T2_REPORT):
+        raise ValueError("T3 T2 status/report hash mismatch")
     validate_t2_dependency(config, status, report)
     return status, report
 
@@ -166,18 +172,6 @@ def training_command(
             ",".join(str(day) for day in checkpoint_days),
             "--v17_probe_checkpoint_dir",
             str((run_dir / "checkpoints").resolve()),
-            "--checkpoint_validation_interval_days",
-            "100000",
-            "--checkpoint_validation_horizon",
-            "2",
-            "--checkpoint_validation_customers",
-            "50",
-            "--checkpoint_validation_openings",
-            "1",
-            "--eval_timesteps",
-            "2",
-            "--eval_customers",
-            "50",
             "--training_resume_state",
             str((run_dir / "resume/training_state.pt").resolve()),
             "--training_resume_every_days",
@@ -194,10 +188,14 @@ def validation_command(
     day: int,
     case: str,
     output: Path,
+    checkpoint_root: Path | None = None,
+    validation_days: int = VALIDATION_DAYS,
+    validation_openings: int = VALIDATION_OPENINGS,
 ) -> list[str]:
     validate_config(config)
     inputs = config["city_inputs"]["nyc"]
-    checkpoint = output / f"h{horizon}/checkpoints/day_{day}.pt"
+    checkpoint_base = output if checkpoint_root is None else checkpoint_root
+    checkpoint = checkpoint_base / f"h{horizon}/checkpoints/day_{day}.pt"
     raw = output / f"h{horizon}/validation/day_{day}/{case}.json"
     prefix = output / f"h{horizon}/validation/day_{day}/{case}"
     command = [
@@ -247,9 +245,9 @@ def validation_command(
         "--trained_model_in", str(checkpoint.resolve()), "--eval_only",
         "--policy_sweep", "rl_actor",
         "--policy_sweep_out", str(raw.resolve()),
-        "--policy_sweep_openings", str(VALIDATION_OPENINGS),
+        "--policy_sweep_openings", str(int(validation_openings)),
         "--policy_sweep_rivals", ",".join(VALIDATION_RIVALS),
-        "--policy_sweep_horizon", str(VALIDATION_DAYS * STEPS_PER_DAY),
+        "--policy_sweep_horizon", str(int(validation_days) * STEPS_PER_DAY),
         "--policy_sweep_seed", str(VALIDATION_SEED),
         "--report_prefix", _report_prefix(prefix),
     ]
@@ -257,6 +255,265 @@ def validation_command(
     if scenario is not None:
         command.extend(("--shock_scenario", str(scenario.resolve())))
     return command
+
+
+def _option_value(command: Sequence[str], flag: str) -> str | None:
+    values = list(command)
+    if flag not in values:
+        return None
+    index = values.index(flag)
+    if index + 1 >= len(values):
+        raise ValueError(f"{flag} has no value")
+    return str(values[index + 1])
+
+
+def validate_training_command_contract(command: Sequence[str]) -> None:
+    """Reject expensive V17 training commands with invalid phase contracts."""
+    values = list(command)
+    if "--external_evaluation_only" not in values:
+        raise ValueError(
+            "V17 training must defer Core's in-process evaluation"
+        )
+    eval_steps = _option_value(values, "--eval_timesteps")
+    if eval_steps is not None and int(eval_steps) < MIN_EXTERNAL_EVALUATION_STEPS:
+        raise ValueError(
+            "V17 cannot embed an evaluation shorter than the durability minimum"
+        )
+    if _option_value(values, "--training_resume_every_days") != "1":
+        raise ValueError("V17 training must save exact continuation every day")
+    if not _option_value(values, "--training_resume_state"):
+        raise ValueError("V17 training requires an exact continuation path")
+
+
+def validate_external_scoring_contract(
+    *,
+    checkpoint_days: Sequence[int],
+    validation_days: int,
+    validation_openings: int,
+) -> None:
+    steps = int(validation_days) * STEPS_PER_DAY
+    if steps < MIN_EXTERNAL_EVALUATION_STEPS:
+        raise ValueError(
+            "external checkpoint evaluation is too short for durability: "
+            f"{steps} < {MIN_EXTERNAL_EVALUATION_STEPS} steps"
+        )
+    if int(validation_openings) < 3:
+        raise ValueError("external checkpoint evaluation requires >=3 openings")
+    if len(tuple(checkpoint_days)) < 3:
+        raise ValueError("T3 scoring requires at least three checkpoints")
+    if len(CASES) < 2 or len(VALIDATION_RIVALS) < 3:
+        raise ValueError("T3 scoring case or rival coverage was reduced")
+
+
+def validate_checkpoint_contract(
+    path: Path,
+    *,
+    config: Mapping[str, Any],
+    horizon: int,
+    day: int,
+) -> dict[str, Any]:
+    """Fail before scoring if a policy does not match the requested experiment."""
+    artifact = _load_artifact(path)
+    if artifact.get("format") != "ride-response-platform-policy":
+        raise ValueError(f"unsupported checkpoint format: {path}")
+    if artifact.get("market_name") != "New York City":
+        raise ValueError(f"checkpoint market mismatch: {path}")
+    metadata = dict(artifact.get("metadata", {}) or {})
+    if int(metadata.get("training_seed", -1)) != 101:
+        raise ValueError(f"checkpoint training seed mismatch: {path}")
+    if int(metadata.get("training_days", -1)) < int(day):
+        raise ValueError(f"checkpoint training length mismatch: {path}")
+    if int(metadata.get("comparison_checkpoint_day", -1)) != int(day):
+        raise ValueError(f"checkpoint day metadata mismatch: {path}")
+    if int(metadata.get("branch_horizon_days", -1)) != int(horizon):
+        raise ValueError(f"checkpoint branch horizon mismatch: {path}")
+
+    contract = str(config["action"]["contract"])
+    levels = tuple(float(value) for value in ACTION_LEVELS[contract])
+    expected_cells = {
+        (distance, time) for distance in levels for time in levels
+    }
+    mapping = dict(artifact.get("action_to_two_lever_cell", {}) or {})
+    actual_cells = {
+        (float(cell[0]), float(cell[1])) for cell in mapping.values()
+    }
+    if actual_cells != expected_cells or len(mapping) != len(expected_cells):
+        raise ValueError(f"checkpoint action grid mismatch: {path}")
+
+    settings = dict(artifact.get("v26_settings", {}).get("v26r", {}) or {})
+    if settings.get("action_contract") != contract:
+        raise ValueError(f"checkpoint action contract mismatch: {path}")
+    if settings.get("supply_model") != "v3":
+        raise ValueError(f"checkpoint supply model mismatch: {path}")
+    expected_settings = {
+        "v16_branch_mode": "one_day_deviation",
+        "v16_branch_design": "stencil11",
+        "v16_value_head": "concave2d",
+        "v16_policy_mode": "q",
+        "v16_store_cap": 20000,
+        "v16_branch_horizon_days": int(horizon),
+        "shortage_willingness_share": 0.5,
+        "driver_pay_basis": "fare",
+        "spillover_price_aware": True,
+    }
+    for key, expected in expected_settings.items():
+        if settings.get(key) != expected:
+            raise ValueError(f"checkpoint {key} mismatch: {path}")
+    if contract == "two_lever_v3":
+        branch_contract = {
+            "branch_profit_planner_sample_cap": int(
+                config["credit"]["branch_profit_planner_sample_cap"]
+            ),
+            "branch_profit_planner_horizon_days": int(
+                config["credit"]["branch_profit_planner_horizon_days"]
+            ),
+            "branch_profit_planner_candidate_radius": int(
+                config["credit"]["branch_profit_planner_candidate_radius"]
+            ),
+        }
+        for key, expected in branch_contract.items():
+            if settings.get(key) != expected:
+                raise ValueError(f"checkpoint {key} mismatch: {path}")
+    if bool(settings.get("persistent_driver_stock")):
+        raise ValueError(f"checkpoint unexpectedly persists driver stock: {path}")
+    supply = dict(settings.get("effective_supply_config", {}) or {})
+    if float(supply.get("eta_v3", float("nan"))) != 0.6:
+        raise ValueError(f"checkpoint eta_v3 mismatch: {path}")
+    if float(settings.get("effective_fleet_scale", float("nan"))) != float(
+        config["city_inputs"]["nyc"]["fleet_scale"]
+    ):
+        raise ValueError(f"checkpoint fleet scale mismatch: {path}")
+    observation = dict(
+        artifact.get("mdp_config", {}).get("observation", {}) or {}
+    )
+    if observation.get("current_active_driver_observation") is not True:
+        raise ValueError(f"checkpoint lacks exact active-driver input: {path}")
+    if observation.get("opponent_features") is not False:
+        raise ValueError(f"checkpoint exposes opponent private features: {path}")
+    reward = dict(artifact.get("mdp_config", {}).get("active_reward", {}) or {})
+    if tuple(reward.get("stage_profit_lead_weights", ())) != (
+        0.0, 0.5, 0.625, 0.75
+    ):
+        raise ValueError(f"checkpoint reward contract mismatch: {path}")
+    if any(float(value) != 0.0 for value in reward.get(
+        "stage_market_share_competitiveness_weights", ()
+    )):
+        raise ValueError(f"checkpoint contains market-share shaping: {path}")
+    if artifact.get("policy_objective") != "profit_maximization":
+        raise ValueError(f"checkpoint policy objective mismatch: {path}")
+    value_model = dict(artifact.get("v16_value_model_config", {}) or {})
+    expected_value_model = {
+        "head": "concave2d",
+        "fit_steps": 50,
+        "fit_batch_size": 64,
+        "polyak": 0.99,
+    }
+    for key, expected in expected_value_model.items():
+        if value_model.get(key) != expected:
+            raise ValueError(f"checkpoint value-model {key} mismatch: {path}")
+    q_policy = dict(artifact.get("v16_q_policy_config", {}) or {})
+    if q_policy.get("mode") != "q" or q_policy.get("target_source") != (
+        "polyak_value_target"
+    ):
+        raise ValueError(f"checkpoint Q-policy contract mismatch: {path}")
+    demand = json.loads(
+        resolve_input(
+            config["city_inputs"]["nyc"]["demand_calibration"]
+        ).read_text(encoding="utf-8")
+    )
+    if artifact.get("demand_calibration") != demand:
+        raise ValueError(f"checkpoint demand calibration mismatch: {path}")
+    population = dict(artifact.get("case_study_population", {}) or {})
+    threshold_path = resolve_input(
+        config["city_inputs"]["nyc"]["threshold_cache"]
+    )
+    if (
+        population.get("threshold_profile_source") != "cached"
+        or population.get("threshold_cache_sha256") != _sha256(threshold_path)
+        or int(population.get("profile_pool_size", -1)) != 2000
+    ):
+        raise ValueError(f"checkpoint rider-population mismatch: {path}")
+    return artifact
+
+
+def validate_policy_sweep_product(
+    path: Path,
+    *,
+    config: Mapping[str, Any],
+    validation_days: int,
+    validation_openings: int,
+) -> dict[str, Any]:
+    """Reject truncated, stale, or malformed external evaluation products."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    expected_steps = int(validation_days) * STEPS_PER_DAY
+    expected_rollouts = {
+        f"{rival}__opening_{opening}"
+        for rival in VALIDATION_RIVALS
+        for opening in range(1, int(validation_openings) + 1)
+    }
+    if payload.get("protocol") != "v26r_policy_sweep_common_random_numbers":
+        raise ValueError(f"wrong policy-sweep protocol: {path}")
+    scalar_contract = {
+        "city": "New York City",
+        "horizon": expected_steps,
+        "customers_per_step": 50,
+        "steps_per_day": STEPS_PER_DAY,
+        "policy_seed": VALIDATION_SEED,
+    }
+    for key, expected in scalar_contract.items():
+        if payload.get(key) != expected:
+            raise ValueError(
+                f"policy-sweep {key} mismatch in {path}: "
+                f"{payload.get(key)!r} != {expected!r}"
+            )
+    v26r = dict(payload.get("v26r", {}) or {})
+    if v26r.get("action_contract") != config["action"]["contract"]:
+        raise ValueError(f"policy-sweep action contract mismatch: {path}")
+    if (
+        v26r.get("supply_model") != "v3"
+        or bool(v26r.get("persistent_driver_stock"))
+        or float(v26r.get("effective_fleet_scale", float("nan")))
+        != float(config["city_inputs"]["nyc"]["fleet_scale"])
+    ):
+        raise ValueError(f"policy-sweep supply contract mismatch: {path}")
+    declared_rollouts = {
+        str(row[0]) for row in payload.get("rollouts", ())
+        if isinstance(row, (list, tuple)) and len(row) == 2
+    }
+    results = dict(payload.get("results", {}).get("rl_actor", {}) or {})
+    if declared_rollouts != expected_rollouts or set(results) != expected_rollouts:
+        raise ValueError(f"policy-sweep rollout coverage mismatch: {path}")
+    finite_keys = (
+        "own_profit", "rival_profit", "own_share", "rival_share",
+        "fulfillment",
+    )
+    for rollout, row in results.items():
+        if int(row.get("steps", -1)) != expected_steps:
+            raise ValueError(
+                f"policy-sweep rollout {rollout} is truncated: {path}"
+            )
+        if not all(
+            np.isfinite(float(row.get(key, float("nan"))))
+            for key in finite_keys
+        ):
+            raise ValueError(
+                f"policy-sweep rollout {rollout} has non-finite metrics: {path}"
+            )
+    traces = list(payload.get("traces", {}).get("rl_actor", ()) or ())
+    trace_counts = {rollout: 0 for rollout in expected_rollouts}
+    for row in traces:
+        rollout = str(row.get("rollout", ""))
+        if rollout not in trace_counts:
+            raise ValueError(f"policy-sweep trace has unknown rollout: {path}")
+        if not all(
+            np.isfinite(float(row.get(key, float("nan"))))
+            for key in ("profit_per_request", "rival_profit_per_request")
+        ):
+            raise ValueError(f"policy-sweep trace has non-finite profit: {path}")
+        trace_counts[rollout] += 1
+    if any(count != expected_steps for count in trace_counts.values()):
+        raise ValueError(f"policy-sweep trace coverage mismatch: {path}")
+    return payload
 
 
 def _run(
@@ -303,26 +560,52 @@ def _run_cached_job(
     identity: Mapping[str, Any],
     force: bool,
 ) -> str:
-    if product.is_file() and manifest.is_file() and not force:
-        if json.loads(manifest.read_text(encoding="utf-8")) != dict(identity):
+    expected_identity = dict(identity)
+    recorded: dict[str, Any] | None = None
+    if manifest.is_file() and not force:
+        recorded = json.loads(manifest.read_text(encoding="utf-8"))
+        recorded_identity = dict(recorded.get("identity", recorded))
+        if recorded_identity != expected_identity:
             raise ValueError(f"stale T3 cache identity: {product}")
-        return "cached"
+        if product.is_file() and recorded.get("state") in (None, "completed"):
+            expected_product_hash = recorded.get("product_sha256")
+            if (
+                expected_product_hash is not None
+                and _sha256(product) != str(expected_product_hash)
+            ):
+                raise ValueError(f"T3 cached product hash changed: {product}")
+            return "cached"
     if (product.exists() or manifest.exists()) and not force:
-        # Training checkpoints are written before the Core subprocess exits.
-        # If the parent disappeared in that window, the exact run state is the
-        # authority and can finish the same job without replaying prior days.
+        # Training checkpoints can exist before Core finishes. Resume only
+        # when the exact daily state exists and the pre-launch identity above
+        # proves that command and source hashes did not change.
         resume_state = _training_resume_path(command)
         if resume_state is None or not resume_state.is_file():
             raise ValueError(f"partial T3 cache requires --force: {product}")
+    _write_json(manifest, {
+        "state": "running",
+        "identity": expected_identity,
+    })
     env = dict(os.environ)
     env.update(
         OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
         MKL_NUM_THREADS="1", MPLBACKEND="Agg",
     )
-    _run(command, log=log, env=env)
+    try:
+        _run(command, log=log, env=env)
+    except BaseException:
+        _write_json(manifest, {
+            "state": "failed",
+            "identity": expected_identity,
+        })
+        raise
     if not product.is_file():
         raise RuntimeError(f"T3 command did not create {product}")
-    _write_json(manifest, identity)
+    _write_json(manifest, {
+        "state": "completed",
+        "identity": expected_identity,
+        "product_sha256": _sha256(product),
+    })
     return "completed"
 
 
@@ -543,7 +826,12 @@ def analyze_timing(
 def analyze_validation(
     output: Path, horizon: int,
     checkpoint_days: Sequence[int] = CHECKPOINT_DAYS,
+    *,
+    config: Mapping[str, Any] | None = None,
+    validation_days: int = VALIDATION_DAYS,
+    validation_openings: int = VALIDATION_OPENINGS,
 ) -> dict[str, Any]:
+    active_config = load_config() if config is None else config
     scores: dict[int, dict[str, float]] = {}
     rollout_values: dict[int, dict[str, float]] = {}
     for day in checkpoint_days:
@@ -551,9 +839,11 @@ def analyze_validation(
         own: list[float] = []
         rival: list[float] = []
         for case in CASES:
-            payload = json.loads(
-                (output / f"h{horizon}/validation/day_{day}/{case}.json")
-                .read_text(encoding="utf-8")
+            payload = validate_policy_sweep_product(
+                output / f"h{horizon}/validation/day_{day}/{case}.json",
+                config=active_config,
+                validation_days=int(validation_days),
+                validation_openings=int(validation_openings),
             )
             for rollout, row in payload["results"]["rl_actor"].items():
                 key = f"{case}/{rollout}"
@@ -631,7 +921,7 @@ def _render_report(report: Mapping[str, Any]) -> str:
     lines = [title, ""]
     if report.get("short_probe"):
         lines.extend((
-            "This diagnostic run is not eligible to freeze the production configuration.",
+            "This is the single widened-grid freeze probe requested after T2.",
             "",
         ))
     lines.append(f"Selected horizon: H={report['selected_horizon']} days")
@@ -663,15 +953,67 @@ def main() -> int:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument(
+        "--score-only",
+        action="store_true",
+        help="Score existing immutable checkpoints without starting training.",
+    )
+    parser.add_argument(
+        "--horizon", type=int, choices=HORIZONS,
+        help="Limit --score-only to one saved branch horizon.",
+    )
+    parser.add_argument(
+        "--checkpoint-source", type=Path,
+        help="Root containing hN/checkpoints for --score-only.",
+    )
+    parser.add_argument(
+        "--action-contract", choices=tuple(ACTION_LEVELS),
+        help="Historical action contract override for --score-only.",
+    )
+    parser.add_argument(
+        "--evaluation-days", type=int, default=VALIDATION_DAYS,
+        help="Days per external policy-sweep rollout (default: 28).",
+    )
+    parser.add_argument(
+        "--validation-openings", type=int, default=VALIDATION_OPENINGS,
+        help="Independent openings per rival and case (default: 3).",
+    )
+    parser.add_argument(
         "--short", action="store_true",
         help="Run a 60-day diagnostic T3 with checkpoints at days 30, 45, and 60.",
     )
     args = parser.parse_args()
+    if args.short and args.score_only:
+        parser.error("--short and --score-only are mutually exclusive")
+    if args.horizon is not None and not args.score_only:
+        parser.error("--horizon is currently restricted to --score-only")
+    if args.checkpoint_source is not None and not args.score_only:
+        parser.error("--checkpoint-source requires --score-only")
+    if args.action_contract is not None and not args.score_only:
+        parser.error("--action-contract override requires --score-only")
     config = load_config(args.config)
+    if args.action_contract is not None:
+        config = copy.deepcopy(config)
+        levels = ACTION_LEVELS[str(args.action_contract)]
+        config["action"].update(
+            contract=str(args.action_contract),
+            distance_levels=list(levels),
+            time_levels=list(levels),
+        )
     validate_config(config)
     training_days = SHORT_TRAINING_DAYS if args.short else TRAINING_DAYS
     checkpoint_days = SHORT_CHECKPOINT_DAYS if args.short else CHECKPOINT_DAYS
     output = (args.output or (SHORT_OUTPUT if args.short else DEFAULT_OUTPUT)).resolve()
+    checkpoint_source = (
+        args.checkpoint_source or output
+    ).resolve()
+    active_horizons = (
+        (int(args.horizon),) if args.horizon is not None else HORIZONS
+    )
+    validate_external_scoring_contract(
+        checkpoint_days=checkpoint_days,
+        validation_days=int(args.evaluation_days),
+        validation_openings=int(args.validation_openings),
+    )
     config_hash = canonical_hash(config)
     sources = {
         str(path.relative_to(BASE)): _sha256(path)
@@ -681,16 +1023,25 @@ def main() -> int:
         )
     }
     plan = {
-        "phase": "T3-short" if args.short else "T3",
+        "phase": (
+            "T3-score-only" if args.score_only
+            else "T3-short" if args.short
+            else "T3"
+        ),
         "state": "planned", "pass": False,
         "short_probe": bool(args.short),
-        "eligible_to_freeze_config": not args.short,
+        "eligible_to_freeze_config": not args.score_only,
         "ranking_objective": OBJECTIVE_NAME,
-        "horizons": list(HORIZONS), "training_days": training_days,
+        "score_only": bool(args.score_only),
+        "horizons": list(active_horizons), "training_days": training_days,
         "checkpoint_days": list(checkpoint_days),
         "validation_cases": list(CASES),
         "validation_rivals": list(VALIDATION_RIVALS),
-        "validation_rollouts": len(HORIZONS) * len(checkpoint_days) * len(CASES) * len(VALIDATION_RIVALS) * VALIDATION_OPENINGS,
+        "evaluation_days": int(args.evaluation_days),
+        "evaluation_steps": int(args.evaluation_days) * STEPS_PER_DAY,
+        "validation_openings": int(args.validation_openings),
+        "validation_rollouts": len(active_horizons) * len(checkpoint_days) * len(CASES) * len(VALIDATION_RIVALS) * int(args.validation_openings),
+        "checkpoint_source": str(checkpoint_source),
         "config_hash": config_hash,
     }
     if args.plan_only:
@@ -699,16 +1050,164 @@ def main() -> int:
     output.mkdir(parents=True, exist_ok=True)
     _write_json(output / "status.json", {**plan, "state": "running"})
     try:
+        if args.score_only:
+            checkpoint_contracts: dict[str, Any] = {}
+            for horizon in active_horizons:
+                for day in checkpoint_days:
+                    checkpoint = (
+                        checkpoint_source
+                        / f"h{horizon}/checkpoints/day_{day}.pt"
+                    )
+                    if not checkpoint.is_file():
+                        raise FileNotFoundError(checkpoint)
+                    validate_checkpoint_contract(
+                        checkpoint,
+                        config=config,
+                        horizon=horizon,
+                        day=day,
+                    )
+                    checkpoint_contracts[f"h{horizon}/day_{day}"] = {
+                        "path": str(checkpoint),
+                        "sha256": _sha256(checkpoint),
+                    }
+
+            validation_jobs = []
+            for horizon in active_horizons:
+                for day in checkpoint_days:
+                    for case in CASES:
+                        command = validation_command(
+                            config,
+                            horizon=horizon,
+                            day=day,
+                            case=case,
+                            output=output,
+                            checkpoint_root=checkpoint_source,
+                            validation_days=int(args.evaluation_days),
+                            validation_openings=int(args.validation_openings),
+                        )
+                        product = (
+                            output
+                            / f"h{horizon}/validation/day_{day}/{case}.json"
+                        )
+                        identity = {
+                            "command": command,
+                            "config_hash": config_hash,
+                            "sources": sources,
+                            "checkpoint_sha256": checkpoint_contracts[
+                                f"h{horizon}/day_{day}"
+                            ]["sha256"],
+                        }
+                        validation_jobs.append(
+                            (horizon, day, case, command, product, identity)
+                        )
+            with ThreadPoolExecutor(
+                max_workers=max(1, int(args.workers))
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        _run_cached_job,
+                        command,
+                        product=product,
+                        manifest=product.with_suffix(".manifest.json"),
+                        log=product.with_suffix(".log"),
+                        identity=identity,
+                        force=args.force,
+                    ): (horizon, day, case)
+                    for horizon, day, case, command, product, identity
+                    in validation_jobs
+                }
+                completed_validation = []
+                for future in as_completed(futures):
+                    future.result()
+                    completed_validation.append(futures[future])
+                    _write_json(output / "status.json", {
+                        **plan,
+                        "state": "running",
+                        "completed_validation_jobs": len(
+                            completed_validation
+                        ),
+                        "validation_jobs": len(validation_jobs),
+                    })
+
+            scored: dict[str, Any] = {}
+            levels = ACTION_LEVELS[str(config["action"]["contract"])]
+            scientific_pass = True
+            for horizon in active_horizons:
+                result = analyze_learning(
+                    checkpoint_source
+                    / f"h{horizon}/checkpoints/day_{training_days}.pt",
+                    levels,
+                )
+                result["t3_4"] = analyze_validation(
+                    output,
+                    horizon,
+                    checkpoint_days,
+                    config=config,
+                    validation_days=int(args.evaluation_days),
+                    validation_openings=int(args.validation_openings),
+                )
+                result["scientific_pass"] = bool(
+                    result["t3_1"]["pass"]
+                    and result["t3_2"]["pass"]
+                    and result["t3_4"]["pass"]
+                )
+                scientific_pass = bool(
+                    scientific_pass and result["scientific_pass"]
+                )
+                scored[str(horizon)] = result
+            report = {
+                **plan,
+                "state": "completed",
+                "execution_pass": True,
+                "pass": scientific_pass,
+                "eligible_to_freeze_config": False,
+                "checkpoint_contracts": checkpoint_contracts,
+                "horizons": scored,
+            }
+            _write_json(output / "report.json", report)
+            lines = [
+                "# V17 historical checkpoint score",
+                "",
+                "Training was not restarted. Checkpoints were evaluated by "
+                f"{int(args.evaluation_days)}-day external policy sweeps "
+                f"({int(args.evaluation_days) * STEPS_PER_DAY} steps each).",
+                "",
+            ]
+            for horizon, result in scored.items():
+                lines.extend((
+                    f"## H={horizon}",
+                    "",
+                    f"- T3.1: {'PASS' if result['t3_1']['pass'] else 'FAIL'}",
+                    f"- T3.2: {'PASS' if result['t3_2']['pass'] else 'FAIL'}",
+                    f"- T3.4 checkpoint stability: {'PASS' if result['t3_4']['pass'] else 'FAIL'}",
+                    f"- Scientific result: {'PASS' if result['scientific_pass'] else 'FAIL'}",
+                    "",
+                ))
+            (output / "report.md").write_text(
+                "\n".join(lines), encoding="utf-8"
+            )
+            _write_json(output / "status.json", {
+                **plan,
+                "state": "completed",
+                "execution_pass": True,
+                "pass": scientific_pass,
+                "checkpoint_contracts": checkpoint_contracts,
+                "report": str((output / "report.json").resolve()),
+                "report_sha256": _sha256(output / "report.json"),
+            })
+            return 0
+
         # T3's adaptation gate depends on T2. Validate that dependency before
         # launching either expensive training horizon.
         _, t2 = load_t2_dependency(config)
         training_jobs = []
-        for horizon in HORIZONS:
+        for horizon in active_horizons:
             command = training_command(
                 config, horizon=horizon, output=output,
                 training_days=training_days,
                 checkpoint_days=checkpoint_days,
             )
+            validate_training_command_contract(command)
             product = output / f"h{horizon}/checkpoints/day_{training_days}.pt"
             identity = {
                 "command": command, "config_hash": config_hash,
@@ -737,11 +1236,17 @@ def main() -> int:
                 })
 
         validation_jobs = []
-        for horizon in HORIZONS:
+        for horizon in active_horizons:
             for day in checkpoint_days:
                 for case in CASES:
                     command = validation_command(
-                        config, horizon=horizon, day=day, case=case, output=output
+                        config,
+                        horizon=horizon,
+                        day=day,
+                        case=case,
+                        output=output,
+                        validation_days=int(args.evaluation_days),
+                        validation_openings=int(args.validation_openings),
                     )
                     product = output / f"h{horizon}/validation/day_{day}/{case}.json"
                     identity = {
@@ -769,7 +1274,7 @@ def main() -> int:
                 completed_validation.append(key)
                 _write_json(output / "status.json", {
                     **plan, "state": "running",
-                    "completed_training_horizons": list(HORIZONS),
+                    "completed_training_horizons": list(active_horizons),
                     "completed_validation_jobs": len(completed_validation),
                     "validation_jobs": len(validation_jobs),
                 })
@@ -777,7 +1282,7 @@ def main() -> int:
         adaptation_found, adaptation_mean = _adaptation_found(t2)
         levels = ACTION_LEVELS[str(config["action"]["contract"])]
         horizons: dict[str, Any] = {}
-        for horizon in HORIZONS:
+        for horizon in active_horizons:
             result = analyze_learning(
                 output / f"h{horizon}/checkpoints/day_{training_days}.pt", levels
             )
@@ -791,7 +1296,12 @@ def main() -> int:
             )
             result["t3_3"]["pass"] = result["t3_3"].pop("pass_")
             result["t3_4"] = analyze_validation(
-                output, horizon, checkpoint_days
+                output,
+                horizon,
+                checkpoint_days,
+                config=config,
+                validation_days=int(args.evaluation_days),
+                validation_openings=int(args.validation_openings),
             )
             result["t3_6"] = analyze_timing(
                 output / f"h{horizon}/training/nyc_training_diagnostics.csv",
@@ -817,7 +1327,7 @@ def main() -> int:
                 float(result["t3_3"]["manhattan_grid_steps"]),
                 -float(horizon),
             )
-        selected = max(HORIZONS, key=selection_key)
+        selected = max(active_horizons, key=selection_key)
         selected_result = horizons[str(selected)]
         production = _production_days(
             float(selected_result["t3_6"]["minutes_per_day_stage_mix"])
@@ -833,13 +1343,14 @@ def main() -> int:
         _write_json(output / "report.json", report)
         (output / "report.md").write_text(_render_report(report), encoding="utf-8")
         _write_json(output / "status.json", {
-            "phase": plan["phase"], "state": report["state"], "pass": report["pass"],
-            "short_probe": bool(args.short),
-            "eligible_to_freeze_config": not args.short,
+            **plan,
+            "state": report["state"], "pass": report["pass"],
+            "eligible_to_freeze_config": True,
             "selected_horizon": selected,
             "probe_training_days": training_days,
             "recommended_production_days": production["training_days"],
             "report": str((output / "report.json").resolve()),
+            "report_sha256": _sha256(output / "report.json"),
         })
         return 0 if report["pass"] else 2
     except Exception as exc:

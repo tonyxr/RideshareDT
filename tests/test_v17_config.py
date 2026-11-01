@@ -37,6 +37,15 @@ def test_command_wires_manual_order_and_user_reward_without_fixed_reward(tmp_pat
     assert command[command.index("--v16_branch_design") + 1] == "stencil11"
     assert command[command.index("--v16_store_cap") + 1] == "20000"
     assert command[command.index("--ppo_update_interval_days") + 1] == "7"
+    assert command[
+        command.index("--branch_profit_planner_sample_cap") + 1
+    ] == "8"
+    assert command[
+        command.index("--branch_profit_planner_horizon_days") + 1
+    ] == "1"
+    assert command[
+        command.index("--branch_profit_planner_candidate_radius") + 1
+    ] == "1"
 
 
 def test_all_city_demand_inputs_are_relative_refits():
@@ -109,3 +118,13 @@ def test_surge_range_v3_is_the_production_grid():
         "base_and_booking_fixed": True,
     }
     v17_config.validate_config(config)
+
+
+def test_branch_only_rival_planner_is_an_explicit_hashed_contract():
+    config = _config()
+    assert config["credit"]["branch_profit_planner_sample_cap"] == 8
+    assert config["credit"]["branch_profit_planner_horizon_days"] == 1
+    assert config["credit"]["branch_profit_planner_candidate_radius"] == 1
+    config["credit"]["branch_profit_planner_sample_cap"] = 7
+    with pytest.raises(ValueError, match="branch-only rival planner"):
+        v17_config.validate_config(config)

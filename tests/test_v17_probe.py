@@ -8,6 +8,60 @@ from scripts.v17_config import ACTION_LEVELS, canonical_hash, load_config
 from v17_objective import OBJECTIVE_NAME
 
 
+def _policy_sweep_payload(
+    *, config=None, days=t3.VALIDATION_DAYS,
+    openings=t3.VALIDATION_OPENINGS, shift=0.0,
+):
+    config = load_config() if config is None else config
+    steps = days * t3.STEPS_PER_DAY
+    rollouts = [
+        (f"{rival}__opening_{opening}", rival)
+        for rival in t3.VALIDATION_RIVALS
+        for opening in range(1, openings + 1)
+    ]
+    results = {}
+    traces = []
+    for rival_index, (rollout, _) in enumerate(rollouts):
+        own_profit = 4.0 + shift + rival_index * 0.01
+        rival_profit = 2.0
+        results[rollout] = {
+            "own_profit": own_profit,
+            "rival_profit": rival_profit,
+            "own_share": 0.5,
+            "rival_share": 0.5,
+            "fulfillment": 0.95,
+            "steps": steps,
+        }
+        traces.extend(
+            {
+                "rollout": rollout,
+                "step": step,
+                "profit_per_request": own_profit,
+                "rival_profit_per_request": rival_profit,
+            }
+            for step in range(steps)
+        )
+    return {
+        "protocol": "v26r_policy_sweep_common_random_numbers",
+        "city": "New York City",
+        "horizon": steps,
+        "customers_per_step": 50,
+        "steps_per_day": t3.STEPS_PER_DAY,
+        "policy_seed": t3.VALIDATION_SEED,
+        "rollouts": [list(row) for row in rollouts],
+        "v26r": {
+            "action_contract": config["action"]["contract"],
+            "supply_model": "v3",
+            "persistent_driver_stock": False,
+            "effective_fleet_scale": config["city_inputs"]["nyc"][
+                "fleet_scale"
+            ],
+        },
+        "results": {"rl_actor": results},
+        "traces": {"rl_actor": traces},
+    }
+
+
 def test_t3_training_command_matches_revb_probe_contract(tmp_path):
     command = t3.training_command(
         load_config(), horizon=5, output=tmp_path
@@ -21,11 +75,44 @@ def test_t3_training_command_matches_revb_probe_contract(tmp_path):
     assert command[command.index("--supply_model") + 1] == "v3"
     assert command[command.index("--shortage_willingness_share") + 1] == "0.5"
     assert command[command.index("--action_contract") + 1] == "two_lever_v3"
-    assert command[command.index("--checkpoint_validation_customers") + 1] == "50"
+    assert "--checkpoint_validation_customers" not in command
     assert command[command.index("--training_resume_state") + 1].endswith(
         "h5/resume/training_state.pt"
     )
     assert command[command.index("--training_resume_every_days") + 1] == "1"
+    assert "--external_evaluation_only" in command
+    assert "--eval_timesteps" not in command
+    assert "--checkpoint_validation_horizon" not in command
+    t3.validate_training_command_contract(command)
+
+
+def test_t3_rejects_embedded_short_evaluation(tmp_path):
+    command = t3.training_command(
+        load_config(), horizon=5, output=tmp_path
+    )
+    command.extend(("--eval_timesteps", "2"))
+    with pytest.raises(ValueError, match="shorter than"):
+        t3.validate_training_command_contract(command)
+
+
+def test_t3_external_scoring_must_be_long_and_replicated():
+    t3.validate_external_scoring_contract(
+        checkpoint_days=t3.CHECKPOINT_DAYS,
+        validation_days=t3.VALIDATION_DAYS,
+        validation_openings=t3.VALIDATION_OPENINGS,
+    )
+    with pytest.raises(ValueError, match="too short"):
+        t3.validate_external_scoring_contract(
+            checkpoint_days=t3.CHECKPOINT_DAYS,
+            validation_days=2,
+            validation_openings=t3.VALIDATION_OPENINGS,
+        )
+    with pytest.raises(ValueError, match="openings"):
+        t3.validate_external_scoring_contract(
+            checkpoint_days=t3.CHECKPOINT_DAYS,
+            validation_days=t3.VALIDATION_DAYS,
+            validation_openings=1,
+        )
 
 
 def test_t3_short_command_uses_60_days_and_three_short_checkpoints(tmp_path):
@@ -61,23 +148,45 @@ def test_t3_validation_ranks_on_final_objective_and_reports_components(tmp_path)
     output = tmp_path
     for day, shift in zip(t3.CHECKPOINT_DAYS, (0.0, 0.1, 0.2)):
         for case in t3.CASES:
-            rows = {}
-            for rival_index, rival in enumerate(t3.VALIDATION_RIVALS):
-                for opening in range(t3.VALIDATION_OPENINGS):
-                    rows[f"{rival}__opening_{opening + 1}"] = {
-                        "own_profit": 4.0 + shift + rival_index * 0.01,
-                        "rival_profit": 2.0,
-                    }
             path = output / f"h5/validation/day_{day}/{case}.json"
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"results": {"rl_actor": rows}}))
+            path.write_text(json.dumps(_policy_sweep_payload(shift=shift)))
     report = t3.analyze_validation(output, 5)
     assert report["pass"] is True
-    assert report["scores"][100]["final_objective"] == pytest.approx(2.51)
-    assert report["scores"][100]["own_profit"] == pytest.approx(4.01)
+    assert report["scores"][100]["final_objective"] == pytest.approx(2.54)
+    assert report["scores"][100]["own_profit"] == pytest.approx(4.04)
     assert report["scores"][100]["competitor_profit"] == pytest.approx(2.0)
-    assert report["scores"][100]["profit_lead"] == pytest.approx(2.01)
+    assert report["scores"][100]["profit_lead"] == pytest.approx(2.04)
     assert all(row["pass"] for row in report["comparisons"])
+
+
+def test_t3_policy_sweep_validator_rejects_truncated_rollout(tmp_path):
+    payload = _policy_sweep_payload()
+    rollout = next(iter(payload["results"]["rl_actor"]))
+    payload["results"]["rl_actor"][rollout]["steps"] -= 1
+    path = tmp_path / "truncated.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="truncated"):
+        t3.validate_policy_sweep_product(
+            path,
+            config=load_config(),
+            validation_days=t3.VALIDATION_DAYS,
+            validation_openings=t3.VALIDATION_OPENINGS,
+        )
+
+
+def test_t3_policy_sweep_validator_rejects_missing_trace_step(tmp_path):
+    payload = _policy_sweep_payload()
+    payload["traces"]["rl_actor"].pop()
+    path = tmp_path / "missing-trace.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="trace coverage"):
+        t3.validate_policy_sweep_product(
+            path,
+            config=load_config(),
+            validation_days=t3.VALIDATION_DAYS,
+            validation_openings=t3.VALIDATION_OPENINGS,
+        )
 
 
 def test_t3_plan_counts_two_horizons_three_checkpoints_and_two_cases():
@@ -98,6 +207,7 @@ def _valid_t2_dependency():
         "action_contract": contract,
     }
     report = {
+        "config_hash": canonical_hash(config),
         "action_contract": contract,
         "levels": list(ACTION_LEVELS[contract]),
         "openings": t3.REQUIRED_T2_OPENINGS,
@@ -137,6 +247,8 @@ def test_t3_rejects_stale_t2_before_starting_training(monkeypatch, tmp_path):
     report_path = tmp_path / "t2_report.json"
     status_path.write_text(json.dumps(status))
     report_path.write_text(json.dumps(report))
+    status["report_sha256"] = t3._sha256(report_path)
+    status_path.write_text(json.dumps(status))
     monkeypatch.setattr(t3, "T2_STATUS", status_path)
     monkeypatch.setattr(t3, "T2_REPORT", report_path)
     monkeypatch.setattr(

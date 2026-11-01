@@ -107,6 +107,13 @@ def validate_config(
         raise ValueError("V17 curriculum fractions drifted")
     if float(curriculum.get("expected_shortage_day_share")) != 0.35:
         raise ValueError("V17 curriculum must target 35% shortage days")
+    credit = config["credit"]
+    if (
+        int(credit.get("branch_profit_planner_sample_cap", 0)) != 8
+        or int(credit.get("branch_profit_planner_horizon_days", 0)) != 1
+        or int(credit.get("branch_profit_planner_candidate_radius", -1)) != 1
+    ):
+        raise ValueError("V17 branch-only rival planner contract drifted")
     learner = config["learner"]
     if (
         learner.get("value_head") != "concave2d"
@@ -178,6 +185,7 @@ def core_args(
         "--firm1_mode", "RL",
         "--firm2_mode", "adaptive_best_response_memory",
         "--run_experiment",
+        "--external_evaluation_only",
         "--credit_assignment_v25",
         "--v26",
         "--deterministic_experiment_seed",
@@ -205,6 +213,15 @@ def core_args(
         "--training_dynamic_episode_days", "30",
         "--training_opening_tariff_randomization", "0.15",
         "--profit_planner_sample_cap", "32",
+        "--branch_profit_planner_sample_cap", str(
+            int(config["credit"]["branch_profit_planner_sample_cap"])
+        ),
+        "--branch_profit_planner_horizon_days", str(
+            int(config["credit"]["branch_profit_planner_horizon_days"])
+        ),
+        "--branch_profit_planner_candidate_radius", str(
+            int(config["credit"]["branch_profit_planner_candidate_radius"])
+        ),
         "--regime_market",
         "--regime_features",
         "--spillover_price_aware",

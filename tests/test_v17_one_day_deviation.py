@@ -23,6 +23,7 @@ def _core(*, horizon: int = 3, audit_every: int = 4) -> Core:
         enable_driver_supply=False,
         openai_api_key="",
         action_contract="two_lever_v1",
+        rivals_two_lever=True,
         v16_crn_tape=True,
         v16_branch_mode="one_day_deviation",
         v16_branch_horizon_days=horizon,
@@ -236,3 +237,56 @@ def test_one_day_deviation_rejects_incomplete_contract(kwargs, match):
 
 def test_registered_levels_remain_the_fixed_five_cell_axes():
     assert TWO_LEVER_LEVELS == (0.8, 0.9, 1.0, 1.2, 1.5)
+
+
+def test_nested_branch_rival_planner_is_local_but_live_planner_stays_full(
+    monkeypatch,
+):
+    core = Core(
+        "Chicago",
+        seed=1712,
+        firm1_mode="RL",
+        firm2_mode="profit_opt_mpc_grid",
+        total_customers_pool=16,
+        simulation_sample_cap=3,
+        enable_driver_supply=False,
+        openai_api_key="",
+        action_contract="two_lever_v1",
+        rivals_two_lever=True,
+        v16_crn_tape=True,
+        v16_branch_mode="one_day_deviation",
+        v16_branch_design="stencil11",
+        branch_profit_planner_sample_cap=2,
+        branch_profit_planner_horizon_days=1,
+        branch_profit_planner_candidate_radius=1,
+    )
+    core._refresh_profile_pool(rides_per_timestep=3)
+    core.shared_steps_per_day = 2
+    core._profit_planner_reference_customers = 10
+    calls = []
+
+    def fake_simulate_batch(**kwargs):
+        calls.append(core.simulation_sample_cap)
+        metrics = SimpleNamespace(
+            profit_per_request=core._tariff_grid_multiplier(core.firm2)
+        )
+        return None, None, metrics, None, None, None
+
+    monkeypatch.setattr(core, "simulate_batch", fake_simulate_batch)
+    full_grid_size = len(core.firm2.profit_candidate_grid)
+    full_horizon = core.firm2.profit_horizon_days * core.shared_steps_per_day
+    core._firm2_profit_best_response_plan(
+        day_of_week=2, hour=12, weather="clear"
+    )
+    assert len(calls) == (full_grid_size + 1) * full_horizon
+    assert set(calls) == {10}
+
+    calls.clear()
+    core._v16_branch_rollout_depth = 1
+    core._firm2_profit_best_response_plan(
+        day_of_week=2, hour=12, weather="clear"
+    )
+    assert len(calls) <= 4 * core.shared_steps_per_day
+    assert set(calls) == {2}
+    assert core.branch_profit_planner_calls == 1
+    assert core.profit_planner_calls == 2

@@ -864,6 +864,9 @@ class Core:
         training_stage_profit_fraction: Optional[float] = None,
         training_dynamic_episode_days: int = 30,
         profit_planner_sample_cap: int = 32,
+        branch_profit_planner_sample_cap: int = 0,
+        branch_profit_planner_horizon_days: int = 0,
+        branch_profit_planner_candidate_radius: int = -1,
         training_opening_tariff_randomization: float = 0.15,
         ppo_batch_size: int = 48,
         ppo_update_epochs: int = 8,
@@ -1458,6 +1461,24 @@ class Core:
             *PROFIT_BEST_RESPONSE_OPPONENT_MODES,
         )))
         self.profit_planner_sample_cap = int(max(2, profit_planner_sample_cap))
+        self.branch_profit_planner_sample_cap = int(
+            max(0, branch_profit_planner_sample_cap)
+        )
+        self.branch_profit_planner_horizon_days = int(
+            max(0, branch_profit_planner_horizon_days)
+        )
+        self.branch_profit_planner_candidate_radius = int(
+            branch_profit_planner_candidate_radius
+        )
+        if self.branch_profit_planner_candidate_radius < -1:
+            raise ValueError(
+                "branch_profit_planner_candidate_radius must be -1 or non-negative"
+            )
+        self._v16_branch_rollout_depth = 0
+        self.profit_planner_seconds = 0.0
+        self.profit_planner_calls = 0
+        self.branch_profit_planner_seconds = 0.0
+        self.branch_profit_planner_calls = 0
         self.privileged_critic = bool(
             v24 if privileged_critic is None else privileged_critic
         )
@@ -3114,6 +3135,15 @@ class Core:
             ),
             "v16_branch_design": self.v16_branch_design,
             "v16_audit_every": int(self.v16_audit_every),
+            "branch_profit_planner_sample_cap": int(
+                self.branch_profit_planner_sample_cap
+            ),
+            "branch_profit_planner_horizon_days": int(
+                self.branch_profit_planner_horizon_days
+            ),
+            "branch_profit_planner_candidate_radius": int(
+                self.branch_profit_planner_candidate_radius
+            ),
             "v16_store_cap": int(self.v16_store_cap),
             "v16_value_head": self.v16_value_head,
             "v16_value_auxiliary_names": list(
@@ -4326,23 +4356,47 @@ class Core:
         logged public reaction table. Switching requires a paired improvement
         larger than one simulation standard error.
         """
+        import time as _time
+
+        started = _time.perf_counter()
         planner = self.firm2
         if not isinstance(planner, FirmTwinProfitOptimizerMixin):
             raise TypeError("profit planning requires a twin-profit controller")
+        branch_planning = bool(
+            int(getattr(self, "_v16_branch_rollout_depth", 0)) > 0
+        )
         steps_per_day = int(max(1, getattr(self, "shared_steps_per_day", 1)))
-        horizon = int(max(1, planner.profit_horizon_days * steps_per_day))
+        horizon_days = int(max(1, planner.profit_horizon_days))
+        if branch_planning and self.branch_profit_planner_horizon_days > 0:
+            horizon_days = int(min(
+                horizon_days, self.branch_profit_planner_horizon_days
+            ))
+        horizon = int(max(1, horizon_days * steps_per_day))
         reference_customers = int(max(
             1, getattr(self, "_profit_planner_reference_customers", 32)
         ))
-        sample_cap = int(max(
-            2,
-            min(
-                reference_customers,
-                getattr(self, "profit_planner_sample_cap", 32),
-            ),
-        ))
-        grid = tuple(float(value) for value in planner.profit_candidate_grid)
+        planner_cap = int(getattr(self, "profit_planner_sample_cap", 32))
+        if branch_planning and self.branch_profit_planner_sample_cap > 0:
+            planner_cap = int(min(
+                planner_cap, self.branch_profit_planner_sample_cap
+            ))
+        sample_cap = int(max(2, min(reference_customers, planner_cap)))
+        full_grid = tuple(
+            float(value) for value in planner.profit_candidate_grid
+        )
         current_multiplier = self._tariff_grid_multiplier(planner)
+        grid = full_grid
+        radius = int(self.branch_profit_planner_candidate_radius)
+        if branch_planning and radius >= 0:
+            center = min(
+                range(len(full_grid)),
+                key=lambda index: (
+                    abs(full_grid[index] - current_multiplier), index
+                ),
+            )
+            grid = full_grid[
+                max(0, center - radius):min(len(full_grid), center + radius + 1)
+            ]
         firm1_multiplier = self._tariff_grid_multiplier(self.firm1)
         snapshot = self._snapshot_counterfactual_state()
         original_cap = int(self.simulation_sample_cap)
@@ -4422,6 +4476,12 @@ class Core:
         selected = best if improvement > max(standard_error, 1e-12) else None
         report_means = {float(value): float(means[value]) for value in grid}
         report_means[current_multiplier] = float(means[None])
+        elapsed = float(_time.perf_counter() - started)
+        self.profit_planner_seconds += elapsed
+        self.profit_planner_calls += 1
+        if branch_planning:
+            self.branch_profit_planner_seconds += elapsed
+            self.branch_profit_planner_calls += 1
         return selected, improvement, standard_error, report_means
 
     def compute_theory_benchmarks(
@@ -9088,6 +9148,10 @@ class Core:
         spd = int(max(1, len(hours)))
         gamma_day = float(self.firm1.agent.gamma) ** spd
         snapshot = self._snapshot_counterfactual_state(presampled[1])
+        previous_branch_depth = int(
+            getattr(self, "_v16_branch_rollout_depth", 0)
+        )
+        self._v16_branch_rollout_depth = previous_branch_depth + 1
         raw_values: Dict[int, float] = {}
         component_returns: Dict[int, List[float]] = {}
         posted_actions: Dict[int, List[int]] = {}
@@ -9255,6 +9319,7 @@ class Core:
                 values[int(action)] = float(total)
         finally:
             self._restore_counterfactual_state(snapshot)
+            self._v16_branch_rollout_depth = previous_branch_depth
 
         target_mask = np.isfinite(values)
         baseline_value = float(values[int(incumbent)])
@@ -11144,6 +11209,7 @@ class Core:
         training_resume_state: Optional[str] = None,
         training_resume_payload: Optional[Mapping[str, Any]] = None,
         training_resume_every_days: int = 1,
+        external_evaluation_only: bool = False,
     ):
         """Run workflow: synthetic-data RL training (day/timestep cadence), then held-out evaluation."""
         training_enabled = bool(training_enabled)
@@ -11156,8 +11222,25 @@ class Core:
                 if value else ""
             )
 
+        source_root = os.path.dirname(os.path.abspath(__file__))
+        training_source_files = (
+            "Core.py",
+            "PPOAgent.py",
+            "MarketInteraction.py",
+            "driver_supply.py",
+            "market_shocks.py",
+            "platform_mdp.py",
+            "pricing_models.py",
+            "v17_branch_store.py",
+            "v17_value_model.py",
+        )
+        training_source_sha256 = {
+            name: _sha256_file(os.path.join(source_root, name))
+            for name in training_source_files
+        }
         training_resume_contract = {
             "core_source_sha256": _sha256_file(__file__),
+            "training_source_sha256": training_source_sha256,
             "market_name": str(self.market_name),
             "seed": int(self.seed),
             "firm1_mode": str(self.firm1_mode),
@@ -11169,6 +11252,15 @@ class Core:
             "policy_objective": str(self._configured_primary_objective()),
             "v17_probe_mode": bool(self.v17_probe_mode),
             "v16_branch_horizon_days": int(self.v16_branch_horizon_days),
+            "branch_profit_planner_sample_cap": int(
+                self.branch_profit_planner_sample_cap
+            ),
+            "branch_profit_planner_horizon_days": int(
+                self.branch_profit_planner_horizon_days
+            ),
+            "branch_profit_planner_candidate_radius": int(
+                self.branch_profit_planner_candidate_radius
+            ),
             "train_timesteps": int(train_timesteps),
             "train_customers_per_step": int(train_customers_per_step),
             "eval_timesteps": int(eval_timesteps),
@@ -11211,6 +11303,7 @@ class Core:
             "model_registry_dir": resume_path(model_registry_dir),
             "trained_model_id": str(trained_model_id or ""),
             "diagnostic_prefix": resume_path(diagnostic_prefix),
+            "external_evaluation_only": bool(external_evaluation_only),
         }
         resuming_training = training_resume_payload is not None
         resume_completed_days = 0
@@ -12811,6 +12904,27 @@ class Core:
                 "firm2_profit_planner_standard_error": float(
                     getattr(self.firm2, "last_profit_standard_error", np.nan)
                 ),
+                "firm2_profit_planner_calls_total": int(
+                    self.profit_planner_calls
+                ),
+                "firm2_profit_planner_seconds_total": float(
+                    self.profit_planner_seconds
+                ),
+                "firm2_branch_profit_planner_calls_total": int(
+                    self.branch_profit_planner_calls
+                ),
+                "firm2_branch_profit_planner_seconds_total": float(
+                    self.branch_profit_planner_seconds
+                ),
+                "firm2_branch_profit_planner_sample_cap": int(
+                    self.branch_profit_planner_sample_cap
+                ),
+                "firm2_branch_profit_planner_horizon_days": int(
+                    self.branch_profit_planner_horizon_days
+                ),
+                "firm2_branch_profit_planner_candidate_radius": int(
+                    self.branch_profit_planner_candidate_radius
+                ),
                 "avg_fulfillment_rate": avg_fulfillment,
                 "avg_wait_minutes": avg_wait,
                 "driver_acceptance_rate": avg_driver_accept,
@@ -13223,7 +13337,14 @@ class Core:
                     },
                 )
             validation_score = np.nan
-            if self.firm1_mode == "RL" and ((d + 1) % validation_interval == 0 or (d + 1) == train_timesteps):
+            if (
+                not external_evaluation_only
+                and self.firm1_mode == "RL"
+                and (
+                    (d + 1) % validation_interval == 0
+                    or (d + 1) == train_timesteps
+                )
+            ):
                 # Validate the same seeded actor distribution used for final
                 # evaluation. There is no learned Q reranker or
                 # deployment-only action rule.
@@ -13735,6 +13856,48 @@ class Core:
             journal.event("training_finished" if training_enabled else "evaluation_only", {
                 "training_days_this_process": len(self.training_logs),
                 "loaded_policy_metadata": getattr(self, "loaded_trained_model_metadata", {})})
+        if external_evaluation_only:
+            # V17 training and evaluation are deliberately separate phases.
+            # The runner scores immutable checkpoints with long, replicated
+            # policy sweeps.  Running Core's legacy end-of-run audit here both
+            # duplicates that work and previously allowed a two-step audit to
+            # be compared with a 100-step durability contract.
+            self.competitive_backtest_report = {
+                "passed": None,
+                "status": "deferred_to_external_checkpoint_scoring",
+                "failures": [],
+                "evaluation_steps": 0,
+            }
+            if training_enabled and self.firm1_mode == "RL" and trained_model_out:
+                self.save_trained_model(
+                    trained_model_out,
+                    registry_dir=None,
+                    model_id=trained_model_id,
+                    metadata={
+                        "training_days": int(train_timesteps),
+                        "training_seed": int(self.seed),
+                        "comparison_checkpoint_day": int(train_timesteps),
+                        "comparison_checkpoint_status": (
+                            "external_evaluation_required"
+                        ),
+                        "competitive_backtest": dict(
+                            self.competitive_backtest_report
+                        ),
+                    },
+                )
+            print(
+                ">>> Post-training evaluation deferred: score immutable "
+                "checkpoints with the external long-horizon V17 evaluator."
+            )
+            if journal:
+                journal.event(
+                    "external_evaluation_deferred",
+                    {"training_days": int(train_timesteps)},
+                )
+                journal.event(
+                    "simulation_complete", {"evaluation_steps": 0}
+                )
+            return self.training_logs, []
         evaluation_checkpoint, evaluation_checkpoint_status = (
             self._evaluation_checkpoint(
                 best_checkpoint,
@@ -19135,6 +19298,15 @@ def main():
         default=1,
         help="Write exact continuation state every N completed training days.",
     )
+    parser.add_argument(
+        "--external_evaluation_only",
+        action="store_true",
+        help=(
+            "Finish training after saving the exact final policy and defer all "
+            "checkpoint validation and post-training evaluation to an external "
+            "long-horizon evaluator. Intended for V17 T3 and production."
+        ),
+    )
     parser.add_argument("--trained_model_in", type=str, default="", help="Load a policy by explicit path, immutable registry model id/archive filename, or 'latest'.")
     parser.add_argument("--trained_model_out", type=str, default="", help="Optional mutable alias for the final completed dynamic-stage policy. Every training run is also saved immutably in --model_registry_dir.")
     parser.add_argument("--trained_model_id", type=str, default="", help="Stable human-readable id recorded for this training run in the model registry.")
@@ -19316,6 +19488,33 @@ def main():
     parser.add_argument("--training_stage_profit_fraction", type=float, default=None, help="Explicit Stage 4 profit-maximizer fraction; when set, all four fractions must sum to one.")
     parser.add_argument("--training_dynamic_episode_days", type=int, default=30, help="Days per independently randomized episode in all corrected stages (production default: 30).")
     parser.add_argument("--profit_planner_sample_cap", type=int, default=32, help="Monte Carlo riders per twin branch for 13-candidate Firm 2 profit best responses.")
+    parser.add_argument(
+        "--branch_profit_planner_sample_cap",
+        type=int,
+        default=0,
+        help=(
+            "Branch-rollout-only rider cap for nested Firm 2 profit planning; "
+            "zero keeps the full live-planner cap."
+        ),
+    )
+    parser.add_argument(
+        "--branch_profit_planner_horizon_days",
+        type=int,
+        default=0,
+        help=(
+            "Branch-rollout-only horizon for nested Firm 2 profit planning; "
+            "zero keeps the controller's full live horizon."
+        ),
+    )
+    parser.add_argument(
+        "--branch_profit_planner_candidate_radius",
+        type=int,
+        default=-1,
+        help=(
+            "Branch-rollout-only radius around Firm 2's current grid cell; "
+            "-1 keeps its full candidate grid."
+        ),
+    )
     parser.add_argument("--training_opening_tariff_randomization", type=float, default=0.15, help="Symmetric tariff-randomization fraction at each stage or dynamic-episode opening.")
     parser.add_argument("--deterministic_experiment_seed", action="store_true", help="If set, keep run_experiment fully deterministic with --experiment_seed (or the resolved run seed).")
     parser.add_argument("--experiment_seed", type=int, default=None, help="Optional explicit run_experiment seed. Overrides stochastic child-seed generation and is recorded in run config.")
@@ -19986,6 +20185,11 @@ def main():
         )
     if int(args.training_resume_every_days) < 1:
         parser.error("--training_resume_every_days must be positive")
+    if args.external_evaluation_only and args.eval_only:
+        parser.error(
+            "--external_evaluation_only is a training-only option and cannot "
+            "be combined with --eval_only"
+        )
     if args.trained_model_in:
         args.firm1_mode = "RL"
         args.run_experiment = True
@@ -20931,6 +21135,15 @@ def main():
         training_stage_profit_fraction=args.training_stage_profit_fraction,
         training_dynamic_episode_days=args.training_dynamic_episode_days,
         profit_planner_sample_cap=args.profit_planner_sample_cap,
+        branch_profit_planner_sample_cap=(
+            args.branch_profit_planner_sample_cap
+        ),
+        branch_profit_planner_horizon_days=(
+            args.branch_profit_planner_horizon_days
+        ),
+        branch_profit_planner_candidate_radius=(
+            args.branch_profit_planner_candidate_radius
+        ),
         training_opening_tariff_randomization=(
             args.training_opening_tariff_randomization
         ),
@@ -21330,6 +21543,7 @@ def main():
             training_resume_state=args.training_resume_state or None,
             training_resume_payload=training_resume_payload,
             training_resume_every_days=args.training_resume_every_days,
+            external_evaluation_only=args.external_evaluation_only,
         )
         rows = []
     else:

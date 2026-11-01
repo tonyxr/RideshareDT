@@ -53,6 +53,12 @@ credit:
   regular_cells: 11
   audit_every_decisions: 10
   crn_tape: true
+  # Inside a Firm 1 counterfactual branch, Firm 2 still replans but uses a
+  # local one-day proxy. The live Firm 2 controller outside branches retains
+  # its full candidate grid, horizon, and 32-rider cap.
+  branch_profit_planner_sample_cap: 8
+  branch_profit_planner_horizon_days: 1
+  branch_profit_planner_candidate_radius: 1
 
 learner:
   value_head: concave2d

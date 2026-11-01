@@ -1,4 +1,5 @@
 import copy
+import json
 
 import pytest
 
@@ -13,6 +14,69 @@ def _result(own, rival, own_share=0.5, rival_share=0.5):
         "own_share": own_share,
         "rival_share": rival_share,
     }
+
+
+def _small_product(tmp_path):
+    specs = (t2.cell_spec(0.8, 0.8), t2.cell_spec(1.0, 1.0))
+    rival = "profit_best_response_myopic"
+    openings = tuple(f"{rival}__opening_{index}" for index in (1, 2))
+    command = [
+        "python", "Core.py",
+        "--policy_sweep", ";".join(specs),
+        "--policy_sweep_rivals", rival,
+        "--policy_sweep_openings", "2",
+        "--policy_sweep_horizon", "2",
+        "--eval_customers", "10",
+        "--policy_sweep_seed", str(t2.VALIDATION_SEED),
+        "--action_contract", "two_lever_v3",
+        "--fleet_scale", "1.2",
+    ]
+    results = {
+        spec: {
+            opening: {
+                **_result(3.0, 2.0),
+                "fulfillment": 0.95,
+                "steps": 2,
+            }
+            for opening in openings
+        }
+        for spec in specs
+    }
+    traces = {
+        spec: [
+            {
+                "rollout": opening,
+                "regime": "calm",
+                "profit_per_request": 3.0,
+                "rival_profit_per_request": 2.0,
+                "own_share": 0.5,
+                "rival_share": 0.5,
+            }
+            for opening in openings
+            for _ in range(2)
+        ]
+        for spec in specs
+    }
+    payload = {
+        "protocol": "v26r_policy_sweep_common_random_numbers",
+        "city": "New York City",
+        "horizon": 2,
+        "customers_per_step": 10,
+        "steps_per_day": t2.STEPS_PER_DAY,
+        "policy_seed": t2.VALIDATION_SEED,
+        "rollouts": [[opening, rival] for opening in openings],
+        "v26r": {
+            "action_contract": "two_lever_v3",
+            "supply_model": "v3",
+            "persistent_driver_stock": False,
+            "effective_fleet_scale": 1.2,
+        },
+        "results": results,
+        "traces": traces,
+    }
+    path = tmp_path / "product.json"
+    path.write_text(json.dumps(payload))
+    return path, command, payload
 
 
 def test_t2_plan_is_3240_surge_range_rollouts_with_five_openings():
@@ -106,6 +170,26 @@ def test_t2_analysis_uses_final_objective_and_reports_components():
         "leave_one_opening_out"
     )
     assert report["cost_of_competing_for_lead"]["own_profit"] == pytest.approx(-0.5)
+
+
+def test_t2_product_validator_accepts_complete_and_rejects_truncation(tmp_path):
+    path, command, payload = _small_product(tmp_path)
+    t2.validate_t2_product(path, command)
+    spec = next(iter(payload["results"]))
+    opening = next(iter(payload["results"][spec]))
+    payload["results"][spec][opening]["steps"] = 1
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="truncated"):
+        t2.validate_t2_product(path, command)
+
+
+def test_t2_product_validator_rejects_missing_trace_step(tmp_path):
+    path, command, payload = _small_product(tmp_path)
+    spec = next(iter(payload["traces"]))
+    payload["traces"][spec].pop()
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="trace coverage"):
+        t2.validate_t2_product(path, command)
 
 
 def test_regime_table_for_each_opening_is_fit_on_the_other_openings():

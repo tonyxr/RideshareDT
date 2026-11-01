@@ -221,6 +221,113 @@ def _job_paths(output: Path, case: str, rival: str) -> tuple[Path, Path, Path]:
     return raw, manifest, log
 
 
+def _command_option(command: Sequence[str], flag: str) -> str:
+    values = list(command)
+    try:
+        index = values.index(flag)
+    except ValueError as exc:
+        raise ValueError(f"T2 command is missing {flag}") from exc
+    if index + 1 >= len(values):
+        raise ValueError(f"T2 command has no value for {flag}")
+    return str(values[index + 1])
+
+
+def validate_t2_product(
+    path: Path, command: Sequence[str]
+) -> dict[str, Any]:
+    """Reject partial or contract-drifted sweep products before analysis."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    expected_specs = set(
+        _command_option(command, "--policy_sweep").split(";")
+    )
+    rival = _command_option(command, "--policy_sweep_rivals")
+    openings = int(_command_option(command, "--policy_sweep_openings"))
+    horizon = int(_command_option(command, "--policy_sweep_horizon"))
+    expected_rollouts = {
+        f"{rival}__opening_{opening}"
+        for opening in range(1, openings + 1)
+    }
+    if payload.get("protocol") != "v26r_policy_sweep_common_random_numbers":
+        raise ValueError(f"wrong T2 policy-sweep protocol: {path}")
+    expected_scalars = {
+        "city": "New York City",
+        "horizon": horizon,
+        "customers_per_step": int(
+            _command_option(command, "--eval_customers")
+        ),
+        "steps_per_day": STEPS_PER_DAY,
+        "policy_seed": int(_command_option(command, "--policy_sweep_seed")),
+    }
+    for key, expected in expected_scalars.items():
+        if payload.get(key) != expected:
+            raise ValueError(
+                f"T2 policy-sweep {key} mismatch in {path}: "
+                f"{payload.get(key)!r} != {expected!r}"
+            )
+    v26r = dict(payload.get("v26r", {}) or {})
+    if (
+        v26r.get("action_contract")
+        != _command_option(command, "--action_contract")
+        or v26r.get("supply_model") != "v3"
+        or bool(v26r.get("persistent_driver_stock"))
+        or float(v26r.get("effective_fleet_scale", float("nan")))
+        != float(_command_option(command, "--fleet_scale"))
+    ):
+        raise ValueError(f"T2 policy-sweep market contract mismatch: {path}")
+    declared_rollouts = {
+        str(row[0])
+        for row in payload.get("rollouts", ())
+        if isinstance(row, (list, tuple)) and len(row) == 2
+    }
+    if declared_rollouts != expected_rollouts:
+        raise ValueError(f"T2 declared rollout coverage mismatch: {path}")
+    results = dict(payload.get("results", {}) or {})
+    traces = dict(payload.get("traces", {}) or {})
+    if set(results) != expected_specs or set(traces) != expected_specs:
+        raise ValueError(f"T2 fixed-cell coverage mismatch: {path}")
+    finite_result_keys = (
+        "own_profit", "rival_profit", "own_share", "rival_share",
+        "fulfillment",
+    )
+    finite_trace_keys = (
+        "profit_per_request", "rival_profit_per_request",
+        "own_share", "rival_share",
+    )
+    for spec in expected_specs:
+        spec_results = dict(results[spec] or {})
+        if set(spec_results) != expected_rollouts:
+            raise ValueError(f"T2 opening coverage mismatch for {spec}: {path}")
+        for rollout, row in spec_results.items():
+            if int(row.get("steps", -1)) != horizon:
+                raise ValueError(
+                    f"T2 rollout {spec}/{rollout} is truncated: {path}"
+                )
+            if not all(
+                math.isfinite(float(row.get(key, float("nan"))))
+                for key in finite_result_keys
+            ):
+                raise ValueError(
+                    f"T2 rollout {spec}/{rollout} has non-finite metrics: "
+                    f"{path}"
+                )
+        counts = {rollout: 0 for rollout in expected_rollouts}
+        for row in list(traces[spec] or ()):
+            rollout = str(row.get("rollout", ""))
+            if rollout not in counts:
+                raise ValueError(f"T2 trace has unknown rollout: {path}")
+            if not str(row.get("regime", "")):
+                raise ValueError(f"T2 trace has no regime label: {path}")
+            if not all(
+                math.isfinite(float(row.get(key, float("nan"))))
+                for key in finite_trace_keys
+            ):
+                raise ValueError(f"T2 trace has non-finite metrics: {path}")
+            counts[rollout] += 1
+        if any(count != horizon for count in counts.values()):
+            raise ValueError(f"T2 trace coverage mismatch for {spec}: {path}")
+    return payload
+
+
 def run_job(
     command: Sequence[str],
     *,
@@ -238,9 +345,16 @@ def run_job(
         "sources": dict(sources),
     }
     if raw.is_file() and manifest.is_file() and not force:
-        if json.loads(manifest.read_text(encoding="utf-8")) != identity:
+        recorded = json.loads(manifest.read_text(encoding="utf-8"))
+        recorded_identity = dict(recorded.get("identity", recorded))
+        if recorded_identity != identity:
             raise ValueError(f"stale T2 cache has a different identity: {raw}")
-        json.loads(raw.read_text(encoding="utf-8"))
+        if recorded.get("state") != "completed":
+            raise ValueError(f"incomplete T2 cache must be repaired: {raw}")
+        expected_hash = recorded.get("product_sha256")
+        if not expected_hash or _sha256_file(raw) != expected_hash:
+            raise ValueError(f"T2 cached product hash changed: {raw}")
+        validate_t2_product(raw, command)
         return "cached"
     if (raw.is_file() or manifest.is_file()) and not force:
         raise ValueError(f"partial T2 cache must be repaired explicitly: {raw}")
@@ -255,16 +369,26 @@ def run_job(
         MPLBACKEND="Agg",
         PYTHONDONTWRITEBYTECODE="1",
     )
-    proc = subprocess.run(
-        list(command), cwd=BASE, env=env, capture_output=True, text=True
-    )
-    log.write_text(proc.stdout + proc.stderr, encoding="utf-8")
-    if proc.returncode != 0 or not raw.is_file():
-        raise RuntimeError(
-            f"T2 simulator job failed ({proc.returncode}): {raw}\n"
-            + (proc.stdout + proc.stderr)[-4000:]
+    atomic_json(manifest, {"state": "running", "identity": identity})
+    try:
+        proc = subprocess.run(
+            list(command), cwd=BASE, env=env, capture_output=True, text=True
         )
-    atomic_json(manifest, identity)
+        log.write_text(proc.stdout + proc.stderr, encoding="utf-8")
+        if proc.returncode != 0 or not raw.is_file():
+            raise RuntimeError(
+                f"T2 simulator job failed ({proc.returncode}): {raw}\n"
+                + (proc.stdout + proc.stderr)[-4000:]
+            )
+        validate_t2_product(raw, command)
+    except BaseException:
+        atomic_json(manifest, {"state": "failed", "identity": identity})
+        raise
+    atomic_json(manifest, {
+        "state": "completed",
+        "identity": identity,
+        "product_sha256": _sha256_file(raw),
+    })
     return "completed"
 
 
@@ -502,7 +626,12 @@ def analyze_job(raw: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def analyze(config: Mapping[str, Any], output: Path, openings: int) -> dict[str, Any]:
+def analyze(
+    config: Mapping[str, Any],
+    output: Path,
+    openings: int,
+    commands: Mapping[tuple[str, str], Sequence[str]] | None = None,
+) -> dict[str, Any]:
     jobs: dict[str, Any] = {}
     levels = ACTION_LEVELS[str(config["action"]["contract"])]
     lower_edge = float(levels[0])
@@ -516,8 +645,21 @@ def analyze(config: Mapping[str, Any], output: Path, openings: int) -> dict[str,
             "lower_any": [], "upper_any": [],
         }
         for rival in RIVALS:
-            raw, _, _ = _job_paths(output, case, rival)
-            report = analyze_job(json.loads(raw.read_text(encoding="utf-8")))
+            raw, manifest, _ = _job_paths(output, case, rival)
+            recorded = json.loads(manifest.read_text(encoding="utf-8"))
+            if (
+                recorded.get("state") != "completed"
+                or not recorded.get("product_sha256")
+                or _sha256_file(raw) != recorded.get("product_sha256")
+            ):
+                raise ValueError(f"T2 analysis found invalidated product: {raw}")
+            command = None if commands is None else commands[(case, rival)]
+            payload = (
+                json.loads(raw.read_text(encoding="utf-8"))
+                if command is None
+                else validate_t2_product(raw, command)
+            )
+            report = analyze_job(payload)
             jobs[case][rival] = report
             chosen = report["best_fixed"]["final"]
             distance = float(chosen["distance_level"])
@@ -737,7 +879,9 @@ def main() -> int:
                         "last_completed": [case, rival],
                     },
                 )
-        report = analyze(config, output, args.openings)
+        report = analyze(config, output, args.openings, commands)
+        report["config_hash"] = config_hash
+        report["source_identity"] = sources
         atomic_json(output / "report.json", report)
         (output / "report.md").write_text(
             render_markdown(report), encoding="utf-8"
@@ -752,6 +896,7 @@ def main() -> int:
                 "pid": os.getpid(),
                 "completed_jobs": completed,
                 "report": str(output / "report.json"),
+                "report_sha256": _sha256_file(output / "report.json"),
                 "lower_edge_check": report["lower_edge_check"],
                 "upper_edge_check": report["upper_edge_check"],
             },
