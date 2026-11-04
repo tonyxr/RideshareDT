@@ -227,6 +227,7 @@ def training_command(
         ),
     ]
     _set_option(command, "--v16_audit_every", "4")
+    _set_option(command, "--eval_customers", "50")
     _set_option(
         command,
         "--report_prefix",

@@ -4,6 +4,7 @@ import sys
 
 import pytest
 
+from Core import _validate_v17_probe_checkpoint_schedule
 from scripts import v17_probe as t3
 from scripts.v17_config import ACTION_LEVELS, canonical_hash, load_config
 from v17_objective import OBJECTIVE_NAME
@@ -68,6 +69,7 @@ def test_t3_training_command_matches_revb_probe_contract(tmp_path):
         load_config(), horizon=5, output=tmp_path
     )
     assert command[command.index("--train_timesteps") + 1] == "200"
+    assert command[command.index("--eval_customers") + 1] == "50"
     assert command[command.index("--v16_branch_horizon_days") + 1] == "5"
     assert command[command.index("--v16_audit_every") + 1] == "4"
     assert command[command.index("--v17_probe_second_tape_fraction") + 1] == "0.25"
@@ -124,6 +126,17 @@ def test_t3_short_command_uses_60_days_and_three_short_checkpoints(tmp_path):
     )
     assert command[command.index("--train_timesteps") + 1] == "60"
     assert command[command.index("--v17_probe_checkpoint_days") + 1] == "30,45,60"
+
+
+def test_core_accepts_only_registered_long_and_short_t3_checkpoint_schedules():
+    assert _validate_v17_probe_checkpoint_schedule((30, 45, 60)) == (
+        30, 45, 60
+    )
+    assert _validate_v17_probe_checkpoint_schedule((100, 150, 200)) == (
+        100, 150, 200
+    )
+    with pytest.raises(ValueError, match="registered checkpoints"):
+        _validate_v17_probe_checkpoint_schedule((30, 60))
 
 
 def test_t3_validation_command_uses_exact_cases_competitors_and_final_policy(tmp_path):

@@ -772,6 +772,25 @@ def _parse_tariff_level_bounds(value: str) -> Tuple[float, float]:
     return (lower, upper)
 
 
+V17_PROBE_CHECKPOINT_SCHEDULES = (
+    (30, 45, 60),
+    (100, 150, 200),
+)
+
+
+def _validate_v17_probe_checkpoint_schedule(
+    days: Sequence[int],
+) -> Tuple[int, ...]:
+    """Accept only the registered short and historical T3 schedules."""
+    schedule = tuple(sorted(set(int(day) for day in days)))
+    if schedule not in V17_PROBE_CHECKPOINT_SCHEDULES:
+        raise ValueError(
+            "T3 requires registered checkpoints at days 30,45,60 or "
+            "100,150,200"
+        )
+    return schedule
+
+
 class Core:
     def __init__(
         self,
@@ -1031,10 +1050,11 @@ class Core:
                 raise ValueError("T3 requires an all-cell audit every 4th decision")
             if self.v17_probe_second_tape_fraction != 0.25:
                 raise ValueError("T3 requires a second tape on 25% of decisions")
-            if self.v17_probe_checkpoint_days != (100, 150, 200):
-                raise ValueError(
-                    "T3 requires checkpoints at days 100, 150, and 200"
+            self.v17_probe_checkpoint_days = (
+                _validate_v17_probe_checkpoint_schedule(
+                    self.v17_probe_checkpoint_days
                 )
+            )
             if not self.v17_probe_checkpoint_dir:
                 raise ValueError("T3 requires a probe checkpoint directory")
         self.v17_progressive_competition = (
@@ -19957,13 +19977,16 @@ def main():
         "--v17_probe_checkpoint_days",
         type=str,
         default="",
-        help="Comma-separated T3 checkpoint days; registered value is 100,150,200.",
+        help=(
+            "Comma-separated T3 checkpoint days; registered values are "
+            "30,45,60 and 100,150,200."
+        ),
     )
     v17.add_argument(
         "--v17_probe_checkpoint_dir",
         type=str,
         default="",
-        help="Directory for the day-100/150/200 T3 policy artifacts.",
+        help="Directory for registered T3 checkpoint policy artifacts.",
     )
 
     v26r = parser.add_argument_group("v26r regime-switching market (all default off)")
