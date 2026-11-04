@@ -139,6 +139,15 @@ def test_core_accepts_only_registered_long_and_short_t3_checkpoint_schedules():
         _validate_v17_probe_checkpoint_schedule((30, 60))
 
 
+def test_score_only_accepts_the_saved_short_checkpoint_schedule():
+    assert t3.registered_score_checkpoint_days("30,45,60") == (30, 45, 60)
+    assert t3.registered_score_checkpoint_days("100,150,200") == (
+        100, 150, 200
+    )
+    with pytest.raises(Exception, match="30,45,60 or 100,150,200"):
+        t3.registered_score_checkpoint_days("30,60")
+
+
 def test_t3_validation_command_uses_exact_cases_competitors_and_final_policy(tmp_path):
     command = t3.validation_command(
         load_config(), horizon=7, day=150,

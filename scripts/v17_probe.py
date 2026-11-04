@@ -375,6 +375,23 @@ def validate_external_scoring_contract(
         raise ValueError("T3 scoring case or rival coverage was reduced")
 
 
+def registered_score_checkpoint_days(value: str) -> tuple[int, ...]:
+    """Parse a score-only schedule without creating an unregistered T3."""
+    try:
+        days = tuple(
+            int(item.strip()) for item in value.split(",") if item.strip()
+        )
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "checkpoint days must be comma-separated integers"
+        ) from exc
+    if days not in (CHECKPOINT_DAYS, SHORT_CHECKPOINT_DAYS):
+        raise argparse.ArgumentTypeError(
+            "score-only checkpoint days must be 30,45,60 or 100,150,200"
+        )
+    return days
+
+
 def validate_checkpoint_contract(
     path: Path,
     *,
@@ -1036,6 +1053,14 @@ def main() -> int:
         help="Root containing hN/checkpoints for --score-only.",
     )
     parser.add_argument(
+        "--checkpoint-days",
+        type=registered_score_checkpoint_days,
+        help=(
+            "Registered checkpoint schedule for --score-only: 30,45,60 or "
+            "100,150,200 (default)."
+        ),
+    )
+    parser.add_argument(
         "--action-contract", choices=tuple(ACTION_LEVELS),
         help="Historical action contract override for --score-only.",
     )
@@ -1065,6 +1090,8 @@ def main() -> int:
         parser.error("--horizon is currently restricted to --score-only")
     if args.checkpoint_source is not None and not args.score_only:
         parser.error("--checkpoint-source requires --score-only")
+    if args.checkpoint_days is not None and not args.score_only:
+        parser.error("--checkpoint-days requires --score-only")
     if args.action_contract is not None and not args.score_only:
         parser.error("--action-contract override requires --score-only")
     if args.accept_completed_legacy_t2 and not args.short:
@@ -1079,8 +1106,16 @@ def main() -> int:
             time_levels=list(levels),
         )
     validate_config(config)
-    training_days = SHORT_TRAINING_DAYS if args.short else TRAINING_DAYS
-    checkpoint_days = SHORT_CHECKPOINT_DAYS if args.short else CHECKPOINT_DAYS
+    checkpoint_days = (
+        tuple(args.checkpoint_days)
+        if args.score_only and args.checkpoint_days is not None
+        else SHORT_CHECKPOINT_DAYS if args.short else CHECKPOINT_DAYS
+    )
+    training_days = (
+        max(checkpoint_days)
+        if args.score_only
+        else SHORT_TRAINING_DAYS if args.short else TRAINING_DAYS
+    )
     output = (args.output or (SHORT_OUTPUT if args.short else DEFAULT_OUTPUT)).resolve()
     checkpoint_source = (
         args.checkpoint_source or output
