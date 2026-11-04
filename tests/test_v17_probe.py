@@ -1,3 +1,4 @@
+import copy
 import json
 import sys
 
@@ -219,6 +220,66 @@ def _valid_t2_dependency():
 def test_t3_requires_current_passed_widened_t2():
     config, status, report = _valid_t2_dependency()
     t3.validate_t2_dependency(config, status, report)
+
+
+def test_explicit_legacy_t2_acceptance_is_validated_and_audited(tmp_path):
+    root = tmp_path / "legacy_t2"
+    root.mkdir()
+    status = {
+        "phase": "T2", "state": "passed", "pass": True,
+        "action_contract": "two_lever_v1",
+    }
+    job = {
+        "best_fixed": {"final": {
+            "own_profit": 3.0,
+            "competitor_profit": 2.0,
+            "final_objective": 1.5,
+            "n": 3,
+        }},
+        "adaptation_value": {"final": {
+            "switch_minus_fixed": {"final_objective": 0.1},
+        }},
+    }
+    report = {
+        "phase": "T2",
+        "action_contract": "two_lever_v1",
+        "levels": list(ACTION_LEVELS["two_lever_v1"]),
+        "openings": 3,
+        "ranking_objective": OBJECTIVE_NAME,
+        "jobs": {
+            case: {f"rival_{index}": copy.deepcopy(job) for index in range(9)}
+            for case in t3.CASES
+        },
+    }
+    (root / "status.json").write_text(json.dumps(status))
+    (root / "report.json").write_text(json.dumps(report))
+
+    loaded_status, loaded_report, provenance = (
+        t3.load_accepted_legacy_t2_dependency(root)
+    )
+    assert loaded_status["pass"] is True
+    assert loaded_report["action_contract"] == "two_lever_v1"
+    assert provenance["mode"].startswith("explicit_user_acceptance")
+    assert provenance["report_sha256"] == t3._sha256(root / "report.json")
+
+
+def test_legacy_t2_acceptance_rejects_incomplete_evidence(tmp_path):
+    root = tmp_path / "legacy_t2"
+    root.mkdir()
+    (root / "status.json").write_text(json.dumps({
+        "phase": "T2", "state": "passed", "pass": True,
+        "action_contract": "two_lever_v1",
+    }))
+    (root / "report.json").write_text(json.dumps({
+        "phase": "T2",
+        "action_contract": "two_lever_v1",
+        "levels": list(ACTION_LEVELS["two_lever_v1"]),
+        "openings": 3,
+        "ranking_objective": OBJECTIVE_NAME,
+        "jobs": {},
+    }))
+    with pytest.raises(ValueError, match="case coverage"):
+        t3.load_accepted_legacy_t2_dependency(root)
 
 
 @pytest.mark.parametrize(

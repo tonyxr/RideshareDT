@@ -41,6 +41,7 @@ DEFAULT_OUTPUT = BASE / "runs/v17_t3"
 SHORT_OUTPUT = BASE / "runs/v17_t3_short"
 T2_REPORT = BASE / "runs/v17_t2/report.json"
 T2_STATUS = BASE / "runs/v17_t2/status.json"
+LEGACY_T2_ROOT = BASE / "runs/v17_t2_two_lever_v1_20261101_pre_v3"
 HORIZONS = (5, 7)
 TRAINING_DAYS = 200
 CHECKPOINT_DAYS = (100, 150, 200)
@@ -119,6 +120,74 @@ def load_t2_dependency(
         raise ValueError("T3 T2 status/report hash mismatch")
     validate_t2_dependency(config, status, report)
     return status, report
+
+
+def load_accepted_legacy_t2_dependency(
+    root: Path = LEGACY_T2_ROOT,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Load the completed pre-widening T2 under an explicit user waiver.
+
+    This is deliberately separate from ``load_t2_dependency`` so the normal
+    current-hash/current-grid gate remains fail-closed.  The waiver is only
+    exposed for the one short widened-grid T3; it never converts the legacy
+    result into a current T2 pass.
+    """
+    status_path = root / "status.json"
+    report_path = root / "report.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    legacy_contract = "two_lever_v1"
+    legacy_levels = tuple(float(value) for value in ACTION_LEVELS[legacy_contract])
+    if status.get("phase") != "T2" or report.get("phase") != "T2":
+        raise ValueError("accepted legacy evidence is not a T2 result")
+    if status.get("state") != "passed" or status.get("pass") is not True:
+        raise ValueError("accepted legacy T2 did not pass")
+    if (
+        status.get("action_contract") != legacy_contract
+        or report.get("action_contract") != legacy_contract
+    ):
+        raise ValueError("accepted legacy T2 uses an unexpected action contract")
+    if tuple(float(value) for value in report.get("levels", ())) != legacy_levels:
+        raise ValueError("accepted legacy T2 uses unexpected action levels")
+    if int(report.get("openings", 0)) < 3:
+        raise ValueError("accepted legacy T2 has insufficient openings")
+    if report.get("ranking_objective") != OBJECTIVE_NAME:
+        raise ValueError("accepted legacy T2 uses the wrong ranking objective")
+    jobs = dict(report.get("jobs", {}) or {})
+    if set(jobs) != set(CASES):
+        raise ValueError("accepted legacy T2 case coverage is incomplete")
+    expected_jobs = len(CASES) * 9
+    observed_jobs = 0
+    for case_jobs in jobs.values():
+        if len(case_jobs) != 9:
+            raise ValueError("accepted legacy T2 rival coverage is incomplete")
+        for job in case_jobs.values():
+            observed_jobs += 1
+            final = dict(job.get("best_fixed", {}) or {}).get("final", {})
+            for key in ("own_profit", "competitor_profit", "final_objective"):
+                value = float(final.get(key, math.nan))
+                if not math.isfinite(value):
+                    raise ValueError(
+                        f"accepted legacy T2 has invalid {key} evidence"
+                    )
+            if int(final.get("n", 0)) < 3:
+                raise ValueError("accepted legacy T2 opening coverage is incomplete")
+    if observed_jobs != expected_jobs:
+        raise ValueError("accepted legacy T2 job coverage is incomplete")
+    provenance = {
+        "mode": "explicit_user_acceptance_of_completed_legacy_t2",
+        "root": str(root.resolve()),
+        "status_sha256": _sha256(status_path),
+        "report_sha256": _sha256(report_path),
+        "action_contract": legacy_contract,
+        "levels": list(legacy_levels),
+        "openings": int(report["openings"]),
+        "known_deviation": (
+            "T2 predates the two_lever_v3 widening; the short T3 itself uses "
+            "the current widened grid and the current configuration hash."
+        ),
+    }
+    return status, report, provenance
 
 
 def _set_option(command: list[str], flag: str, value: str) -> None:
@@ -981,6 +1050,13 @@ def main() -> int:
         "--short", action="store_true",
         help="Run a 60-day diagnostic T3 with checkpoints at days 30, 45, and 60.",
     )
+    parser.add_argument(
+        "--accept-completed-legacy-t2", action="store_true",
+        help=(
+            "Explicitly accept the completed archived two_lever_v1 T2 only "
+            "for the one short widened-grid T3."
+        ),
+    )
     args = parser.parse_args()
     if args.short and args.score_only:
         parser.error("--short and --score-only are mutually exclusive")
@@ -990,6 +1066,8 @@ def main() -> int:
         parser.error("--checkpoint-source requires --score-only")
     if args.action_contract is not None and not args.score_only:
         parser.error("--action-contract override requires --score-only")
+    if args.accept_completed_legacy_t2 and not args.short:
+        parser.error("--accept-completed-legacy-t2 requires --short")
     config = load_config(args.config)
     if args.action_contract is not None:
         config = copy.deepcopy(config)
@@ -1043,6 +1121,11 @@ def main() -> int:
         "validation_rollouts": len(active_horizons) * len(checkpoint_days) * len(CASES) * len(VALIDATION_RIVALS) * int(args.validation_openings),
         "checkpoint_source": str(checkpoint_source),
         "config_hash": config_hash,
+        "t2_dependency_mode": (
+            "accepted_completed_legacy"
+            if args.accept_completed_legacy_t2
+            else "strict_current"
+        ),
     }
     if args.plan_only:
         print(json.dumps(plan, indent=2))
@@ -1199,7 +1282,12 @@ def main() -> int:
 
         # T3's adaptation gate depends on T2. Validate that dependency before
         # launching either expensive training horizon.
-        _, t2 = load_t2_dependency(config)
+        if args.accept_completed_legacy_t2:
+            _, t2, t2_provenance = load_accepted_legacy_t2_dependency()
+            plan["t2_dependency"] = t2_provenance
+            _write_json(output / "status.json", {**plan, "state": "running"})
+        else:
+            _, t2 = load_t2_dependency(config)
         training_jobs = []
         for horizon in active_horizons:
             command = training_command(
