@@ -210,3 +210,32 @@ def test_v3_surge_range_has_exactly_the_requested_36_cells():
         for time in TWO_LEVER_V3_LEVELS
     ]
     assert v3.action_label(35) == "cell:distance=2.5,time=2.5"
+
+
+def test_v3_core_artifact_reloads_with_its_registered_grid(tmp_path):
+    from Core import Core
+    import torch
+
+    core = Core(
+        "Chicago",
+        seed=26,
+        firm1_mode="RL",
+        firm2_mode="static",
+        total_customers_pool=8,
+        simulation_sample_cap=3,
+        enable_driver_supply=False,
+        openai_api_key="",
+        action_contract="two_lever_v3",
+        v16_crn_tape=True,
+        v16_branch_mode="one_day_deviation",
+        v16_branch_design="stencil11",
+        v16_store_cap=20,
+        v16_value_head="concave2d",
+        v16_policy_mode="q",
+    )
+    artifact_path = tmp_path / "two-lever-v3-policy.pt"
+    core.save_trained_model(str(artifact_path))
+    artifact = torch.load(artifact_path, weights_only=False, map_location="cpu")
+    assert artifact["action_semantics"] == "two_lever_absolute_card_v3"
+    assert len(artifact["action_to_two_lever_cell"]) == 36
+    core.load_trained_model(str(artifact_path))

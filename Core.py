@@ -87,6 +87,7 @@ from pricing_models import (
     LEVEL_STEP_ACTION_SEMANTICS,
     TWO_LEVER_ACTION_SEMANTICS,
     TWO_LEVER_V2_ACTION_SEMANTICS,
+    TWO_LEVER_V3_ACTION_SEMANTICS,
     TWO_LEVER_CONTRACT_LEVELS,
     LEVEL_STEP_EXPOSURE,
     TARIFF_LEVEL_GRID_STEP,
@@ -20240,6 +20241,7 @@ def main():
         saved_two_lever_contract = {
             TWO_LEVER_ACTION_SEMANTICS: "two_lever_v1",
             TWO_LEVER_V2_ACTION_SEMANTICS: "two_lever_v2",
+            TWO_LEVER_V3_ACTION_SEMANTICS: "two_lever_v3",
         }.get(artifact_header.get("action_semantics"))
         if saved_two_lever_contract is not None:
             args.action_contract = saved_two_lever_contract
