@@ -122,6 +122,9 @@ def validate_config(
         or int(learner.get("batch_size")) != 64
         or float(learner.get("polyak")) != 0.99
         or int(learner.get("store_rows")) != 20000
+        or int(learner.get("move_radius", 0)) != 1
+        or learner.get("temperature_mode") != "relative"
+        or _tuple(learner.get("tau_relative")) != (0.50, 0.15)
     ):
         raise ValueError("V17 learner contract drifted")
     if _tuple(config["training"].get("seeds")) != (101, 202, 303):
@@ -247,6 +250,16 @@ def core_args(
         "--v16_tau_start", "0.10",
         "--v16_tau_end", "0.03",
         "--v16_policy_epsilon", "0.05",
+        "--v17_move_radius", str(int(config["learner"]["move_radius"])),
+        "--v17_temperature_mode", str(
+            config["learner"]["temperature_mode"]
+        ),
+        "--v17_tau_rel_start", str(
+            float(config["learner"]["tau_relative"][0])
+        ),
+        "--v17_tau_rel_end", str(
+            float(config["learner"]["tau_relative"][1])
+        ),
         "--report_prefix", str(out / city),
         "--trained_model_out", str(out / "policy.pt"),
         "--trained_model_id", f"v17-{city}-seed{seed}",

@@ -64,6 +64,9 @@ learner:
   value_head: concave2d
   policy_mode: q
   tau: [0.10, 0.03]
+  move_radius: 1
+  temperature_mode: relative
+  tau_relative: [0.50, 0.15]
   epsilon: 0.05
   fit_steps_per_day: 50
   batch_size: 64

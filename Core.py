@@ -775,6 +775,7 @@ def _parse_tariff_level_bounds(value: str) -> Tuple[float, float]:
 
 
 V17_PROBE_CHECKPOINT_SCHEDULES = (
+    (10, 15, 20),
     (30, 45, 60),
     (100, 150, 200),
 )
@@ -787,8 +788,8 @@ def _validate_v17_probe_checkpoint_schedule(
     schedule = tuple(sorted(set(int(day) for day in days)))
     if schedule not in V17_PROBE_CHECKPOINT_SCHEDULES:
         raise ValueError(
-            "T3 requires registered checkpoints at days 30,45,60 or "
-            "100,150,200"
+            "T3 requires registered checkpoints at days 10,15,20, "
+            "30,45,60, or 100,150,200"
         )
     return schedule
 
@@ -940,6 +941,10 @@ class Core:
         v16_tau_start: float = 0.10,
         v16_tau_end: float = 0.03,
         v16_policy_epsilon: float = 0.05,
+        v17_move_radius: int = 0,
+        v17_temperature_mode: str = "absolute",
+        v17_tau_rel_start: float = 0.50,
+        v17_tau_rel_end: float = 0.15,
         v16_action_credit_scale: float = 1.0,
         v16_reward: bool = False,
         current_active_driver_observation: bool = False,
@@ -1017,6 +1022,35 @@ class Core:
         self.v16_tau_start = float(v16_tau_start)
         self.v16_tau_end = float(v16_tau_end)
         self.v16_policy_epsilon = float(v16_policy_epsilon)
+        self.v17_move_radius = int(v17_move_radius)
+        self.v17_temperature_mode = str(v17_temperature_mode)
+        self.v17_tau_rel_start = float(v17_tau_rel_start)
+        self.v17_tau_rel_end = float(v17_tau_rel_end)
+        if self.v17_move_radius not in (0, 1, 2):
+            raise ValueError("v17_move_radius must be 0, 1, or 2")
+        if self.v17_temperature_mode not in ("absolute", "relative"):
+            raise ValueError(
+                "v17_temperature_mode must be absolute or relative"
+            )
+        if not (
+            np.isfinite(self.v17_tau_rel_start)
+            and np.isfinite(self.v17_tau_rel_end)
+            and self.v17_tau_rel_start >= self.v17_tau_rel_end > 0.0
+        ):
+            raise ValueError(
+                "V17 relative tau must satisfy start >= end > 0"
+            )
+        if (
+            self.v17_move_radius != 0
+            or self.v17_temperature_mode != "absolute"
+        ) and (
+            self.v16_policy_mode != "q"
+            or not str(action_contract).startswith("two_lever")
+        ):
+            raise ValueError(
+                "V17 move/temperature features require Q policy and a "
+                "two-lever action card"
+            )
         self.v16_action_credit_scale = float(v16_action_credit_scale)
         self.v16_reward = bool(v16_reward)
         self.v17_probe_mode = bool(v17_probe_mode)
@@ -1048,8 +1082,16 @@ class Core:
                 raise ValueError(
                     "V17 probe mode requires one-day-deviation branches"
                 )
-            if self.v16_audit_every != 4:
-                raise ValueError("T3 requires an all-cell audit every 4th decision")
+            revc = bool(
+                self.v17_move_radius == 1
+                and self.v17_temperature_mode == "relative"
+            )
+            expected_audit_every = 10 if revc else 4
+            if self.v16_audit_every != expected_audit_every:
+                raise ValueError(
+                    "T3 requires an all-cell audit every "
+                    f"{expected_audit_every}th decision"
+                )
             if self.v17_probe_second_tape_fraction != 0.25:
                 raise ValueError("T3 requires a second tape on 25% of decisions")
             self.v17_probe_checkpoint_days = (
@@ -3175,6 +3217,10 @@ class Core:
             "v16_tau_start": float(self.v16_tau_start),
             "v16_tau_end": float(self.v16_tau_end),
             "v16_policy_epsilon": float(self.v16_policy_epsilon),
+            "v17_move_radius": int(self.v17_move_radius),
+            "v17_temperature_mode": self.v17_temperature_mode,
+            "v17_tau_rel_start": float(self.v17_tau_rel_start),
+            "v17_tau_rel_end": float(self.v17_tau_rel_end),
             "v16_action_credit_scale": float(
                 self.v16_action_credit_scale
             ),
@@ -7026,6 +7072,10 @@ class Core:
                 "tau_start": float(self.v16_tau_start),
                 "tau_end": float(self.v16_tau_end),
                 "epsilon": float(self.v16_policy_epsilon),
+                "move_radius": int(self.v17_move_radius),
+                "temperature_mode": self.v17_temperature_mode,
+                "tau_rel_start": float(self.v17_tau_rel_start),
+                "tau_rel_end": float(self.v17_tau_rel_end),
                 "target_source": "polyak_value_target",
             }
         if independent_actions:
@@ -7585,11 +7635,19 @@ class Core:
         saved_target_state = artifact.get("v16_value_target_model_state")
         saved_q_config = dict(artifact.get("v16_q_policy_config", {}) or {})
         if self.v16_value_target_model is not None:
+            saved_q_config.setdefault("move_radius", 0)
+            saved_q_config.setdefault("temperature_mode", "absolute")
+            saved_q_config.setdefault("tau_rel_start", 0.50)
+            saved_q_config.setdefault("tau_rel_end", 0.15)
             expected_q_config = {
                 "mode": self.v16_policy_mode,
                 "tau_start": float(self.v16_tau_start),
                 "tau_end": float(self.v16_tau_end),
                 "epsilon": float(self.v16_policy_epsilon),
+                "move_radius": int(self.v17_move_radius),
+                "temperature_mode": self.v17_temperature_mode,
+                "tau_rel_start": float(self.v17_tau_rel_start),
+                "tau_rel_end": float(self.v17_tau_rel_end),
                 "target_source": "polyak_value_target",
             }
             if saved_q_config != expected_q_config:
@@ -9591,6 +9649,41 @@ class Core:
         fit_mask &= mask
         if not bool(fit_mask[int(metadata["incumbent_action"])]):
             raise RuntimeError("V17 fit stencil must retain its incumbent")
+        prediction = np.full(mask.size, np.nan, dtype=np.float64)
+        greedy_action = -1
+        model = self.v16_value_target_model
+        if model is not None:
+            was_training = model.training
+            model.eval()
+            with torch.no_grad():
+                device = next(model.parameters()).device
+                obs_t = torch.as_tensor(
+                    observation.reshape(1, -1),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                cells_t = torch.as_tensor(
+                    self.v16_value_cells,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                q = (
+                    model(obs_t, cells_t)["q"][0]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64)
+                )
+            if was_training:
+                model.train()
+            incumbent = int(metadata["incumbent_action"])
+            prediction[mask] = q[mask] - q[incumbent]
+            allowed = self._v17_move_mask(incumbent) & mask
+            if bool(np.any(allowed)):
+                allowed_actions = np.flatnonzero(allowed)
+                greedy_action = int(
+                    allowed_actions[np.argmax(q[allowed_actions])]
+                )
         self.v16_branch_store.add(
             {
                 "observation_window": observation.reshape(-1).tolist(),
@@ -9626,6 +9719,10 @@ class Core:
                 "label_noise_sd": float(
                     metadata.get("label_noise_sd", np.nan)
                 ),
+                "prequential_prediction": prediction.tolist(),
+                "prequential_model": "polyak_target_before_today_fit",
+                "greedy_action": int(greedy_action),
+                "move_radius": int(self.v17_move_radius),
             }
         )
 
@@ -9886,6 +9983,32 @@ class Core:
             + (self.v16_tau_start - self.v16_tau_end) * cosine
         )
 
+    def _v17_tau_rel(self, training_progress: float) -> float:
+        progress = float(np.clip(training_progress, 0.0, 1.0))
+        cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+        return float(
+            self.v17_tau_rel_end
+            + (self.v17_tau_rel_start - self.v17_tau_rel_end) * cosine
+        )
+
+    def _v17_move_mask(self, incumbent: int) -> np.ndarray:
+        n = int(self.firm1.agent.action_dim)
+        if int(self.v17_move_radius) <= 0:
+            return np.ones(n, dtype=bool)
+        levels = tuple(float(value) for value in self.firm1.two_lever_levels)
+        cells = self.firm1.action_to_two_lever_cell
+        incumbent_cell = cells[int(incumbent)]
+        ci = levels.index(float(incumbent_cell[0]))
+        cj = levels.index(float(incumbent_cell[1]))
+        mask = np.zeros(n, dtype=bool)
+        for action, (distance, time) in cells.items():
+            i = levels.index(float(distance))
+            j = levels.index(float(time))
+            mask[int(action)] = max(abs(i - ci), abs(j - cj)) <= int(
+                self.v17_move_radius
+            )
+        return mask
+
     @torch.no_grad()
     def _v16_q_policy_decision(
         self,
@@ -9916,9 +10039,29 @@ class Core:
             )
         if not torch.any(mask_t):
             raise ValueError("V17 Q policy has no feasible action cell")
+        incumbent = int(self._v16_incumbent_two_lever_action())
+        move = torch.as_tensor(
+            self._v17_move_mask(incumbent),
+            dtype=torch.bool,
+            device=device,
+        )
+        mask_t = mask_t & move
+        if not bool(mask_t[incumbent]):
+            raise RuntimeError("V17 move mask must keep the incumbent feasible")
         masked_q = q_values.masked_fill(~mask_t, float("-inf"))
-        temperature = self._v16_q_temperature(training_progress)
-        target_probs = torch.softmax(masked_q / temperature, dim=-1)
+        allowed_q = masked_q[mask_t]
+        spread = float(allowed_q.max().item() - allowed_q.min().item())
+        tau_rel = self._v17_tau_rel(training_progress)
+        if self.v17_temperature_mode == "relative":
+            if spread <= 1e-9:
+                target_probs = mask_t.to(q_values.dtype) / mask_t.sum()
+            else:
+                logits = (masked_q - allowed_q.max()) / (tau_rel * spread)
+                target_probs = torch.softmax(logits, dim=-1)
+            temperature = tau_rel * spread
+        else:
+            temperature = self._v16_q_temperature(training_progress)
+            target_probs = torch.softmax(masked_q / temperature, dim=-1)
         epsilon = 0.0 if deterministic else self.v16_policy_epsilon
         uniform = mask_t.to(dtype=target_probs.dtype)
         uniform = uniform / uniform.sum()
@@ -9941,7 +10084,6 @@ class Core:
             (-(policy_probs * torch.log(policy_probs.clamp(min=1e-12))).sum())
             .item()
         )
-        incumbent = int(self._v16_incumbent_two_lever_action())
         posted_distance, posted_time = self.v16_value_cells[action]
         diagnostics = {
             "policy_top_action": float(top),
@@ -9977,6 +10119,9 @@ class Core:
             "v16_q_posted_time": float(posted_time),
             "v16_q_temperature": float(temperature),
             "v16_q_epsilon": float(epsilon),
+            "v17_allowed_cells": float(mask_t.sum().item()),
+            "v17_tau_rel": float(tau_rel),
+            "v17_q_spread_allowed": float(spread),
         }
         return action, log_probability.detach(), diagnostics
 
@@ -13684,6 +13829,21 @@ class Core:
                     driver_stock_firm2=float(self.driver_supply.online_stock.get('Firm2', 1.)))
             else:
                 log_row.pop('behavior_exploration_rate')
+            if (
+                self.v17_move_radius != 0
+                or self.v17_temperature_mode != "absolute"
+            ):
+                log_row.update({
+                    "v17_allowed_cells": float(
+                        avg_policy_diag.get("v17_allowed_cells", 0.0)
+                    ),
+                    "v17_tau_rel": float(
+                        avg_policy_diag.get("v17_tau_rel", 0.0)
+                    ),
+                    "v17_q_spread_allowed": float(
+                        avg_policy_diag.get("v17_q_spread_allowed", 0.0)
+                    ),
+                })
             self.training_logs.append(log_row)
 
             if self.firm1_mode == "RL":
@@ -14744,6 +14904,21 @@ class Core:
             for diag_key, diag_value in reward_diag.items():
                 if diag_key.startswith(("reward_positive_", "constraint_cost_", "constraint_lambda_")):
                     log_row[diag_key] = float(diag_value)
+            if (
+                self.v17_move_radius != 0
+                or self.v17_temperature_mode != "absolute"
+            ):
+                log_row.update({
+                    "v17_allowed_cells": float(
+                        eval_policy_diag.get("v17_allowed_cells", 0.0)
+                    ),
+                    "v17_tau_rel": float(
+                        eval_policy_diag.get("v17_tau_rel", 0.0)
+                    ),
+                    "v17_q_spread_allowed": float(
+                        eval_policy_diag.get("v17_q_spread_allowed", 0.0)
+                    ),
+                })
             self.evaluation_logs.append(log_row)
             if journal:
                 journal.append("evaluation_live", log_row)
@@ -19938,6 +20113,19 @@ def main():
     v17.add_argument("--v16_tau_end", type=float, default=0.03)
     v17.add_argument("--v16_policy_epsilon", type=float, default=0.05)
     v17.add_argument(
+        "--v17_move_radius",
+        type=int,
+        default=0,
+        help="0 = off (any cell). 1 = at most one grid step per lever per day.",
+    )
+    v17.add_argument(
+        "--v17_temperature_mode",
+        choices=("absolute", "relative"),
+        default="absolute",
+    )
+    v17.add_argument("--v17_tau_rel_start", type=float, default=0.50)
+    v17.add_argument("--v17_tau_rel_end", type=float, default=0.15)
+    v17.add_argument(
         "--v16_action_credit_scale",
         type=float,
         default=1.0,
@@ -21119,6 +21307,10 @@ def main():
         v16_tau_start=args.v16_tau_start,
         v16_tau_end=args.v16_tau_end,
         v16_policy_epsilon=args.v16_policy_epsilon,
+        v17_move_radius=args.v17_move_radius,
+        v17_temperature_mode=args.v17_temperature_mode,
+        v17_tau_rel_start=args.v17_tau_rel_start,
+        v17_tau_rel_end=args.v17_tau_rel_end,
         v16_action_credit_scale=args.v16_action_credit_scale,
         v16_reward=args.v16_reward,
         current_active_driver_observation=(
