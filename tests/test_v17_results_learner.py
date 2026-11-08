@@ -16,6 +16,9 @@ def _core(
     seed: int = 17101,
     move_radius: int = 1,
     temperature_mode: str = "relative",
+    progressive: bool = False,
+    ablate_driver_observation: bool = False,
+    ablate_profit_lead: bool = False,
 ) -> Core:
     return Core(
         "Chicago",
@@ -37,6 +40,9 @@ def _core(
         v17_temperature_mode=temperature_mode,
         v17_tau_rel_start=0.50,
         v17_tau_rel_end=0.15,
+        training_curriculum=("v17_progressive" if progressive else "staged"),
+        v17_ablate_driver_observation=ablate_driver_observation,
+        v17_ablate_profit_lead=ablate_profit_lead,
     )
 
 
@@ -177,3 +183,43 @@ def test_prequential_recorded_before_fit(monkeypatch):
         core.v16_value_target_model.values.add_(10.0)
     assert row["prequential_prediction"] == stored
     assert mask[int(row["greedy_action"])]
+
+
+def test_driver_observation_ablation_is_default_off():
+    main = _core(progressive=True)
+    ablated = _core(
+        progressive=True,
+        ablate_driver_observation=True,
+    )
+    assert main.observation_config.current_active_driver_observation
+    assert not ablated.observation_config.current_active_driver_observation
+    assert not main.v17_ablate_driver_observation
+    assert ablated.v17_ablate_driver_observation
+
+
+def test_profit_lead_ablation_is_default_off():
+    main = _core(progressive=True)
+    ablated = _core(progressive=True, ablate_profit_lead=True)
+    assert tuple(
+        main.long_term_profit_reward_config.stage_profit_lead_weights
+    ) == (0.0, 0.5, 0.625, 0.75)
+    assert tuple(
+        ablated.long_term_profit_reward_config.stage_profit_lead_weights
+    ) == (0.0, 0.0, 0.0, 0.0)
+    assert not main.v17_ablate_profit_lead
+    assert ablated.v17_ablate_profit_lead
+
+
+def test_ablation_switches_are_recorded_in_checkpoint(tmp_path):
+    core = _core(
+        progressive=True,
+        ablate_driver_observation=True,
+        ablate_profit_lead=True,
+    )
+    path = tmp_path / "policy.pt"
+    core.save_trained_model(path=str(path), model_id="results-ablation")
+    artifact = torch.load(path, map_location="cpu", weights_only=False)
+    assert artifact["v17_ablation_config"] == {
+        "driver_observation": True,
+        "profit_lead": True,
+    }

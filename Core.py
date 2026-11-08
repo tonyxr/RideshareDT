@@ -948,6 +948,8 @@ class Core:
         v16_action_credit_scale: float = 1.0,
         v16_reward: bool = False,
         current_active_driver_observation: bool = False,
+        v17_ablate_driver_observation: bool = False,
+        v17_ablate_profit_lead: bool = False,
         v17_probe_mode: bool = False,
         v17_probe_second_tape_fraction: float = 0.0,
         v17_probe_checkpoint_days: Sequence[int] = (),
@@ -1053,6 +1055,10 @@ class Core:
             )
         self.v16_action_credit_scale = float(v16_action_credit_scale)
         self.v16_reward = bool(v16_reward)
+        self.v17_ablate_driver_observation = bool(
+            v17_ablate_driver_observation
+        )
+        self.v17_ablate_profit_lead = bool(v17_ablate_profit_lead)
         self.v17_probe_mode = bool(v17_probe_mode)
         self.v17_probe_second_tape_fraction = float(
             v17_probe_second_tape_fraction
@@ -1115,20 +1121,25 @@ class Core:
                     "v17_progressive uses direct profit competitiveness, not "
                     "the legacy temporal reward"
                 )
+            registered_weights = (
+                (0.0, 0.0, 0.0, 0.0)
+                if self.v17_ablate_profit_lead
+                else V17_PROGRESSIVE_PROFIT_LEAD_WEIGHTS
+            )
             requested_weights = (
-                V17_PROGRESSIVE_PROFIT_LEAD_WEIGHTS
+                registered_weights
                 if stage_profit_lead_weights is None
                 else tuple(float(value) for value in stage_profit_lead_weights)
             )
             if not np.allclose(
                 requested_weights,
-                V17_PROGRESSIVE_PROFIT_LEAD_WEIGHTS,
+                registered_weights,
                 rtol=0.0,
                 atol=1e-12,
             ):
                 raise ValueError(
-                    "v17_progressive fixes market/static/catchup/profit "
-                    "profit-lead weights at 0,0.5,0.625,0.75"
+                    "v17_progressive profit-lead weights do not match the "
+                    "selected registered ablation"
                 )
             if (
                 stage_market_share_competitiveness_weights is not None
@@ -1141,9 +1152,11 @@ class Core:
                     "v17_progressive reward contains no market-share shaping"
                 )
             stage_specific_rewards = True
-            stage_profit_lead_weights = V17_PROGRESSIVE_PROFIT_LEAD_WEIGHTS
+            stage_profit_lead_weights = registered_weights
             stage_market_share_competitiveness_weights = (0.0, 0.0, 0.0, 0.0)
-            current_active_driver_observation = True
+            current_active_driver_observation = (
+                not self.v17_ablate_driver_observation
+            )
         if not (
             np.isfinite(self.v16_tau_start)
             and np.isfinite(self.v16_tau_end)
@@ -3221,6 +3234,12 @@ class Core:
             "v17_temperature_mode": self.v17_temperature_mode,
             "v17_tau_rel_start": float(self.v17_tau_rel_start),
             "v17_tau_rel_end": float(self.v17_tau_rel_end),
+            "v17_ablate_driver_observation": bool(
+                self.v17_ablate_driver_observation
+            ),
+            "v17_ablate_profit_lead": bool(
+                self.v17_ablate_profit_lead
+            ),
             "v16_action_credit_scale": float(
                 self.v16_action_credit_scale
             ),
@@ -6823,6 +6842,12 @@ class Core:
             "credit_assignment_config": copy.deepcopy(
                 self.credit_assignment_config
             ),
+            "v17_ablation_config": {
+                "driver_observation": bool(
+                    self.v17_ablate_driver_observation
+                ),
+                "profit_lead": bool(self.v17_ablate_profit_lead),
+            },
             "v26_settings": copy.deepcopy(getattr(self, "v26_settings", {"enabled": False})),
             "demand_calibration": copy.deepcopy(getattr(self.choice_model, 'demand_spec', None)),
             "supply_operating_point": ({'contract': 'revision6-posted-pay-entry-stochastic-rounding',
@@ -20152,6 +20177,22 @@ def main():
         ),
     )
     v17.add_argument(
+        "--v17_ablate_driver_observation",
+        action="store_true",
+        help=(
+            "Registered C3 ablation: keep the exact current own-driver "
+            "observation disabled under the v17_progressive curriculum."
+        ),
+    )
+    v17.add_argument(
+        "--v17_ablate_profit_lead",
+        action="store_true",
+        help=(
+            "Registered C3 ablation: use own profit only in every "
+            "v17_progressive curriculum stage."
+        ),
+    )
+    v17.add_argument(
         "--v17_probe_mode",
         action="store_true",
         help=(
@@ -20621,6 +20662,25 @@ def main():
             )
         args.credit_assignment_v24 = saved_v24
         args.credit_assignment_v25 = saved_v25
+        saved_ablations = dict(
+            artifact_header.get("v17_ablation_config", {}) or {}
+        )
+        for argument_name, saved_value in (
+            (
+                "v17_ablate_driver_observation",
+                bool(saved_ablations.get("driver_observation", False)),
+            ),
+            (
+                "v17_ablate_profit_lead",
+                bool(saved_ablations.get("profit_lead", False)),
+            ),
+        ):
+            flag = f"--{argument_name}"
+            if flag in argv_flag_names and not saved_value:
+                parser.error(
+                    f"{flag} conflicts with the trained policy ablation contract"
+                )
+            setattr(args, argument_name, saved_value)
         credit_cli_contract = {
             "privileged_critic": (
                 bool(saved_credit.get("privileged_critic", False)),
@@ -21316,6 +21376,10 @@ def main():
         current_active_driver_observation=(
             args.current_active_driver_observation
         ),
+        v17_ablate_driver_observation=(
+            args.v17_ablate_driver_observation
+        ),
+        v17_ablate_profit_lead=args.v17_ablate_profit_lead,
         v17_probe_mode=args.v17_probe_mode,
         v17_probe_second_tape_fraction=(
             args.v17_probe_second_tape_fraction
