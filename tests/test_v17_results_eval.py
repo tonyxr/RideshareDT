@@ -129,6 +129,19 @@ def test_rl_commands_preserve_q_and_plain_ppo_variants(tmp_path):
     assert main[main.index("--policy_sweep_seed") + 1] == "77311"
 
 
+def test_no_driver_observation_command_matches_saved_contract(tmp_path):
+    config = load_config()
+    command = evaluation.evaluation_command(
+        config, city="nyc", case="C0_calm", specs=("rl_actor",),
+        raw=tmp_path / "no-driver.json",
+        report_prefix=tmp_path / "no-driver",
+        run=RUN_BY_NAME["nyc_s101_no_driver_obs"],
+        policy=tmp_path / "policy.pt",
+    )
+    assert "--v17_ablate_driver_observation" in command
+    assert "--current_active_driver_observation" not in command
+
+
 def test_evaluation_validator_accepts_complete_and_rejects_truncation(tmp_path):
     raw, command, payload = _small_product(tmp_path)
     evaluation.validate_eval_product(raw, command)

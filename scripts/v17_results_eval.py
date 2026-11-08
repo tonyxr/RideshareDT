@@ -286,6 +286,7 @@ def evaluation_command(
             "--v17_tau_rel_end", "0.15",
         ))
         if run.kind == "no_driver_observation":
+            command.remove("--current_active_driver_observation")
             command.append("--v17_ablate_driver_observation")
         elif run.kind == "own_profit":
             command.append("--v17_ablate_profit_lead")
