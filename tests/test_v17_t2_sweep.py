@@ -22,6 +22,7 @@ def _small_product(tmp_path):
     openings = tuple(f"{rival}__opening_{index}" for index in (1, 2))
     command = [
         "python", "Core.py",
+        "--market", "New York City",
         "--policy_sweep", ";".join(specs),
         "--policy_sweep_rivals", rival,
         "--policy_sweep_openings", "2",
@@ -110,6 +111,78 @@ def test_t2_command_wires_production_market_and_live_driver_contract(tmp_path):
     assert command[command.index("--shock_scenario") + 1].endswith(
         "scenarios/v17_t2_shortage_severe.json"
     )
+
+
+def test_results_comparator_plan_is_registered_648_rollouts(tmp_path):
+    config = load_config()
+    rivals = (
+        "adaptive_best_response_memory",
+        "profit_best_response_myopic",
+        "profit_opt_mpc_grid",
+    )
+    assert t2.expected_rollouts(config, openings=3, rivals=rivals) == 648
+    command = t2.sweep_command(
+        config,
+        case="C0_calm",
+        rival=rivals[0],
+        output=tmp_path,
+        openings=3,
+        customers=50,
+        pool=2000,
+        city="boston",
+        days=28,
+    )
+    assert command[command.index("--market") + 1] == "Boston"
+    assert command[command.index("--eval_customers") + 1] == "50"
+    assert command[command.index("--policy_sweep_horizon") + 1] == "168"
+    assert command[command.index("--fleet_scale") + 1] == "1.0"
+
+
+def test_selected_comparators_pool_cells_and_build_declared_day_rule(
+    tmp_path, monkeypatch
+):
+    config = load_config()
+    rival = "adaptive_best_response_memory"
+    specs = t2.fixed_specs(config)
+
+    def payload_for(case):
+        results = {}
+        for spec in specs:
+            distance, time = t2.parse_cell(spec)
+            own = 10.0 - abs(distance - 1.5) - abs(time - 1.5)
+            competitor = 4.0
+            if case == "A1_shortage_severe" and distance == time == 2.0:
+                own = 20.0
+            results[spec] = {
+                f"{rival}__opening_1": _result(own, competitor)
+            }
+        return {"results": results}
+
+    def fake_validate(path, command):
+        case = path.parent.name
+        return payload_for(case)
+
+    monkeypatch.setattr(t2, "validate_t2_product", fake_validate)
+    commands = {(case, rival): [case] for case in t2.CASES}
+    selected = t2.select_comparators(
+        config,
+        tmp_path,
+        city="chicago",
+        openings=1,
+        days=28,
+        rivals=(rival,),
+        commands=commands,
+    )
+    assert selected["city"] == "chicago"
+    assert selected["surge_rule"]["event_level"] == 2.0
+    shortage_rule = selected["surge_rule"]["per_case"][
+        "A1_shortage_severe"
+    ]
+    assert shortage_rule["event_days"] == [10, 11, 12, 13, 14, 15]
+    assert shortage_rule["spec"].startswith("schedule:")
+    assert selected["surge_rule"]["per_case"]["C0_calm"][
+        "event_days"
+    ] == []
 
 
 def test_t2_v2_switch_expands_the_same_plan_to_36_cells():

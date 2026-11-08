@@ -32,6 +32,7 @@ if str(BASE) not in sys.path:
 from diagnostic_logging import atomic_json  # noqa: E402
 from scripts.v17_config import (  # noqa: E402
     ACTION_LEVELS,
+    CITY_SLUGS,
     DEFAULT_CONFIG,
     canonical_hash,
     load_config,
@@ -120,17 +121,22 @@ def fixed_specs(config: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(cell_spec(distance, time) for distance in levels for time in levels)
 
 
-def expected_rollouts(config: Mapping[str, Any], openings: int = OPENINGS) -> int:
-    return len(fixed_specs(config)) * len(CASES) * len(RIVALS) * int(openings)
+def expected_rollouts(
+    config: Mapping[str, Any],
+    openings: int = OPENINGS,
+    rivals: Sequence[str] = RIVALS,
+) -> int:
+    return len(fixed_specs(config)) * len(CASES) * len(rivals) * int(openings)
 
 
 def estimated_wall_hours(
-    config: Mapping[str, Any], *, openings: int, workers: int
+    config: Mapping[str, Any], *, openings: int, workers: int,
+    rivals: Sequence[str] = RIVALS,
 ) -> float:
     """Scale the completed V1 T2 wall time by rollouts and worker count."""
     return (
         PRIOR_T2_WALL_HOURS
-        * expected_rollouts(config, openings) / PRIOR_T2_ROLLOUTS
+        * expected_rollouts(config, openings, rivals) / PRIOR_T2_ROLLOUTS
         * PRIOR_T2_WORKERS / max(1, int(workers))
     )
 
@@ -144,6 +150,8 @@ def sweep_command(
     openings: int,
     customers: int,
     pool: int,
+    city: str = "nyc",
+    days: int = HORIZON_DAYS,
 ) -> list[str]:
     """Render one isolated case/competitor Core sweep."""
     validate_config(config)
@@ -151,7 +159,11 @@ def sweep_command(
         raise ValueError(f"unknown T2 case: {case}")
     if rival not in RIVALS:
         raise ValueError(f"unknown T2 rival: {rival}")
-    inputs = config["city_inputs"]["nyc"]
+    if city not in CITY_SLUGS:
+        raise ValueError(f"unknown T2 city: {city}")
+    if int(days) < 1:
+        raise ValueError("T2 days must be positive")
+    inputs = config["city_inputs"][city]
     raw = output / "raw" / case / f"{rival}.json"
     prefix = output / "logs" / case / rival
     return [
@@ -208,7 +220,7 @@ def sweep_command(
         "--policy_sweep_out", str(raw),
         "--policy_sweep_openings", str(int(openings)),
         "--policy_sweep_rivals", rival,
-        "--policy_sweep_horizon", str(HORIZON_DAYS * STEPS_PER_DAY),
+        "--policy_sweep_horizon", str(int(days) * STEPS_PER_DAY),
         "--policy_sweep_seed", str(VALIDATION_SEED),
         "--report_prefix", str(prefix),
     ]
@@ -250,7 +262,7 @@ def validate_t2_product(
     if payload.get("protocol") != "v26r_policy_sweep_common_random_numbers":
         raise ValueError(f"wrong T2 policy-sweep protocol: {path}")
     expected_scalars = {
-        "city": "New York City",
+        "city": _command_option(command, "--market"),
         "horizon": horizon,
         "customers_per_step": int(
             _command_option(command, "--eval_customers")
@@ -631,6 +643,10 @@ def analyze(
     output: Path,
     openings: int,
     commands: Mapping[tuple[str, str], Sequence[str]] | None = None,
+    *,
+    city: str = "nyc",
+    days: int = HORIZON_DAYS,
+    rivals: Sequence[str] = RIVALS,
 ) -> dict[str, Any]:
     jobs: dict[str, Any] = {}
     levels = ACTION_LEVELS[str(config["action"]["contract"])]
@@ -644,7 +660,7 @@ def analyze(
             "upper_distance": [], "upper_time": [],
             "lower_any": [], "upper_any": [],
         }
-        for rival in RIVALS:
+        for rival in rivals:
             raw, manifest, _ = _job_paths(output, case, rival)
             recorded = json.loads(manifest.read_text(encoding="utf-8"))
             if (
@@ -680,12 +696,12 @@ def analyze(
         {"case": case, "edge": edge, "count": len(summary[edge])}
         for case, summary in edges.items()
         for edge in ("lower_any", "upper_any")
-        if len(summary[edge]) > len(RIVALS) / 2.0
+        if len(summary[edge]) > len(rivals) / 2.0
     ]
     edge_checks = {
         "lower_level": lower_edge,
         "upper_level": upper_edge,
-        "competitors_total": len(RIVALS),
+        "competitors_total": len(rivals),
         "by_case": edges,
         "majority_hits": majority_hits,
         "requires_grid_review": bool(majority_hits),
@@ -693,15 +709,15 @@ def analyze(
     return {
         "phase": "T2",
         "omega": 0.5,
-        "city": "nyc",
-        "horizon_days": HORIZON_DAYS,
+        "city": city,
+        "horizon_days": int(days),
         "onset_day": ONSET_DAY,
         "openings": int(openings),
-        "competitors": list(RIVALS),
+        "competitors": list(rivals),
         "cases": list(CASES),
         "action_contract": str(config["action"]["contract"]),
         "levels": list(levels),
-        "rollouts": expected_rollouts(config, openings),
+        "rollouts": expected_rollouts(config, openings, rivals),
         "ranking_objective": OBJECTIVE_NAME,
         "jobs": jobs,
         "edge_checks": edge_checks,
@@ -713,6 +729,118 @@ def analyze(
             "level": upper_edge,
             "by_case": {case: data["upper_any"] for case, data in edges.items()},
         },
+    }
+
+
+SURGE_LEVELS = (1.25, 1.5, 2.0)
+SURGE_EVENT_KINDS = ("driver_shortage", "winter_storm")
+
+
+def _schedule_spec(level: float, event_days: Sequence[int]) -> str:
+    payload = {
+        "default": [1.0, 1.0],
+        "days": {str(int(day)): [float(level), 1.0] for day in event_days},
+    }
+    return "schedule:" + json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _declared_event_days(case: str) -> list[int]:
+    scenario = json.loads(CASES[case].read_text(encoding="utf-8"))
+    days: set[int] = set()
+    for event in scenario.get("events", ()):
+        if str(event.get("kind")) not in SURGE_EVENT_KINDS:
+            continue
+        start = int(event["start_day"])
+        end = int(event["end_day"])
+        days.update(range(start, end + 1))
+    return sorted(days)
+
+
+def select_comparators(
+    config: Mapping[str, Any],
+    output: Path,
+    *,
+    city: str,
+    openings: int,
+    days: int,
+    rivals: Sequence[str],
+    commands: Mapping[tuple[str, str], Sequence[str]],
+) -> dict[str, Any]:
+    """Pool registered validation cells and emit the three fixed selectors."""
+    pooled: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    shortage: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for case in CASES:
+        for rival in rivals:
+            raw, _, _ = _job_paths(output, case, rival)
+            payload = validate_t2_product(raw, commands[(case, rival)])
+            for spec, by_opening in dict(payload["results"]).items():
+                rows = list(dict(by_opening).values())
+                pooled[spec].extend(rows)
+                if case == "A1_shortage_severe":
+                    shortage[spec].extend(rows)
+
+    pooled_metrics = {
+        spec: _metric_mean(rows) for spec, rows in pooled.items()
+    }
+    best_final_spec = _best_spec(pooled_metrics, "final")
+    best_own_spec = _best_spec(pooled_metrics, "own")
+    surge_metrics = {
+        cell_spec(level, level): _metric_mean(
+            shortage[cell_spec(level, level)]
+        )
+        for level in SURGE_LEVELS
+    }
+    best_surge_spec = _best_spec(surge_metrics, "final")
+    surge_level, _ = parse_cell(best_surge_spec)
+    per_case = {
+        case: {
+            "event_days": _declared_event_days(case),
+            "spec": _schedule_spec(surge_level, _declared_event_days(case)),
+        }
+        for case in CASES
+    }
+    return {
+        "schema_version": "v17-results-comparator-selection-v1",
+        "city": city,
+        "validation_seed": VALIDATION_SEED,
+        "horizon_days": int(days),
+        "openings": int(openings),
+        "cases": list(CASES),
+        "rivals": list(rivals),
+        "ranking": {
+            "final_objective": "own_profit - 0.75 * competitor_profit",
+            "best_fixed_cell": "highest pooled final_objective over cases, rivals, and openings",
+            "own_profit_best_fixed_cell": "highest pooled own_profit over cases, rivals, and openings",
+            "surge_rule": "highest pooled final_objective on A1_shortage_severe among diagonal levels 1.25, 1.5, and 2.0",
+        },
+        "best_fixed_cell": _labeled_cell(
+            best_final_spec, pooled_metrics[best_final_spec]
+        ),
+        "own_profit_best_fixed_cell": _labeled_cell(
+            best_own_spec, pooled_metrics[best_own_spec]
+        ),
+        "surge_rule": {
+            "published_card_level": 1.0,
+            "event_level": surge_level,
+            "incentive_level": 1.0,
+            "declared_event_days_only": True,
+            "event_kinds": list(SURGE_EVENT_KINDS),
+            "tuning_case": "A1_shortage_severe",
+            "validation_metrics": _labeled_cell(
+                best_surge_spec, surge_metrics[best_surge_spec]
+            ),
+            "candidate_metrics": {
+                str(level): _labeled_cell(
+                    cell_spec(level, level),
+                    surge_metrics[cell_spec(level, level)],
+                )
+                for level in SURGE_LEVELS
+            },
+            "per_case": per_case,
+        },
+        "config_hash": canonical_hash(config),
     }
 
 
@@ -778,6 +906,12 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--openings", type=int, default=OPENINGS)
     parser.add_argument("--customers", type=int, default=100)
+    parser.add_argument("--days", type=int, default=HORIZON_DAYS)
+    parser.add_argument("--city", choices=CITY_SLUGS, default="nyc")
+    parser.add_argument(
+        "--rivals", default=",".join(RIVALS),
+        help="comma-separated registered rival subset",
+    )
     parser.add_argument("--pool", type=int, default=2000)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
@@ -785,8 +919,16 @@ def main() -> int:
 
     config = load_config(args.config)
     validate_config(config)
-    if args.workers < 1 or args.openings < 1 or args.customers < 1:
-        parser.error("workers, openings, and customers must be positive")
+    if args.workers < 1 or args.openings < 1 or args.customers < 1 or args.days < 1:
+        parser.error("workers, openings, customers, and days must be positive")
+    rivals = tuple(
+        item.strip() for item in str(args.rivals).split(",") if item.strip()
+    )
+    if not rivals or len(set(rivals)) != len(rivals):
+        parser.error("rivals must be a non-empty list without duplicates")
+    unknown_rivals = [rival for rival in rivals if rival not in RIVALS]
+    if unknown_rivals:
+        parser.error(f"unregistered rivals: {','.join(unknown_rivals)}")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     config_hash = canonical_hash(config)
@@ -799,19 +941,25 @@ def main() -> int:
             openings=args.openings,
             customers=args.customers,
             pool=args.pool,
+            city=args.city,
+            days=args.days,
         )
         for case in CASES
-        for rival in RIVALS
+        for rival in rivals
     }
     plan = {
         "phase": "T2",
         "jobs": len(commands),
         "workers": int(args.workers),
-        "rollouts": expected_rollouts(config, args.openings),
+        "city": args.city,
+        "days": int(args.days),
+        "rivals": list(rivals),
+        "rollouts": expected_rollouts(config, args.openings, rivals),
         "action_contract": config["action"]["contract"],
         "config_hash": config_hash,
         "estimated_wall_hours": estimated_wall_hours(
-            config, openings=args.openings, workers=args.workers
+            config, openings=args.openings, workers=args.workers,
+            rivals=rivals,
         ),
         "runtime_basis": {
             "prior_rollouts": PRIOR_T2_ROLLOUTS,
@@ -879,13 +1027,28 @@ def main() -> int:
                         "last_completed": [case, rival],
                     },
                 )
-        report = analyze(config, output, args.openings, commands)
+        report = analyze(
+            config, output, args.openings, commands,
+            city=args.city, days=args.days, rivals=rivals,
+        )
         report["config_hash"] = config_hash
         report["source_identity"] = sources
         atomic_json(output / "report.json", report)
         (output / "report.md").write_text(
             render_markdown(report), encoding="utf-8"
         )
+        selected = select_comparators(
+            config,
+            output,
+            city=args.city,
+            openings=args.openings,
+            days=args.days,
+            rivals=rivals,
+            commands=commands,
+        )
+        selected["report_sha256"] = _sha256_file(output / "report.json")
+        selected["source_identity"] = sources
+        atomic_json(output / "selected.json", selected)
         review = bool(report["edge_checks"]["requires_grid_review"])
         atomic_json(
             status_path,
@@ -897,6 +1060,8 @@ def main() -> int:
                 "completed_jobs": completed,
                 "report": str(output / "report.json"),
                 "report_sha256": _sha256_file(output / "report.json"),
+                "selected": str(output / "selected.json"),
+                "selected_sha256": _sha256_file(output / "selected.json"),
                 "lower_edge_check": report["lower_edge_check"],
                 "upper_edge_check": report["upper_edge_check"],
             },
