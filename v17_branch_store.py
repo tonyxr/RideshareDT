@@ -74,7 +74,14 @@ class BranchReplayStore:
         batch_size: int,
         *,
         regime_balanced: bool = True,
+        copy_rows: bool = True,
     ) -> List[Dict[str, Any]]:
+        """Draw a batch; ``copy_rows=False`` returns the stored rows themselves.
+
+        The random draws are identical either way. Use ``copy_rows=False`` only
+        for read-only consumers (the daily value fit), which skips one deep copy
+        per sampled row.
+        """
         batch_size = int(batch_size)
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -104,6 +111,8 @@ class BranchReplayStore:
             indices = np.asarray(chosen, dtype=np.int64)
             if len(indices) > 1:
                 indices = indices[self._rng.permutation(len(indices))]
+        if not copy_rows:
+            return [self._rows[int(index)] for index in indices]
         return [copy.deepcopy(self._rows[int(index)]) for index in indices]
 
     def state_dict(self) -> Dict[str, Any]:

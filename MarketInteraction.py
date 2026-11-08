@@ -19,6 +19,7 @@ from typing import Dict, Optional, Tuple, List
 import mkl_config  # set oneMKL env before NumPy/Torch
 del mkl_config
 import numpy as np
+from fast_scalar import sclip
 
 from Market_models import MarketCoefficients, CoefficientOverrides
 from market_shocks import ShockEffect, ShockProcess
@@ -340,7 +341,7 @@ class MarketInteraction:
     
     @staticmethod
     def _normalize_probs(vals: np.ndarray) -> np.ndarray:
-        arr = np.clip(np.array(vals, dtype=float), 1e-6, None)
+        arr = sclip(np.array(vals, dtype=float), 1e-6, None)
         s = float(arr.sum())
         if s <= 0.0:
             return np.ones_like(arr, dtype=float) / float(len(arr))
@@ -442,7 +443,7 @@ class MarketInteraction:
         if calibrated_hours is not None:
             self._base_hour_probs = calibrated_hours
         if airport_prob is not None:
-            self._base_airport_prob = float(np.clip(float(airport_prob), 0.01, 0.60))
+            self._base_airport_prob = float(sclip(float(airport_prob), 0.01, 0.60))
         if isinstance(service_probs, dict) and service_probs:
             keys = list(self.curr_market.service_multiplier.keys())
             values = self._normalize_probs(
@@ -490,7 +491,7 @@ class MarketInteraction:
         )
 
         airport_base = float(self._base_airport_prob)
-        self.airport_prob = float(np.clip(airport_base + self.rng.normal(0.0, 0.05 * j), 0.03, 0.35))
+        self.airport_prob = float(sclip(airport_base + self.rng.normal(0.0, 0.05 * j), 0.03, 0.35))
 
         service_keys = list(self.curr_market.service_multiplier.keys())
         base_service = np.array(
@@ -764,8 +765,8 @@ class MarketInteraction:
         weekend = 1.0 if int(ctx.day_of_week) >= 5 else 0.0
 
         feats: List[float] = [
-            float(np.clip(ctx.hour / 23.0, 0.0, 1.0)),
-            float(np.clip(ctx.day_of_week / 6.0, 0.0, 1.0)),
+            float(sclip(ctx.hour / 23.0, 0.0, 1.0)),
+            float(sclip(ctx.day_of_week / 6.0, 0.0, 1.0)),
             weekend,
             1.0 if bool(ctx.airport) else 0.0,
             *weather_one_hot,
@@ -791,7 +792,7 @@ class MarketInteraction:
 
             delta = float(step_size[key]) * float(np.sign(step_dir))
             lb, ub = bounds[key]
-            setattr(overrides, key, float(np.clip(float(current) + delta, lb, ub)))
+            setattr(overrides, key, float(sclip(float(current) + delta, lb, ub)))
 
     def generate_ride(self) -> SyntheticRide:
         """Sample a synthetic ride request for bootstrapping profile cold-start scenarios."""
@@ -806,13 +807,13 @@ class MarketInteraction:
         distance_std = float(max(0.10, self.distance_std_miles))
         distance_shape = float(max(0.10, (distance_mean / distance_std) ** 2))
         distance_scale = float(max(0.01, distance_std ** 2 / distance_mean))
-        distance_miles = float(np.clip(
+        distance_miles = float(sclip(
             self.rng.gamma(shape=distance_shape, scale=distance_scale),
             0.25,
             100.0,
         ))
         if self.duration_mean_minutes is None:
-            avg_speed_mph = float(np.clip(
+            avg_speed_mph = float(sclip(
                 self.rng.normal(loc=18.0, scale=4.0), 8.0, 35.0
             ))
             duration_minutes = float(
@@ -834,7 +835,7 @@ class MarketInteraction:
                 + distance_slope * (distance_miles - distance_mean)
                 + self.rng.normal(0.0, residual_std)
             )
-        duration_minutes = float(np.clip(duration_minutes, 1.0, 180.0))
+        duration_minutes = float(sclip(duration_minutes, 1.0, 180.0))
 
         return SyntheticRide(
             day_of_week=int(day_ctx.day_of_week),

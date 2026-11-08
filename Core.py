@@ -43,6 +43,7 @@ import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
 mkl_config  # imported intentionally for its process-wide environment side effects
 
 import numpy as np
+from fast_scalar import sclip
 import torch
 from diagnostic_logging import DiagnosticJournal
 from model_contract import OPPONENT_PROFIT_LEAD_WEIGHT
@@ -1338,10 +1339,10 @@ class Core:
         self.evaluation_profile_pool: List[Dict[str, Any]] = []
         self.generalization_profile_pool: List[Dict[str, Any]] = []
         self.generalization_profiles_by_city: Dict[str, List[Dict[str, Any]]] = {}
-        self.training_generalization_fraction = float(np.clip(
+        self.training_generalization_fraction = float(sclip(
             training_generalization_fraction, 0.0, 1.0
         ))
-        self.evaluation_generalization_fraction = float(np.clip(
+        self.evaluation_generalization_fraction = float(sclip(
             evaluation_generalization_fraction, 0.0, 1.0
         ))
         self.gpt_threshold_batch_size = int(max(1, gpt_threshold_batch_size))
@@ -1383,7 +1384,7 @@ class Core:
         self.threshold_profile_source = requested_profile_source
         self.save_threshold_cache = bool(save_threshold_cache)
         self.gpt_threshold_include_rationales = bool(gpt_threshold_include_rationales)
-        self.gpt_threshold_coldstart_rides = int(np.clip(gpt_threshold_coldstart_rides, 1, 10))
+        self.gpt_threshold_coldstart_rides = int(sclip(gpt_threshold_coldstart_rides, 1, 10))
         self.gpt_threshold_send_raw_rides = bool(gpt_threshold_send_raw_rides)
         self.training_stable_window = 30
         self.training_stable_tol = 0.012
@@ -1518,7 +1519,7 @@ class Core:
             if counterfactual_q_coeff is None
             else counterfactual_q_coeff,
         ))
-        self.counterfactual_actor_weight = float(np.clip(
+        self.counterfactual_actor_weight = float(sclip(
             # V25's one-market-step CRN branches are deliberately critic-only:
             # their immediate ordering is not the five-step semi-MDP objective
             # and can point against profit after demand, supply, and the rival
@@ -1540,7 +1541,7 @@ class Core:
         self.hard_kl_stop = bool(
             v24 if hard_kl_stop is None else hard_kl_stop
         )
-        self.reward_rate_beta = float(np.clip(
+        self.reward_rate_beta = float(sclip(
             # V25 updates a regime-keyed lagged reward-rate cache only after
             # the current population's advantages have been fixed.  A modest
             # beta prevents one noisy completed population from replacing the
@@ -1685,7 +1686,7 @@ class Core:
             quote_probe_interval_steps=int(max(1, quote_probe_interval_steps)),
             quote_probe_delay_steps=int(max(0, quote_probe_delay_steps)),
             quote_noise_dollars=float(max(0.0, quote_noise_dollars)),
-            quote_missing_probability=float(np.clip(quote_missing_probability, 0.0, 0.95)),
+            quote_missing_probability=float(sclip(quote_missing_probability, 0.0, 0.95)),
             revenue_scale=float(max(1e-6, reward_rev_scale)),
             profit_scale=float(max(1e-6, reward_profit_scale)),
             regime_features=bool(self.regime_features),
@@ -1779,9 +1780,9 @@ class Core:
             target_gap=mdp_target_gap,
             overall_tolerance=float(max(0.05, price_gap_tolerance)),
             segment_tolerances=tuple(float(max(0.05, x)) for x in segment_gap_tolerances),
-            margin_floor=float(np.clip(min_profit_margin, 0.0, 0.95)),
+            margin_floor=float(sclip(min_profit_margin, 0.0, 0.95)),
             completion_coverage_floor=float(
-                np.clip(min_completion_coverage, 0.0, 1.0)
+                sclip(min_completion_coverage, 0.0, 1.0)
             ),
             multiplier_lr=float(max(0.0, constraint_lr)),
         )
@@ -2138,7 +2139,7 @@ class Core:
         self.convergence_delta_per_day_at_day: Optional[float] = None
         self.training_certification_report: Optional[Dict[str, Any]] = None
         
-        self.min_profit_margin = float(np.clip(min_profit_margin, 0.0, 0.95))
+        self.min_profit_margin = float(sclip(min_profit_margin, 0.0, 0.95))
         self.reward_target_price_gap = float(self.constraint_config.target_gap)
         self.driver_cost_per_mile = float(max(0.0, driver_cost_per_mile))
         self.driver_cost_per_minute = float(max(0.0, driver_cost_per_minute))
@@ -2153,8 +2154,8 @@ class Core:
                 operating_cost_per_mile=self.driver_cost_per_mile,
                 platform_variable_cost=self.fixed_trip_cost,
                 acceptance_mode=str(driver_acceptance_mode),
-                expected_acceptance_cutoff=float(np.clip(driver_expected_acceptance_cutoff, 0.0, 1.0)),
-                state_smoothing_alpha=float(np.clip(driver_state_smoothing, 0.0, 1.0)),
+                expected_acceptance_cutoff=float(sclip(driver_expected_acceptance_cutoff, 0.0, 1.0)),
+                state_smoothing_alpha=float(sclip(driver_state_smoothing, 0.0, 1.0)),
             ),
             use_osmnx=bool(use_osmnx),
             osmnx_place=osmnx_place or f"{market_name}, USA",
@@ -2247,7 +2248,7 @@ class Core:
             policy = self.driver_supply.pay_policies.get(firm_name)
             if policy is None:
                 continue
-            policy.incentive_multiplier = float(np.clip(
+            policy.incentive_multiplier = float(sclip(
                 getattr(pricer, "supply_incentive_multiplier", 1.0),
                 0.85,
                 1.25,
@@ -2327,7 +2328,7 @@ class Core:
             if "household_lambda" in agent_cal:
                 self.agent_gen.household_lambda = float(max(1.1, float(agent_cal["household_lambda"])))
             if "p_new" in agent_cal:
-                self.agent_gen.p_new = float(np.clip(float(agent_cal["p_new"]), 0.05, 0.95))
+                self.agent_gen.p_new = float(sclip(float(agent_cal["p_new"]), 0.05, 0.95))
             if "income_probs" in agent_cal and isinstance(agent_cal["income_probs"], dict):
                 keys = list(self.agent_gen.income_names)
                 vals = np.array([float(agent_cal["income_probs"].get(k, 0.0)) for k in keys], dtype=float)
@@ -2525,7 +2526,7 @@ class Core:
         ))
         self._v26_reference_driver_reservation_wage = reference_wage
         choice_calibration = dict((self.active_calibration or {}).get("choice", {}) or {})
-        price_level = float(np.clip(
+        price_level = float(sclip(
             choice_calibration.get("price_level_index", 1.0), 0.25, 4.0
         ))
         wage_scale = price_level if config.price_level_scaling else 1.0
@@ -2912,9 +2913,9 @@ class Core:
         if self.choice_model is not None:
             setattr(self.choice_model, "loyalty_v2_weight", self.loyalty_weight)
         self.loyalty_model = str(loyalty_model).lower()
-        self.loyalty_lambda = float(np.clip(loyalty_lambda, 0.0, 1.0))
+        self.loyalty_lambda = float(sclip(loyalty_lambda, 0.0, 1.0))
         self.loyalty_pool_size = int(max(1, loyalty_pool_size))
-        self.returning_rider_share = float(np.clip(returning_rider_share, 0.0, 1.0))
+        self.returning_rider_share = float(sclip(returning_rider_share, 0.0, 1.0))
         self.loyalty_overcharge_penalty = bool(loyalty_overcharge_penalty)
         self.rider_loyalty = {}
         self._active_rider_pool = []
@@ -2947,7 +2948,7 @@ class Core:
         for rid, index in enumerate(indices):
             profile = dict(primary_pool[int(index)])
             firm = profile.get("LoyaltyFirm")
-            strength = float(np.clip(float(profile.get("LoyaltyStrength", 0.0) or 0.0), 0.0, 1.0))
+            strength = float(sclip(float(profile.get("LoyaltyStrength", 0.0) or 0.0), 0.0, 1.0))
             stock = {"Firm1": 0.0, "Firm2": 0.0, "rides_Firm1": 0.0, "rides_Firm2": 0.0}
             if firm in ("Firm1", "Firm2"):
                 stock[firm] = strength
@@ -3021,7 +3022,7 @@ class Core:
             else:
                 x[choice] = -1.0            # stranded
         for firm in ("Firm1", "Firm2"):
-            stock[firm] = float(np.clip((1.0 - lam) * float(stock[firm]) + lam * x[firm], -1.0, 1.0))
+            stock[firm] = float(sclip((1.0 - lam) * float(stock[firm]) + lam * x[firm], -1.0, 1.0))
         if fulfilled and matched_firm in ("Firm1", "Firm2"):
             stock["rides_" + matched_firm] = float(stock.get("rides_" + matched_firm, 0.0)) + 1.0
 
@@ -3083,7 +3084,7 @@ class Core:
             if model == "v3" and persistent_driver_stock:
                 raise ValueError("supply v3 is an expected-earnings response, not a persistent-stock model")
             cfg.persistent_stock = bool(persistent_driver_stock) or model == "v2"
-            cfg.stock_adjustment_rate = float(np.clip(stock_adjustment_rate, 0.0, 1.0))
+            cfg.stock_adjustment_rate = float(sclip(stock_adjustment_rate, 0.0, 1.0))
             cfg.stock_floor = float(max(0.0, stock_floor))
             cfg.supply_model = model
             cfg.eta_day = float(max(0.0, supply_eta_day))
@@ -3309,9 +3310,9 @@ class Core:
     ) -> bool:
         """Shift the airport share of trips by ``multiplier`` (holiday/storm waves)."""
         source = self.rng if rng is None else rng
-        p = float(np.clip(self.market.airport_prob, 1e-6, 0.95))
+        p = float(sclip(self.market.airport_prob, 1e-6, 0.95))
         if multiplier > 1.0 and not airport:
-            flip = float(np.clip(p * (multiplier - 1.0) / max(1e-6, 1.0 - p), 0.0, 0.95))
+            flip = float(sclip(p * (multiplier - 1.0) / max(1e-6, 1.0 - p), 0.0, 0.95))
             return bool(source.random() < flip)
         if multiplier < 1.0 and airport:
             return bool(source.random() >= (1.0 - float(multiplier)))
@@ -3326,18 +3327,18 @@ class Core:
         backlog = float(shocks.backlog) if shocks is not None else 0.0
         stock = getattr(self.driver_supply, "online_stock", {"Firm1": 1.0, "Firm2": 1.0})
         return [
-            float(np.clip(effect.fleet_multiplier - 1.0, -1.0, 1.0)),
-            float(np.clip(effect.firm_capacity_multiplier.get("Firm1", 1.0) - 1.0, -1.0, 1.0)),
-            float(np.clip(effect.firm_capacity_multiplier.get("Firm2", 1.0) - 1.0, -1.0, 1.0)),
-            float(np.clip(effect.firm2_price_multiplier - 1.0, -1.0, 1.0)),
-            float(np.clip(np.log(max(1e-3, effect.volume_multiplier)), -1.5, 1.5)),
-            float(np.clip(backlog / 1000.0, 0.0, 2.0)),
-            float(np.clip(float(stock.get("Firm1", 1.0)) - 1.0, -1.0, 1.0)),
-            float(np.clip(float(stock.get("Firm2", 1.0)) - 1.0, -1.0, 1.0)),
+            float(sclip(effect.fleet_multiplier - 1.0, -1.0, 1.0)),
+            float(sclip(effect.firm_capacity_multiplier.get("Firm1", 1.0) - 1.0, -1.0, 1.0)),
+            float(sclip(effect.firm_capacity_multiplier.get("Firm2", 1.0) - 1.0, -1.0, 1.0)),
+            float(sclip(effect.firm2_price_multiplier - 1.0, -1.0, 1.0)),
+            float(sclip(np.log(max(1e-3, effect.volume_multiplier)), -1.5, 1.5)),
+            float(sclip(backlog / 1000.0, 0.0, 2.0)),
+            float(sclip(float(stock.get("Firm1", 1.0)) - 1.0, -1.0, 1.0)),
+            float(sclip(float(stock.get("Firm2", 1.0)) - 1.0, -1.0, 1.0)),
             # v26r persistence channels (training only): mean loyalty stocks
             # and the rival's memory state.
-            float(np.clip(self._loyalty_mean("Firm1"), -1.0, 1.0)),
-            float(np.clip(self._loyalty_mean("Firm2"), -1.0, 1.0)),
+            float(sclip(self._loyalty_mean("Firm1"), -1.0, 1.0)),
+            float(sclip(self._loyalty_mean("Firm2"), -1.0, 1.0)),
             float(getattr(self.firm2, "memory_state", "") == "retaliation"),
             float(getattr(self.firm2, "memory_state", "") == "accommodation"),
         ]
@@ -3350,7 +3351,7 @@ class Core:
             earned = float(getattr(previous, "driver_earnings_per_online_hour", 0.0) or 0.0) if previous is not None else 0.0
             reference = float(self.driver_supply._earnings_reference(str(firm_name)))
             if earned > 0.0 and reference > 0.0:
-                earnings_index = float(np.clip(earned / reference - 1.0, -1.0, 1.0))
+                earnings_index = float(sclip(earned / reference - 1.0, -1.0, 1.0))
         # This current-day workforce count is visible before pricing. Unlike
         # the diagnostic oracle flag, it does not name the hidden event or
         # expose any future outcome.
@@ -3362,9 +3363,9 @@ class Core:
         gap = float(np.mean(self._rival_gap_history)) if self._rival_gap_history else 0.0
         return {
             "driver_earnings_index": earnings_index,
-            "same_day_driver_supply_index": float(np.clip(supply_index, -1.0, 1.0)),
-            "returning_share": float(np.clip(self._returning_share_ema, 0.0, 1.0)),
-            "rival_quote_index_7d": gap if getattr(self, "learning_corrections", False) else float(np.clip(gap / 8.0, -1.0, 1.0)),
+            "same_day_driver_supply_index": float(sclip(supply_index, -1.0, 1.0)),
+            "returning_share": float(sclip(self._returning_share_ema, 0.0, 1.0)),
+            "rival_quote_index_7d": gap if getattr(self, "learning_corrections", False) else float(sclip(gap / 8.0, -1.0, 1.0)),
         }
 
     def _step_customers(
@@ -3846,7 +3847,7 @@ class Core:
                 opponent_mode,
                 self.seed + 10_000 if episode_seed is None else int(episode_seed),
             )
-        fraction = float(np.clip(tariff_reset_fraction, 0.02, 0.40))
+        fraction = float(sclip(tariff_reset_fraction, 0.02, 0.40))
         if self.level_step_actions and bool(symmetric_tariffs):
             raise ValueError("symmetric openings are undefined under the level-step contract")
         reset_rng = (
@@ -3873,7 +3874,7 @@ class Core:
                     )
                 if config is not None and key in getattr(config, "bounds", {}):
                     lb, ub = config.bounds[key]
-                    value = float(np.clip(value, lb, ub))
+                    value = float(sclip(value, lb, ub))
                 elif key in {"base_fare", "per_minute", "per_mile"}:
                     value = max(0.01, value)
                 else:
@@ -4033,7 +4034,7 @@ class Core:
             return 0.0
         # A mean-only risk target hides rare but severe service failures.  Blend
         # expected pressure with the worst currently visible tail channel.
-        return float(np.clip(0.35 * np.mean(operational) + 0.65 * np.max(operational), 0.0, 1.0))
+        return float(sclip(0.35 * np.mean(operational) + 0.65 * np.max(operational), 0.0, 1.0))
 
     def _response_target_from_metrics(self, m1: FirmMetrics, m2: FirmMetrics, mean_gap: float) -> np.ndarray:
         """Current observable response snapshot, used to form causal deltas."""
@@ -4045,17 +4046,17 @@ class Core:
                 # Put public opponent-response probes first.  These are the
                 # highest-value prediction targets for strategic adaptation.
                 *[
-                    float(np.clip(probes[s].get("gap", 0.0) / self.observation_config.gap_scale_dollars, -1.5, 1.5))
+                    float(sclip(probes[s].get("gap", 0.0) / self.observation_config.gap_scale_dollars, -1.5, 1.5))
                     for s in ("0_2", "2_5", "5_10", "10_plus")
                 ],
-                float(np.clip(telemetry.get("chosen_share_estimate", 0.0), 0.0, 1.0)),
-                float(np.clip(telemetry.get("completed_share_estimate", 0.0), 0.0, 1.0)),
-                float(np.clip(telemetry.get("revenue_per_request", 0.0) / self.reward_rev_scale, 0.0, 1.5)),
-                float(np.clip(telemetry.get("profit_per_request", 0.0) / self.reward_profit_scale, -1.0, 1.0)),
-                float(np.clip(telemetry.get("fulfillment_rate", 1.0), 0.0, 1.0)),
-                float(np.clip(telemetry.get("wait_minutes", 0.0) / 15.0, 0.0, 1.5)),
-                float(np.clip(demand.get("distance_mean", 0.0) / 12.0, 0.0, 1.5)),
-                float(np.clip(demand.get("long_trip_share", 0.0), 0.0, 1.0)),
+                float(sclip(telemetry.get("chosen_share_estimate", 0.0), 0.0, 1.0)),
+                float(sclip(telemetry.get("completed_share_estimate", 0.0), 0.0, 1.0)),
+                float(sclip(telemetry.get("revenue_per_request", 0.0) / self.reward_rev_scale, 0.0, 1.5)),
+                float(sclip(telemetry.get("profit_per_request", 0.0) / self.reward_profit_scale, -1.0, 1.0)),
+                float(sclip(telemetry.get("fulfillment_rate", 1.0), 0.0, 1.0)),
+                float(sclip(telemetry.get("wait_minutes", 0.0) / 15.0, 0.0, 1.5)),
+                float(sclip(demand.get("distance_mean", 0.0) / 12.0, 0.0, 1.5)),
+                float(sclip(demand.get("long_trip_share", 0.0), 0.0, 1.0)),
             ],
             dtype=np.float32,
         )
@@ -4067,7 +4068,7 @@ class Core:
         after = np.asarray(future, dtype=np.float32).reshape(-1)
         if before.shape != after.shape:
             raise ValueError(f"response target shapes differ: {before.shape} != {after.shape}")
-        return np.clip(after - before, -2.0, 2.0).astype(np.float32)
+        return sclip(after - before, -2.0, 2.0).astype(np.float32)
 
     def _sync_agent_optimization_context(self) -> None:
         """Keep PPO optimization tied only to its scalar economic reward."""
@@ -4128,7 +4129,7 @@ class Core:
                 "policy_entropy": 0.0,
                 "policy_hold_prob": 0.0,
             }
-        safe_probs = np.clip(probs.astype(float), 1e-12, 1.0)
+        safe_probs = sclip(probs.astype(float), 1e-12, 1.0)
         top_action = int(np.argmax(probs))
         action_i = int(action)
         action_prob = float(probs[action_i]) if 0 <= action_i < probs.size else 0.0
@@ -4260,7 +4261,7 @@ class Core:
         for key in keys:
             value = float(getattr(base, key)) * float(multiplier)
             if config is not None and key in getattr(config, "bounds", {}):
-                value = float(np.clip(value, *config.bounds[key]))
+                value = float(sclip(value, *config.bounds[key]))
             set_coeff(base, pricer.overrides, key, value)
 
     def _tariff_grid_multiplier(self, pricer) -> float:
@@ -4729,7 +4730,7 @@ class Core:
         for key in self.shared_edit_keys:
             scale = max(1e-6, float(steps.get(key, fallback[key])))
             delta = float(after.get(key, 0.0) - before.get(key, 0.0))
-            moves.append(float(np.clip(delta / scale, -2.0, 2.0)))
+            moves.append(float(sclip(delta / scale, -2.0, 2.0)))
         intervened = float(any(abs(value) > 1e-6 for value in moves))
         return np.asarray([*moves, intervened], dtype=np.float32)
 
@@ -4742,7 +4743,7 @@ class Core:
                 "opponent action target has incompatible size: "
                 f"{result.size}; expected 2-{OPPONENT_ACTION_FORECAST_DIM}"
             )
-        result[:-1] = np.clip(result[:-1], -2.0, 2.0)
+        result[:-1] = sclip(result[:-1], -2.0, 2.0)
         result[-1] = float(result[-1] > 0.0)
         return result
 
@@ -4915,17 +4916,17 @@ class Core:
             completed = float(stats.get(f"distance_bin_{label}_firm1_completed_share", np.nan))
             gap = float(stats.get(f"distance_bin_{label}_price_gap_mean", np.nan))
             if np.isfinite(completed):
-                completed_shares.append(float(np.clip(completed, 0.0, 1.0)))
+                completed_shares.append(float(sclip(completed, 0.0, 1.0)))
             if np.isfinite(choice) and np.isfinite(completed):
-                flood_penalties.append(float(np.clip(choice - completed - 0.25, 0.0, 1.0)))
+                flood_penalties.append(float(sclip(choice - completed - 0.25, 0.0, 1.0)))
             if np.isfinite(gap):
-                gap_penalties.append(float(np.clip((abs(gap) - 3.0) / 3.0, 0.0, 1.0)))
+                gap_penalties.append(float(sclip((abs(gap) - 3.0) / 3.0, 0.0, 1.0)))
         imbalance = 0.0
         if len(completed_shares) >= 2:
-            imbalance = float(np.clip(np.std(completed_shares) / 0.30, 0.0, 1.0))
+            imbalance = float(sclip(np.std(completed_shares) / 0.30, 0.0, 1.0))
         flood = float(np.mean(flood_penalties)) if flood_penalties else 0.0
         gap_extreme = float(np.mean(gap_penalties)) if gap_penalties else 0.0
-        return float(np.clip(0.50 * imbalance + 0.35 * flood + 0.15 * gap_extreme, 0.0, 1.0))
+        return float(sclip(0.50 * imbalance + 0.35 * flood + 0.15 * gap_extreme, 0.0, 1.0))
 
     def _validation_score_from_metrics(
         self,
@@ -5209,9 +5210,9 @@ class Core:
         )
         # The optimized competitiveness metric is actual served demand. It is
         # not renormalized after the outside option or failed fulfillment.
-        market_share = float(np.clip(completed, 0.0, 1.0))
-        rival_market_share = float(np.clip(rival_completed, 0.0, 1.0))
-        completion_coverage = float(np.clip(
+        market_share = float(sclip(completed, 0.0, 1.0))
+        rival_market_share = float(sclip(rival_completed, 0.0, 1.0))
+        completion_coverage = float(sclip(
             market_share + rival_market_share,
             0.0,
             1.0,
@@ -5269,8 +5270,8 @@ class Core:
             durable_profit_advantage_per_request=durable_profit_lead,
             adaptive_profit_residual_per_request=adaptive_profit_residual,
         )
-        previous_market_share = float(np.clip(prev_share, 0.0, 1.0))
-        previous_rival_market_share = float(np.clip(
+        previous_market_share = float(sclip(prev_share, 0.0, 1.0))
+        previous_rival_market_share = float(sclip(
             0.0
             if prev_rival_market_share is None
             else prev_rival_market_share,
@@ -5294,7 +5295,7 @@ class Core:
             durable_profit_advantage_per_request=float(previous_profit_lead),
             adaptive_profit_residual_per_request=0.0,
         )
-        objective_delta_diagnostic = float(np.clip(
+        objective_delta_diagnostic = float(sclip(
             active_reward["reward_base"] - previous_objective["reward_base"],
             -2.0,
             2.0,
@@ -5311,7 +5312,7 @@ class Core:
             oscillation_cost=oscillation,
             completion_coverage=completion_coverage,
         )
-        discipline = float(np.clip(1.0 - max(costs.get("gap_overprice", 0.0), costs.get("gap_underprice", 0.0)), 0.0, 1.0))
+        discipline = float(sclip(1.0 - max(costs.get("gap_overprice", 0.0), costs.get("gap_underprice", 0.0)), 0.0, 1.0))
         efficiency = float(
             0.50 * positive["reward_positive_profit"]
             + 0.30 * positive["reward_positive_revenue"]
@@ -5355,9 +5356,9 @@ class Core:
             "reward_efficiency_term": efficiency,
             "reward_profit_per_request": profitpr,
             "reward_profit_margin": margin,
-            "reward_fulfillment_rate": float(np.clip(fulfillment_rate, 0.0, 1.0)),
+            "reward_fulfillment_rate": float(sclip(fulfillment_rate, 0.0, 1.0)),
             "reward_avg_wait_minutes": float(max(0.0, avg_wait_minutes)),
-            "reward_driver_acceptance_rate": float(np.clip(driver_acceptance_rate, 0.0, 1.0)),
+            "reward_driver_acceptance_rate": float(sclip(driver_acceptance_rate, 0.0, 1.0)),
             "reward_service_quality": positive["reward_positive_service"],
             "reward_profit_objective": float(
                 active_reward["reward_base"]
@@ -5382,13 +5383,13 @@ class Core:
                 float(active_reward["reward_price_gap_abs_error"])
                 <= self.constraint_config.overall_tolerance
             ),
-            "reward_choice_share": float(np.clip(share, 0.0, 1.0)),
+            "reward_choice_share": float(sclip(share, 0.0, 1.0)),
             "reward_baseline_choice_share": float(
-                np.clip(baseline_share, 0.0, 1.0)
+                sclip(baseline_share, 0.0, 1.0)
             ),
-            "reward_completed_share": float(np.clip(completed, 0.0, 1.0)),
+            "reward_completed_share": float(sclip(completed, 0.0, 1.0)),
             "reward_baseline_completed_share": float(
-                np.clip(rival_completed, 0.0, 1.0)
+                sclip(rival_completed, 0.0, 1.0)
             ),
             "reward_market_share": market_share,
             "reward_rival_market_share": rival_market_share,
@@ -5404,7 +5405,7 @@ class Core:
             ),
             "reward_outside_option_share": outside_option_share,
             "reward_completion_coverage": completion_coverage,
-            "reward_served_share": float(np.clip(completed, 0.0, 1.0)),
+            "reward_served_share": float(sclip(completed, 0.0, 1.0)),
             "reward_zero_effect_action": float(bool(getattr(getattr(self, "firm1", None), "last_action_was_zero_effect", False))),
             "reward_saturated_action": float(bool(getattr(getattr(self, "firm1", None), "last_action_was_saturated", False))),
             "reward_action_reversal": float(self.action_stability.last_reversal),
@@ -6543,7 +6544,7 @@ class Core:
             training = list(ranked)
             evaluation = list(ranked)
         else:
-            evaluation_count = int(np.clip(round(0.20 * len(ranked)), 1, len(ranked) - 1))
+            evaluation_count = int(sclip(round(0.20 * len(ranked)), 1, len(ranked) - 1))
             evaluation = ranked[:evaluation_count]
             training = ranked[evaluation_count:]
         for row in ranked:
@@ -6584,7 +6585,7 @@ class Core:
             self._build_generalization_profile_pool(
                 pool_size=min(4000, max(512, self.total_customers_pool // 4))
             )
-        fraction = float(np.clip(
+        fraction = float(sclip(
             self.training_generalization_fraction
             if generalization_fraction is None
             else generalization_fraction,
@@ -8168,7 +8169,7 @@ class Core:
                             rollout=str(rollout_name), step=int(step_index), hour=int(hour), m1=m1, m2=m2,
                             reward=float(diag["reward"]),
                         ))
-                    realized_coverage = float(np.clip(
+                    realized_coverage = float(sclip(
                         m1.completed_share + m2.completed_share, 0.0, 1.0
                     ))
                     completion_coverage.append(realized_coverage)
@@ -9630,7 +9631,7 @@ class Core:
 
     def _v16_value_learning_rate(self, training_progress: float) -> float:
         """Registered absolute cosine schedule for the V17 value fit."""
-        progress = float(np.clip(training_progress, 0.0, 1.0))
+        progress = float(sclip(training_progress, 0.0, 1.0))
         cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
         return float(
             self.v16_value_lr_end
@@ -9788,8 +9789,10 @@ class Core:
         auxiliary_target_count = 0
         huber_delta = 0.5 * float(self.v16_action_credit_scale)
         for _ in range(self.v16_value_fit_steps):
+            # Read-only use: _v16_value_fit_batch copies values into new arrays.
             rows = self.v16_branch_store.sample(
-                self.v16_value_fit_batch_size, regime_balanced=True
+                self.v16_value_fit_batch_size, regime_balanced=True,
+                copy_rows=False,
             )
             (
                 observations,
@@ -9876,7 +9879,7 @@ class Core:
         return metrics
 
     def _v16_q_temperature(self, training_progress: float) -> float:
-        progress = float(np.clip(training_progress, 0.0, 1.0))
+        progress = float(sclip(training_progress, 0.0, 1.0))
         cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
         return float(
             self.v16_tau_end
@@ -10446,10 +10449,10 @@ class Core:
         )
         for key in keys:
             lb, ub = self.firm1.config.bounds[key]
-            value = float(np.clip(float(getattr(base, key)) * float(multiplier), lb, ub))
+            value = float(sclip(float(getattr(base, key)) * float(multiplier), lb, ub))
             setattr(self.firm1.overrides, key, value)
         if hasattr(self.firm1, "supply_incentive_multiplier"):
-            self.firm1.supply_incentive_multiplier = float(np.clip(incentive, 0.85, 1.25))
+            self.firm1.supply_incentive_multiplier = float(sclip(incentive, 0.85, 1.25))
 
     def _post_firm1_coefficient_targets(
         self, multipliers: Mapping[str, float]
@@ -10471,7 +10474,7 @@ class Core:
             )
         for key in self.firm1.opt_keys:
             lb, ub = self.firm1.config.bounds[key]
-            value = float(np.clip(
+            value = float(sclip(
                 float(getattr(base, key))
                 * float(multipliers.get(key, 1.0)),
                 lb,
@@ -10521,7 +10524,7 @@ class Core:
         inc += float(p.get("inc_wait_gain", 0.0)) * (k["wait"] - wait_ref) / max(1e-6, wait_ref)
         inc += float(p.get("inc_storm_gain", 0.0)) * k["storm_warning"]
         lo, hi = float(p.get("min", 0.6)), float(p.get("max", 1.6))
-        return float(np.clip(m, lo, hi)), float(np.clip(inc, 0.85, 1.25))
+        return float(sclip(m, lo, hi)), float(sclip(inc, 0.85, 1.25))
 
     def _evaluate_baseline_suite(
         self,
@@ -10959,7 +10962,7 @@ class Core:
         late_completion_coverage = float(np.mean([
             float(row.get(
                 "completion_coverage",
-                np.clip(
+                sclip(
                     float(row.get("rl_completed_share", 0.0))
                     + float(row.get("heuristic_completed_share", 0.0)),
                     0.0,
@@ -12542,7 +12545,7 @@ class Core:
                 market_share_sum += market_share
                 firm2_market_share_sum += firm2_market_share
                 outside_option_share_sum += outside_option_share
-                completion_coverage_sum += float(np.clip(
+                completion_coverage_sum += float(sclip(
                     m1.completed_share + m2.completed_share, 0.0, 1.0
                 ))
                 firm2_revpr_sum += float(m2.rev_per_request)
@@ -12568,7 +12571,7 @@ class Core:
                 self.last_gap = float(mean_gap)
                 self.last_profitpr = float(m1.profit_per_request)
                 self.last_fulfillment = float(m1.fulfillment_rate)
-                self.last_completion_coverage = float(np.clip(
+                self.last_completion_coverage = float(sclip(
                     m1.completed_share + m2.completed_share, 0.0, 1.0
                 ))
                 self.last_acceptance = float(m1.driver_acceptance_rate)
@@ -14379,7 +14382,7 @@ class Core:
                 
             # Use the same shaped reward family as training for consistent trajectory logs.
             # Compute with local baselines to avoid mutating training history state.
-            share = float(np.clip(m1.chosen_share, 0.0, 1.0))
+            share = float(sclip(m1.chosen_share, 0.0, 1.0))
             revpr = float(max(0.0, m1.rev_per_request))
             reward_diag = self._reward_diagnostics(
                 share=share,
@@ -14750,7 +14753,7 @@ class Core:
             self.last_gap = float(mean_gap)
             self.last_profitpr = float(m1.profit_per_request)
             self.last_fulfillment = float(m1.fulfillment_rate)
-            self.last_completion_coverage = float(np.clip(
+            self.last_completion_coverage = float(sclip(
                 m1.completed_share + m2.completed_share, 0.0, 1.0
             ))
             self.last_acceptance = float(m1.driver_acceptance_rate)
@@ -15252,9 +15255,9 @@ class Core:
                                dur_abs_pct.append(float(dae / float(actual_duration)))
 
                        ctx = RideContext(
-                           day_of_week=int(np.clip(day_of_week, 0, 6)),
+                           day_of_week=int(sclip(day_of_week, 0, 6)),
                            weather=weather,
-                           hour=int(np.clip(hour, 0, 23)),
+                           hour=int(sclip(hour, 0, 23)),
                            airport=bool(airport),
                            service=service,
                        )
@@ -15533,7 +15536,7 @@ class Core:
         base_price = float(self.market.quote_price(base_distance, base_duration, base_ctx, overrides=self.firm1.overrides))
 
         def _quote(distance: float, duration: float, hour: int, weather: str, airport: bool, service: str) -> float:
-            ctx = RideContext(day_of_week=2, weather=weather, hour=int(np.clip(hour, 0, 23)), airport=airport, service=service)
+            ctx = RideContext(day_of_week=2, weather=weather, hour=int(sclip(hour, 0, 23)), airport=airport, service=service)
             return float(self.market.quote_price(distance, duration, ctx, overrides=self.firm1.overrides))
 
         dist_up = _quote(base_distance * 1.2, base_duration, base_ctx.hour, base_ctx.weather, base_ctx.airport, base_ctx.service)
@@ -15794,7 +15797,7 @@ class Core:
         self.last_gap = float(gap)
         self.last_profitpr = float(m1.profit_per_request)
         self.last_fulfillment = float(m1.fulfillment_rate)
-        self.last_completion_coverage = float(np.clip(
+        self.last_completion_coverage = float(sclip(
             m1.completed_share + m2.completed_share, 0.0, 1.0
         ))
         self.last_acceptance = float(m1.driver_acceptance_rate)
@@ -15832,7 +15835,7 @@ class Core:
     @staticmethod
     def _bounded_context(value: float, center: float, scale: float) -> float:
         """Normalize a public/calibrated market descriptor without city identity."""
-        return float(np.clip((float(value) - float(center)) / max(1e-6, float(scale)), -1.5, 1.5))
+        return float(sclip((float(value) - float(center)) / max(1e-6, float(scale)), -1.5, 1.5))
 
     def _build_city_context(self, *, hour: int, day_of_week: int, weather: str) -> Dict[str, float]:
         """Return the current observable demand intensity."""
@@ -15940,21 +15943,21 @@ class Core:
                 relative = get_coeff(base, overrides, key) / anchor - 1.0
                 tariff_ratios.append(float((np.arcsinh(relative)
                     if float(getattr(base, key)) > 0 else 0.) if normalized_city
-                    else np.clip(relative, -1.5, 1.5)))
+                    else sclip(relative, -1.5, 1.5)))
 
         def money(value, legacy_scale):
             return float(np.arcsinh(value / self.city_reference_fare) if normalized_city
-                         else np.clip(value / legacy_scale, -2., 2.))
+                         else sclip(value / legacy_scale, -2., 2.))
 
         exact_outcomes = [
-            float(np.clip(self.last_share, 0.0, 1.0)),
+            float(sclip(self.last_share, 0.0, 1.0)),
             money(self.last_revpr, self.reward_rev_scale),
             money(self.last_profitpr, self.reward_profit_scale),
-            float(np.clip(self.last_fulfillment, 0.0, 1.0)),
-            float(np.clip(self.last_firm2_share, 0.0, 1.0)),
+            float(sclip(self.last_fulfillment, 0.0, 1.0)),
+            float(sclip(self.last_firm2_share, 0.0, 1.0)),
             money(self.last_firm2_revpr, self.reward_rev_scale),
             money(self.last_firm2_profitpr, self.reward_profit_scale),
-            float(np.clip(self.last_firm2_fulfillment, 0.0, 1.0)),
+            float(sclip(self.last_firm2_fulfillment, 0.0, 1.0)),
         ]
         if self.enable_driver_supply:
             supply = np.concatenate((
@@ -15968,19 +15971,19 @@ class Core:
         else:
             supply = np.zeros(16, dtype=np.float32)
         opponent_execution = [
-            float(np.clip(
+            float(sclip(
                 (float(getattr(self.firm2, "_last_applied_action", -1)) + 1.0)
                 / max(1.0, float(getattr(self.firm1.agent, "action_dim", 1))),
                 0.0,
                 1.0,
             )),
-            float(np.clip(
+            float(sclip(
                 float(getattr(self.firm2, "_repeat_action_count", 0)) / 10.0,
                 0.0,
                 1.0,
             )),
-            float(np.clip(float(getattr(self.firm2, "step_scale", 1.0)), 0.0, 2.0) / 2.0),
-            float(np.clip(
+            float(sclip(float(getattr(self.firm2, "step_scale", 1.0)), 0.0, 2.0) / 2.0),
+            float(sclip(
                 float(getattr(self.firm2, "supply_incentive_multiplier", 1.0))
                 - 1.0,
                 -0.5,
@@ -16040,7 +16043,7 @@ class Core:
             alpha * profit_potential
             + (1.0 - alpha) * competitiveness_potential
         )
-        return float(np.clip(potential, -1.0, 1.0))
+        return float(sclip(potential, -1.0, 1.0))
 
     def _snapshot_counterfactual_state(self, profiles=()) -> Dict[str, Any]:
         """Capture every mutable component touched by a one-step branch."""
@@ -16475,7 +16478,7 @@ class Core:
                 scenario['ReferenceFare'] = float(self.market.quote_price(
                     travel_distance, duration, ctx, overrides=None))
             
-            threshold = float(np.clip(float(profile.get("PriceThreshold", 1.50) or 1.50), 0.25, 8.00))
+            threshold = float(sclip(float(profile.get("PriceThreshold", 1.50) or 1.50), 0.25, 8.00))
             if hasattr(self.choice_model, 'demand_spec'):
                 threshold = float(profile['PriceThreshold'])  # Report the same unclipped prior used by demand.
             threshold_values.append(threshold)
@@ -16602,7 +16605,7 @@ class Core:
                             1.0 - float(no_ride_fn(profile, scenario, other_price, other_price))
                             if callable(no_ride_fn) else (1.0 if other_price <= reservation else 0.25)
                         )
-                    retry_probability = float(self.market_dynamics.spillover_probability) * float(np.clip(accept, 0.0, 1.0))
+                    retry_probability = float(self.market_dynamics.spillover_probability) * float(sclip(accept, 0.0, 1.0))
                 else:
                     retry_probability = float(self.market_dynamics.spillover_probability) * (
                         1.0 if other_price <= reservation else 0.25
@@ -17134,7 +17137,7 @@ class Core:
                 self.last_gap = float(mean_gap)
                 self.last_profitpr = float(m1.profit_per_request)
                 self.last_fulfillment = float(m1.fulfillment_rate)
-                self.last_completion_coverage = float(np.clip(
+                self.last_completion_coverage = float(sclip(
                     m1.completed_share + m2.completed_share, 0.0, 1.0
                 ))
                 self.last_acceptance = float(m1.driver_acceptance_rate)
@@ -17571,8 +17574,8 @@ def _plot_reports(
             return float(entry["avg_reward"])
         if "rl_share" in entry and "rl_revenue" in entry:
             return float(
-                np.clip(
-                    (0.60 * np.clip(float(entry["rl_share"]), 0.0, 1.0))
+                sclip(
+                    (0.60 * sclip(float(entry["rl_share"]), 0.0, 1.0))
                     + (0.20 * np.tanh((float(entry["rl_revenue"]) - 10.0) / 8.0)),
                     -1.0,
                     1.0,

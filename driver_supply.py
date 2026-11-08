@@ -24,6 +24,7 @@ import importlib.util
 
 import mkl_config  # noqa: F401 - set oneMKL env before NumPy/Torch
 import numpy as np
+from fast_scalar import sclip
 
 
 @dataclass
@@ -239,7 +240,7 @@ class OpenStreetMapRouter:
         median_speed = float(np.median(speeds)) if speeds else 22.0
         median_circuity = float(np.median(circuities)) if circuities else 1.15
         speed_factor = 24.0 / max(8.0, median_speed)
-        return float(np.clip(speed_factor * median_circuity, 0.75, 1.75))
+        return float(sclip(speed_factor * median_circuity, 0.75, 1.75))
 
     @property
     def enabled(self) -> bool:
@@ -454,7 +455,7 @@ class DriverSupplyLayer:
         cfg = self.config
         previous = self.smoothed_states.get(firm, self.last_states.get(firm, FirmDriverBatchState()))
         earnings = float(previous.driver_earnings_per_hour or cfg.reservation_wage_per_hour)
-        incentive = float(np.clip(self.pay_policies[firm].incentive_multiplier, 0.85, 1.25))
+        incentive = float(sclip(self.pay_policies[firm].incentive_multiplier, 0.85, 1.25))
         perceived = earnings * (1.0 + float(cfg.incentive_earnings_weight) * (incentive - 1.0))
         wage = float(cfg.reservation_wage_per_hour) * float(self.shock_wage_multiplier)
         target = 1.0 + float(cfg.supply_elasticity) * float(np.tanh(
@@ -473,7 +474,7 @@ class DriverSupplyLayer:
             return dict(self.online_stock)
         if self.supply_v2 and self._observed_blocks == 0 and not any(self._daily_online.values()):
             return dict(self.online_stock)  # Opening, not a zero-exposure day.
-        kappa = float(np.clip(self.config.stock_adjustment_rate, 0.0, 1.0))
+        kappa = float(sclip(self.config.stock_adjustment_rate, 0.0, 1.0))
         floor = float(max(0.0, self.config.stock_floor))
         ceiling = float(max(floor, self.config.stock_ceiling))
         for firm in ("Firm1", "Firm2"):
@@ -494,7 +495,7 @@ class DriverSupplyLayer:
                 target = self.stock_target(firm) * float(self.shock_fleet_multiplier) \
                     * float(self.shock_firm_capacity.get(firm, 1.0))
             updated = (1.0 - kappa) * float(self.online_stock[firm]) + kappa * target
-            self.online_stock[firm] = float(updated if self.supply_v2 else np.clip(updated, floor, ceiling))
+            self.online_stock[firm] = float(updated if self.supply_v2 else sclip(updated, floor, ceiling))
             self._daily_pay[firm] = self._daily_online[firm] = 0.0
             if not self.supply_v2:
                 self.pay_index_smoothed[firm] = float(
@@ -572,7 +573,7 @@ class DriverSupplyLayer:
                 self._feature_capacity_reference = self.config.base_active_drivers * demand_scale
             else:
                 active = int(max(1, round(expected_active)))
-            busy = int(np.clip(round(active * (0.18 if busy_peak else 0.12)), 0, max(0, active - 1)))
+            busy = int(sclip(round(active * (0.18 if busy_peak else 0.12)), 0, max(0, active - 1)))
             idle = max(1, active - busy)
             state = FirmDriverBatchState(active_drivers=active, idle_drivers=idle, busy_drivers=busy)
             state.total_online_minutes = float(active * 60.0)
@@ -608,12 +609,12 @@ class DriverSupplyLayer:
         airport_factor = 1.18 if airport else 1.0
         noise = float(self.rng.lognormal(mean=0.0, sigma=max(0.0, self.config.pickup_noise_sigma)))
         network_factor = float(getattr(self.router, "network_pickup_factor", 1.0))
-        config_factor = float(np.clip(self.config.osmnx_pickup_minutes_factor, 0.5, 2.0))
-        return float(np.clip(self.config.base_pickup_minutes * scarcity * airport_factor * network_factor * config_factor * noise, 1.0, 25.0))
+        config_factor = float(sclip(self.config.osmnx_pickup_minutes_factor, 0.5, 2.0))
+        return float(sclip(self.config.base_pickup_minutes * scarcity * airport_factor * network_factor * config_factor * noise, 1.0, 25.0))
 
     def estimate_service_quality(self, firm: str, airport: bool = False) -> Dict[str, float]:
         pickup = self.estimate_pickup_minutes(firm, airport=airport)
-        cancel_risk = float(np.clip((pickup - 6.0) / 18.0, 0.0, 0.95))
+        cancel_risk = float(sclip((pickup - 6.0) / 18.0, 0.0, 0.95))
         return {"pickup_minutes": pickup, "cancel_risk": cancel_risk}
 
     def quote_driver_pay(
@@ -628,7 +629,7 @@ class DriverSupplyLayer:
         del distance_miles, duration_minutes, pickup_minutes, airport
         policy = self.pay_policies[firm]
         base_pay = max(policy.minimum_pay, policy.fare_share * max(0.0, float(rider_fare)))
-        return float(max(policy.minimum_pay, base_pay * float(np.clip(policy.incentive_multiplier, 0.85, 1.25))))
+        return float(max(policy.minimum_pay, base_pay * float(sclip(policy.incentive_multiplier, 0.85, 1.25))))
 
     def driver_acceptance_ratio(
         self,
@@ -664,13 +665,13 @@ class DriverSupplyLayer:
             pickup_minutes=pickup_minutes,
             weather=weather,
         )
-        return float(np.clip(ratio / max(1e-6, self.config.acceptance_ratio_threshold), 0.0, 1.0))
+        return float(sclip(ratio / max(1e-6, self.config.acceptance_ratio_threshold), 0.0, 1.0))
     
     def _resolve_acceptance(self, feasible: bool, acceptance_probability: float) -> bool:
         """Resolve whether a feasible dispatch is accepted under the configured mode."""
         if not feasible:
             return False
-        probability = float(np.clip(acceptance_probability, 0.0, 1.0))
+        probability = float(sclip(acceptance_probability, 0.0, 1.0))
         if self.config.acceptance_mode == "stochastic":
             return bool(self.rng.random() < probability)
         # Expected mode is deterministic for lower-variance PPO training, but use
@@ -754,7 +755,7 @@ class DriverSupplyLayer:
     def end_batch(self) -> Dict[str, FirmDriverBatchState]:
         self._observed_blocks += 1
         self.last_states = {firm: state for firm, state in self._batch_states.items()}
-        alpha = float(np.clip(self.config.state_smoothing_alpha, 0.0, 1.0))
+        alpha = float(sclip(self.config.state_smoothing_alpha, 0.0, 1.0))
         for firm, state in self.last_states.items():
             self._daily_pay[firm] += state.total_driver_pay
             self._daily_online[firm] += state.total_online_minutes
@@ -803,7 +804,7 @@ class DriverSupplyLayer:
                     f"active-driver feature reference must be positive: {reference}"
                 )
             return float(np.arcsinh(active / reference))
-        return float(np.clip(active / 800.0, 0.0, 1.0))
+        return float(sclip(active / 800.0, 0.0, 1.0))
 
     def current_active_driver_feature(self, active_drivers: float) -> float:
         """Invertibly encode the live own-platform count for V17 actors."""
@@ -827,14 +828,14 @@ class DriverSupplyLayer:
         other = self.smoothed_states.get(opponent, self.last_states.get(opponent, FirmDriverBatchState()))
         features = [
             self.active_driver_feature(own.active_drivers),
-            np.clip(own.idle_driver_share, 0.0, 1.0),
-            np.clip(own.utilization, 0.0, 1.0),
-            np.clip(own.acceptance_rate, 0.0, 1.0),
-            np.clip(own.fulfillment_rate, 0.0, 1.0),
-            np.clip(own.avg_wait_minutes / 20.0, 0.0, 1.0),
+            sclip(own.idle_driver_share, 0.0, 1.0),
+            sclip(own.utilization, 0.0, 1.0),
+            sclip(own.acceptance_rate, 0.0, 1.0),
+            sclip(own.fulfillment_rate, 0.0, 1.0),
+            sclip(own.avg_wait_minutes / 20.0, 0.0, 1.0),
             (np.arcsinh(own.driver_earnings_per_online_hour / self._earnings_reference(firm))
-             if (self.supply_v2 or self.supply_v3) else np.clip(own.driver_earnings_per_hour / 60.0, 0.0, 1.0)),
-            np.clip((other.avg_wait_minutes - own.avg_wait_minutes + 10.0) / 20.0, 0.0, 1.0),
+             if (self.supply_v2 or self.supply_v3) else sclip(own.driver_earnings_per_hour / 60.0, 0.0, 1.0)),
+            sclip((other.avg_wait_minutes - own.avg_wait_minutes + 10.0) / 20.0, 0.0, 1.0),
         ]
         return np.asarray(features, dtype=np.float32)
 

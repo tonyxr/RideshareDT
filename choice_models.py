@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import mkl_config  # set oneMKL env before NumPy/Torch
 del mkl_config
 import numpy as np
+from fast_scalar import sclip
 
 
 @dataclass(frozen=True)
@@ -33,9 +34,9 @@ class BaseChoiceModel:
         if not isinstance(params, dict):
             return
         if params.get("price_level_index") is not None:
-            self.price_level_index = float(np.clip(float(params["price_level_index"]), 0.25, 4.0))
+            self.price_level_index = float(sclip(float(params["price_level_index"]), 0.25, 4.0))
         if params.get("outside_option_base_fare") is not None:
-            self.outside_option_base_fare = float(np.clip(float(params["outside_option_base_fare"]), 0.0, 20.0))
+            self.outside_option_base_fare = float(sclip(float(params["outside_option_base_fare"]), 0.0, 20.0))
 
     def choose(self, profile: Dict[str, Any], scenario: Dict[str, Any], price1: float, price2: float) -> ChoiceResult:
         raise NotImplementedError
@@ -46,7 +47,7 @@ class BaseChoiceModel:
     
     @staticmethod
     def _sigmoid(x: float) -> float:
-        x = float(np.clip(x, -60.0, 60.0))
+        x = float(sclip(x, -60.0, 60.0))
         return 1.0 / (1.0 + float(np.exp(-x)))
 
     @staticmethod
@@ -57,7 +58,7 @@ class BaseChoiceModel:
         """Estimate the maximum acceptable rideshare fare before outside options become attractive."""
         explicit = profile.get("ReservationPrice", profile.get("RideshareReservationPrice"))
         if explicit is not None:
-            return float(np.clip(float(explicit), 5.0, 120.0))
+            return float(sclip(float(explicit), 5.0, 120.0))
 
         income_score = self._income_score(profile.get("IncomeBracket", "50k-100k"))
         household = int(profile.get("HouseholdSize", 1) or 1)
@@ -83,26 +84,26 @@ class BaseChoiceModel:
         level = float(self.price_level_index)
         # v26r regime channel (storm/holiday riders value the ride more).
         reservation *= float(scenario.get("ShockReservationMultiplier", 1.0) or 1.0)
-        return float(np.clip(reservation * level, 5.0 * level, 120.0 * level))
+        return float(sclip(reservation * level, 5.0 * level, 120.0 * level))
 
     def _outside_option_cost(self, profile: Dict[str, Any], scenario: Dict[str, Any]) -> float:
         explicit = profile.get("OutsideOptionCost", profile.get("AlternativeTransportCost"))
         if explicit is not None:
-            return float(np.clip(float(explicit), 0.0, 80.0))
+            return float(sclip(float(explicit), 0.0, 80.0))
         distance = float(scenario.get("DistanceMiles", 4.0) or 4.0)
         airport = bool(scenario.get("Airport", False))
         level = float(self.price_level_index)
         cost = float(self.outside_option_base_fare) + level * (0.20 * distance + (9.0 if airport else 0.0))
         # v26r regime channel: transit degraded/suspended makes the outside
         # option dearer (a taxi/parking-type fallback), up to 3x when absent.
-        availability = float(np.clip(float(scenario.get("ShockTransitAvailability", 1.0) or 0.0), 0.0, 1.0))
+        availability = float(sclip(float(scenario.get("ShockTransitAvailability", 1.0) or 0.0), 0.0, 1.0))
         cost *= 1.0 + 2.0 * (1.0 - availability)
-        return float(np.clip(cost, 0.0, 80.0 * level))
+        return float(sclip(cost, 0.0, 80.0 * level))
 
     def _outside_option_inconvenience(self, profile: Dict[str, Any], scenario: Dict[str, Any]) -> float:
         explicit = profile.get("OutsideOptionInconvenience")
         if explicit is not None:
-            return float(np.clip(float(explicit), 0.0, 4.0))
+            return float(sclip(float(explicit), 0.0, 4.0))
         distance = float(scenario.get("DistanceMiles", 4.0) or 4.0)
         hour = int(scenario.get("Hour", 12) or 12)
         weather = str(scenario.get("Weather", "clear") or "clear").lower()
@@ -118,9 +119,9 @@ class BaseChoiceModel:
         inconvenience += 0.20 if rush else 0.0
         inconvenience += 0.25 + 0.25 * income_score if service == "premium" else 0.0
         # v26r regime channel: an unavailable transit option is inconvenient.
-        availability = float(np.clip(float(scenario.get("ShockTransitAvailability", 1.0) or 0.0), 0.0, 1.0))
+        availability = float(sclip(float(scenario.get("ShockTransitAvailability", 1.0) or 0.0), 0.0, 1.0))
         inconvenience += 1.0 * (1.0 - availability)
-        return float(np.clip(inconvenience, 0.0, 4.0))
+        return float(sclip(inconvenience, 0.0, 4.0))
 
     def _no_ride_probability(self, profile: Dict[str, Any], scenario: Dict[str, Any], price1: float, price2: float) -> float:
         """Probability that the rider rejects both quotes in favor of no ride/outside transport."""
@@ -147,7 +148,7 @@ class BaseChoiceModel:
             - loyalty_pull
             - income_buffer
         )
-        return float(np.clip(self._sigmoid(latent), 0.0, 0.98))
+        return float(sclip(self._sigmoid(latent), 0.0, 0.98))
 
 class ParametricChoiceModel(BaseChoiceModel):
     """Simple baseline model: price + loyalty + random noise."""
@@ -162,8 +163,8 @@ class ParametricChoiceModel(BaseChoiceModel):
         self._apply_price_level(params)
         ps = float(params.get("price_sensitivity_scale", 1.0))
         ls = float(params.get("loyalty_scale", 1.0))
-        self.base_price_beta = float(np.clip(0.35 * ps, 0.05, 1.20))
-        self.loyalty_bias = float(np.clip(0.80 * ls, 0.10, 2.00))
+        self.base_price_beta = float(sclip(0.35 * ps, 0.05, 1.20))
+        self.loyalty_bias = float(sclip(0.80 * ls, 0.10, 2.00))
 
     @staticmethod
     def _income_score(income: str) -> float:
@@ -253,9 +254,9 @@ class CognitiveChoiceModel(BaseChoiceModel):
 
     def apply_calibration(self, params: Dict[str, float]) -> None:
         self._apply_price_level(params)
-        self.price_sensitivity_scale = float(np.clip(params.get("price_sensitivity_scale", 1.0), 0.30, 2.80))
-        self.loyalty_scale = float(np.clip(params.get("loyalty_scale", 1.0), 0.30, 2.80))
-        self.reliability_scale = float(np.clip(params.get("reliability_scale", 1.0), 0.30, 2.80))
+        self.price_sensitivity_scale = float(sclip(params.get("price_sensitivity_scale", 1.0), 0.30, 2.80))
+        self.loyalty_scale = float(sclip(params.get("loyalty_scale", 1.0), 0.30, 2.80))
+        self.reliability_scale = float(sclip(params.get("reliability_scale", 1.0), 0.30, 2.80))
 
     @staticmethod
     def _income_score(income: str) -> float:
@@ -307,7 +308,7 @@ class CognitiveChoiceModel(BaseChoiceModel):
                 raise ValueError('rider price threshold must be finite and positive')
             price_threshold /= currency_unit
         else:
-            price_threshold = float(np.clip(price_threshold, 0.25, 8.00))
+            price_threshold = float(sclip(price_threshold, 0.25, 8.00))
 
         # ---- Economic utility ----
         # Low income + larger household -> stronger price pain.
@@ -328,7 +329,7 @@ class CognitiveChoiceModel(BaseChoiceModel):
         cancel_gap = float(scenario.get("CancelRiskFirm2", 0.0) or 0.0) - float(scenario.get("CancelRiskFirm1", 0.0) or 0.0)
         threshold_ratio = abs(price_gap) / max(price_threshold, 1e-6)
         price_salience = 0.35 + 0.65 * min(threshold_ratio, 1.0) + 0.25 * max(threshold_ratio - 1.0, 0.0)
-        price_salience = float(np.clip(price_salience, 0.20, 2.25))
+        price_salience = float(sclip(price_salience, 0.20, 2.25))
         price_term = price_sensitivity * np.sign(price_gap) * (abs(price_gap) ** 0.92) * shopping_intensity * price_salience
 
         # ---- Habit / loyalty ----
@@ -384,11 +385,11 @@ class CognitiveChoiceModel(BaseChoiceModel):
 
         # Choice stochasticity: lower temp in urgent contexts -> more deterministic.
         temperature = 0.70 - 0.15 * float(rush) - 0.10 * float(bad_weather) - 0.05 * float(airport)
-        temperature = float(np.clip(temperature, 0.35, 0.90))
+        temperature = float(sclip(temperature, 0.35, 0.90))
         
         p_no_ride = self._no_ride_probability(profile, scenario, price1, price2)
         if reputation is not None:
-            p_no_ride = float(np.clip(p_no_ride * reputation.outside_option_factor(), 0.0, 0.98))
+            p_no_ride = float(sclip(p_no_ride * reputation.outside_option_factor(), 0.0, 0.98))
         if _probabilities:
             p_f1 = 1.0 / (1.0 + float(np.exp(-latent / temperature)))
             return {"Firm1": (1.0-p_no_ride)*p_f1, "Firm2": (1.0-p_no_ride)*(1.0-p_f1),
