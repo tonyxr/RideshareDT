@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -182,6 +183,7 @@ def core_args(
         raise ValueError("branch horizon must be the T3-selected 5 or 7 days")
     inputs = config["city_inputs"][city]
     out = output.resolve()
+    report_prefix = os.path.relpath(out / city, BASE)
     return [
         "--market", inputs["market_name"],
         "--choice_mode", "cognitive",
@@ -260,7 +262,7 @@ def core_args(
         "--v17_tau_rel_end", str(
             float(config["learner"]["tau_relative"][1])
         ),
-        "--report_prefix", str(out / city),
+        "--report_prefix", report_prefix,
         "--trained_model_out", str(out / "policy.pt"),
         "--trained_model_id", f"v17-{city}-seed{seed}",
         "--model_registry_dir", str(out / "registry"),

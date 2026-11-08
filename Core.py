@@ -11522,7 +11522,8 @@ class Core:
             journal = self.diagnostic_journal
         if train_timesteps > 0:
             self._check_supply_calibration_volume(train_customers_per_step)
-        self._check_supply_calibration_volume(eval_customers_per_step)
+        if not external_evaluation_only:
+            self._check_supply_calibration_volume(eval_customers_per_step)
         train_steps_per_day = int(max(1, train_steps_per_day))
         loaded_steps_per_day = int(
             getattr(self, "loaded_steps_per_day", 0) or 0

@@ -71,6 +71,11 @@ def test_main_command_uses_registered_q_learner_and_explicit_days(tmp_path):
     assert _value(command, "--v16_policy_mode") == "q"
     assert _value(command, "--v17_move_radius") == "1"
     assert _value(command, "--v17_temperature_mode") == "relative"
+    report_prefix = _value(command, "--report_prefix")
+    assert not Path(report_prefix).is_absolute()
+    assert (train.BASE / report_prefix).resolve() == (
+        tmp_path / "nyc_s101" / "nyc"
+    ).resolve()
 
 
 def test_run_selection_rejects_unknown_and_duplicates():
