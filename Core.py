@@ -11739,7 +11739,11 @@ class Core:
             else max(1, int(checkpoint_validation_customers_per_step))
         )
         resolved_checkpoint_openings = int(max(1, checkpoint_validation_openings))
-        if training_enabled and self.firm1_mode == "RL":
+        if (
+            training_enabled
+            and self.firm1_mode == "RL"
+            and not external_evaluation_only
+        ):
             # Validate this independently from the train/eval volumes. A
             # checkpoint-only mismatch must fail before an expensive run.
             self._check_supply_calibration_volume(

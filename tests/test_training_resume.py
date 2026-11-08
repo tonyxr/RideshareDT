@@ -242,6 +242,12 @@ def test_external_evaluation_only_suppresses_legacy_end_of_run_scoring(
         training_curriculum="direct",
     )
     core.active_calibration = {}
+    checked_supply_volumes = []
+    monkeypatch.setattr(
+        core,
+        "_check_supply_calibration_volume",
+        lambda customers: checked_supply_volumes.append(int(customers)),
+    )
     monkeypatch.setattr(
         core,
         "_adaptive_policy_validation",
@@ -253,7 +259,7 @@ def test_external_evaluation_only_suppresses_legacy_end_of_run_scoring(
         train_timesteps=1,
         train_customers_per_step=3,
         eval_timesteps=2,
-        eval_customers_per_step=3,
+        eval_customers_per_step=1000,
         train_steps_per_day=1,
         ppo_update_interval_days=2,
         ppo_min_rollout_transitions=1,
@@ -271,6 +277,7 @@ def test_external_evaluation_only_suppresses_legacy_end_of_run_scoring(
     )
     assert len(training) == 1
     assert evaluation == []
+    assert checked_supply_volumes == [3]
     assert core.competitive_backtest_report == {
         "passed": None,
         "status": "deferred_to_external_checkpoint_scoring",
