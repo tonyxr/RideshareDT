@@ -114,6 +114,7 @@ def build_command(
     days: int,
     output_root: Path,
     config: dict[str, Any] | None = None,
+    diagnostic_prefix: Path | None = None,
 ) -> list[str]:
     if int(days) < 4:
         raise ValueError("--days must be at least 4")
@@ -127,6 +128,11 @@ def build_command(
         days=int(days),
         branch_horizon_days=5,
     )
+    if diagnostic_prefix is not None:
+        prefix_index = values.index("--report_prefix") + 1
+        values[prefix_index] = os.path.relpath(
+            diagnostic_prefix.resolve(), BASE
+        )
     if spec.kind == "no_driver_observation":
         values.append("--v17_ablate_driver_observation")
     elif spec.kind == "own_profit":
@@ -168,6 +174,20 @@ def build_command(
     ]
 
 
+def _reserve_attempt_prefix(run_dir: Path, city: str) -> tuple[str, Path]:
+    attempts_dir = run_dir / "attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    for number in range(1, 10_000):
+        attempt_id = f"attempt-{number:04d}"
+        attempt_dir = attempts_dir / attempt_id
+        try:
+            attempt_dir.mkdir()
+        except FileExistsError:
+            continue
+        return attempt_id, attempt_dir / city
+    raise RuntimeError(f"attempt namespace exhausted for {run_dir}")
+
+
 def _selected_specs(raw: str) -> tuple[RunSpec, ...]:
     if not str(raw).strip():
         return RUN_SPECS
@@ -190,6 +210,8 @@ def _status_payload(
     pid: int | None = None,
     exit_code: int | None = None,
     message: str = "",
+    attempt_id: str = "",
+    diagnostic_prefix: Path | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": "v17-results-train-status-v1",
@@ -204,6 +226,10 @@ def _status_payload(
         "training_log": str(run_dir / "training.log"),
         "resume_state": str(run_dir / "resume/training_state.pt"),
         "policy": str(run_dir / "policy.pt"),
+        "attempt_id": str(attempt_id),
+        "diagnostic_prefix": (
+            "" if diagnostic_prefix is None else str(diagnostic_prefix)
+        ),
         "message": str(message),
     }
 
@@ -227,18 +253,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     children: dict[str, subprocess.Popen[Any]] = {}
     commands: dict[str, list[str]] = {}
     external: dict[str, int] = {}
+    attempts: dict[str, tuple[str, Path]] = {}
 
     for spec in specs:
         run_dir = output_root / spec.name
         status_path = run_dir / "status.json"
         status = _read_status(status_path)
-        command = build_command(
-            spec,
-            days=args.days,
-            output_root=output_root,
-            config=config,
-        )
-        commands[spec.name] = command
         if (
             status.get("state") == "completed"
             and int(status.get("days_expected", -1)) == int(args.days)
@@ -252,6 +272,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"[already running pid={prior_pid}] {spec.name}", flush=True)
             continue
         run_dir.mkdir(parents=True, exist_ok=True)
+        attempt_id, diagnostic_prefix = _reserve_attempt_prefix(
+            run_dir, spec.city
+        )
+        attempts[spec.name] = (attempt_id, diagnostic_prefix)
+        command = build_command(
+            spec,
+            days=args.days,
+            output_root=output_root,
+            config=config,
+            diagnostic_prefix=diagnostic_prefix,
+        )
+        commands[spec.name] = command
         log_path = run_dir / "training.log"
         log_stream = log_path.open("a", encoding="utf-8", buffering=1)
         process = subprocess.Popen(
@@ -274,6 +306,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 command=command,
                 pid=process.pid,
                 message="launched or resumed from daily state",
+                attempt_id=attempt_id,
+                diagnostic_prefix=diagnostic_prefix,
             ),
         )
         print(f"[launched pid={process.pid}] {spec.name}", flush=True)
@@ -301,6 +335,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 continue
             spec = RUN_BY_NAME[name]
             run_dir = output_root / name
+            attempt_id, diagnostic_prefix = attempts[name]
             state = "completed" if exit_code == 0 else "failed"
             if exit_code != 0:
                 failed = True
@@ -315,6 +350,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     pid=process.pid,
                     exit_code=exit_code,
                     message="Core process exited",
+                    attempt_id=attempt_id,
+                    diagnostic_prefix=diagnostic_prefix,
                 ),
             )
             print(f"[{state} exit={exit_code}] {name}", flush=True)

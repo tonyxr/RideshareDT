@@ -104,3 +104,33 @@ def test_status_payload_has_auditable_command_and_paths(tmp_path):
     assert payload["pid"] == 123
     assert payload["days_expected"] == 20
     assert payload["command"] == command
+
+
+def test_retry_attempt_prefixes_are_unique_and_preserve_prior_files(tmp_path):
+    run_dir = tmp_path / "nyc_s101"
+    first_id, first_prefix = train._reserve_attempt_prefix(run_dir, "nyc")
+    (first_prefix.parent / "nyc_events.jsonl").write_text(
+        "prior evidence\n", encoding="utf-8"
+    )
+    second_id, second_prefix = train._reserve_attempt_prefix(run_dir, "nyc")
+
+    assert first_id == "attempt-0001"
+    assert second_id == "attempt-0002"
+    assert first_prefix != second_prefix
+    assert (first_prefix.parent / "nyc_events.jsonl").read_text(
+        encoding="utf-8"
+    ) == "prior evidence\n"
+
+
+def test_command_can_use_reserved_attempt_journal(tmp_path):
+    spec = train.RUN_BY_NAME["nyc_s101"]
+    prefix = tmp_path / spec.name / "attempts/attempt-0001/nyc"
+    command = train.build_command(
+        spec,
+        days=20,
+        output_root=tmp_path,
+        diagnostic_prefix=prefix,
+    )
+    value = _value(command, "--report_prefix")
+    assert not Path(value).is_absolute()
+    assert (train.BASE / value).resolve() == prefix.resolve()
