@@ -1,0 +1,12 @@
+{
+  "start_date": "2023-03-06",
+  "events": [
+    {
+      "kind": "driver_shortage",
+      "start_day": 10,
+      "end_day": 15,
+      "intensity": 0.65,
+      "announced": false
+    }
+  ]
+}
