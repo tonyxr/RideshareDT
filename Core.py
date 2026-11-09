@@ -12064,6 +12064,14 @@ class Core:
                     self.current_training_stage, opponent_mode
                 )
             )
+            # On an exact in-stage resume there is no stage-opening branch
+            # below, so derive the reporting label from the restored episode
+            # state before it is used by diagnostics and the journal.
+            opponent_label = (
+                "city_market_reference"
+                if self.current_training_stage.opponent_regime == "market"
+                else selected_mode
+            )
             if stage_changed or episode_expired:
                 if d > 0 and self.firm1_mode == "RL" and self.firm1.agent.buffer_size:
                     unresolved = any(

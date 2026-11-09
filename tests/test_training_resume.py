@@ -170,6 +170,7 @@ def test_interrupted_training_continues_after_last_completed_day(
         enable_driver_supply=False,
         openai_api_key="",
         training_curriculum="direct",
+        regime_market=True,
     )
     core.active_calibration = {}
     state = tmp_path / "exact_state.pt"
@@ -225,6 +226,10 @@ def test_interrupted_training_continues_after_last_completed_day(
     )
 
     assert [row["batch"] for row in resumed.training_logs] == [0, 1, 2, 3]
+    assert [row["training_opponent"] for row in resumed.training_logs] == [
+        "price_gap_catchup", "price_gap_catchup",
+        "price_gap_catchup", "price_gap_catchup",
+    ]
 
 
 def test_external_evaluation_only_suppresses_legacy_end_of_run_scoring(
