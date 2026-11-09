@@ -52,6 +52,7 @@ from strategic_benchmarks import solve_tariff_game
 from v17_branch_store import BranchReplayStore
 from v17_tape import ExogenousTape
 from v17_value_model import V17ConcaveValueModel
+from v17_surge_decay import surge_decay_cell
 
 
 from MarketInteraction import MarketInteraction, RideContext
@@ -806,6 +807,8 @@ class Core:
         firm2_mode: str = "static",
         firm1_static_values: str = "",
         firm2_static_values: str = "",
+        memory_rival_hold_mean_days: Optional[float] = None,
+        memory_rival_retaliation: str = "on",
         manipulated_price_coefficients: int = 5,
         total_customers_pool: int = 20000,
         simulation_sample_cap: int = 2000,
@@ -1462,6 +1465,22 @@ class Core:
         # firms
         self.firm1_mode = firm1_mode
         self.firm2_mode = firm2_mode
+        self.memory_rival_hold_mean_days = (
+            None
+            if memory_rival_hold_mean_days is None
+            else float(memory_rival_hold_mean_days)
+        )
+        if (
+            self.memory_rival_hold_mean_days is not None
+            and (
+                not np.isfinite(self.memory_rival_hold_mean_days)
+                or self.memory_rival_hold_mean_days <= 0.0
+            )
+        ):
+            raise ValueError("memory_rival_hold_mean_days must be finite and positive")
+        self.memory_rival_retaliation = str(memory_rival_retaliation)
+        if self.memory_rival_retaliation not in {"on", "off"}:
+            raise ValueError("memory_rival_retaliation must be 'on' or 'off'")
         # The default production clock is five market steps. run_experiment
         # replaces this with the resolved shared value before collecting data.
         self.shared_action_interval_steps = 5
@@ -2112,6 +2131,7 @@ class Core:
             self.firm2 = pricer_by_mode[self.firm2_mode](seed=self.seed + 1, managed_keys=self.shared_edit_keys)
         else:
             self.firm2 = FirmStaticPricer()
+        self._apply_memory_rival_overrides(self.firm2)
         setattr(self.firm2, "_ride_response_mode", str(self.firm2_mode))
         setattr(
             self.firm2,
@@ -3109,6 +3129,7 @@ class Core:
         supply_model: str = "v1",
         supply_eta_day: float = 0.40,
         supply_eta_hour: float = 0.20,
+        supply_eta_v3: float = 0.60,
         supply_reference_earnings: float = 0.0,
         shortage_willingness_share: float = 0.0,
         supply_operating_point: Optional[Mapping[str, Any]] = None,
@@ -3144,6 +3165,9 @@ class Core:
             cfg.supply_model = model
             cfg.eta_day = float(max(0.0, supply_eta_day))
             cfg.eta_hour = float(max(0.0, supply_eta_hour))
+            if not np.isfinite(supply_eta_v3) or supply_eta_v3 <= 0.0:
+                raise ValueError("supply_eta_v3 must be finite and positive")
+            cfg.eta_v3 = float(supply_eta_v3)
             if not np.isfinite(shortage_willingness_share) or not 0.0 <= shortage_willingness_share <= 1.0:
                 raise ValueError("shortage_willingness_share must lie in [0, 1]")
             if shortage_willingness_share > 0.0 and model != "v3":
@@ -3163,11 +3187,31 @@ class Core:
                 from calibration_artifact import validate_supply_point
                 if supply_operating_point.get('demand_calibration') != getattr(self.choice_model, 'demand_spec', None):
                     raise ValueError('supply point was calibrated under a different demand model; recalibrate')
-                validate_supply_point(supply_operating_point, customers=self.supply_calibration_customers,
-                                      explicit=explicit_supply_settings or {})
+                sensitivity_keys = {
+                    "eta_v3", "shortage_willingness_share"
+                }
+                validate_supply_point(
+                    supply_operating_point,
+                    customers=self.supply_calibration_customers,
+                    explicit={
+                        key: value
+                        for key, value in (explicit_supply_settings or {}).items()
+                        if key not in sensitivity_keys
+                    },
+                )
                 if supply_operating_point['city'] != self.market_name:
                     raise ValueError('saved supply operating point belongs to another city')
                 self.driver_supply.config = DriverSupplyConfig(**supply_operating_point['config'])
+                # The robustness protocol deliberately deploys a frozen policy
+                # under alternative response elasticities.  Preserve the saved
+                # calibrated operating point, then apply only explicitly
+                # requested sensitivity axes.
+                if "eta_v3" in (explicit_supply_settings or {}):
+                    self.driver_supply.config.eta_v3 = float(supply_eta_v3)
+                if "shortage_willingness_share" in (explicit_supply_settings or {}):
+                    self.driver_supply.config.shortage_willingness_share = float(
+                        shortage_willingness_share
+                    )
                 self.market_dynamics = replace(self.market_dynamics, fleet_scale=supply_operating_point['fleet_scale'])
                 self.driver_supply.hour_profile = {int(k): float(v) for k, v in supply_operating_point['hour_profile'].items()}
                 self.driver_supply.pay_policies = {f: DriverPayPolicy(**p) for f, p in supply_operating_point['pay_policies'].items()}
@@ -3267,6 +3311,7 @@ class Core:
             "supply_model": self.driver_supply.config.supply_model,
             "supply_eta_day": float(self.driver_supply.config.eta_day),
             "supply_eta_hour": float(self.driver_supply.config.eta_hour),
+            "supply_eta_v3": float(self.driver_supply.config.eta_v3),
             "shortage_willingness_share": float(
                 self.driver_supply.config.shortage_willingness_share
             ),
@@ -3280,6 +3325,10 @@ class Core:
             "stock_floor_applied": self.driver_supply.config.supply_model != 'v2',
             "operating_point_restored_from_artifact": supply_operating_point is not None,
             "explicit_supply_settings": dict(explicit_supply_settings or {}),
+            "memory_rival_overrides": {
+                "hold_mean_days": self.memory_rival_hold_mean_days,
+                "retaliation": self.memory_rival_retaliation,
+            },
             "effective_fleet_scale": self.market_dynamics.fleet_scale,
             "driver_incentive_levels": list(self.driver_incentive_levels),
             "tariff_targets": list(self.tariff_targets) if self.tariff_targets else "v26_default",
@@ -3594,6 +3643,17 @@ class Core:
     def estimate_duration(miles: float, hod: int) -> float:
         mph = 18.0 if (7 <= hod < 10 or 16 <= hod < 19) else 25.0
         return max(5.0, 60.0 * miles / max(8.0, mph))
+
+    def _apply_memory_rival_overrides(self, pricer: Any) -> None:
+        """Apply registered robustness overrides to the rival that plays."""
+        if not isinstance(pricer, FirmMemoryBestResponsePricer):
+            return
+        days = getattr(self, "memory_rival_hold_mean_days", None)
+        if days is not None:
+            steps = int(max(1, getattr(self, "shared_steps_per_day", 6)))
+            pricer.hold_mean_steps = int(max(1, round(float(days) * steps)))
+        if str(getattr(self, "memory_rival_retaliation", "on")) == "off":
+            pricer.lag_steps = 10**9
     
     def _initialize_arbitrary_starting_coefficients(self) -> None:
         """Set both firms to arbitrary (seeded-random) initial values for optimized coefficients."""
@@ -3622,6 +3682,7 @@ class Core:
             if cls is None
             else cls(seed=int(seed), managed_keys=self.shared_edit_keys)
         )
+        self._apply_memory_rival_overrides(pricer)
         market_dynamics = getattr(self, "market_dynamics", None)
         if isinstance(pricer, FirmAdaptiveBestResponsePricer):
             pricer.operational_clock = bool(getattr(self, 'regime_market', False))
@@ -9011,6 +9072,35 @@ class Core:
             day = int(step_index) // int(max(1, self.shared_steps_per_day))
             entry = dict(table.get("days", {})).get(str(day), table.get("default", [1.0, 1.0]))
             self._post_firm1_target(float(entry[0]), float(entry[1]) if len(entry) > 1 else 1.0)
+            return posted_action
+        if name.startswith("surge_decay:"):
+            # Robustness comparator: a normal cell, an event cell on declared
+            # shortage/storm days (privileged timing), held for hold_days,
+            # then stepped back linearly over decay_days.  It posts the full
+            # card like static_tariff and only re-posts when the cell changes.
+            table = self._parse_policy_table(name.split(":", 1)[1])
+            day = int(step_index) // int(max(1, self.shared_steps_per_day))
+            distance, time_level = surge_decay_cell(
+                day,
+                table["normal"],
+                table["event"],
+                table.get("windows", ()),
+                int(table.get("hold_days", 0)),
+                int(table.get("decay_days", 0)),
+            )
+            cell = (round(distance, 12), round(time_level, 12))
+            if (
+                int(step_index) == 0
+                or cell != getattr(self, "_surge_decay_last_cell", None)
+            ):
+                self._post_firm1_coefficient_targets({
+                    "airport_fee": 1.0,
+                    "base_fare": 1.0,
+                    "booking_fee": 1.0,
+                    "per_mile": distance,
+                    "per_minute": time_level,
+                })
+                self._surge_decay_last_cell = cell
             return posted_action
         if name.startswith("oracle:"):
             # Regime-oracle static policy: told the true regime, posts the
@@ -20331,6 +20421,30 @@ def main():
                             "v3: V17 expected-earnings response with eta=0.6."))
     v26r.add_argument("--supply_eta_day", type=float, default=0.40)
     v26r.add_argument("--supply_eta_hour", type=float, default=0.20)
+    v26r.add_argument(
+        "--supply_eta_v3",
+        type=float,
+        default=0.60,
+        help=(
+            "V17 supply-v3 elasticity of online drivers to expected "
+            "earnings per online hour."
+        ),
+    )
+    v26r.add_argument(
+        "--memory_rival_hold_mean_days",
+        type=float,
+        default=None,
+        help=(
+            "Override the memory best-response rival's geometric "
+            "retaliation hold mean in market days."
+        ),
+    )
+    v26r.add_argument(
+        "--memory_rival_retaliation",
+        choices=("on", "off"),
+        default="on",
+        help="Enable or disable memory-rival retaliation.",
+    )
     v26r.add_argument("--supply_reference_earnings", type=float, default=0.0,
                       help="Fixed reference earnings per hour (0 = city-scaled opportunity wage; never learned inside scored episodes).")
     v26r.add_argument("--loyalty_model", choices=["v1", "v2"], default="v1",
@@ -21310,6 +21424,8 @@ def main():
         firm2_mode=args.firm2_mode,
         firm1_static_values=args.firm1_static_values,
         firm2_static_values=args.firm2_static_values,
+        memory_rival_hold_mean_days=args.memory_rival_hold_mean_days,
+        memory_rival_retaliation=args.memory_rival_retaliation,
         manipulated_price_coefficients=args.manipulated_price_coefficients,
         total_customers_pool=args.pool,
         deterministic_torch=args.deterministic_torch,
@@ -21695,11 +21811,13 @@ def main():
                 supply_model=str(args.supply_model),
                 supply_eta_day=float(args.supply_eta_day),
                 supply_eta_hour=float(args.supply_eta_hour),
+                supply_eta_v3=float(args.supply_eta_v3),
                 supply_reference_earnings=float(args.supply_reference_earnings),
                 shortage_willingness_share=float(args.shortage_willingness_share),
                 supply_calibration_customers=int(args.eval_customers if args.eval_only else args.train_customers),
                 explicit_supply_settings={key: getattr(args, flag) for flag, key in {
                     'supply_model': 'supply_model', 'supply_eta_day': 'eta_day', 'supply_eta_hour': 'eta_hour',
+                    'supply_eta_v3': 'eta_v3',
                     'stock_adjustment_rate': 'stock_adjustment_rate', 'stock_floor': 'stock_floor',
                     'supply_reference_earnings': 'reference_earnings_per_hour', 'fleet_scale': 'fleet_scale',
                     'shortage_willingness_share': 'shortage_willingness_share',
