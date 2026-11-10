@@ -84,6 +84,7 @@ class DriverSupplyConfig:
     eta_hour: float = 0.20                  # within-day online response to current pay
     eta_v3: float = 0.60                    # V17 response to expected earnings per online hour
     shortage_willingness_share: float = 0.0 # V17 M2 omega; default off
+    acceptance_shock_wage: str = "legacy"  # scenario shock used by dispatch acceptance
     reference_earnings_per_hour: float = 0.0  # 0 selects the fixed opportunity wage, never policy earnings
     availability_block_hours: float = 1.0
     driver_minute_capacity: bool = True  # used only by supply v2
@@ -100,6 +101,9 @@ class DriverSupplyConfig:
         if (not np.isfinite(self.shortage_willingness_share)
                 or not 0.0 <= self.shortage_willingness_share <= 1.0):
             raise ValueError("shortage_willingness_share must lie in [0, 1]")
+        self.acceptance_shock_wage = str(self.acceptance_shock_wage).lower().strip()
+        if self.acceptance_shock_wage not in {"legacy", "declared"}:
+            raise ValueError("acceptance_shock_wage must be legacy or declared")
         self.acceptance_mode = str(self.acceptance_mode).lower().strip()
         if self.acceptance_mode not in {"expected", "stochastic"}:
             raise ValueError("acceptance_mode must be 'expected' or 'stochastic'")
@@ -646,7 +650,12 @@ class DriverSupplyLayer:
         minutes = max(0.0, float(duration_minutes)) + pickup
         operating_cost = self.config.operating_cost_per_mile * (miles + max(0.1, pickup * 0.28))
         net_earnings = max(0.0, float(driver_pay) - operating_cost)
-        required_earnings = self.config.reservation_wage_per_hour * float(self.shock_wage_multiplier) * (minutes / 60.0) * weather_penalty
+        wage_scale = (
+            float(self.raw_shock_wage_multiplier)
+            if self.supply_v3 and self.config.acceptance_shock_wage == "declared"
+            else float(self.shock_wage_multiplier)
+        )
+        required_earnings = self.config.reservation_wage_per_hour * wage_scale * (minutes / 60.0) * weather_penalty
         return float(net_earnings / max(1e-6, required_earnings))
 
     def driver_acceptance_probability(

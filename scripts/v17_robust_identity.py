@@ -18,7 +18,12 @@ if str(BASE) not in sys.path:
 
 from diagnostic_logging import atomic_json  # noqa: E402
 from scripts import v17_results_eval as registered  # noqa: E402
-from scripts.v17_config import canonical_hash, load_config, validate_config  # noqa: E402
+from scripts.v17_config import (  # noqa: E402
+    canonical_hash,
+    check_model,
+    load_config,
+    validate_config,
+)
 from scripts.v17_results_train import RUN_BY_NAME  # noqa: E402
 from scripts.v17_robust_common import robust_sources, set_option  # noqa: E402
 from scripts.v17_robust_eval import make_job, run_robust_job  # noqa: E402
@@ -78,8 +83,15 @@ def _compare_products(
     }
 
 
-def _identity_jobs(config: Mapping[str, Any], output: Path, *, explicit: bool):
-    comparator_root = BASE / "runs/v17_results_comparators"
+def _identity_jobs(
+    config: Mapping[str, Any], output: Path, *, explicit: bool,
+    comparator_root: Path | None = None,
+    runs_root: Path | None = None,
+):
+    comparator_root = (
+        BASE / "runs/v17_results_comparators"
+        if comparator_root is None else comparator_root
+    )
     selected_path = comparator_root / "nyc/selected.json"
     selected = _load(selected_path)
     comparator_specs = registered.comparator_specs(
@@ -98,7 +110,8 @@ def _identity_jobs(config: Mapping[str, Any], output: Path, *, explicit: bool):
         input_hashes={"selected.json": registered._sha256_file(selected_path)},
     )
     run = RUN_BY_NAME["nyc_s101"]
-    run_dir = BASE / "runs/v17_results" / run.name
+    runs_root = BASE / "runs/v17_results" if runs_root is None else runs_root
+    run_dir = runs_root / run.name
     status_path = run_dir / "status.json"
     policy = run_dir / "policy.pt"
     rl = make_job(
@@ -133,10 +146,98 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--legacy-model", action="store_true")
+    parser.add_argument(
+        "--archive-root", type=Path,
+        default=BASE / "runs/archive_v17_pre_correction_20261110",
+    )
     args = parser.parse_args(argv)
     config = load_config()
     validate_config(config)
     output = args.output.resolve()
+    if args.legacy_model:
+        archive = args.archive_root.resolve()
+        jobs = _identity_jobs(
+            config,
+            output,
+            explicit=False,
+            comparator_root=archive / "v17_results_comparators",
+            runs_root=archive / "v17_results",
+        )
+        expected_model = {
+            "acceptance_shock_wage": "legacy",
+            "rate_upper_multiple": 2.0,
+        }
+        for job in jobs:
+            command = set_option(
+                job.command, "--acceptance_shock_wage", "legacy"
+            )
+            command = set_option(command, "--rate_upper_multiple", 2.0)
+            object.__setattr__(job, "command", tuple(command))
+        if args.plan_only:
+            print(json.dumps({
+                "jobs": [job.name for job in jobs],
+                "commands": [list(job.command) for job in jobs],
+                "references": str(archive / "v17_results_eval"),
+            }, indent=2, sort_keys=True))
+            return 0
+        sources = robust_sources(tuple(registered.CASES.values()))
+        config_hash = canonical_hash(config)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(max(1, int(args.workers)), len(jobs))
+        ) as executor:
+            futures = [
+                executor.submit(
+                    run_robust_job,
+                    job,
+                    config_hash=config_hash,
+                    sources=sources,
+                    overrides={},
+                    model_expected=expected_model,
+                )
+                for job in jobs
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+        expected_comparator = _load(
+            archive / "v17_results_eval/_combined/nyc/A1_shortage_severe/comparators.json"
+        )
+        expected_rl = _load(
+            archive / "v17_results_eval/nyc/C0_calm/nyc_s101.json"
+        )
+        actual = (_load(jobs[0].raw), _load(jobs[1].raw))
+        for payload in actual:
+            check_model(payload, config, expected=expected_model)
+        checks = [
+            _compare_products(
+                actual[0], expected_comparator,
+                label="legacy/nyc/A1/comparators",
+            ),
+            _compare_products(
+                actual[1], expected_rl,
+                label="legacy/nyc/C0/nyc_s101",
+            ),
+        ]
+        passed = all(
+            row["pass"] and row["maximum_absolute_difference"] <= 1e-12
+            for row in checks
+        )
+        status = {
+            "schema_version": "v17-corrected-legacy-identity-v1",
+            "state": "completed" if passed else "failed",
+            "pass": passed,
+            "tolerance": 1e-12,
+            "archive_root": str(archive),
+            "model_switches": expected_model,
+            "checks": checks,
+        }
+        output.mkdir(parents=True, exist_ok=True)
+        atomic_json(output / "status.json", status)
+        if not passed:
+            raise SystemExit("legacy-model identity check failed")
+        print(json.dumps(status, indent=2, sort_keys=True))
+        return 0
+
     implicit = _identity_jobs(config, output, explicit=False)
     explicit = _identity_jobs(config, output, explicit=True)
     all_jobs = (*implicit, *explicit)

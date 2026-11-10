@@ -89,6 +89,7 @@ class MarketDynamicsConfig:
     linear_driver_scaling: bool = True
     driver_reference_customers: float = 500.0
     market_relative_bounds: bool = True
+    rate_upper_multiple: float = 2.0
     calibrated_tariff_anchors: bool = True
     # A rider whose chosen platform cannot dispatch a driver re-requests on the
     # other platform (multi-homing) with this probability; the retry is less
@@ -128,6 +129,9 @@ class MarketDynamicsConfig:
     fleet_scale: float = 1.0
 
     def __post_init__(self) -> None:
+        self.rate_upper_multiple = float(self.rate_upper_multiple)
+        if not np.isfinite(self.rate_upper_multiple) or not 2.0 <= self.rate_upper_multiple <= 4.0:
+            raise ValueError("rate_upper_multiple must lie in [2.0, 4.0]")
         self.weather_persistence = float(np.clip(self.weather_persistence, 0.0, 0.98))
         self.supply_tracking = float(np.clip(self.supply_tracking, 0.0, 1.0))
         self.max_volume_multiple = float(max(1.0, self.max_volume_multiple))
@@ -478,11 +482,18 @@ def realized_request_count(
 # --------------------------------------------------------------------------
 # Tariff bounds relative to the city anchors
 # --------------------------------------------------------------------------
-def market_relative_bounds(anchors: Mapping[str, float]) -> Dict[str, Tuple[float, float]]:
+def market_relative_bounds(
+    anchors: Mapping[str, float], rate_upper: float = 2.0
+) -> Dict[str, Tuple[float, float]]:
+    rate_upper = float(rate_upper)
+    if not np.isfinite(rate_upper) or not 2.0 <= rate_upper <= 4.0:
+        raise ValueError("rate_upper must lie in [2.0, 4.0]")
     bounds: Dict[str, Tuple[float, float]] = {}
     for key in TARIFF_KEYS:
         anchor = float(anchors.get(key, 0.0))
         lo, hi = RELATIVE_BOUNDS[key]
+        if key in {"per_minute", "per_mile"}:
+            hi = rate_upper
         floor = 0.01 if key in {"base_fare", "per_minute", "per_mile"} else 0.0
         bounds[key] = (max(floor, lo * anchor), max(floor + 1e-6, hi * anchor))
     return bounds
@@ -495,9 +506,11 @@ def market_relative_steps(anchors: Mapping[str, float]) -> Dict[str, float]:
     }
 
 
-def rescale_pricer_to_market(pricer: Any, anchors: Mapping[str, float]) -> None:
+def rescale_pricer_to_market(
+    pricer: Any, anchors: Mapping[str, float], rate_upper: float = 2.0
+) -> None:
     """Replace absolute NYC-dollar bounds/steps on any pricer with relative ones."""
-    bounds = market_relative_bounds(anchors)
+    bounds = market_relative_bounds(anchors, rate_upper=rate_upper)
     steps = market_relative_steps(anchors)
     config = getattr(pricer, "config", None)
     if config is not None and hasattr(config, "bounds"):

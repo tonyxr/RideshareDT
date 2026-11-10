@@ -45,6 +45,7 @@ def check_overrides(
     v26r = dict(payload.get("v26r", {}) or {})
     supply = dict(v26r.get("effective_supply_config", {}) or {})
     memory = dict(v26r.get("memory_rival_overrides", {}) or {})
+    model = dict(payload.get("model_switches", {}) or {})
     locations = {
         "supply_eta_v3": (supply, "eta_v3"),
         "eta_v3": (supply, "eta_v3"),
@@ -55,6 +56,11 @@ def check_overrides(
         "hold_mean_days": (memory, "hold_mean_days"),
         "memory_rival_retaliation": (memory, "retaliation"),
         "retaliation": (memory, "retaliation"),
+        "acceptance_shock_wage": (model, "acceptance_shock_wage"),
+        "rate_upper_multiple": (model, "rate_upper_multiple"),
+        "loyalty_model": (model, "loyalty_model"),
+        "unfulfilled_spillover": (model, "unfulfilled_spillover"),
+        "threshold_ablation": (model, "threshold_ablation"),
     }
     for raw_key, expected in overrides.items():
         key = str(raw_key).lstrip("-").replace("-", "_")

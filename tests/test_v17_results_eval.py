@@ -40,6 +40,10 @@ def _small_product(tmp_path):
         "customers_per_step": evaluation.CUSTOMERS,
         "steps_per_day": evaluation.STEPS_PER_DAY,
         "policy_seed": evaluation.EVAL_SEED,
+        "model_switches": {
+            "acceptance_shock_wage": "declared",
+            "rate_upper_multiple": 2.5,
+        },
         "rollouts": [[rollout, "pi_price_gap"]],
         "v26r": {
             "action_contract": "two_lever_v3",

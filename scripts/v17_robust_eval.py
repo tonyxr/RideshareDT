@@ -21,7 +21,12 @@ if str(BASE) not in sys.path:
 
 from diagnostic_logging import atomic_json  # noqa: E402
 from scripts import v17_results_eval as registered  # noqa: E402
-from scripts.v17_config import canonical_hash, load_config, validate_config  # noqa: E402
+from scripts.v17_config import (  # noqa: E402
+    canonical_hash,
+    check_command_model,
+    load_config,
+    validate_config,
+)
 from scripts.v17_results_train import RunSpec  # noqa: E402
 from scripts.v17_results_train import RUN_SPECS  # noqa: E402
 from scripts.v17_t2_sweep import cell_spec  # noqa: E402
@@ -169,9 +174,11 @@ def run_robust_job(
     config_hash: str,
     sources: Mapping[str, str],
     overrides: Mapping[str, Any] | None = None,
+    model_expected: Mapping[str, Any] | None = None,
 ) -> str:
     result = registered.run_job(
-        job, config_hash=config_hash, sources=sources
+        job, config_hash=config_hash, sources=sources,
+        model_expected=model_expected,
     )
     for output in job.outputs:
         payload = json.loads(output.read_text(encoding="utf-8"))
@@ -336,6 +343,7 @@ def _require_run(
     status_path = run_dir / "status.json"
     policy = run_dir / "policy.pt"
     status = _load(status_path)
+    check_command_model(status.get("command"), load_config())
     if status.get("state") != "completed" or not policy.is_file():
         raise ValueError(f"training run is not complete: {run.name}")
     if days is not None and int(status.get("days_expected", -1)) != int(days):

@@ -29,6 +29,7 @@ from scripts.v17_config import (  # noqa: E402
     canonical_hash,
     core_args,
     load_config,
+    model_flags,
     resolve_input,
     validate_config,
 )
@@ -302,6 +303,7 @@ def validation_command(
         "--loyalty_model", "v2", "--loyalty_pool_size", "180",
         "--persistence_features", "--fare_model", "realistic",
         "--shortage_willingness_share", "0.5",
+        *model_flags(config),
         "--fleet_scale", str(float(inputs.get("fleet_scale", 1.0))),
         "--price_sensitivity_units", "relative",
         "--action_contract", str(config["action"]["contract"]),

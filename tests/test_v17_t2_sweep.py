@@ -65,6 +65,10 @@ def _small_product(tmp_path):
         "customers_per_step": 10,
         "steps_per_day": t2.STEPS_PER_DAY,
         "policy_seed": t2.VALIDATION_SEED,
+        "model_switches": {
+            "acceptance_shock_wage": "declared",
+            "rate_upper_multiple": 2.5,
+        },
         "rollouts": [[opening, rival] for opening in openings],
         "v26r": {
             "action_contract": "two_lever_v3",

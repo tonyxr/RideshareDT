@@ -2865,7 +2865,11 @@ class Core:
             return
         anchors = {key: float(getattr(self.market.curr_market, key)) for key in MANIPULATABLE_PRICE_COEFFICIENT_KEYS}
         for pricer in (self.firm1, self.firm2):
-            rescale_pricer_to_market(pricer, anchors)
+            rescale_pricer_to_market(
+                pricer,
+                anchors,
+                rate_upper=float(self.market_dynamics.rate_upper_multiple),
+            )
             if isinstance(pricer, FirmAdaptiveBestResponsePricer) and self.regime_market:
                 pricer.reference_window_steps = int(self.shared_steps_per_day)
                 pricer.earnings_reference = self.driver_supply._earnings_reference('Firm2' if pricer is self.firm2 else 'Firm1')
@@ -3132,6 +3136,7 @@ class Core:
         supply_eta_v3: float = 0.60,
         supply_reference_earnings: float = 0.0,
         shortage_willingness_share: float = 0.0,
+        acceptance_shock_wage: str = "legacy",
         supply_operating_point: Optional[Mapping[str, Any]] = None,
         supply_calibration_customers: int = 50,
         explicit_supply_settings: Optional[Mapping[str, Any]] = None,
@@ -3173,6 +3178,12 @@ class Core:
             if shortage_willingness_share > 0.0 and model != "v3":
                 raise ValueError("positive shortage willingness requires supply_model v3")
             cfg.shortage_willingness_share = float(shortage_willingness_share)
+            acceptance_shock_wage = str(acceptance_shock_wage).lower().strip()
+            if acceptance_shock_wage not in {"legacy", "declared"}:
+                raise ValueError("acceptance_shock_wage must be legacy or declared")
+            if acceptance_shock_wage == "declared" and model != "v3":
+                raise ValueError("declared acceptance shock wage requires supply_model v3")
+            cfg.acceptance_shock_wage = acceptance_shock_wage
             cfg.reference_earnings_per_hour = float(max(0.0, supply_reference_earnings))
             self._supply_reference_is_explicit = supply_reference_earnings > 0
             if cfg.supply_model in {"v2", "v3"}:
@@ -3188,7 +3199,7 @@ class Core:
                 if supply_operating_point.get('demand_calibration') != getattr(self.choice_model, 'demand_spec', None):
                     raise ValueError('supply point was calibrated under a different demand model; recalibrate')
                 sensitivity_keys = {
-                    "eta_v3", "shortage_willingness_share"
+                    "eta_v3", "shortage_willingness_share", "acceptance_shock_wage"
                 }
                 validate_supply_point(
                     supply_operating_point,
@@ -3212,6 +3223,8 @@ class Core:
                     self.driver_supply.config.shortage_willingness_share = float(
                         shortage_willingness_share
                     )
+                if "acceptance_shock_wage" in (explicit_supply_settings or {}):
+                    self.driver_supply.config.acceptance_shock_wage = acceptance_shock_wage
                 self.market_dynamics = replace(self.market_dynamics, fleet_scale=supply_operating_point['fleet_scale'])
                 self.driver_supply.hour_profile = {int(k): float(v) for k, v in supply_operating_point['hour_profile'].items()}
                 self.driver_supply.pay_policies = {f: DriverPayPolicy(**p) for f, p in supply_operating_point['pay_policies'].items()}
@@ -3344,6 +3357,7 @@ class Core:
             "tariff_level_bounds": (
                 list(self.tariff_level_bounds) if self.level_step_actions else None
             ),
+            "model_switches": self._model_switches(),
             "ppo_entropy_start": self.ppo_entropy_start,
             "branch_imitation_coeff": float(self.branch_imitation_coeff),
             "branch_imitation_temperature_scale": float(
@@ -3355,6 +3369,24 @@ class Core:
         self.v26_settings = {**dict(self.v26_settings or {}), "v26r": self.v26r_settings}
         print(f"[v26r] {json.dumps(self.v26r_settings, default=str)}")
         return self.v26r_settings
+
+    def _model_switches(self) -> Dict[str, Any]:
+        """Return the live scientific switches required to identify a product."""
+        return {
+            "acceptance_shock_wage": str(
+                self.driver_supply.config.acceptance_shock_wage
+            ),
+            "rate_upper_multiple": float(self.market_dynamics.rate_upper_multiple),
+            "supply_eta_v3": float(self.driver_supply.config.eta_v3),
+            "shortage_willingness_share": float(
+                self.driver_supply.config.shortage_willingness_share
+            ),
+            "loyalty_model": str(self.loyalty_model),
+            "unfulfilled_spillover": bool(
+                self.market_dynamics.unfulfilled_spillover
+            ),
+            "threshold_ablation": str(self.threshold_ablation_mode),
+        }
 
     def _install_regime_process(self, market: MarketInteraction, *, seed: int, training_openings: bool) -> None:
         process = ShockProcess(
@@ -3698,6 +3730,7 @@ class Core:
             rescale_pricer_to_market(
                 pricer,
                 {key: float(getattr(self.market.curr_market, key)) for key in MANIPULATABLE_PRICE_COEFFICIENT_KEYS},
+                rate_upper=float(market_dynamics.rate_upper_multiple),
             )
         if variant is not None and cls is not None:
             # The draw depends only on (class, variant), never on the rollout
@@ -10570,6 +10603,7 @@ class Core:
             "steps_per_day": int(steps_per_day),
             "policy_seed": int(policy_seed),
             "v26r": dict(self.v26r_settings),
+            "model_switches": self._model_switches(),
             "results": results,
         }
 
@@ -20099,6 +20133,8 @@ def main():
                           "of rider requests (0 keeps the legacy 260-drivers-per-500 fleet).")
     v26.add_argument("--fleet_scale", type=float, default=1.0,
                      help="Multiply the calibrated fleet (capacity-slack sensitivity).")
+    v26.add_argument("--rate_upper_multiple", type=float, default=2.0,
+                     help="Upper city-anchor multiple for per-minute and per-mile rates.")
     v26.add_argument("--disable_supply_feedback", action="store_true",
                      help="Freeze the driver online response to recent earnings (channel ablation).")
     v26.add_argument("--asymmetric_firms", action="store_true",
@@ -20138,6 +20174,12 @@ def main():
             "V17 M2 shortage share routed through reservation wages; "
             "0 preserves the 15d/v2 shock and production uses 0.5."
         ),
+    )
+    v17.add_argument(
+        "--acceptance_shock_wage",
+        choices=("legacy", "declared"),
+        default="legacy",
+        help="Use the legacy effective or declared scenario wage shock in acceptance.",
     )
     v17.add_argument(
         "--price_sensitivity_units",
@@ -21694,6 +21736,7 @@ def main():
                 driver_pay_basis=str(args.driver_pay_basis),
                 capacity_target_fulfillment=float(args.capacity_target_fulfillment),
                 fleet_scale=float(args.fleet_scale),
+                rate_upper_multiple=float(args.rate_upper_multiple),
             ),
             steps_per_day=int(args.train_steps_per_day),
             trip_bank_path=str(args.trip_bank_path or ""),
@@ -21822,6 +21865,7 @@ def main():
                 supply_eta_v3=float(args.supply_eta_v3),
                 supply_reference_earnings=float(args.supply_reference_earnings),
                 shortage_willingness_share=float(args.shortage_willingness_share),
+                acceptance_shock_wage=str(args.acceptance_shock_wage),
                 supply_calibration_customers=int(args.eval_customers if args.eval_only else args.train_customers),
                 explicit_supply_settings={key: getattr(args, flag) for flag, key in {
                     'supply_model': 'supply_model', 'supply_eta_day': 'eta_day', 'supply_eta_hour': 'eta_hour',
@@ -21829,6 +21873,7 @@ def main():
                     'stock_adjustment_rate': 'stock_adjustment_rate', 'stock_floor': 'stock_floor',
                     'supply_reference_earnings': 'reference_earnings_per_hour', 'fleet_scale': 'fleet_scale',
                     'shortage_willingness_share': 'shortage_willingness_share',
+                    'acceptance_shock_wage': 'acceptance_shock_wage',
                     'persistent_driver_stock': 'persistent_stock',
                 }.items() if '--'+flag in argv_flag_names},
                 supply_operating_point=(artifact_header.get('supply_operating_point') if args.trained_model_in else

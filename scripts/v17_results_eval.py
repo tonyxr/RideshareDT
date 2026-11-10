@@ -32,7 +32,10 @@ from diagnostic_logging import atomic_json  # noqa: E402
 from scripts.v17_config import (  # noqa: E402
     CITY_SLUGS,
     canonical_hash,
+    check_command_model,
+    check_model,
     load_config,
+    model_flags,
     resolve_input,
     validate_config,
 )
@@ -241,6 +244,7 @@ def _base_command(
         "--loyalty_model", "v2", "--loyalty_pool_size", "180",
         "--persistence_features", "--fare_model", "realistic",
         "--shortage_willingness_share", "0.5",
+        *model_flags(config),
         "--fleet_scale", str(float(inputs.get("fleet_scale", 1.0))),
         "--price_sensitivity_units", "relative",
         "--action_contract", str(config["action"]["contract"]),
@@ -295,8 +299,10 @@ def evaluation_command(
 
 def validate_eval_product(
     path: Path, command: Sequence[str], *, specs: Sequence[str] | None = None,
+    model_expected: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
+    check_model(payload, load_config(), expected=model_expected)
     expected_specs = set(
         specs if specs is not None else _option(command, "--policy_sweep").split(";")
     )
@@ -403,6 +409,7 @@ def _identity(job: EvalJob, config_hash: str, sources: Mapping[str, str]) -> dic
 
 def run_job(
     job: EvalJob, *, config_hash: str, sources: Mapping[str, str],
+    model_expected: Mapping[str, Any] | None = None,
 ) -> str:
     identity = _identity(job, config_hash, sources)
     if job.manifest.is_file():
@@ -413,12 +420,17 @@ def run_job(
             raise ValueError(f"incomplete evaluation cache requires review: {job.name}")
         if _sha256_file(job.raw) != recorded.get("raw_sha256"):
             raise ValueError(f"evaluation raw product hash changed: {job.name}")
-        validate_eval_product(job.raw, job.command)
+        validate_eval_product(
+            job.raw, job.command, model_expected=model_expected
+        )
         output_hashes = dict(recorded.get("output_sha256", {}) or {})
         for label, spec, output in zip(job.labels, job.specs, job.outputs):
             if not output.is_file() or _sha256_file(output) != output_hashes.get(label):
                 raise ValueError(f"evaluation output hash changed: {job.name}/{label}")
-            validate_eval_product(output, job.command, specs=(spec,))
+            validate_eval_product(
+                output, job.command, specs=(spec,),
+                model_expected=model_expected,
+            )
         return "cached"
     existing = [path for path in (job.raw, *job.outputs) if path.is_file()]
     if existing:
@@ -438,12 +450,17 @@ def run_job(
                 f"evaluation Core job failed ({proc.returncode}): {job.name}\n"
                 + (proc.stdout + proc.stderr)[-8000:]
             )
-        payload = validate_eval_product(job.raw, job.command)
+        payload = validate_eval_product(
+            job.raw, job.command, model_expected=model_expected
+        )
         if job.kind == "comparators":
             for spec, output in zip(job.specs, job.outputs):
                 _split_comparator_product(payload, spec=spec, output=output)
         for spec, output in zip(job.specs, job.outputs):
-            validate_eval_product(output, job.command, specs=(spec,))
+            validate_eval_product(
+                output, job.command, specs=(spec,),
+                model_expected=model_expected,
+            )
     except BaseException as exc:
         atomic_json(job.manifest, {
             "state": "failed", "identity": identity, "error": repr(exc),
@@ -491,6 +508,7 @@ def build_jobs(
         status_path = run_dir / "status.json"
         policy = run_dir / "policy.pt"
         status = json.loads(status_path.read_text(encoding="utf-8"))
+        check_command_model(status.get("command"), config)
         if (
             status.get("state") != "completed"
             or int(status.get("days_expected", -1)) != 1200

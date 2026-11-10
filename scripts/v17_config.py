@@ -67,6 +67,8 @@ def validate_config(
         "eta_v3": 0.6,
         "persistent_driver_stock": False,
         "shortage_willingness_share": 0.5,
+        "acceptance_shock_wage": "declared",
+        "rate_upper_multiple": 2.5,
         "price_sensitivity_units": "relative",
         "fare_model": "realistic",
         "driver_pay_basis": "fare",
@@ -159,6 +161,54 @@ def validate_config(
         raise ValueError("T3 must freeze training days and branch horizon first")
 
 
+def model_flags(config: Mapping[str, Any]) -> list[str]:
+    market = config["market"]
+    return [
+        "--acceptance_shock_wage", str(market["acceptance_shock_wage"]),
+        "--rate_upper_multiple", str(float(market["rate_upper_multiple"])),
+    ]
+
+
+def check_model(
+    payload: Mapping[str, Any], config: Mapping[str, Any],
+    expected: Mapping[str, Any] | None = None,
+) -> None:
+    """Every product must carry the model switches the config asks for."""
+    want = expected or {
+        "acceptance_shock_wage": config["market"]["acceptance_shock_wage"],
+        "rate_upper_multiple": float(config["market"]["rate_upper_multiple"]),
+    }
+    got = dict(payload.get("model_switches") or {})
+    same_wage = (
+        str(got.get("acceptance_shock_wage"))
+        == str(want["acceptance_shock_wage"])
+    )
+    cap = float(got.get("rate_upper_multiple", -1))
+    if not same_wage or abs(cap - float(want["rate_upper_multiple"])) > 1e-12:
+        raise ValueError(
+            f"product was not built on the requested model: {got} != {want}"
+        )
+
+
+def check_command_model(
+    command: Any, config: Mapping[str, Any]
+) -> None:
+    """Require a saved training command to declare each corrected-model flag once."""
+    values = [str(item) for item in command or ()]
+    expected = model_flags(config)
+    for index in range(0, len(expected), 2):
+        flag, want = expected[index:index + 2]
+        positions = [i for i, item in enumerate(values) if item == flag]
+        if len(positions) != 1 or positions[0] + 1 >= len(values):
+            raise ValueError(f"training command omitted or duplicated {flag}")
+        got = values[positions[0] + 1]
+        if flag == "--rate_upper_multiple":
+            if abs(float(got) - float(want)) > 1e-12:
+                raise ValueError(f"training command model mismatch for {flag}")
+        elif got != want:
+            raise ValueError(f"training command model mismatch for {flag}")
+
+
 def core_args(
     config: Mapping[str, Any],
     *,
@@ -237,6 +287,7 @@ def core_args(
         "--persistence_features",
         "--fare_model", "realistic",
         "--shortage_willingness_share", "0.5",
+        *model_flags(config),
         "--fleet_scale", str(float(inputs.get("fleet_scale", 1.0))),
         "--price_sensitivity_units", "relative",
         "--action_contract", str(config["action"]["contract"]),

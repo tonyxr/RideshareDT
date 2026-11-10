@@ -15,6 +15,8 @@ market:
   eta_v3: 0.6
   persistent_driver_stock: false
   shortage_willingness_share: 0.5
+  acceptance_shock_wage: declared
+  rate_upper_multiple: 2.5
   price_sensitivity_units: relative
   fare_model: realistic
   driver_pay_basis: fare
