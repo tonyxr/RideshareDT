@@ -20233,7 +20233,18 @@ def _write_run_config(prefix: str, args: argparse.Namespace, core: Core) -> None
         )
 
 def build_shock_config_from_args(args, calibration: Optional[Mapping[str, Any]] = None) -> ShockConfig:
-    """ShockConfig from the v26r CLI flags (scripted scenarios zero the hazards)."""
+    """Build the shock configuration while preserving the V17 CLI contract.
+
+    V17 had no ``--scenario_hazards`` flag.  Supplying ``--shock_scenario``
+    implicitly disabled spontaneous events *and* demand drift.  V18 exposes
+    the two intended modes explicitly, but an omitted V18 flag must retain
+    that old scripted-scenario behaviour for exact default-path identity.
+    """
+    scenario_hazards_arg = getattr(args, "scenario_hazards", None)
+    scenario_hazards = (
+        "natural" if scenario_hazards_arg is None else str(scenario_hazards_arg)
+    )
+    legacy_scripted_compat = bool(args.shock_scenario) and scenario_hazards_arg is None
     overrides: Dict[str, Any] = {
         "enabled": True,
         "mode": str(args.shocks),
@@ -20250,15 +20261,17 @@ def build_shock_config_from_args(args, calibration: Optional[Mapping[str, Any]] 
         ),
         "emergency_surge_cap": float(args.emergency_surge_cap),
         "conditional_sampling": False,
-        "scenario_hazards": str(args.scenario_hazards),
+        "scenario_hazards": scenario_hazards,
     }
     types = [item.strip() for item in str(args.shock_types or "").split(",") if item.strip()]
     if types:
         overrides["types"] = tuple(types)
-    if args.shock_scenario and str(args.scenario_hazards) == "off":
-        # V18 pure scripted case. Demand drift remains market noise; every
-        # event arrival is disabled inside ShockProcess and the zero rates
-        # keep saved configs explicit for old readers.
+    if args.shock_scenario and (
+        legacy_scripted_compat or scenario_hazards == "off"
+    ):
+        # Explicit V18 ``off`` leaves demand drift in place because it is
+        # market noise rather than an event.  The implicit compatibility path
+        # also zeros drift, exactly matching V17 scripted-scenario runs.
         overrides.update({
             "storm_daily_hazard": {},
             "event_rate_per_day": 0.0,
@@ -20268,6 +20281,8 @@ def build_shock_config_from_args(args, calibration: Optional[Mapping[str, Any]] 
             "rival_promotion_rate_per_day": 0.0,
             "training_shock_opening_share": 0.0,
         })
+        if legacy_scripted_compat:
+            overrides["drift_sd"] = 0.0
     if args.shock_rates_json:
         extra = json.loads(str(args.shock_rates_json))
         if not isinstance(extra, dict):
@@ -21247,8 +21262,13 @@ def main():
                       help="Path to a scripted scenario JSON (start_date, events, forecasts); "
                            "event arrivals follow --scenario_hazards.")
     v26r.add_argument(
-        "--scenario_hazards", choices=("natural", "off"), default="natural",
-        help="V18 C5: keep natural arrivals or use only scripted events.",
+        "--scenario_hazards", choices=("natural", "off"), default=None,
+        help=(
+            "V18 C5: keep natural arrivals or use only scripted events. "
+            "The effective default is natural; when omitted alongside "
+            "--shock_scenario, the V17 implicit scripted-only path is "
+            "preserved for exact backward compatibility."
+        ),
     )
     v26r.add_argument("--training_scenario_manifest", type=str, default="",
                       help="Predeclared dynamic-stage episode curriculum. Scripted cases rotate "

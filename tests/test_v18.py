@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from Core import Core
+from Core import Core, build_shock_config_from_args
 from driver_supply import DriverPayPolicy, DriverSupplyConfig, DriverSupplyLayer, FirmDriverBatchState
 from market_shocks import ShockConfig, ShockEvent, ShockProcess, ShockScenario
 from scripts.v18_config import HORIZON_CANDIDATES, load_config, validate_config
@@ -113,6 +113,52 @@ def test_scripted_hazards_off_adds_no_random_events():
         for _ in range(40):
             process.advance_day()
         assert {event.kind for event in process.events} <= {"driver_shortage"}
+
+
+def _shock_args(*, scenario_hazards):
+    return SimpleNamespace(
+        shocks="calibrated",
+        shock_intensity=1.0,
+        actor_true_shortage_flag=False,
+        regime_features=True,
+        regime_feature_ablation=False,
+        emergency_surge_cap=0.0,
+        scenario_hazards=scenario_hazards,
+        shock_types="",
+        shock_scenario="scenario.json",
+        shock_rates_json="",
+    )
+
+
+def test_implicit_scripted_scenario_is_exact_v17_compatibility():
+    config = build_shock_config_from_args(
+        _shock_args(scenario_hazards=None)
+    )
+    assert config.scenario_hazards == "natural"
+    assert config.storm_daily_hazard == {}
+    assert config.event_rate_per_day == 0.0
+    assert config.shortage_rate_per_day == 0.0
+    assert config.outage_rate_per_day == 0.0
+    assert config.transit_disruption_rate_per_day == 0.0
+    assert config.rival_promotion_rate_per_day == 0.0
+    assert config.training_shock_opening_share == 0.0
+    assert config.drift_sd == 0.0
+
+
+def test_explicit_v18_scenario_modes_do_not_use_legacy_compatibility():
+    natural = build_shock_config_from_args(
+        _shock_args(scenario_hazards="natural")
+    )
+    assert natural.scenario_hazards == "natural"
+    assert natural.event_rate_per_day > 0.0
+    assert natural.drift_sd > 0.0
+
+    scripted = build_shock_config_from_args(
+        _shock_args(scenario_hazards="off")
+    )
+    assert scripted.scenario_hazards == "off"
+    assert scripted.event_rate_per_day == 0.0
+    assert scripted.drift_sd > 0.0
 
 
 def test_reference_candidate_counts_are_registered():

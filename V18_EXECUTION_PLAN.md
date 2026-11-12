@@ -43,7 +43,9 @@ Status: code-preparation only. No V18 simulation, download, calibration, trainin
 6. **Evaluation E1-E10**
    - First inspect each suite with `python scripts/v18_eval.py --suite E<n>`.
    - Launch with `--execute --workers 10` only after all required policies and selected references validate.
-   - Scripted cases use `scenario_hazards=off`; training and E5 use `natural`.
+   - Scripted cases explicitly use `scenario_hazards=off`; training and E5
+     explicitly use `natural`. Omitting the flag with a scripted scenario is
+     reserved for the exact V17 compatibility gate.
    - E5 and E10 write gzip request logs. E4 writes evaluation-time credit probes. E6 overrides evaluation size to 500.
    - Accept a job only when its product is finite, complete, command-addressed, source-addressed, and carries the frozen V18 switches.
 
