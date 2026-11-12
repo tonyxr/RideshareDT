@@ -25,14 +25,23 @@ def select_fit(
     ))]
     if not finite:
         raise ValueError("fleet refit has no finite measurements")
+    fleet_rows = [row for row in finite if row.get("stage") == "fleet"] or finite
     fleet = min(
-        finite,
+        fleet_rows,
         key=lambda row: (
             abs(float(row["trips_per_online_driver_hour"]) - target_trips_per_hour),
             float(row["fleet_scale"]),
         ),
     )
-    same_scale = [row for row in finite if float(row["fleet_scale"]) == float(fleet["fleet_scale"])]
+    pickup_rows = [
+        row for row in finite
+        if row.get("stage") == "pickup"
+        and float(row["fleet_scale"]) == float(fleet["fleet_scale"])
+    ]
+    same_scale = pickup_rows or [
+        row for row in finite
+        if float(row["fleet_scale"]) == float(fleet["fleet_scale"])
+    ]
     pickup = min(
         same_scale,
         key=lambda row: abs(float(row["median_wait_minutes"]) - target_median_wait),

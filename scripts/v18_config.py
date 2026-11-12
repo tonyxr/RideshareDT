@@ -180,6 +180,11 @@ def _apply_v18_common(
         ("--base_pickup_minutes", supply["base_pickup_minutes"]),
     ):
         values = _set_option(values, flag, value)
+    reference_earnings = float(supply.get("reference_earnings_per_hour") or 0.0)
+    if reference_earnings > 0.0:
+        values = _set_option(
+            values, "--supply_reference_earnings", reference_earnings
+        )
     return values
 
 

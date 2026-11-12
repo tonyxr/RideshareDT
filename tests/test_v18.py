@@ -15,6 +15,7 @@ from market_shocks import ShockConfig, ShockEvent, ShockProcess, ShockScenario
 from scripts.v18_config import HORIZON_CANDIDATES, load_config, validate_config
 from scripts.v18_fit_pay_rule import DEFAULT_INPUT, fit, load_rows, transfer
 from scripts.v18_fleet_refit import FLEET_GRID, select_fit
+from scripts.v18_p2 import _histogram_median, _measurement
 from scripts.v18_select import card_grid, count_rule_candidates, reactive_candidates
 from scripts.v18_stats import holm, two_level_bootstrap
 from scripts.v18_value_of_timing import timing
@@ -217,3 +218,41 @@ def test_fleet_grid_and_selection():
     ]
     selected = select_fit(rows, target_trips_per_hour=1.78, target_median_wait=6.0)
     assert selected["fleet_scale"] == 1.1
+
+
+def test_fleet_selection_separates_fleet_and_pickup_stages():
+    rows = [
+        {"stage": "fleet", "fleet_scale": 1.0, "base_pickup_minutes": 3.5,
+         "trips_per_online_driver_hour": 1.79, "median_wait_minutes": 4.0,
+         "fulfillment": 0.9},
+        {"stage": "fleet", "fleet_scale": 1.1, "base_pickup_minutes": 3.5,
+         "trips_per_online_driver_hour": 1.6, "median_wait_minutes": 4.0,
+         "fulfillment": 0.9},
+        {"stage": "pickup", "fleet_scale": 1.0, "base_pickup_minutes": 5.0,
+         "trips_per_online_driver_hour": 1.0, "median_wait_minutes": 6.0,
+         "fulfillment": 0.88},
+    ]
+    selected = select_fit(rows, target_trips_per_hour=1.78, target_median_wait=6.0)
+    assert selected["fleet_scale"] == 1.0
+    assert selected["base_pickup_minutes"] == 5.0
+
+
+def test_wait_histogram_median_and_p2_measurement():
+    counts = np.zeros(10, dtype=np.int64)
+    counts[[2, 4, 8]] = [1, 2, 1]
+    assert _histogram_median(counts) == 4.0
+    payload = {
+        "traces": {"card": [
+            {"own_share": 0.4, "active_drivers_firm1": 25,
+             "wait": 5.0, "fulfillment": 0.9},
+            {"own_share": 0.5, "active_drivers_firm1": 25,
+             "wait": 7.0, "fulfillment": 1.0},
+        ]},
+        "v26r": {"supply_reference_earnings": 20.0},
+    }
+    row = _measurement(
+        payload, "card", stage="fleet", fleet_scale=1.2,
+        base_pickup_minutes=3.5,
+    )
+    assert row["trips_per_online_driver_hour"] == pytest.approx(2.25)
+    assert row["median_wait_minutes"] == pytest.approx(6.0)
