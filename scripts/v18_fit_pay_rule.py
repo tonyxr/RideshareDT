@@ -15,6 +15,7 @@ import numpy as np
 
 
 BASE = Path(__file__).resolve().parents[1]
+DEFAULT_INPUT = BASE.parent / "data/processed/nyc/trip_bank.csv"
 NYC_RATE = {"per_mile": 2.50, "per_minute": 0.50}
 CITY_RATE = {
     "nyc": NYC_RATE,
@@ -128,7 +129,7 @@ def atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--city", choices=tuple(CITY_RATE), default="nyc")
-    parser.add_argument("--input", type=Path, default=BASE / "data/processed/nyc/trip_bank.csv")
+    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--nyc-rule", type=Path, default=BASE / "calibration_artifacts/v18/nyc/pay_rule.json")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()

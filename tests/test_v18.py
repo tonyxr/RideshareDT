@@ -13,7 +13,7 @@ from Core import Core, build_shock_config_from_args
 from driver_supply import DriverPayPolicy, DriverSupplyConfig, DriverSupplyLayer, FirmDriverBatchState
 from market_shocks import ShockConfig, ShockEvent, ShockProcess, ShockScenario
 from scripts.v18_config import HORIZON_CANDIDATES, load_config, validate_config
-from scripts.v18_fit_pay_rule import fit, load_rows, transfer
+from scripts.v18_fit_pay_rule import DEFAULT_INPUT, fit, load_rows, transfer
 from scripts.v18_fleet_refit import FLEET_GRID, select_fit
 from scripts.v18_select import card_grid, count_rule_candidates, reactive_candidates
 from scripts.v18_stats import holm, two_level_bootstrap
@@ -91,6 +91,10 @@ def test_pay_fit_recovers_fixed_coefficients(tmp_path: Path):
     result = fit(load_rows(path))
     assert [result[key] for key in ("intercept", "per_mile", "per_minute", "fare_coef")] == pytest.approx(beta, abs=1e-6)
     assert result["test_r2"] == pytest.approx(1.0)
+
+
+def test_pay_fit_default_uses_shared_registered_trip_bank():
+    assert DEFAULT_INPUT == Path(__file__).resolve().parents[2] / "data/processed/nyc/trip_bank.csv"
 
 
 def test_run_capacity_feature_is_scale_invariant():
