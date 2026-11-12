@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -231,7 +232,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     output.mkdir(parents=True, exist_ok=True)
     status_path = output / "status.json"
-    atomic_json(status_path, {**plan, "state": "running", "pass": False})
+    atomic_json(status_path, {
+        **plan,
+        "state": "running",
+        "pass": False,
+        "pid": os.getpid(),
+    })
     sources = robust_sources(tuple(registered.CASES.values()))
     config_hash = canonical_hash(config)
     completed = 0
@@ -256,6 +262,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     **plan,
                     "state": "running",
                     "pass": False,
+                    "pid": os.getpid(),
                     "completed_jobs": completed,
                     "last_completed": futures[future].name,
                 })
@@ -265,6 +272,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             **plan,
             "state": "completed" if passed else "failed",
             "pass": passed,
+            "pid": os.getpid(),
             "completed_jobs": len(jobs),
             "tolerance": 0.0,
             "checks": checks,
