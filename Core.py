@@ -865,6 +865,7 @@ class Core:
         osmnx_place: Optional[str] = None,
         driver_base_active: int = 260,
         driver_reservation_wage: float = 24.0,
+        base_pickup_minutes: float = 3.5,
         driver_acceptance_mode: str = "expected",
         driver_expected_acceptance_cutoff: float = 0.65,
         driver_state_smoothing: float = 0.35,
@@ -948,6 +949,15 @@ class Core:
         v17_temperature_mode: str = "absolute",
         v17_tau_rel_start: float = 0.50,
         v17_tau_rel_end: float = 0.15,
+        v17_credit_source: str = "branches",
+        v17_branch_noise: str = "crn",
+        v17_eval_credit_probe: int = 0,
+        v17_eval_credit_horizons: Sequence[int] = (5, 10),
+        v17_eval_credit_rival_planner: str = "proxy",
+        v17_eval_credit_probe_out: str = "",
+        policy_snapshot_every_days: int = 0,
+        policy_snapshot_dir: str = "",
+        policy_sweep_request_log: str = "",
         v16_action_credit_scale: float = 1.0,
         v16_reward: bool = False,
         current_active_driver_observation: bool = False,
@@ -981,6 +991,12 @@ class Core:
         self.actor_true_shortage_flag = bool(actor_true_shortage_flag)
         # Revision 11: one multiplier moves the whole tariff in one decision.
         self.whole_tariff_actions = bool(whole_tariff_actions)
+        self.v17_credit_source = str(v17_credit_source).strip().lower()
+        if self.v17_credit_source not in {"branches", "mc_return"}:
+            raise ValueError("v17_credit_source must be branches or mc_return")
+        self.v17_branch_noise = str(v17_branch_noise).strip().lower()
+        if self.v17_branch_noise not in {"crn", "independent"}:
+            raise ValueError("v17_branch_noise must be crn or independent")
         self.v16_branch_mode = str(v16_branch_mode)
         if self.v16_branch_mode not in ("hold_h", "one_day_deviation"):
             raise ValueError(
@@ -1003,7 +1019,9 @@ class Core:
                 raise ValueError(
                     "one_day_deviation uses exactly 11 non-audit branch cells"
                 )
-            counterfactual_day_credit = 11
+            counterfactual_day_credit = (
+                11 if self.v17_credit_source == "branches" else 0
+            )
             counterfactual_day_horizon_days = self.v16_branch_horizon_days
             nmcc_advantage_scale = "none"
             nmcc_stages = ("market", "static", "catchup", "profit")
@@ -1031,6 +1049,40 @@ class Core:
         self.v17_temperature_mode = str(v17_temperature_mode)
         self.v17_tau_rel_start = float(v17_tau_rel_start)
         self.v17_tau_rel_end = float(v17_tau_rel_end)
+        self.v17_eval_credit_probe = int(max(0, v17_eval_credit_probe))
+        self.v17_eval_credit_horizons = tuple(sorted(set(
+            int(value) for value in v17_eval_credit_horizons
+        )))
+        if any(value <= 0 for value in self.v17_eval_credit_horizons):
+            raise ValueError("v17_eval_credit_horizons must be positive")
+        self.v17_eval_credit_rival_planner = str(
+            v17_eval_credit_rival_planner
+        ).strip().lower()
+        if self.v17_eval_credit_rival_planner not in {"proxy", "full"}:
+            raise ValueError(
+                "v17_eval_credit_rival_planner must be proxy or full"
+            )
+        self.v17_eval_credit_probe_out = str(
+            v17_eval_credit_probe_out or ""
+        )
+        if self.v17_eval_credit_probe and not self.v17_eval_credit_probe_out:
+            raise ValueError(
+                "v17_eval_credit_probe requires v17_eval_credit_probe_out"
+            )
+        self.policy_snapshot_every_days = int(
+            max(0, policy_snapshot_every_days)
+        )
+        self.policy_snapshot_dir = str(policy_snapshot_dir or "")
+        if self.policy_snapshot_every_days and not self.policy_snapshot_dir:
+            raise ValueError(
+                "policy_snapshot_every_days requires policy_snapshot_dir"
+            )
+        self.policy_sweep_request_log = str(
+            policy_sweep_request_log or ""
+        )
+        self._v18_mc_pending: Deque[Dict[str, Any]] = deque()
+        self.v18_mc_dropped_incomplete = 0
+        self._v18_eval_decision_counter = 0
         if self.v17_move_radius not in (0, 1, 2):
             raise ValueError("v17_move_radius must be 0, 1, or 2")
         if self.v17_temperature_mode not in ("absolute", "relative"):
@@ -2226,6 +2278,7 @@ class Core:
             config=DriverSupplyConfig(
                 base_active_drivers=int(max(1, driver_base_active)),
                 reservation_wage_per_hour=float(max(1.0, driver_reservation_wage)),
+                base_pickup_minutes=float(max(0.1, base_pickup_minutes)),
                 operating_cost_per_mile=self.driver_cost_per_mile,
                 platform_variable_cost=self.fixed_trip_cost,
                 acceptance_mode=str(driver_acceptance_mode),
@@ -3134,9 +3187,14 @@ class Core:
         supply_eta_day: float = 0.40,
         supply_eta_hour: float = 0.20,
         supply_eta_v3: float = 0.60,
+        v3_daily_stock: bool = False,
+        supply_eta_within: Optional[float] = None,
         supply_reference_earnings: float = 0.0,
         shortage_willingness_share: float = 0.0,
         acceptance_shock_wage: str = "legacy",
+        active_driver_feature_reference: str = "fixed",
+        driver_pay_rule: str = "share",
+        pay_rule_json: str = "",
         supply_operating_point: Optional[Mapping[str, Any]] = None,
         supply_calibration_customers: int = 50,
         explicit_supply_settings: Optional[Mapping[str, Any]] = None,
@@ -3162,9 +3220,16 @@ class Core:
             model = str(supply_model).lower()
             if model not in {"v1", "v2", "v3"}:
                 raise ValueError("supply_model must be v1, v2, or v3")
-            if model == "v3" and persistent_driver_stock:
+            if model == "v3" and persistent_driver_stock and not v3_daily_stock:
                 raise ValueError("supply v3 is an expected-earnings response, not a persistent-stock model")
-            cfg.persistent_stock = bool(persistent_driver_stock) or model == "v2"
+            # V18 splits the v3 day-level stock from the legacy persistent
+            # stock implementation.  They deliberately cannot be active at
+            # the same time: the v3 stock follows the registered expected-
+            # earnings update in DriverSupplyModel._advance_v3_stock().
+            cfg.persistent_stock = bool(
+                model == "v2"
+                or (bool(persistent_driver_stock) and model == "v1")
+            )
             cfg.stock_adjustment_rate = float(sclip(stock_adjustment_rate, 0.0, 1.0))
             cfg.stock_floor = float(max(0.0, stock_floor))
             cfg.supply_model = model
@@ -3173,6 +3238,28 @@ class Core:
             if not np.isfinite(supply_eta_v3) or supply_eta_v3 <= 0.0:
                 raise ValueError("supply_eta_v3 must be finite and positive")
             cfg.eta_v3 = float(supply_eta_v3)
+            cfg.v3_daily_stock = bool(v3_daily_stock)
+            cfg.eta_within = (
+                None
+                if supply_eta_within is None
+                else float(supply_eta_within)
+            )
+            if cfg.v3_daily_stock and model != "v3":
+                raise ValueError("v3_daily_stock requires supply_model v3")
+            if cfg.v3_daily_stock and (
+                cfg.eta_within is None or cfg.eta_within < 0.0
+            ):
+                raise ValueError(
+                    "v3_daily_stock requires a non-negative supply_eta_within"
+                )
+            feature_reference = str(
+                active_driver_feature_reference
+            ).strip().lower()
+            if feature_reference not in {"fixed", "run_capacity"}:
+                raise ValueError(
+                    "active_driver_feature_reference must be fixed or run_capacity"
+                )
+            cfg.count_feature_reference = feature_reference
             if not np.isfinite(shortage_willingness_share) or not 0.0 <= shortage_willingness_share <= 1.0:
                 raise ValueError("shortage_willingness_share must lie in [0, 1]")
             if shortage_willingness_share > 0.0 and model != "v3":
@@ -3184,6 +3271,47 @@ class Core:
             if acceptance_shock_wage == "declared" and model != "v3":
                 raise ValueError("declared acceptance shock wage requires supply_model v3")
             cfg.acceptance_shock_wage = acceptance_shock_wage
+            pay_rule = str(driver_pay_rule).strip().lower()
+            if pay_rule not in {"share", "linear"}:
+                raise ValueError("driver_pay_rule must be share or linear")
+            if pay_rule == "linear":
+                if not pay_rule_json:
+                    raise ValueError("linear driver pay requires --pay_rule_json")
+                pay_path = Path(pay_rule_json).expanduser().resolve()
+                with pay_path.open("r", encoding="utf-8") as handle:
+                    pay_payload = json.load(handle)
+                coefficients = dict(
+                    pay_payload.get("coefficients", pay_payload)
+                )
+                required = {
+                    "intercept", "per_mile", "per_minute", "fare_coef"
+                }
+                missing = sorted(required - set(coefficients))
+                if missing:
+                    raise ValueError(
+                        f"pay rule artifact is missing {missing}"
+                    )
+                for firm in ("Firm1", "Firm2"):
+                    legacy = self.driver_supply.pay_policies[firm]
+                    self.driver_supply.pay_policies[firm] = DriverPayPolicy(
+                        fare_share=float(legacy.fare_share),
+                        minimum_pay=float(
+                            coefficients.get("minimum_pay", legacy.minimum_pay)
+                        ),
+                        incentive_multiplier=float(
+                            legacy.incentive_multiplier
+                        ),
+                        rule="linear",
+                        intercept=float(coefficients["intercept"]),
+                        per_mile=float(coefficients["per_mile"]),
+                        per_minute=float(coefficients["per_minute"]),
+                        fare_coef=float(coefficients["fare_coef"]),
+                    )
+                self._v18_pay_rule_source = str(pay_path)
+            else:
+                for policy in self.driver_supply.pay_policies.values():
+                    policy.rule = "share"
+                self._v18_pay_rule_source = ""
             cfg.reference_earnings_per_hour = float(max(0.0, supply_reference_earnings))
             self._supply_reference_is_explicit = supply_reference_earnings > 0
             if cfg.supply_model in {"v2", "v3"}:
@@ -3291,6 +3419,21 @@ class Core:
             "v17_temperature_mode": self.v17_temperature_mode,
             "v17_tau_rel_start": float(self.v17_tau_rel_start),
             "v17_tau_rel_end": float(self.v17_tau_rel_end),
+            "v17_credit_source": str(self.v17_credit_source),
+            "v17_branch_noise": str(self.v17_branch_noise),
+            "v17_eval_credit_probe": int(self.v17_eval_credit_probe),
+            "v17_eval_credit_horizons": list(
+                self.v17_eval_credit_horizons
+            ),
+            "v17_eval_credit_rival_planner": str(
+                self.v17_eval_credit_rival_planner
+            ),
+            "policy_snapshot_every_days": int(
+                self.policy_snapshot_every_days
+            ),
+            "policy_sweep_request_log": bool(
+                self.policy_sweep_request_log
+            ),
             "v17_ablate_driver_observation": bool(
                 self.v17_ablate_driver_observation
             ),
@@ -3325,6 +3468,48 @@ class Core:
             "supply_eta_day": float(self.driver_supply.config.eta_day),
             "supply_eta_hour": float(self.driver_supply.config.eta_hour),
             "supply_eta_v3": float(self.driver_supply.config.eta_v3),
+            "v3_daily_stock": bool(
+                self.driver_supply.config.v3_daily_stock
+            ),
+            "supply_eta_within": (
+                None
+                if self.driver_supply.config.eta_within is None
+                else float(self.driver_supply.config.eta_within)
+            ),
+            "supply_eta_day": float(self.driver_supply.config.eta_day),
+            "stock_adjustment_rate": float(
+                self.driver_supply.config.stock_adjustment_rate
+            ),
+            "stock_floor": float(self.driver_supply.config.stock_floor),
+            "stock_ceiling": float(self.driver_supply.config.stock_ceiling),
+            "active_driver_feature_reference": str(
+                self.driver_supply.config.count_feature_reference
+            ),
+            "driver_pay_rule": str(
+                self.driver_supply.pay_policies["Firm1"].rule
+            ),
+            "driver_pay_policy": asdict(
+                self.driver_supply.pay_policies["Firm1"]
+            ),
+            "base_pickup_minutes": float(
+                self.driver_supply.config.base_pickup_minutes
+            ),
+            "scenario_hazards": str(self.shock_config.scenario_hazards),
+            "v17_credit_source": str(self.v17_credit_source),
+            "v17_branch_noise": str(self.v17_branch_noise),
+            "v17_eval_credit_probe": int(self.v17_eval_credit_probe),
+            "v17_eval_credit_horizons": list(
+                self.v17_eval_credit_horizons
+            ),
+            "v17_eval_credit_rival_planner": str(
+                self.v17_eval_credit_rival_planner
+            ),
+            "policy_snapshot_every_days": int(
+                self.policy_snapshot_every_days
+            ),
+            "policy_sweep_request_log": bool(
+                self.policy_sweep_request_log
+            ),
             "shortage_willingness_share": float(
                 self.driver_supply.config.shortage_willingness_share
             ),
@@ -3372,14 +3557,44 @@ class Core:
 
     def _model_switches(self) -> Dict[str, Any]:
         """Return the live scientific switches required to identify a product."""
+        supply_config = self.driver_supply.config
+        pay_policy = getattr(
+            self.driver_supply, "pay_policies", {}
+        ).get("Firm1")
+        shock_config = getattr(self, "shock_config", None)
         return {
             "acceptance_shock_wage": str(
-                self.driver_supply.config.acceptance_shock_wage
+                supply_config.acceptance_shock_wage
             ),
             "rate_upper_multiple": float(self.market_dynamics.rate_upper_multiple),
-            "supply_eta_v3": float(self.driver_supply.config.eta_v3),
+            "supply_eta_v3": float(supply_config.eta_v3),
+            "v3_daily_stock": bool(
+                getattr(supply_config, "v3_daily_stock", False)
+            ),
+            "supply_eta_within": (
+                None
+                if getattr(supply_config, "eta_within", None) is None
+                else float(supply_config.eta_within)
+            ),
+            "supply_eta_day": float(getattr(supply_config, "eta_day", 0.40)),
+            "stock_adjustment_rate": float(
+                getattr(supply_config, "stock_adjustment_rate", 0.30)
+            ),
+            "stock_floor": float(getattr(supply_config, "stock_floor", 0.40)),
+            "stock_ceiling": float(getattr(supply_config, "stock_ceiling", 2.0)),
+            "active_driver_feature_reference": str(
+                getattr(supply_config, "count_feature_reference", "fixed")
+            ),
+            "driver_pay_rule": str(getattr(pay_policy, "rule", "share")),
+            "driver_pay_policy": asdict(pay_policy) if pay_policy is not None else {},
+            "base_pickup_minutes": float(
+                getattr(supply_config, "base_pickup_minutes", 3.5)
+            ),
+            "scenario_hazards": str(
+                getattr(shock_config, "scenario_hazards", "natural")
+            ),
             "shortage_willingness_share": float(
-                self.driver_supply.config.shortage_willingness_share
+                supply_config.shortage_willingness_share
             ),
             "loyalty_model": str(self.loyalty_model),
             "unfulfilled_spillover": bool(
@@ -3995,6 +4210,15 @@ class Core:
         dynamic stage. Validation and evaluation use the same opening
         randomization for independent long trajectories.
         """
+        # Scripted baselines retain their most recent cell within an episode,
+        # but never across independently randomized openings.
+        for name in (
+            "_count_rule_last_cell",
+            "_reactive_surge_last_cell",
+            "_surge_decay_last_cell",
+        ):
+            if hasattr(self, name):
+                delattr(self, name)
         self._reset_rider_memory()
         if self.regime_market:
             self.driver_supply.reset_stock()
@@ -4148,6 +4372,16 @@ class Core:
                 )
             )
         return context, supply_vector
+
+    def _firm1_current_active_drivers(self) -> float:
+        """Exact live own-platform driver count shared by actor and C7 rules."""
+        if not self.enable_driver_supply:
+            return 0.0
+        return float(
+            self.driver_supply.last_states.get(
+                "Firm1", FirmDriverBatchState()
+            ).active_drivers
+        )
     
     @staticmethod
     def _smooth_positive_penalty(value: float, scale: float) -> float:
@@ -8038,6 +8272,7 @@ class Core:
             )
             resolved_steps_per_day = int(max(1, steps_per_day))
             for rollout_index, (rollout_name, mode) in enumerate(validation_rollouts):
+                self._active_policy_sweep_rollout = str(rollout_name)
                 rollout_seed = resolved_policy_seed + 10_007 * rollout_index
                 validation_city = str(self.market_name)
                 validation_mode_cities[str(rollout_name)] = validation_city
@@ -8234,6 +8469,27 @@ class Core:
                         pending_critic_reward = 0.0
                         pending_critic_discount = 1.0
                         pending_critic_potential = float(current_potential)
+                        self._v18_eval_decision_counter += 1
+                        if (
+                            self.v17_eval_credit_probe > 0
+                            and presampled is not None
+                        ):
+                            self._v18_eval_credit_probe_rows(
+                                selected_action=int(action),
+                                action_mask=np.asarray(action_mask, dtype=bool),
+                                day_index=int(
+                                    step_index // resolved_steps_per_day
+                                ),
+                                hour=int(hour),
+                                day_ctx=ctx,
+                                presampled=presampled,
+                                customers_per_step=int(customers_per_step),
+                                steps_per_day=int(resolved_steps_per_day),
+                                firm2_interval_steps=int(
+                                    opponent_interval_steps
+                                ),
+                                rollout=str(rollout_name),
+                            )
                         if int(action) >= 0:
                             self.firm1.apply_action(action, self.market)
                         actions.append(int(action))
@@ -8252,15 +8508,26 @@ class Core:
                             generalization_fraction=1.0,
                             generalization_city=validation_city,
                         )
-                    _, m1, m2, gap, _, _ = self.simulate_batch(
+                    request_rows, m1, m2, gap, _, _ = self.simulate_batch(
                         day_of_week=ctx.day_of_week,
                         weather=ctx.weather,
                         hour=hour,
                         customers_per_step=step_customers,
                         sampled_profiles=profiles,
-                        collect_rows=False,
+                        collect_rows=bool(self.policy_sweep_request_log),
                         supply_reference_customers=customers_per_step,
                     )
+                    if self.policy_sweep_request_log:
+                        self._write_policy_request_rows(
+                            rows=request_rows,
+                            rollout=str(rollout_name),
+                            rival=str(mode),
+                            step=int(step_index),
+                            day=int(step_index // resolved_steps_per_day),
+                            hour=int(hour),
+                            day_of_week=int(ctx.day_of_week),
+                            weather=str(ctx.weather),
+                        )
                     if self.market_dynamics.enabled:
                         self._accumulate_welfare(mode_welfare, getattr(self, "last_welfare_stats", None))
                     self._ingest_platform_observations(m1, m2)
@@ -9113,11 +9380,14 @@ class Core:
             # card like static_tariff and only re-posts when the cell changes.
             table = self._parse_policy_table(name.split(":", 1)[1])
             day = int(step_index) // int(max(1, self.shared_steps_per_day))
+            windows = table.get("windows", ())
+            if windows == "realized":
+                windows = self._v18_realized_surge_windows()
             distance, time_level = surge_decay_cell(
                 day,
                 table["normal"],
                 table["event"],
-                table.get("windows", ()),
+                windows,
                 int(table.get("hold_days", 0)),
                 int(table.get("decay_days", 0)),
             )
@@ -9134,6 +9404,88 @@ class Core:
                     "per_minute": time_level,
                 })
                 self._surge_decay_last_cell = cell
+            return posted_action
+        if name.startswith("count_rule:"):
+            table = self._parse_policy_table(name.split(":", 1)[1])
+            steps_per_day = int(max(1, self.shared_steps_per_day))
+            if int(step_index) % steps_per_day != 0:
+                return posted_action
+            normal = tuple(float(value) for value in table["normal"])
+            event = tuple(float(value) for value in table["event"])
+            norm = tuple(float(value) for value in table["norm"])
+            block = int(step_index) % steps_per_day
+            if len(norm) != steps_per_day or norm[block] <= 0.0:
+                raise ValueError(
+                    "count_rule norm must contain one positive value per block"
+                )
+            ratio = self._firm1_current_active_drivers() / norm[block]
+            mode = str(table.get("mode", "step"))
+            theta = float(table.get("theta", 0.7))
+            if mode == "step":
+                target = event if ratio < theta else normal
+            elif mode == "ramp":
+                theta_lo = float(table.get("theta_lo", 0.5))
+                if not theta_lo < theta:
+                    raise ValueError("count_rule requires theta_lo < theta")
+                weight = float(sclip(
+                    (theta - ratio) / (theta - theta_lo), 0.0, 1.0
+                ))
+                target = tuple(
+                    normal[index]
+                    + weight * (event[index] - normal[index])
+                    for index in range(2)
+                )
+            else:
+                raise ValueError("count_rule mode must be step or ramp")
+            cell = self._v18_move_limited_cell(
+                target, int(table.get("move_limit", 0))
+            )
+            if cell != getattr(self, "_count_rule_last_cell", None):
+                self._post_firm1_coefficient_targets({
+                    "airport_fee": 1.0,
+                    "base_fare": 1.0,
+                    "booking_fee": 1.0,
+                    "per_mile": cell[0],
+                    "per_minute": cell[1],
+                })
+                self._count_rule_last_cell = cell
+            return posted_action
+        if name.startswith("reactive_surge:"):
+            table = self._parse_policy_table(name.split(":", 1)[1])
+            steps_per_day = int(max(1, self.shared_steps_per_day))
+            if int(step_index) % steps_per_day != 0:
+                return posted_action
+            normal = tuple(float(value) for value in table["normal"])
+            kpis = self._firm1_public_kpis(int(hour))
+            wait_ref = float(table["wait_ref"])
+            if wait_ref <= 0.0:
+                raise ValueError("reactive_surge wait_ref must be positive")
+            multiplier = 1.0
+            multiplier += float(table.get("fill_gain", 0.0)) * max(
+                0.0,
+                float(table.get("fill_ref", 1.0)) - kpis["fulfillment"],
+            )
+            multiplier += float(table.get("wait_gain", 0.0)) * max(
+                0.0, kpis["wait"] / wait_ref - 1.0
+            )
+            multiplier += float(table.get("storm_gain", 0.0)) * float(
+                kpis["storm_warning"]
+            )
+            max_level = float(table.get("max_level", 2.5))
+            target = tuple(
+                min(max_level, max(normal[index], normal[index] * multiplier))
+                for index in range(2)
+            )
+            cell = self._nearest_v18_two_lever_cell(*target)
+            if cell != getattr(self, "_reactive_surge_last_cell", None):
+                self._post_firm1_coefficient_targets({
+                    "airport_fee": 1.0,
+                    "base_fare": 1.0,
+                    "booking_fee": 1.0,
+                    "per_mile": cell[0],
+                    "per_minute": cell[1],
+                })
+                self._reactive_surge_last_cell = cell
             return posted_action
         if name.startswith("oracle:"):
             # Regime-oracle static policy: told the true regime, posts the
@@ -9383,8 +9735,18 @@ class Core:
         raw_values: Dict[int, float] = {}
         component_returns: Dict[int, List[float]] = {}
         posted_actions: Dict[int, List[int]] = {}
+        branch_tape_ids: Dict[int, int] = {}
         try:
             for action in candidates:
+                # CRN is the registered legacy behavior.  The V18
+                # independent-noise ablation assigns a deterministic tape to
+                # each candidate while preserving reproducibility.
+                candidate_tape_id = (
+                    probe_tape_id
+                    if self.v17_branch_noise == "crn"
+                    else 100 + int(action)
+                )
+                branch_tape_ids[int(action)] = int(candidate_tape_id)
                 self._restore_counterfactual_state(snapshot)
                 self.firm1.apply_action(int(action), self.market)
                 total = 0.0
@@ -9404,7 +9766,7 @@ class Core:
                             ctx, day_hours = self._sample_v16_day_and_hours(
                                 int(day_index) + k,
                                 spd,
-                                tape_id=probe_tape_id,
+                                tape_id=candidate_tape_id,
                             )
                         else:
                             ctx = self.market.sample_day_context()
@@ -9427,7 +9789,7 @@ class Core:
                             self._set_v16_tape_position(
                                 int(day_index) + k,
                                 int(t),
-                                tape_id=probe_tape_id,
+                                tape_id=candidate_tape_id,
                             )
                         hour = int(day_hours[t])
                         if offset > 0:
@@ -9451,7 +9813,7 @@ class Core:
                             profiles = self._sample_profiles_from_pool(
                                 self._effective_simulation_sample_size(count)
                             )
-                        elif probe_tape_id == 0:
+                        elif candidate_tape_id == 0:
                             count, profiles = presampled
                         else:
                             # T3's second tape conditions on the same observed
@@ -9601,6 +9963,11 @@ class Core:
                 else int(self.exogenous_tape.root_seed)
             ),
             "tape_id": int(probe_tape_id),
+            "branch_noise": str(self.v17_branch_noise),
+            "branch_tape_ids": {
+                str(int(action)): int(tape_id)
+                for action, tape_id in branch_tape_ids.items()
+            },
             "branch_mode": "one_day_deviation",
             "branch_design": (
                 f"all{self.firm1.agent.action_dim}" if audit else "stencil11"
@@ -9834,6 +10201,7 @@ class Core:
                 )
         self.v16_branch_store.add(
             {
+                "label_kind": "difference",
                 "observation_window": observation.reshape(-1).tolist(),
                 "observation_shape": list(observation.shape),
                 "incumbent_action": int(metadata["incumbent_action"]),
@@ -9883,6 +10251,194 @@ class Core:
             + (self.v16_value_lr_start - self.v16_value_lr_end) * cosine
         )
 
+    def _v18_mc_begin(
+        self, *, observation_window: Any, action: int, day: int
+    ) -> None:
+        """Start one selected-action Monte Carlo label at a live decision.
+
+        V18's MC-return control removes counterfactual rollouts without
+        removing the replay/value-head machinery.  Only the action actually
+        posted receives a target; unfinished horizons are deliberately
+        discarded at episode boundaries.
+        """
+        if self.v17_credit_source != "mc_return":
+            return
+        if isinstance(observation_window, torch.Tensor):
+            observation = (
+                observation_window.detach().cpu().numpy().astype(np.float32)
+            )
+        else:
+            observation = np.asarray(observation_window, dtype=np.float32)
+        self._v18_mc_pending.append({
+            "observation_window": observation.reshape(-1).tolist(),
+            "observation_shape": list(observation.shape),
+            "selected_action": int(action),
+            "day": int(day),
+            "age": 0,
+            "discount": 1.0,
+            "return": 0.0,
+            "components": np.zeros(4, dtype=np.float64),
+            "stage": str(self.current_training_stage.opponent_regime),
+            "rival": str(self.firm2_mode),
+            "regime_events": list(
+                getattr(
+                    getattr(self, "_regime_last_effect", None),
+                    "active",
+                    (),
+                )
+                or ()
+            ),
+        })
+
+    def _v18_mc_observe_day(
+        self,
+        *,
+        reward: float,
+        components: Sequence[float],
+        terminal: bool = False,
+    ) -> int:
+        """Advance live MC labels by one decision day and persist maturities."""
+        if self.v17_credit_source != "mc_return":
+            return 0
+        vector = np.asarray(components, dtype=np.float64).reshape(-1)
+        if vector.size < 4:
+            raise ValueError("V18 MC return requires four economic components")
+        completed: List[Dict[str, Any]] = []
+        gamma_day = float(self.firm1.agent.gamma) ** int(
+            max(1, getattr(self, "_active_steps_per_day", 1))
+        )
+        for row in self._v18_mc_pending:
+            row["return"] += float(row["discount"]) * float(reward)
+            row["components"] += float(row["discount"]) * vector[:4]
+            row["age"] += 1
+            row["discount"] *= gamma_day
+            if int(row["age"]) >= int(self.v16_branch_horizon_days):
+                completed.append(row)
+        if completed:
+            completed_ids = {id(row) for row in completed}
+            self._v18_mc_pending = deque(
+                row for row in self._v18_mc_pending
+                if id(row) not in completed_ids
+            )
+            for row in completed:
+                self._append_v18_mc_store_row(row)
+        if terminal and self._v18_mc_pending:
+            self.v18_mc_dropped_incomplete += len(self._v18_mc_pending)
+            self._v18_mc_pending.clear()
+        return len(completed)
+
+    def _append_v18_mc_store_row(self, row: Mapping[str, Any]) -> None:
+        if self.v16_branch_store is None:
+            return
+        action_count = int(self.firm1.agent.action_dim)
+        selected = int(row["selected_action"])
+        mask = np.zeros(action_count, dtype=bool)
+        mask[selected] = True
+        credits = np.full(action_count, np.nan, dtype=np.float32)
+        credits[selected] = float(row["return"])
+        component_matrix: List[Optional[List[float]]] = [
+            None for _ in range(action_count)
+        ]
+        component_matrix[selected] = np.asarray(
+            row["components"], dtype=float
+        ).tolist()
+        regimes = sorted(str(value) for value in row["regime_events"])
+        self.v16_branch_store.add({
+            "label_kind": "absolute",
+            "observation_window": list(row["observation_window"]),
+            "observation_shape": list(row["observation_shape"]),
+            "incumbent_action": selected,
+            "selected_action": selected,
+            "candidate_actions": [selected],
+            "action_credits": credits.tolist(),
+            "action_credit_mask": mask.tolist(),
+            "action_fit_mask": mask.tolist(),
+            "component_credit_names": list(self.v16_value_auxiliary_names),
+            "component_credit_matrix": component_matrix,
+            "regime_label": "+".join(regimes) if regimes else "calm",
+            "regime_events": regimes,
+            "stage": str(row["stage"]),
+            "rival": str(row["rival"]),
+            "day": int(row["day"]),
+            "tape_seed": None,
+            "tape_id": None,
+            "audit": False,
+            "horizon_days": int(row["age"]),
+            "second_tape": False,
+            "second_tape_action_credits": None,
+            "second_tape_credit_mask": None,
+            "label_noise_sd": float("nan"),
+            "prequential_prediction": [float("nan")] * action_count,
+            "prequential_model": "polyak_target_before_today_fit",
+            "greedy_action": -1,
+            "move_radius": int(self.v17_move_radius),
+        })
+
+    def _v18_eval_credit_probe_rows(
+        self,
+        *,
+        selected_action: int,
+        action_mask: np.ndarray,
+        day_index: int,
+        hour: int,
+        day_ctx: Any,
+        presampled: Tuple[int, Sequence[Mapping[str, Any]]],
+        customers_per_step: int,
+        steps_per_day: int,
+        firm2_interval_steps: int,
+        rollout: str,
+    ) -> None:
+        """Append registered held-out credit probes without changing policy."""
+        if self.v17_eval_credit_probe <= 0:
+            return
+        if self._v18_eval_decision_counter % self.v17_eval_credit_probe != 0:
+            return
+        previous_horizon = int(self.v16_branch_horizon_days)
+        previous_internal = bool(self._v17_probe_internal_second_tape)
+        previous_forced = self._v17_probe_forced_candidates
+        records: List[Dict[str, Any]] = []
+        try:
+            self._v17_probe_internal_second_tape = True
+            self._v17_probe_forced_candidates = None
+            for horizon in self.v17_eval_credit_horizons:
+                self.v16_branch_horizon_days = int(horizon)
+                values, mask = self._v16_one_day_deviation_values(
+                    selected_action=int(selected_action),
+                    action_mask=np.asarray(action_mask, dtype=bool),
+                    day_index=int(day_index),
+                    step_in_day=0,
+                    hours=[int(hour)] * int(max(1, steps_per_day)),
+                    day_ctx=day_ctx,
+                    presampled=presampled,
+                    customers_per_step=int(customers_per_step),
+                    firm2_interval_steps=int(firm2_interval_steps),
+                    days_left=None,
+                )
+                records.append({
+                    "rollout": str(rollout),
+                    "decision": int(self._v18_eval_decision_counter),
+                    "day": int(day_index),
+                    "horizon_days": int(horizon),
+                    "selected_action": int(selected_action),
+                    "credit_values": np.asarray(values, dtype=float).tolist(),
+                    "credit_mask": np.asarray(mask, dtype=bool).tolist(),
+                    "branch_noise": str(self.v17_branch_noise),
+                    "rival_planner": str(
+                        self.v17_eval_credit_rival_planner
+                    ),
+                })
+        finally:
+            self.v16_branch_horizon_days = previous_horizon
+            self._v17_probe_internal_second_tape = previous_internal
+            self._v17_probe_forced_candidates = previous_forced
+        out = os.path.abspath(os.path.expanduser(
+            self.v17_eval_credit_probe_out
+        ))
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        with open(out, "a", encoding="utf-8") as stream:
+            for record in records:
+                stream.write(json.dumps(record, sort_keys=True) + "\n")
+
     def _v17_current_component_weights(self) -> np.ndarray:
         """Return the active stage's linear reward weights for replay labels."""
         regime = str(self.current_training_stage.opponent_regime)
@@ -9910,6 +10466,7 @@ class Core:
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
     ]:
         """Convert branch-store rows into the registered supervised targets."""
         if self.v16_value_model is None:
@@ -9923,12 +10480,16 @@ class Core:
         action_masks: List[List[bool]] = []
         component_credits: List[List[List[float]]] = []
         component_masks: List[List[List[bool]]] = []
+        absolute_rows: List[bool] = []
         expected_names = list(self.v16_value_auxiliary_names)
         action_count = int(self.v16_value_cells.shape[0])
         flat_observation_dim = int(
             self.firm1.state_frame_stack * self.platform_observation_dim
         )
         for row in rows:
+            label_kind = str(row.get("label_kind", "difference"))
+            if label_kind not in {"difference", "absolute"}:
+                raise ValueError("V18 replay row has an invalid label_kind")
             observation = np.asarray(
                 row.get("observation_window", []), dtype=np.float32
             ).reshape(-1)
@@ -9997,6 +10558,7 @@ class Core:
             )
             row_component_mask &= fit_mask.reshape(-1, 1)
             component_masks.append(row_component_mask.tolist())
+            absolute_rows.append(label_kind == "absolute")
         return (
             torch.as_tensor(observations, dtype=torch.float32, device=device),
             torch.as_tensor(incumbents, dtype=torch.long, device=device),
@@ -10004,6 +10566,7 @@ class Core:
             torch.as_tensor(action_masks, dtype=torch.bool, device=device),
             torch.as_tensor(component_credits, dtype=torch.float32, device=device),
             torch.as_tensor(component_masks, dtype=torch.bool, device=device),
+            torch.as_tensor(absolute_rows, dtype=torch.bool, device=device),
         )
 
     def _v16_fit_value_model(
@@ -10046,6 +10609,7 @@ class Core:
                 credit_mask,
                 component_credits,
                 component_mask,
+                absolute_rows,
             ) = self._v16_value_fit_batch(rows)
             output = self.v16_value_model(observations, cells)
             q_values = output["q"]
@@ -10055,8 +10619,11 @@ class Core:
             q_differences = q_values - q_values[
                 row_indices, incumbents
             ].unsqueeze(-1)
+            q_predictions = torch.where(
+                absolute_rows.unsqueeze(-1), q_values, q_differences
+            )
             main_loss = torch.nn.functional.huber_loss(
-                q_differences[credit_mask],
+                q_predictions[credit_mask],
                 credits[credit_mask],
                 reduction="mean",
                 delta=huber_delta,
@@ -10065,12 +10632,17 @@ class Core:
             auxiliary_differences = auxiliary_values - auxiliary_values[
                 row_indices, incumbents, :
             ].unsqueeze(1)
+            auxiliary_predictions = torch.where(
+                absolute_rows.reshape(-1, 1, 1),
+                auxiliary_values,
+                auxiliary_differences,
+            )
             auxiliary_loss = main_loss.new_zeros(())
             for component_index in range(len(self.v16_value_auxiliary_names)):
                 valid = component_mask[:, :, component_index]
                 if bool(valid.any()):
                     auxiliary_loss = auxiliary_loss + torch.nn.functional.huber_loss(
-                        auxiliary_differences[:, :, component_index][valid],
+                        auxiliary_predictions[:, :, component_index][valid],
                         component_credits[:, :, component_index][valid],
                         reduction="mean",
                         delta=1.0,
@@ -10558,7 +11130,9 @@ class Core:
             )
         results: Dict[str, Any] = {}
         traces: Dict[str, List[Dict[str, float]]] = {}
+        self._request_log_initialized: set[str] = set()
         for spec in specs:
+            self._active_policy_sweep_spec = str(spec)
             self._sweep_trace_enabled = True
             self._sweep_trace = []
             report = self._adaptive_policy_validation(
@@ -10592,6 +11166,7 @@ class Core:
             traces[str(spec)] = list(self._sweep_trace)
             self._sweep_trace_enabled = False
             print(f"[PolicySweep] {spec}: mean objective {np.mean(means):.4f} over {len(means)} rollouts")
+        self._active_policy_sweep_spec = ""
         return {
             "traces": traces,
             "protocol": "v26r_policy_sweep_common_random_numbers",
@@ -10606,6 +11181,55 @@ class Core:
             "model_switches": self._model_switches(),
             "results": results,
         }
+
+    def _write_policy_request_rows(
+        self,
+        *,
+        rows: Sequence[Mapping[str, Any]],
+        rollout: str,
+        rival: str,
+        step: int,
+        day: int,
+        hour: int,
+        day_of_week: int,
+        weather: str,
+    ) -> None:
+        """Write one lossless gzip CSV stream per policy/rollout pair."""
+        root = str(self.policy_sweep_request_log or "")
+        if not root or not rows:
+            return
+        os.makedirs(root, exist_ok=True)
+        policy = str(getattr(self, "_active_policy_sweep_spec", "policy"))
+        safe = lambda value: re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value))
+        path = os.path.join(root, f"{safe(policy)}__{safe(rollout)}.csv.gz")
+        enriched: List[Dict[str, Any]] = []
+        for request_index, original in enumerate(rows):
+            row = dict(original)
+            row.update({
+                "PolicySpec": policy,
+                "RivalSpec": str(rival),
+                "Rollout": str(rollout),
+                "Step": int(step),
+                "Day": int(day),
+                "Block": int(step),
+                "RequestIndex": int(request_index),
+                "Hour": int(hour),
+                "DayOfWeek": int(day_of_week),
+                "Weather": str(weather),
+                "Regime": self._regime_key_for_hour(int(hour)),
+            })
+            enriched.append(row)
+        initialized = path in getattr(self, "_request_log_initialized", set())
+        mode = "at" if initialized else "wt"
+        fieldnames = sorted(enriched[0])
+        with gzip.open(path, mode, encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(
+                stream, fieldnames=fieldnames, extrasaction="ignore"
+            )
+            if not initialized:
+                writer.writeheader()
+            writer.writerows(enriched)
+        self._request_log_initialized.add(path)
 
     @staticmethod
     def _learned_actor_due_for_policy(
@@ -10775,6 +11399,68 @@ class Core:
                 ub,
             ))
             setattr(self.firm1.overrides, key, value)
+
+    def _nearest_v18_two_lever_cell(
+        self, distance: float, time_level: float
+    ) -> Tuple[float, float]:
+        """Snap a C7 rule target independently to the registered action grid."""
+        levels = tuple(float(value) for value in getattr(
+            self.firm1, "two_lever_levels", ()
+        ))
+        if not levels:
+            base = self.market.curr_market
+            distance_bounds = self.firm1.config.bounds["per_mile"]
+            time_bounds = self.firm1.config.bounds["per_minute"]
+            return (
+                float(sclip(
+                    distance,
+                    distance_bounds[0] / float(base.per_mile),
+                    distance_bounds[1] / float(base.per_mile),
+                )),
+                float(sclip(
+                    time_level,
+                    time_bounds[0] / float(base.per_minute),
+                    time_bounds[1] / float(base.per_minute),
+                )),
+            )
+
+        def nearest(value: float) -> float:
+            return min(levels, key=lambda level: (abs(level - value), level))
+
+        return nearest(float(distance)), nearest(float(time_level))
+
+    def _v18_move_limited_cell(
+        self, target: Sequence[float], move_limit: int
+    ) -> Tuple[float, float]:
+        """Apply the agent's per-lever one-grid-step daily move constraint."""
+        snapped = self._nearest_v18_two_lever_cell(
+            float(target[0]), float(target[1])
+        )
+        if int(move_limit) <= 0:
+            return snapped
+        levels = tuple(float(value) for value in self.firm1.two_lever_levels)
+        incumbent_action = self._v16_incumbent_two_lever_action()
+        incumbent = self.firm1.action_to_two_lever_cell[int(incumbent_action)]
+        limited: List[float] = []
+        for current, wanted in zip(incumbent, snapped):
+            current_index = levels.index(float(current))
+            wanted_index = levels.index(float(wanted))
+            delta = int(np.clip(wanted_index - current_index, -1, 1))
+            limited.append(levels[current_index + delta])
+        return float(limited[0]), float(limited[1])
+
+    def _v18_realized_surge_windows(self) -> Tuple[Tuple[int, int], ...]:
+        """Return realized shortage/storm windows, excluding curriculum events."""
+        shocks = getattr(self.market, "shocks", None)
+        if shocks is None:
+            return ()
+        windows = {
+            (int(event.start_day), int(event.end_day))
+            for event in shocks.events
+            if event.kind in {"driver_shortage", "winter_storm"}
+            and not bool(dict(event.detail).get("training_curriculum", False))
+        }
+        return tuple(sorted(windows))
 
     def _regime_key_for_hour(self, hour: int) -> str:
         """Canonical regime label from the true effect (oracle information)."""
@@ -12535,6 +13221,12 @@ class Core:
                         pending_discount = 1.0
                         pending_reward_weight = 0.0
                         pending_count = 0
+                        self._active_steps_per_day = int(max(1, len(hours)))
+                        self._v18_mc_begin(
+                            observation_window=s_ts,
+                            action=int(action),
+                            day=int(d),
+                        )
                     else:
                         rl_step = None
                         self.firm1.agent.observe_recurrent_state(
@@ -12709,6 +13401,32 @@ class Core:
                                 else str(active_episode_opponent_mode)
                             ),
                         )
+                        if self.v17_credit_source == "mc_return":
+                            mc_components = np.asarray(
+                                pending_component_sum, dtype=float
+                            ).reshape(-1)
+                            if mc_components.size < 4:
+                                mc_components = np.pad(
+                                    mc_components,
+                                    (0, 4 - mc_components.size),
+                                )
+                            matured = self._v18_mc_observe_day(
+                                reward=transition_reward,
+                                components=mc_components[:4],
+                                terminal=bool(episode_truncated),
+                            )
+                            if matured:
+                                fit_metrics = self._v16_fit_value_model(
+                                    training_progress=(
+                                        float(d)
+                                        / max(1.0, float(train_timesteps - 1))
+                                    )
+                                )
+                                if fit_metrics.get("performed", False):
+                                    v16_value_fit_calls_today += 1
+                                    v16_value_fit_steps_today += int(
+                                        fit_metrics["optimizer_steps"]
+                                    )
                         interval_closed_this_step = True
                         pending_rl_step = None
                         pending_reward_sum = 0.0
@@ -13667,6 +14385,51 @@ class Core:
                         ),
                     },
                 )
+            if (
+                self.policy_snapshot_every_days > 0
+                and (
+                    (d + 1) % self.policy_snapshot_every_days == 0
+                    or (d + 1) == train_timesteps
+                )
+            ):
+                snapshot_dir = os.path.abspath(os.path.expanduser(
+                    self.policy_snapshot_dir
+                ))
+                os.makedirs(snapshot_dir, exist_ok=True)
+                snapshot_path = os.path.join(
+                    snapshot_dir, f"policy.day{d + 1}.pt"
+                )
+                snapshot_metadata = {
+                    "training_days": int(d + 1),
+                    "main_training_days": int(d + 1),
+                    "branch_rollout_calls": int(self.counterfactual_day_calls),
+                    "mc_return_rows": int(
+                        len(self.v16_branch_store)
+                        if self.v17_credit_source == "mc_return"
+                        and self.v16_branch_store is not None
+                        else 0
+                    ),
+                    "credit_source": str(self.v17_credit_source),
+                    "branch_noise": str(self.v17_branch_noise),
+                    "training_seed": int(self.seed),
+                    "training_stage": str(self.current_training_stage.name),
+                }
+                self.save_trained_model(
+                    snapshot_path,
+                    registry_dir=None,
+                    model_id=f"v18-day{d + 1}",
+                    metadata=snapshot_metadata,
+                )
+                with open(
+                    os.path.join(snapshot_dir, "snapshots.jsonl"),
+                    "a",
+                    encoding="utf-8",
+                ) as snapshot_stream:
+                    snapshot_stream.write(json.dumps({
+                        **snapshot_metadata,
+                        "path": snapshot_path,
+                        "wall_time_utc": datetime.utcnow().isoformat() + "Z",
+                    }, sort_keys=True) + "\n")
             validation_score = np.nan
             if (
                 not external_evaluation_only
@@ -16222,13 +16985,24 @@ class Core:
         current_active_drivers = 0.0
         active_driver_scale = 1.0
         if self.enable_driver_supply:
-            current_active_drivers = float(
-                self.driver_supply.last_states.get(
-                    firm_name, FirmDriverBatchState()
-                ).active_drivers
+            current_active_drivers = (
+                self._firm1_current_active_drivers()
+                if firm_name == "Firm1"
+                else float(
+                    self.driver_supply.last_states.get(
+                        firm_name, FirmDriverBatchState()
+                    ).active_drivers
+                )
             )
-            active_driver_scale = float(
-                self.driver_supply.config.base_active_drivers
+            active_driver_scale = (
+                float(getattr(
+                    self.driver_supply,
+                    "_feature_capacity_reference",
+                    self.driver_supply.config.base_active_drivers,
+                ))
+                if self.driver_supply.config.count_feature_reference
+                == "run_capacity"
+                else float(self.driver_supply.config.base_active_drivers)
             )
         return self.platform_observers[firm_name].build_observation(
             hour=hour,
@@ -19476,12 +20250,15 @@ def build_shock_config_from_args(args, calibration: Optional[Mapping[str, Any]] 
         ),
         "emergency_surge_cap": float(args.emergency_surge_cap),
         "conditional_sampling": False,
+        "scenario_hazards": str(args.scenario_hazards),
     }
     types = [item.strip() for item in str(args.shock_types or "").split(",") if item.strip()]
     if types:
         overrides["types"] = tuple(types)
-    if args.shock_scenario:
-        # A scripted scenario: no random arrivals unless re-enabled explicitly.
+    if args.shock_scenario and str(args.scenario_hazards) == "off":
+        # V18 pure scripted case. Demand drift remains market noise; every
+        # event arrival is disabled inside ShockProcess and the zero rates
+        # keep saved configs explicit for old readers.
         overrides.update({
             "storm_daily_hazard": {},
             "event_rate_per_day": 0.0,
@@ -19489,7 +20266,6 @@ def build_shock_config_from_args(args, calibration: Optional[Mapping[str, Any]] 
             "outage_rate_per_day": 0.0,
             "transit_disruption_rate_per_day": 0.0,
             "rival_promotion_rate_per_day": 0.0,
-            "drift_sd": 0.0,
             "training_shock_opening_share": 0.0,
         })
     if args.shock_rates_json:
@@ -20012,6 +20788,10 @@ def main():
     parser.add_argument("--osmnx_place", type=str, default="", help="OSMnx place string; defaults to '<market>, USA'.")
     parser.add_argument("--driver_base_active", type=int, default=260, help="Baseline active drivers for the batch-level driver supply model.")
     parser.add_argument("--driver_reservation_wage", type=float, default=24.0, help="Driver reservation wage used by acceptance and online-supply response.")
+    parser.add_argument(
+        "--base_pickup_minutes", type=float, default=3.5,
+        help="Calibrated calm pickup-time base used by the driver layer.",
+    )
     parser.add_argument("--driver_acceptance_mode", type=str, default="expected", choices=["expected", "stochastic"], help="Use deterministic expected driver acceptance for faster RL convergence, or stochastic Bernoulli acceptance for realism.")
     parser.add_argument("--driver_expected_acceptance_cutoff", type=float, default=0.65, help="Minimum expected driver acceptance probability required to count an offered ride as accepted in expected driver acceptance mode.")
     parser.add_argument("--driver_state_smoothing", type=float, default=0.35, help="EMA smoothing alpha for driver features fed into the RL state.")
@@ -20296,6 +21076,31 @@ def main():
     v17.add_argument("--v17_tau_rel_start", type=float, default=0.50)
     v17.add_argument("--v17_tau_rel_end", type=float, default=0.15)
     v17.add_argument(
+        "--v17_credit_source",
+        choices=("branches", "mc_return"),
+        default="branches",
+        help="V18 control: counterfactual branch labels or live H-day returns.",
+    )
+    v17.add_argument(
+        "--v17_branch_noise",
+        choices=("crn", "independent"),
+        default="crn",
+        help="V18 control for common versus per-candidate branch tapes.",
+    )
+    v17.add_argument("--v17_eval_credit_probe", type=int, default=0)
+    v17.add_argument(
+        "--v17_eval_credit_horizons", type=str, default="5,10"
+    )
+    v17.add_argument(
+        "--v17_eval_credit_rival_planner",
+        choices=("proxy", "full"),
+        default="proxy",
+    )
+    v17.add_argument("--v17_eval_credit_probe_out", type=str, default="")
+    v17.add_argument("--policy_snapshot_every_days", type=int, default=0)
+    v17.add_argument("--policy_snapshot_dir", type=str, default="")
+    v17.add_argument("--policy_sweep_request_log", type=str, default="")
+    v17.add_argument(
         "--v16_action_credit_scale",
         type=float,
         default=1.0,
@@ -20440,7 +21245,11 @@ def main():
                       help="JSON object of ShockConfig overrides (e.g. '{\"storm_daily_hazard\": {}}').")
     v26r.add_argument("--shock_scenario", type=str, default="",
                       help="Path to a scripted scenario JSON (start_date, events, forecasts); "
-                           "random arrivals are disabled unless --shock_rates_json re-enables them.")
+                           "event arrivals follow --scenario_hazards.")
+    v26r.add_argument(
+        "--scenario_hazards", choices=("natural", "off"), default="natural",
+        help="V18 C5: keep natural arrivals or use only scripted events.",
+    )
     v26r.add_argument("--training_scenario_manifest", type=str, default="",
                       help="Predeclared dynamic-stage episode curriculum. Scripted cases rotate "
                            "only after each case is paired with every training opponent.")
@@ -20479,6 +21288,30 @@ def main():
             "V17 supply-v3 elasticity of online drivers to expected "
             "earnings per online hour."
         ),
+    )
+    v26r.add_argument(
+        "--v3_daily_stock",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="V18 C1: carry a slow daily driver stock on supply v3.",
+    )
+    v26r.add_argument(
+        "--supply_eta_within", type=float, default=None,
+        help="V18 C1 within-day V3 elasticity; None preserves eta_v3.",
+    )
+    v26r.add_argument(
+        "--active_driver_feature_reference",
+        choices=("fixed", "run_capacity"),
+        default="fixed",
+        help="V18 C4 live-count feature denominator.",
+    )
+    v26r.add_argument(
+        "--driver_pay_rule", choices=("share", "linear"), default="share",
+        help="V18 C2 driver compensation rule.",
+    )
+    v26r.add_argument(
+        "--pay_rule_json", default="",
+        help="V18 C2 fitted linear driver-pay artifact.",
     )
     v26r.add_argument(
         "--memory_rival_hold_mean_days",
@@ -21542,6 +22375,21 @@ def main():
         v17_temperature_mode=args.v17_temperature_mode,
         v17_tau_rel_start=args.v17_tau_rel_start,
         v17_tau_rel_end=args.v17_tau_rel_end,
+        v17_credit_source=args.v17_credit_source,
+        v17_branch_noise=args.v17_branch_noise,
+        v17_eval_credit_probe=args.v17_eval_credit_probe,
+        v17_eval_credit_horizons=tuple(
+            int(value)
+            for value in str(args.v17_eval_credit_horizons).split(",")
+            if value.strip()
+        ),
+        v17_eval_credit_rival_planner=(
+            args.v17_eval_credit_rival_planner
+        ),
+        v17_eval_credit_probe_out=args.v17_eval_credit_probe_out,
+        policy_snapshot_every_days=args.policy_snapshot_every_days,
+        policy_snapshot_dir=args.policy_snapshot_dir,
+        policy_sweep_request_log=args.policy_sweep_request_log,
         v16_action_credit_scale=args.v16_action_credit_scale,
         v16_reward=args.v16_reward,
         current_active_driver_observation=(
@@ -21566,6 +22414,7 @@ def main():
         osmnx_place=args.osmnx_place or None,
         driver_base_active=args.driver_base_active,
         driver_reservation_wage=args.driver_reservation_wage,
+        base_pickup_minutes=args.base_pickup_minutes,
         driver_acceptance_mode=args.driver_acceptance_mode,
         driver_expected_acceptance_cutoff=args.driver_expected_acceptance_cutoff,
         driver_state_smoothing=args.driver_state_smoothing,
@@ -21863,9 +22712,16 @@ def main():
                 supply_eta_day=float(args.supply_eta_day),
                 supply_eta_hour=float(args.supply_eta_hour),
                 supply_eta_v3=float(args.supply_eta_v3),
+                v3_daily_stock=bool(args.v3_daily_stock),
+                supply_eta_within=args.supply_eta_within,
                 supply_reference_earnings=float(args.supply_reference_earnings),
                 shortage_willingness_share=float(args.shortage_willingness_share),
                 acceptance_shock_wage=str(args.acceptance_shock_wage),
+                active_driver_feature_reference=str(
+                    args.active_driver_feature_reference
+                ),
+                driver_pay_rule=str(args.driver_pay_rule),
+                pay_rule_json=str(args.pay_rule_json),
                 supply_calibration_customers=int(args.eval_customers if args.eval_only else args.train_customers),
                 explicit_supply_settings={key: getattr(args, flag) for flag, key in {
                     'supply_model': 'supply_model', 'supply_eta_day': 'eta_day', 'supply_eta_hour': 'eta_hour',

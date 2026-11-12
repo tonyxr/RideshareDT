@@ -34,6 +34,30 @@ class DriverPayPolicy:
     fare_share: float = 0.72
     minimum_pay: float = 3.50
     incentive_multiplier: float = 1.0
+    # V18 C2. ``share`` is the exact V17 path; ``linear`` uses the fitted
+    # trip-record pay equation while retaining the common minimum/incentive
+    # contract below.
+    rule: str = "share"
+    intercept: float = 0.0
+    per_mile: float = 0.0
+    per_minute: float = 0.0
+    fare_coef: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.rule = str(self.rule).strip().lower()
+        if self.rule not in {"share", "linear"}:
+            raise ValueError("driver pay rule must be share or linear")
+        numeric = (
+            self.fare_share,
+            self.minimum_pay,
+            self.incentive_multiplier,
+            self.intercept,
+            self.per_mile,
+            self.per_minute,
+            self.fare_coef,
+        )
+        if not all(np.isfinite(float(value)) for value in numeric):
+            raise ValueError("driver pay policy values must be finite")
 
 @dataclass
 class DriverSupplyConfig:
@@ -83,6 +107,12 @@ class DriverSupplyConfig:
     eta_day: float = 0.40                   # daily labour-supply elasticity (Chen et al. 2019: 0.3-0.6)
     eta_hour: float = 0.20                  # within-day online response to current pay
     eta_v3: float = 0.60                    # V17 response to expected earnings per online hour
+    # V18 C1. V3 keeps its V17 expected-earnings response when this is off.
+    # When on, eta_within controls the block response and eta_day controls the
+    # slow daily stock, preserving eta_within + eta_day as the long-run
+    # elasticity used by the shortage willingness decomposition.
+    v3_daily_stock: bool = False
+    eta_within: Optional[float] = None
     shortage_willingness_share: float = 0.0 # V17 M2 omega; default off
     acceptance_shock_wage: str = "legacy"  # scenario shock used by dispatch acceptance
     reference_earnings_per_hour: float = 0.0  # 0 selects the fixed opportunity wage, never policy earnings
@@ -91,6 +121,9 @@ class DriverSupplyConfig:
     initial_online_stock: Optional[Dict[str, float]] = None
     hour_profile: Optional[Dict[int, float]] = None  # phi(h); None = DEFAULT_HOUR_PROFILE
     stock_ceiling: float = 2.0
+    # V18 C4. ``fixed`` is the exact V17 live-count encoding. Production uses
+    # the run-capacity reference installed by begin_batch.
+    count_feature_reference: str = "fixed"
 
     def __post_init__(self) -> None:
         self.supply_model = str(self.supply_model).lower().strip()
@@ -98,6 +131,11 @@ class DriverSupplyConfig:
             raise ValueError("supply_model must be v1, v2, or v3")
         if not np.isfinite(self.eta_v3) or self.eta_v3 < 0:
             raise ValueError("eta_v3 must be finite and nonnegative")
+        if self.eta_within is not None and (
+            not np.isfinite(float(self.eta_within))
+            or float(self.eta_within) < 0.0
+        ):
+            raise ValueError("eta_within must be finite and nonnegative")
         if (not np.isfinite(self.shortage_willingness_share)
                 or not 0.0 <= self.shortage_willingness_share <= 1.0):
             raise ValueError("shortage_willingness_share must lie in [0, 1]")
@@ -109,6 +147,13 @@ class DriverSupplyConfig:
             raise ValueError("acceptance_mode must be 'expected' or 'stochastic'")
         if not 0 <= self.expected_acceptance_cutoff <= 1:
             raise ValueError("expected_acceptance_cutoff must lie in [0, 1]")
+        self.count_feature_reference = str(
+            self.count_feature_reference
+        ).strip().lower()
+        if self.count_feature_reference not in {"fixed", "run_capacity"}:
+            raise ValueError(
+                "count_feature_reference must be fixed or run_capacity"
+            )
 
 
 # Stylised active-vehicle profile by hour (mean 1), shaped on the NYC TLC
@@ -407,6 +452,19 @@ class DriverSupplyLayer:
         expected = pay_per_trip * trips_per_hour
         return float(pay_per_trip), float(trips_per_hour), float(expected)
 
+    def _v3_eta_within(self) -> float:
+        """V18 C1 within-day elasticity, with the V17 value as its default."""
+        config = self.config
+        if not config.v3_daily_stock or config.eta_within is None:
+            return float(config.eta_v3)
+        return float(config.eta_within)
+
+    def _v3_eta_total(self) -> float:
+        """Long-run V3 elasticity used by shortage willingness."""
+        if not self.config.v3_daily_stock:
+            return float(self.config.eta_v3)
+        return float(self._v3_eta_within() + self.config.eta_day)
+
     def supply_v3_online_response(self, firm: str) -> float:
         """Continuous V17 online-driver response before fleet realization."""
         _, _, expected = self.supply_v3_expected_earnings(firm)
@@ -415,7 +473,7 @@ class DriverSupplyLayer:
         )
         if not np.isfinite(expected) or not np.isfinite(wage_reference) or wage_reference <= 0:
             raise ValueError("supply v3 requires finite earnings and a positive reference")
-        return float(max(0.0, expected / wage_reference) ** float(self.config.eta_v3))
+        return float(max(0.0, expected / wage_reference) ** self._v3_eta_within())
 
     def apply_shock(self, *, fleet_multiplier: float = 1.0, wage_multiplier: float = 1.0,
                     firm_capacity: Optional[Dict[str, float]] = None) -> None:
@@ -431,17 +489,18 @@ class DriverSupplyLayer:
             if self.supply_v3 and 0.0 < fleet_multiplier < 1.0:
                 omega = float(self.config.shortage_willingness_share)
                 if omega > 0.0:
-                    if self.config.eta_v3 <= 0.0:
-                        raise ValueError("positive shortage willingness requires eta_v3 > 0")
+                    eta_total = self._v3_eta_total()
+                    if eta_total <= 0.0:
+                        raise ValueError(
+                            "positive shortage willingness requires total V3 elasticity > 0"
+                        )
                     # Split an original shortage m into a hard capacity part
                     # m^(1-omega) and a reservation-wage part.  Because v3
                     # participation is proportional to wage^(-eta), choosing
                     # the latter as m^(-omega/eta) keeps total card-price
                     # severity exactly m while making omega recoverable by pay.
                     hard_fleet = float(fleet_multiplier) ** (1.0 - omega)
-                    willingness = float(fleet_multiplier) ** (
-                        -omega / float(self.config.eta_v3)
-                    )
+                    willingness = float(fleet_multiplier) ** (-omega / eta_total)
             self.shock_fleet_multiplier = hard_fleet
             self.shortage_willingness_multiplier = willingness
             self.shock_wage_multiplier = float(wage_multiplier) * willingness
@@ -474,6 +533,8 @@ class DriverSupplyLayer:
         regime fleet multiplier enters the target (a shortage lowers it) so a
         lost stock recovers only over the following days.
         """
+        if self.supply_v3 and self.config.v3_daily_stock:
+            return self._advance_v3_stock()
         if not self.config.persistent_stock:
             return dict(self.online_stock)
         if self.supply_v2 and self._observed_blocks == 0 and not any(self._daily_online.values()):
@@ -504,6 +565,36 @@ class DriverSupplyLayer:
             if not self.supply_v2:
                 self.pay_index_smoothed[firm] = float(
                     (1.0 - kappa) * self.pay_index_smoothed.get(firm, 1.0) + kappa * self.pay_index.get(firm, 1.0))
+        self._observed_blocks = 0
+        return dict(self.online_stock)
+
+    def _advance_v3_stock(self) -> Dict[str, float]:
+        """Advance the V18 C1 slow stock from realized online-hour earnings."""
+        config = self.config
+        kappa = float(sclip(config.stock_adjustment_rate, 0.0, 1.0))
+        floor = float(max(0.0, config.stock_floor))
+        ceiling = float(max(floor, config.stock_ceiling))
+        for firm in ("Firm1", "Firm2"):
+            if self._daily_online[firm] > 0.0:
+                earned = 60.0 * self._daily_pay[firm] / self._daily_online[firm]
+            else:
+                earned = self.supply_v3_expected_earnings(firm)[2]
+            wage = self._earnings_reference(firm) * float(
+                self.shock_wage_multiplier
+            )
+            if not np.isfinite(earned) or not np.isfinite(wage) or wage <= 0.0:
+                raise ValueError("V18 V3 stock requires finite positive earnings units")
+            target = float(sclip(
+                max(0.0, earned / wage) ** float(config.eta_day),
+                floor,
+                ceiling,
+            ))
+            self.online_stock[firm] = float(
+                (1.0 - kappa) * float(self.online_stock[firm])
+                + kappa * target
+            )
+            self._daily_pay[firm] = 0.0
+            self._daily_online[firm] = 0.0
         self._observed_blocks = 0
         return dict(self.online_stock)
 
@@ -551,7 +642,12 @@ class DriverSupplyLayer:
             elif self.supply_v3:
                 # V17 M1: participation responds to expected earnings, written
                 # explicitly as pay per trip times trips per online hour.
-                online_response = self.supply_v3_online_response(firm) * float(
+                stock = (
+                    float(self.online_stock.get(firm, 1.0))
+                    if self.config.v3_daily_stock
+                    else 1.0
+                )
+                online_response = self.supply_v3_online_response(firm) * stock * float(
                     self.shock_fleet_multiplier
                 ) * float(self.shock_firm_capacity.get(firm, 1.0))
                 peak = 1.0
@@ -630,10 +726,25 @@ class DriverSupplyLayer:
         pickup_minutes: float,
         airport: bool,
     ) -> float:
-        del distance_miles, duration_minutes, pickup_minutes, airport
+        del pickup_minutes, airport
         policy = self.pay_policies[firm]
-        base_pay = max(policy.minimum_pay, policy.fare_share * max(0.0, float(rider_fare)))
-        return float(max(policy.minimum_pay, base_pay * float(sclip(policy.incentive_multiplier, 0.85, 1.25))))
+        if policy.rule == "linear":
+            raw = (
+                float(policy.intercept)
+                + float(policy.per_mile) * float(distance_miles)
+                + float(policy.per_minute) * float(duration_minutes)
+                + float(policy.fare_coef) * max(0.0, float(rider_fare))
+            )
+            base_pay = max(float(policy.minimum_pay), raw)
+        else:
+            base_pay = max(
+                float(policy.minimum_pay),
+                float(policy.fare_share) * max(0.0, float(rider_fare)),
+            )
+        return float(max(
+            float(policy.minimum_pay),
+            base_pay * float(sclip(policy.incentive_multiplier, 0.85, 1.25)),
+        ))
 
     def driver_acceptance_ratio(
         self,
@@ -818,10 +929,18 @@ class DriverSupplyLayer:
     def current_active_driver_feature(self, active_drivers: float) -> float:
         """Invertibly encode the live own-platform count for V17 actors."""
         active = float(active_drivers)
-        # Use the fixed, artifact-saved fleet reference. A demand-varying
-        # denominator would turn this into a supply ratio instead of an exact
-        # count channel.
-        reference = float(self.config.base_active_drivers)
+        # V18 can normalize against the run's fixed capacity so the same
+        # market state has the same feature at N=50 and N=500. The reference
+        # remains constant *within* a run and therefore does not leak demand.
+        reference = (
+            float(getattr(
+                self,
+                "_feature_capacity_reference",
+                self.config.base_active_drivers,
+            ))
+            if self.config.count_feature_reference == "run_capacity"
+            else float(self.config.base_active_drivers)
+        )
         if not np.isfinite(active) or active < 0.0:
             raise ValueError(
                 f"active-driver count must be finite and non-negative: {active}"

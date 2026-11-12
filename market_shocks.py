@@ -165,6 +165,9 @@ class ShockConfig:
     # v28: resample the empirical trip/profile caches conditionally on the
     # active regime.  With shocks disabled the legacy v27 path is untouched.
     conditional_sampling: bool = True
+    # V18 C5. ``natural`` preserves the existing hazard/calendar process;
+    # ``off`` makes a scripted scenario contain exactly its declared events.
+    scenario_hazards: str = "natural"
     # This label is intentionally explicit in artifacts.  Defaults below are
     # documented priors, not empirical calibration.
     calibration_source: str = "documented_prior"
@@ -232,6 +235,9 @@ class ShockConfig:
     training_shortage_fleet: Tuple[float, float] = (0.40, 0.60)
 
     def __post_init__(self) -> None:
+        self.scenario_hazards = str(self.scenario_hazards).strip().lower()
+        if self.scenario_hazards not in {"natural", "off"}:
+            raise ValueError("scenario_hazards must be natural or off")
         if self.mode not in {"calibrated", "stress"}:
             raise ValueError("shock mode must be 'calibrated' or 'stress'")
         unknown = set(self.types) - set(SHOCK_TYPES)
@@ -564,6 +570,9 @@ class ShockProcess:
         day = self.day_index
         c = self.config
         types = set(c.types)
+        random_ok = (
+            self.scenario is None or c.scenario_hazards == "natural"
+        )
         date = self.date_for(day)
         # Demand drift
         if "demand_drift" in types:
@@ -572,7 +581,7 @@ class ShockProcess:
                 + float(self.rng.normal(0.0, c.drift_sd)) * c.intensity_scale
             )
         # Holidays (deterministic calendar), scheduled once per year in view
-        if "holiday_wave" in types:
+        if "holiday_wave" in types and random_ok:
             for name, _, pre, post in HOLIDAY_RULES:
                 for year in (date.year - 1, date.year, date.year + 1):
                     anchor = holiday_dates(year)[name]
@@ -588,7 +597,7 @@ class ShockProcess:
                                     "pre": pre, "post": post},
                         ))
         # Storms: drawn one day ahead so a (noisy) forecast exists
-        if "winter_storm" in types:
+        if "winter_storm" in types and random_ok:
             target = day + int(c.storm_forecast_lead_days)
             if target not in self.storm_forecast:
                 tdate = self.date_for(target)
@@ -609,7 +618,7 @@ class ShockProcess:
                 self.storm_forecast[target] = bool(forecast)
         blocks = self.steps_per_day
         # Large events (single day, 1-3 blocks, mostly evenings)
-        if "large_event" in types and self.rng.random() < c.event_rate_per_day:
+        if random_ok and "large_event" in types and self.rng.random() < c.event_rate_per_day:
             length = int(self.rng.integers(1, 4))
             start_block = int(self.rng.integers(max(0, blocks // 2), blocks))
             self.events.append(_Event(
@@ -618,7 +627,8 @@ class ShockProcess:
                 announced=bool(self.rng.random() < c.event_announce_prob),
             ))
         if (
-            "driver_shortage" in types
+            random_ok
+            and "driver_shortage" in types
             and not (self.training_episode and c.training_shortage_curriculum)
             and self.rng.random() < c.shortage_rate_per_day
         ):
@@ -627,7 +637,7 @@ class ShockProcess:
                 "driver_shortage", day, day + length - 1,
                 intensity=float(self.rng.uniform(*c.shortage_fleet)), announced=False,
             ))
-        if "platform_outage" in types and self.rng.random() < c.outage_rate_per_day:
+        if random_ok and "platform_outage" in types and self.rng.random() < c.outage_rate_per_day:
             start_block = int(self.rng.integers(0, blocks))
             length = int(self.rng.integers(c.outage_blocks[0], c.outage_blocks[1] + 1))
             self.events.append(_Event(
@@ -635,10 +645,10 @@ class ShockProcess:
                 start_block=start_block, end_block=min(blocks - 1, start_block + length - 1),
                 announced=False, firm=str(self.rng.choice(["Firm1", "Firm2"])),
             ))
-        if "transit_disruption" in types and self.rng.random() < c.transit_disruption_rate_per_day:
+        if random_ok and "transit_disruption" in types and self.rng.random() < c.transit_disruption_rate_per_day:
             length = int(self.rng.integers(c.transit_disruption_days[0], c.transit_disruption_days[1] + 1))
             self.events.append(_Event("transit_disruption", day, day + length - 1))
-        if "rival_promotion" in types and self.rng.random() < c.rival_promotion_rate_per_day:
+        if random_ok and "rival_promotion" in types and self.rng.random() < c.rival_promotion_rate_per_day:
             length = int(self.rng.integers(c.rival_promotion_days[0], c.rival_promotion_days[1] + 1))
             self.events.append(_Event("rival_promotion", day, day + length - 1, announced=False))
         # Keep physical recovery tails (especially driver supply) instead of
@@ -809,15 +819,28 @@ class ShockProcess:
                     continue
                 active.append("rival_promotion")
                 effect.firm2_price_multiplier *= s(c.rival_promotion_multiplier)
-        if "holiday_wave" in c.types:
+        scripted_holidays = [
+            event for event in self.events if event.kind == "holiday_wave"
+        ]
+        if "holiday_wave" in c.types and (
+            self.scenario is None
+            or c.scenario_hazards == "natural"
+            or bool(scripted_holidays)
+        ):
             # Public calendar knowledge: closeness to the nearest holiday anchor
             # (1 on the day, 0 at a week or more away), known well in advance.
             date = self.date_for(day)
-            nearest = min(
-                abs((anchor - date).days)
-                for year in (date.year - 1, date.year, date.year + 1)
-                for anchor in holiday_dates(year).values()
-            )
+            if self.scenario is not None and c.scenario_hazards == "off":
+                nearest = min(
+                    abs(int(event.detail.get("anchor_day", event.start_day)) - day)
+                    for event in scripted_holidays
+                )
+            else:
+                nearest = min(
+                    abs((anchor - date).days)
+                    for year in (date.year - 1, date.year, date.year + 1)
+                    for anchor in holiday_dates(year).values()
+                )
             public["holiday_proximity"] = float(np.clip(1.0 - nearest / 7.0, 0.0, 1.0))
         warning = 1.0 if self.storm_forecast.get(day + int(c.storm_forecast_lead_days), False) else 0.0
         public["storm_warning"] = max(warning, public["storm_active"])

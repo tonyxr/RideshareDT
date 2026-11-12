@@ -1,0 +1,114 @@
+schema_version: v18-production-v1
+status: preflight
+tree: rideshare_v26r_v17
+branch: v18-threats
+output_root: runs/v18
+execution_order: [P1_P7, freeze, wave_A, wave_B, E1_E10, V1_V7, results]
+
+market:
+  supply_model: v3
+  eta_total: 0.6
+  eta_within: 0.2
+  eta_day: 0.4
+  v3_daily_stock: true
+  persistent_driver_stock: false
+  stock_adjustment_rate: 0.05
+  stock_floor: 0.4
+  stock_ceiling: 2.0
+  shortage_willingness_share: 0.5
+  acceptance_shock_wage: declared
+  rate_upper_multiple: 2.5
+  price_sensitivity_units: relative
+  fare_model: realistic
+  driver_pay_basis: fare
+  driver_pay_rule: linear
+  active_driver_feature_reference: run_capacity
+
+population:
+  pool: 20000
+  customers: null
+  confirmation_customers: 500
+  loyalty_ratio: 3.6
+  training_fraction: 0.8
+
+credit:
+  source: branches
+  branch_noise: crn
+  horizon_days: null
+  horizon_candidates: [5, 7, 10]
+  branch_design: stencil11
+  audit_every_decisions: 10
+  branch_profit_planner_sample_cap: null
+  branch_profit_planner_horizon_days: null
+  branch_profit_planner_candidate_radius: 1
+
+learner:
+  value_head: null
+  policy_mode: q
+  move_radius: 1
+  temperature_mode: relative
+  tau_relative: [0.5, 0.15]
+  store_rows: 20000
+  fit_steps_per_day: 50
+  batch_size: 64
+  policy_snapshot_every_days: 200
+
+training:
+  days: 1200
+  seeds_by_city:
+    nyc: [101, 202, 303, 404, 505]
+    boston: [101, 202, 303]
+    chicago: [101, 202, 303]
+  ppo_clock_days: null
+  mc_clock_days: null
+
+evaluation:
+  seeds: [77311, 88411]
+  days: 40
+  steps_per_day: 6
+  scripted_scenario_hazards: off
+  natural_scenario_hazards: natural
+  rivals:
+    - adaptive_best_response_memory
+    - profit_best_response_myopic
+    - profit_best_response_forward
+    - profit_best_response_anticipating
+    - profit_opt_mpc_grid
+    - pi_price_gap
+    - region_supply_demand
+    - queue_service_threshold
+    - pi_price_gap@perturbed0
+    - queue_service_threshold@perturbed0
+
+decisions:
+  N_star: null
+  H_star: null
+  threshold_outcome: null
+  branch_planner: null
+  ppo_clock_days: null
+  mc_clock_days: null
+  value_head: null
+  fitted_supply: null
+
+city_inputs:
+  nyc:
+    market_name: New York City
+    calibration_json: calibration_artifacts/v17/nyc/calibration.json
+    threshold_cache: ../artifacts/v26_confirmatory/thresholds/nyc/llm_numeric_primary.jsonl
+    demand_calibration: artifacts/v17_relative_demand_post_fare_20261028/nyc/demand_1.15.json
+    pay_rule_json: calibration_artifacts/v18/nyc/pay_rule.json
+    supply_json: calibration_artifacts/v18/nyc/supply.json
+  boston:
+    market_name: Boston
+    calibration_json: calibration_artifacts/v17/boston/calibration.json
+    threshold_cache: ../artifacts/v26_confirmatory/thresholds/boston/llm_numeric_primary.jsonl
+    demand_calibration: artifacts/v17_relative_demand_post_fare_20261028/boston/demand_1.15.json
+    pay_rule_json: calibration_artifacts/v18/boston/pay_rule.json
+    supply_json: calibration_artifacts/v18/boston/supply.json
+  chicago:
+    market_name: Chicago
+    calibration_json: calibration_artifacts/v17/chicago/calibration.json
+    threshold_cache: ../artifacts/v26_confirmatory/thresholds/chicago/llm_numeric_primary.jsonl
+    demand_calibration: artifacts/v17_relative_demand_post_fare_20261028/chicago/demand_1.15.json
+    pay_rule_json: calibration_artifacts/v18/chicago/pay_rule.json
+    supply_json: calibration_artifacts/v18/chicago/supply.json
