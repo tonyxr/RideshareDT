@@ -7,7 +7,9 @@ Status: code-preparation only. No V18 simulation, download, calibration, trainin
 1. **Code gate**
    - Run `python -m pytest -q tests/test_v18.py` and the existing V17 suites.
    - Run `python scripts/v18_preflight.py --step P1 --run-unit-tests`.
-   - Complete the two 40-day V17/V18-default identity comparisons for NYC C0 and A1.
+   - Run `python scripts/v18_identity.py --workers 4` for the four registered
+     40-day V17/V18-default identity cells: published and `nyc_s101` in NYC
+     C0 and A1, one rival by one opening.
    - Stop on the first test or exact-identity failure.
 
 2. **Preflight P2-P7**
