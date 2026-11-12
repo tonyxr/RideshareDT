@@ -64,6 +64,9 @@ def check_overrides(
     }
     for raw_key, expected in overrides.items():
         key = str(raw_key).lstrip("-").replace("-", "_")
+        if key == "disable_spillover":
+            key = "unfulfilled_spillover"
+            expected = not bool(expected)
         if key not in locations:
             raise ValueError(f"unknown robustness override {raw_key!r}")
         container, field = locations[key]

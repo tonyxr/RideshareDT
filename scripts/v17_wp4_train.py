@@ -35,6 +35,8 @@ from scripts.v17_robust_common import set_option  # noqa: E402
 RUNS = {
     "nyc_s101_ppo_tuned": RunSpec("nyc_s101_ppo_tuned", "nyc", 101, "plain_ppo"),
     "nyc_s101_ppo_matched": RunSpec("nyc_s101_ppo_matched", "nyc", 101, "plain_ppo"),
+    "nyc_s202_no_driver_obs": RunSpec("nyc_s202_no_driver_obs", "nyc", 202, "no_driver_observation"),
+    "nyc_s202_own_profit": RunSpec("nyc_s202_own_profit", "nyc", 202, "own_profit"),
 }
 
 
@@ -120,6 +122,8 @@ def _tuned_command(
         spec, days=days, output_root=output, config=config,
         diagnostic_prefix=diagnostic_prefix,
     )
+    if spec.kind != "plain_ppo":
+        return command
     command = set_option(command, "--ppo_rollout_episodes", 1)
     command = set_option(command, "--ppo_min_rollout_transitions", 30)
     command = set_option(command, "--ppo_batch_size", 32)

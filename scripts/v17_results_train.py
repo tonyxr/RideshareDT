@@ -188,6 +188,26 @@ def _reserve_attempt_prefix(run_dir: Path, city: str) -> tuple[str, Path]:
     raise RuntimeError(f"attempt namespace exhausted for {run_dir}")
 
 
+def _attempt_prefix(run_dir: Path, city: str) -> tuple[str, Path]:
+    """Reuse the original diagnostic prefix when resuming a durable checkpoint.
+
+    The checkpoint contract includes ``--report_prefix``. Allocating a new
+    attempt directory on controller restart therefore makes an otherwise exact
+    resume fail before the next training day. A fresh run still reserves a new
+    immutable attempt namespace.
+    """
+    resume_state = run_dir / "resume/training_state.pt"
+    attempts_dir = run_dir / "attempts"
+    if resume_state.is_file() and attempts_dir.is_dir():
+        existing = sorted(
+            path for path in attempts_dir.glob("attempt-*") if path.is_dir()
+        )
+        if existing:
+            attempt_dir = existing[0]
+            return attempt_dir.name, attempt_dir / city
+    return _reserve_attempt_prefix(run_dir, city)
+
+
 def _selected_specs(raw: str) -> tuple[RunSpec, ...]:
     if not str(raw).strip():
         return RUN_SPECS
@@ -272,7 +292,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"[already running pid={prior_pid}] {spec.name}", flush=True)
             continue
         run_dir.mkdir(parents=True, exist_ok=True)
-        attempt_id, diagnostic_prefix = _reserve_attempt_prefix(
+        attempt_id, diagnostic_prefix = _attempt_prefix(
             run_dir, spec.city
         )
         attempts[spec.name] = (attempt_id, diagnostic_prefix)

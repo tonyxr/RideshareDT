@@ -30,6 +30,7 @@ from scripts.v17_config import (  # noqa: E402
 from scripts.v17_results_train import RunSpec  # noqa: E402
 from scripts.v17_results_train import RUN_SPECS  # noqa: E402
 from scripts.v17_t2_sweep import cell_spec  # noqa: E402
+from scripts.v17_robust_select import LEFTOUT_VARIANTS  # noqa: E402
 from scripts.v17_robust_common import (  # noqa: E402
     check_overrides,
     robust_sources,
@@ -45,6 +46,8 @@ COMPARATOR_ROOT = BASE / "runs/v17_results_comparators"
 RUNS_ROOT = BASE / "runs/v17_results"
 WP1_SELECTED = ROBUST_ROOT / "select/wp1"
 POINT_SELECTED = ROBUST_ROOT / "select/point"
+RULE_SELECTED = ROBUST_ROOT / "select/rule"
+LEFTOUT_SELECTED = ROBUST_ROOT / "select/leftout"
 LADDER_CASES = {
     "L080_shortage_mild": BASE / "scenarios/cases/v17_shortage_i080.json",
     "L065_shortage_moderate": BASE / "scenarios/cases/v17_shortage_i065.json",
@@ -137,6 +140,8 @@ def make_job(
         command = set_option(
             command, "--policy_sweep_rivals", ",".join(str(v) for v in rivals)
         )
+        if tuple(rivals) == ("static",):
+            command = set_option(command, "--firm2_mode", "static")
     if openings is not None:
         command = set_option(command, "--policy_sweep_openings", int(openings))
     flag_map = {
@@ -144,9 +149,16 @@ def make_job(
         "shortage_willingness_share": "--shortage_willingness_share",
         "memory_rival_hold_mean_days": "--memory_rival_hold_mean_days",
         "memory_rival_retaliation": "--memory_rival_retaliation",
+        "loyalty_model": "--loyalty_model",
+        "threshold_ablation": "--threshold_ablation",
     }
     for name, value in overrides.items():
         key = str(name).lstrip("-").replace("-", "_")
+        if key == "disable_spillover":
+            command = [item for item in command if item != "--disable_spillover"]
+            if bool(value):
+                command.append("--disable_spillover")
+            continue
         if key not in flag_map:
             raise ValueError(f"unknown evaluation override {name!r}")
         command = set_option(command, flag_map[key], value)
@@ -563,6 +575,159 @@ def _build_wp4(
     return jobs, {}, paths
 
 
+def _build_abl(
+    config: Mapping[str, Any], output: Path,
+) -> tuple[list[registered.EvalJob], dict[str, dict[str, Any]], list[Path]]:
+    """Evaluate both registered ablations on a second seed and all five cases."""
+    jobs: list[registered.EvalJob] = []
+    paths: list[Path] = []
+    runs = (
+        (
+            RunSpec("nyc_s101_no_driver_obs", "nyc", 101, "no_driver_observation"),
+            ("A3_storm_transit_late", "S1_promotion_bait", "S6_shortage_during_promotion"),
+        ),
+        (
+            RunSpec("nyc_s101_own_profit", "nyc", 101, "own_profit"),
+            ("A3_storm_transit_late", "S1_promotion_bait", "S6_shortage_during_promotion"),
+        ),
+        (
+            RunSpec("nyc_s202_no_driver_obs", "nyc", 202, "no_driver_observation"),
+            tuple(registered.CASES),
+        ),
+        (
+            RunSpec("nyc_s202_own_profit", "nyc", 202, "own_profit"),
+            tuple(registered.CASES),
+        ),
+    )
+    for run, cases in runs:
+        status_path, policy, _ = _require_run(run)
+        paths.extend((status_path, policy))
+        for case in cases:
+            jobs.append(make_job(
+                config, suite="abl", point="nominal", city="nyc", case=case,
+                scenario=registered.CASES[case], labels=(run.name,), specs=("rl_actor",),
+                output_root=output, run=run, policy=policy,
+                input_hashes={
+                    "policy.pt": _sha256_file(policy),
+                    "status.json": _sha256_file(status_path),
+                },
+            ))
+    return jobs, {}, paths
+
+
+def _build_rule(
+    config: Mapping[str, Any], output: Path,
+) -> tuple[list[registered.EvalJob], dict[str, dict[str, Any]], list[Path]]:
+    """Evaluate each city's selected live-signal rule on all registered cases."""
+    jobs: list[registered.EvalJob] = []
+    paths: list[Path] = []
+    for city in ("nyc", "boston", "chicago"):
+        selected_path = RULE_SELECTED / city / "selected_rule.json"
+        selected = _load(selected_path)
+        spec = str(selected["reactive_surge"]["spec"])
+        if not spec.startswith("reactive_surge:"):
+            raise ValueError(f"wrong reactive rule selection for {city}: {spec}")
+        paths.append(selected_path)
+        for case, scenario in registered.CASES.items():
+            jobs.append(make_job(
+                config, suite="rule", point="nominal", city=city, case=case,
+                scenario=scenario, labels=("reactive_surge",), specs=(spec,),
+                output_root=output,
+                input_hashes={"selected_rule.json": _sha256_file(selected_path)},
+            ))
+    return jobs, {}, paths
+
+
+def _leftout_selected(city: str, variant: str) -> tuple[Path, dict[str, Any]]:
+    path = LEFTOUT_SELECTED / city / variant / "selected_leftout.json"
+    return path, _load(path)
+
+
+def _build_leftout(
+    config: Mapping[str, Any], output: Path,
+    *, cities: Sequence[str] = ("nyc", "boston", "chicago"),
+) -> tuple[list[registered.EvalJob], dict[str, dict[str, Any]], list[Path]]:
+    """Evaluate partial-model selected fares back in the full market."""
+    jobs: list[registered.EvalJob] = []
+    paths: list[Path] = []
+    for city in cities:
+        full_path = LEFTOUT_SELECTED / city / "full" / "selected_leftout.json"
+        available = [
+            variant for variant in LEFTOUT_VARIANTS
+            if (LEFTOUT_SELECTED / city / variant / "selected_leftout.json").is_file()
+        ]
+        if not full_path.is_file() or not available:
+            continue
+        selections: list[tuple[str, Path, dict[str, Any]]] = [
+            ("full", full_path, _load(full_path))
+        ]
+        selections.extend(
+            (variant, *_leftout_selected(city, variant))
+            for variant in available
+        )
+        paths.extend(path for _variant, path, _selected in selections)
+        labels: list[str] = []
+        for variant, _path, _selected in selections:
+            labels.extend((f"fixed@{variant}", f"dated@{variant}"))
+        for case, scenario in registered.CASES.items():
+            specs: list[str] = []
+            for _variant, _path, selected in selections:
+                normal = selected["best_fixed_cell"]["cell"]
+                event = selected["best_shortage_cell"]["cell"]
+                specs.extend((
+                    str(selected["best_fixed_cell"]["spec"]),
+                    surge_decay_spec(
+                        normal, event, scenario_windows(_scenario(scenario)), 0, 0,
+                    ),
+                ))
+            jobs.append(make_job(
+                config,
+                suite="leftout",
+                point="nominal",
+                city=city,
+                case=case,
+                scenario=scenario,
+                labels=tuple(labels),
+                specs=tuple(specs),
+                output_root=output,
+                input_hashes={
+                    f"selected_leftout_{variant}.json": _sha256_file(path)
+                    for variant, path, _selected in selections
+                },
+            ))
+    return jobs, {}, paths
+
+
+def _build_leftout_market(
+    config: Mapping[str, Any], output: Path, *, cities: Sequence[str],
+) -> tuple[list[registered.EvalJob], dict[str, dict[str, Any]], list[Path]]:
+    """Evaluate the published card under each one-piece-omitted market."""
+    jobs: list[registered.EvalJob] = []
+    overrides_by_name: dict[str, dict[str, Any]] = {}
+    paths: list[Path] = []
+    for city in cities:
+        for variant, settings in LEFTOUT_VARIANTS.items():
+            overrides = dict(settings["overrides"])
+            rivals = tuple(settings["rivals"])
+            for case, scenario in registered.CASES.items():
+                job = make_job(
+                    config,
+                    suite="leftout_market",
+                    point=variant,
+                    city=city,
+                    case=case,
+                    scenario=scenario,
+                    labels=("published_card",),
+                    specs=(cell_spec(1.0, 1.0),),
+                    output_root=output,
+                    overrides=overrides,
+                    rivals=rivals,
+                )
+                jobs.append(job)
+                overrides_by_name[job.name] = overrides
+    return jobs, overrides_by_name, paths
+
+
 def _built_in_checks(suite: str, jobs: Sequence[registered.EvalJob], output: Path) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
     if suite == "wp1":
@@ -601,7 +766,11 @@ def _built_in_checks(suite: str, jobs: Sequence[registered.EvalJob], output: Pat
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--suite", required=True, choices=("wp1", "wp2a", "wp2b", "wp3", "wp4")
+        "--suite", required=True,
+        choices=(
+            "wp1", "wp2a", "wp2b", "wp3", "wp4", "abl", "rule",
+            "leftout", "leftout_market",
+        ),
     )
     parser.add_argument("--city", default="")
     parser.add_argument("--points", default="all")
@@ -627,6 +796,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         jobs, overrides, paths = _build_wp2b(config, output)
     elif args.suite == "wp4":
         jobs, overrides, paths = _build_wp4(config, output)
+    elif args.suite == "abl":
+        jobs, overrides, paths = _build_abl(config, output)
+    elif args.suite == "rule":
+        jobs, overrides, paths = _build_rule(config, output)
+    elif args.suite == "leftout":
+        cities = _parse_cities(args.city, ("nyc", "boston", "chicago"))
+        jobs, overrides, paths = _build_leftout(config, output, cities=cities)
+        if not jobs:
+            raise ValueError("leftout suite has no completed city selections")
+    elif args.suite == "leftout_market":
+        cities = _parse_cities(args.city, ("nyc", "chicago"))
+        jobs, overrides, paths = _build_leftout_market(
+            config, output, cities=cities,
+        )
     else:
         raise AssertionError(args.suite)
     sources = robust_sources(tuple(dict.fromkeys(path.resolve() for path in paths if path.is_file())))
