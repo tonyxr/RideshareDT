@@ -69,6 +69,8 @@ def validate_config(
     for key, wanted in expected.items():
         if market.get(key) != wanted:
             raise ValueError(f"V18 market contract drifted for {key}")
+    if market.get("demand_scale") not in {"lyft_prior", "revealed_foc"}:
+        raise ValueError("V18 demand scale must be lyft_prior or revealed_foc")
     if float(market.get("stock_adjustment_rate", -1.0)) not in (0.03, 0.05, 0.08):
         raise ValueError("V18 stock adjustment rate is outside the registered P2 candidates")
     population = dict(config["population"])
@@ -154,6 +156,22 @@ def _supply_values(config: Mapping[str, Any], city: str) -> dict[str, Any]:
             "base_pickup_minutes": 3.5}
 
 
+def demand_artifact(config: Mapping[str, Any], city: str) -> Path:
+    scale = str(config["market"].get("demand_scale", "lyft_prior"))
+    if scale not in {"lyft_prior", "revealed_foc"}:
+        raise ValueError("market.demand_scale must be lyft_prior or revealed_foc")
+    key = (
+        "demand_calibration"
+        if scale == "lyft_prior" else "revealed_demand_calibration"
+    )
+    if key not in config["city_inputs"][city]:
+        raise ValueError("revealed_foc is a registered NYC-only sensitivity")
+    path = resolve_input(config["city_inputs"][city][key])
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
 def _apply_v18_common(
     values: Sequence[str], config: Mapping[str, Any], *, city: str,
     scenario_hazards: str,
@@ -181,6 +199,7 @@ def _apply_v18_common(
         ("--fleet_scale", supply["fleet_scale"]),
         ("--base_pickup_minutes", supply["base_pickup_minutes"]),
         ("--supply_base_active_drivers", supply.get("base_active_drivers", 0)),
+        ("--demand_calibration_artifact", demand_artifact(config, city)),
     ):
         values = _set_option(values, flag, value)
     if market.get("eta_day") is None:

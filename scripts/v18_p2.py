@@ -1355,6 +1355,7 @@ def finalize(output: Path) -> dict[str, Any]:
     market = json.loads((output / "market_checks/report.json").read_text())
     effects = json.loads((output / "effects/report.json").read_text())
     kappa = json.loads((output / "kappa_test/report.json").read_text())
+    revealed = json.loads((output / "revealed_beta/report.json").read_text())
     decision = {
         "fitted_supply": {
             city: {
@@ -1379,6 +1380,7 @@ def finalize(output: Path) -> dict[str, Any]:
         "pay_rules": pay_rules,
         "supply": supplies,
         "kappa_test": kappa,
+        "revealed_beta": revealed,
         "market_checks": market,
         "effect_table": effects,
         "stop_conditions": {
@@ -1407,6 +1409,7 @@ def finalize(output: Path) -> dict[str, Any]:
     production["market"]["stock_adjustment_rate"] = float(
         kappa["selected_kappa"]
     )
+    production["market"]["demand_scale"] = "lyft_prior"
     production["calibration"].update({
         "base_active_drivers_frozen": {
             city: int(supplies[city]["base_active_drivers"])
@@ -1477,7 +1480,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--stage",
         choices=(
             "all", "pay", "wait", "supply", "reference", "kappa",
-            "market", "effects", "finalize",
+            "revealed", "market", "effects", "finalize",
         ),
         default="all",
     )
@@ -1500,6 +1503,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "capacity_anchors": len(REFERENCE_CITIES),
             "confirmation_jobs": len(REFERENCE_CITIES),
             "kappa_jobs": len(KAPPA_CANDIDATES),
+            "revealed_beta_jobs": 5,
             "market_jobs": len(T1_CITIES) * len(T1_JOBS),
             "effect_jobs": len(EFFECT_ARMS) * len(EFFECT_CASES) * len(EFFECT_RIVALS),
             "effect_rollouts": len(EFFECT_ARMS) * len(EFFECT_CASES)
@@ -1520,6 +1524,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_reference_earnings(config, output, workers=args.workers)
         if args.stage in {"all", "kappa"}:
             run_kappa_test(config, output, workers=args.workers)
+        if args.stage in {"all", "revealed"}:
+            from scripts.v18_revealed_beta import run as run_revealed_beta
+            run_revealed_beta(
+                output / "revealed_beta", workers=args.workers
+            )
         if args.stage in {"all", "market"}:
             run_market_checks(config, output, workers=args.workers)
         if args.stage in {"all", "effects"}:

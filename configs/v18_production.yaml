@@ -24,6 +24,7 @@ market:
   driver_pay_basis: fare
   driver_pay_rule: linear
   active_driver_feature_reference: run_capacity
+  demand_scale: lyft_prior
 
 calibration:
   targets:
@@ -108,6 +109,7 @@ city_inputs:
     calibration_json: calibration_artifacts/v17/nyc/calibration.json
     threshold_cache: ../artifacts/v26_confirmatory/thresholds/nyc/llm_numeric_primary.jsonl
     demand_calibration: artifacts/v17_relative_demand_post_fare_20261028/nyc/demand_1.15.json
+    revealed_demand_calibration: artifacts/v18_revealed_demand/nyc/demand_foc.json
     pay_rule_json: calibration_artifacts/v18/nyc/pay_rule.json
     supply_json: calibration_artifacts/v18/nyc/supply.json
   boston:

@@ -14,8 +14,11 @@ import torch
 from Core import Core, build_shock_config_from_args
 from driver_supply import DriverPayPolicy, DriverSupplyConfig, DriverSupplyLayer, FirmDriverBatchState
 from market_shocks import ShockConfig, ShockEvent, ShockProcess, ShockScenario
-from scripts.v18_config import HORIZON_CANDIDATES, load_config, validate_config
+from scripts.v18_config import (
+    HORIZON_CANDIDATES, demand_artifact, load_config, validate_config,
+)
 from scripts.v18_fit_pay_rule import DEFAULT_INPUT, fit, load_rows, transfer
+from scripts.v18_revealed_beta import _interpolated_factor
 from scripts.v18_p2 import (
     FLEET_GRID, PICKUP_GRID, Job, _histogram_median, _measurement,
     _run_parallel, _select_joint_calibration,
@@ -47,6 +50,8 @@ def test_v18_config_is_prefreeze_and_registered():
     validate_config(config)
     assert config["status"] == "preflight"
     assert tuple(config["credit"]["horizon_candidates"]) == HORIZON_CANDIDATES
+    assert config["market"]["demand_scale"] == "lyft_prior"
+    assert demand_artifact(config, "nyc").name == "demand_1.15.json"
     with pytest.raises(ValueError, match="freeze"):
         validate_config(config, require_frozen=True)
 
@@ -342,6 +347,15 @@ def test_joint_selection_interpolates_and_obeys_trip_ceiling():
     selected = _select_joint_calibration(rows, target_wait=4.27)
     assert selected["fleet_scale"] == pytest.approx(1.1)
     assert selected["base_pickup_minutes"] == pytest.approx(2.25)
+
+
+def test_revealed_beta_interpolates_unit_optimum():
+    rows = [
+        {"factor": 1.0, "quadratic_maximizer": 1.08},
+        {"factor": 2.0, "quadratic_maximizer": 0.96},
+        {"factor": 3.0, "quadratic_maximizer": 0.92},
+    ]
+    assert _interpolated_factor(rows) == pytest.approx(5.0 / 3.0)
 
 
 def test_wait_histogram_median_and_p2_measurement():
