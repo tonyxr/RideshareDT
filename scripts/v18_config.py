@@ -23,7 +23,7 @@ DEFAULT_CONFIG = BASE / "configs/v18_production.yaml"
 CITY_SLUGS = ("nyc", "boston", "chicago")
 HORIZON_CANDIDATES = (5, 7, 10)
 V18_MODEL_FLAGS = (
-    "v3_daily_stock", "supply_eta_within", "supply_eta_day",
+    "v3_daily_stock", "stock_rule", "supply_eta_within", "supply_eta_day",
     "stock_adjustment_rate", "stock_floor", "driver_pay_rule",
     "active_driver_feature_reference", "scenario_hazards",
     "v17_credit_source", "v17_branch_noise",
@@ -58,9 +58,9 @@ def validate_config(
         raise ValueError("V18 execution order drifted")
     market = dict(config["market"])
     expected = {
-        "supply_model": "v3", "eta_total": 0.6, "eta_within": 0.2,
-        "eta_day": 0.4, "v3_daily_stock": True,
-        "persistent_driver_stock": False, "stock_adjustment_rate": 0.05,
+        "supply_model": "v3", "eta_total": 0.6, "eta_within": 0.6,
+        "eta_day": None, "v3_daily_stock": True, "stock_rule": "integral",
+        "persistent_driver_stock": False,
         "stock_floor": 0.4, "stock_ceiling": 2.0,
         "driver_pay_rule": "linear",
         "active_driver_feature_reference": "run_capacity",
@@ -69,6 +69,8 @@ def validate_config(
     for key, wanted in expected.items():
         if market.get(key) != wanted:
             raise ValueError(f"V18 market contract drifted for {key}")
+    if float(market.get("stock_adjustment_rate", -1.0)) not in (0.03, 0.05, 0.08):
+        raise ValueError("V18 stock adjustment rate is outside the registered P2 candidates")
     population = dict(config["population"])
     if int(population.get("pool", 0)) != 20_000:
         raise ValueError("V18 must load all 20,000 riders")
@@ -165,7 +167,7 @@ def _apply_v18_common(
     for flag, value in (
         ("--supply_eta_v3", market["eta_total"]),
         ("--supply_eta_within", market["eta_within"]),
-        ("--supply_eta_day", market["eta_day"]),
+        ("--stock_rule", market["stock_rule"]),
         ("--stock_adjustment_rate", market["stock_adjustment_rate"]),
         ("--stock_floor", market["stock_floor"]),
         ("--driver_pay_rule", market["driver_pay_rule"]),
@@ -180,6 +182,10 @@ def _apply_v18_common(
         ("--base_pickup_minutes", supply["base_pickup_minutes"]),
     ):
         values = _set_option(values, flag, value)
+    if market.get("eta_day") is None:
+        values = _drop_options(values, ("--supply_eta_day",))
+    else:
+        values = _set_option(values, "--supply_eta_day", market["eta_day"])
     reference_earnings = float(supply.get("reference_earnings_per_hour") or 0.0)
     if reference_earnings > 0.0:
         values = _set_option(
@@ -274,8 +280,11 @@ def model_flags(config: Mapping[str, Any], *, city: str) -> dict[str, Any]:
     market = config["market"]
     return {
         "v3_daily_stock": True,
+        "stock_rule": str(market["stock_rule"]),
         "supply_eta_within": float(market["eta_within"]),
-        "supply_eta_day": float(market["eta_day"]),
+        "supply_eta_day": (
+            None if market.get("eta_day") is None else float(market["eta_day"])
+        ),
         "stock_adjustment_rate": float(market["stock_adjustment_rate"]),
         "stock_floor": float(market["stock_floor"]),
         "driver_pay_rule": str(market["driver_pay_rule"]),
@@ -301,6 +310,7 @@ def check_command_model(command: Sequence[str], config: Mapping[str, Any], *, ci
     if values.count("--v3_daily_stock") != 1:
         raise ValueError("V18 command must declare v3_daily_stock exactly once")
     mapping = {
+        "stock_rule": "--stock_rule",
         "supply_eta_within": "--supply_eta_within",
         "supply_eta_day": "--supply_eta_day",
         "stock_adjustment_rate": "--stock_adjustment_rate",
@@ -311,10 +321,14 @@ def check_command_model(command: Sequence[str], config: Mapping[str, Any], *, ci
         "rate_upper_multiple": "--rate_upper_multiple",
     }
     for key, flag in mapping.items():
+        wanted = model_flags(config, city=city)[key]
+        if wanted is None:
+            if flag in values:
+                raise ValueError(f"V18 command must omit unused {flag}")
+            continue
         if values.count(flag) != 1:
             raise ValueError(f"V18 command must declare {flag} exactly once")
         actual = values[values.index(flag) + 1]
-        wanted = model_flags(config, city=city)[key]
         if isinstance(wanted, float):
             if abs(float(actual) - wanted) > 1e-12:
                 raise ValueError(f"V18 command mismatch for {flag}")

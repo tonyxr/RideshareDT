@@ -8,9 +8,10 @@ execution_order: [P1_P7, freeze, wave_A, wave_B, E1_E10, V1_V7, results]
 market:
   supply_model: v3
   eta_total: 0.6
-  eta_within: 0.2
-  eta_day: 0.4
+  eta_within: 0.6
+  eta_day: null
   v3_daily_stock: true
+  stock_rule: integral
   persistent_driver_stock: false
   stock_adjustment_rate: 0.05
   stock_floor: 0.4

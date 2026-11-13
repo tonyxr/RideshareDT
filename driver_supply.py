@@ -113,6 +113,7 @@ class DriverSupplyConfig:
     # elasticity used by the shortage willingness decomposition.
     v3_daily_stock: bool = False
     eta_within: Optional[float] = None
+    stock_rule: str = "power"               # "power" (12 Nov) | V18 fix B "integral"
     shortage_willingness_share: float = 0.0 # V17 M2 omega; default off
     acceptance_shock_wage: str = "legacy"  # scenario shock used by dispatch acceptance
     reference_earnings_per_hour: float = 0.0  # 0 selects the fixed opportunity wage, never policy earnings
@@ -136,6 +137,9 @@ class DriverSupplyConfig:
             or float(self.eta_within) < 0.0
         ):
             raise ValueError("eta_within must be finite and nonnegative")
+        self.stock_rule = str(self.stock_rule).lower().strip()
+        if self.stock_rule not in {"power", "integral"}:
+            raise ValueError("stock_rule must be power or integral")
         if (not np.isfinite(self.shortage_willingness_share)
                 or not 0.0 <= self.shortage_willingness_share <= 1.0):
             raise ValueError("shortage_willingness_share must lie in [0, 1]")
@@ -463,7 +467,25 @@ class DriverSupplyLayer:
         """Long-run V3 elasticity used by shortage willingness."""
         if not self.config.v3_daily_stock:
             return float(self.config.eta_v3)
+        if self.config.stock_rule == "integral":
+            return float(self._v3_eta_within())
         return float(self._v3_eta_within() + self.config.eta_day)
+
+    @staticmethod
+    def earnings_per_online_hour(total_pay: float, online_minutes: float) -> float:
+        """Return the registered ratio-of-sums earnings statistic."""
+        pay = float(total_pay)
+        online = float(online_minutes)
+        if not np.isfinite(pay) or not np.isfinite(online) or online <= 0.0:
+            raise ValueError("earnings per online hour requires finite pay and positive online minutes")
+        return float(60.0 * pay / online)
+
+    def realized_earnings_per_online_hour(self, firm: str) -> float:
+        """Daily realized earnings, with the legacy no-exposure fallback."""
+        online = float(self._daily_online[firm])
+        if online > 0.0:
+            return self.earnings_per_online_hour(self._daily_pay[firm], online)
+        return float(self.supply_v3_expected_earnings(firm)[2])
 
     def supply_v3_online_response(self, firm: str) -> float:
         """Continuous V17 online-driver response before fleet realization."""
@@ -575,10 +597,17 @@ class DriverSupplyLayer:
         floor = float(max(0.0, config.stock_floor))
         ceiling = float(max(floor, config.stock_ceiling))
         for firm in ("Firm1", "Firm2"):
-            if self._daily_online[firm] > 0.0:
-                earned = 60.0 * self._daily_pay[firm] / self._daily_online[firm]
-            else:
-                earned = self.supply_v3_expected_earnings(firm)[2]
+            earned = self.realized_earnings_per_online_hour(firm)
+            if config.stock_rule == "integral":
+                reference = self._earnings_reference(firm)
+                if not np.isfinite(earned) or not np.isfinite(reference) or reference <= 0.0:
+                    raise ValueError("V18 integral stock requires finite positive earnings units")
+                ratio = max(float(earned), 1e-6) / float(reference)
+                log_stock = np.log(float(self.online_stock[firm])) + kappa * np.log(ratio)
+                self.online_stock[firm] = float(sclip(np.exp(log_stock), floor, ceiling))
+                self._daily_pay[firm] = 0.0
+                self._daily_online[firm] = 0.0
+                continue
             wage = self._earnings_reference(firm) * float(
                 self.shock_wage_multiplier
             )

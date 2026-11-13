@@ -67,6 +67,54 @@ def test_v3_daily_stock_uses_realized_pay_formula():
     assert value == pytest.approx(0.95 + 0.05 * target)
 
 
+def test_v18_integral_stock_is_stationary_at_reference_and_monotone():
+    layer = _v3(True)
+    layer.config.stock_rule = "integral"
+    layer.config.eta_within = 0.6
+    for _ in range(3):
+        layer._daily_pay.update({"Firm1": 1000.0, "Firm2": 1000.0})
+        layer._daily_online.update({"Firm1": 3000.0, "Firm2": 3000.0})
+        assert layer.advance_day()["Firm1"] == 1.0
+    above = []
+    for _ in range(10):
+        layer._daily_pay.update({"Firm1": 1100.0, "Firm2": 1000.0})
+        layer._daily_online.update({"Firm1": 3000.0, "Firm2": 3000.0})
+        above.append(layer.advance_day()["Firm1"])
+    assert all(right > left for left, right in zip([1.0, *above[:-1]], above))
+    below = []
+    for _ in range(10):
+        layer._daily_pay.update({"Firm1": 900.0, "Firm2": 1000.0})
+        layer._daily_online.update({"Firm1": 3000.0, "Firm2": 3000.0})
+        below.append(layer.advance_day()["Firm1"])
+    assert all(right < left for left, right in zip([above[-1], *below[:-1]], below))
+    layer.online_stock["Firm1"] = 1.99
+    layer._daily_pay["Firm1"] = 100_000.0
+    layer._daily_online["Firm1"] = 1.0
+    assert layer.advance_day()["Firm1"] == 2.0
+    layer.online_stock["Firm1"] = 0.41
+    layer._daily_pay["Firm1"] = 0.0
+    layer._daily_online["Firm1"] = 1.0
+    assert layer.advance_day()["Firm1"] == 0.4
+
+
+def test_v18_integral_stock_ignores_shock_wage_and_uses_same_day_eta():
+    layer = _v3(True)
+    layer.config.stock_rule = "integral"
+    layer.config.eta_within = 0.6
+    layer.shock_wage_multiplier = 9.0
+    layer._daily_pay.update({"Firm1": 1100.0, "Firm2": 1000.0})
+    layer._daily_online.update({"Firm1": 3000.0, "Firm2": 3000.0})
+    expected = float(np.exp(0.05 * np.log(1.1)))
+    assert layer.advance_day()["Firm1"] == pytest.approx(expected)
+    assert layer._v3_eta_total() == pytest.approx(0.6)
+
+
+def test_v18_earnings_helper_is_ratio_of_sums():
+    assert DriverSupplyLayer.earnings_per_online_hour(300.0, 900.0) == 20.0
+    with pytest.raises(ValueError, match="positive online minutes"):
+        DriverSupplyLayer.earnings_per_online_hour(1.0, 0.0)
+
+
 def test_v18_scaled_fleet_remeasures_reference_without_refitting(monkeypatch):
     core = Core.__new__(Core)
     config = DriverSupplyConfig(

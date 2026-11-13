@@ -3238,6 +3238,7 @@ class Core:
         supply_eta_v3: float = 0.60,
         v3_daily_stock: bool = False,
         supply_eta_within: Optional[float] = None,
+        stock_rule: str = "power",
         supply_reference_earnings: float = 0.0,
         shortage_willingness_share: float = 0.0,
         acceptance_shock_wage: str = "legacy",
@@ -3293,6 +3294,9 @@ class Core:
                 if supply_eta_within is None
                 else float(supply_eta_within)
             )
+            cfg.stock_rule = str(stock_rule).strip().lower()
+            if cfg.stock_rule not in {"power", "integral"}:
+                raise ValueError("stock_rule must be power or integral")
             if cfg.v3_daily_stock and model != "v3":
                 raise ValueError("v3_daily_stock requires supply_model v3")
             if cfg.v3_daily_stock and (
@@ -3516,18 +3520,27 @@ class Core:
             "regime_critic_extra_dim": int(self.regime_critic_extra_dim),
             "persistent_driver_stock": bool(self.driver_supply.config.persistent_stock),
             "supply_model": self.driver_supply.config.supply_model,
-            "supply_eta_day": float(self.driver_supply.config.eta_day),
+            "supply_eta_day": (
+                None
+                if self.driver_supply.config.stock_rule == "integral"
+                else float(self.driver_supply.config.eta_day)
+            ),
             "supply_eta_hour": float(self.driver_supply.config.eta_hour),
             "supply_eta_v3": float(self.driver_supply.config.eta_v3),
             "v3_daily_stock": bool(
                 self.driver_supply.config.v3_daily_stock
             ),
+            "stock_rule": str(self.driver_supply.config.stock_rule),
             "supply_eta_within": (
                 None
                 if self.driver_supply.config.eta_within is None
                 else float(self.driver_supply.config.eta_within)
             ),
-            "supply_eta_day": float(self.driver_supply.config.eta_day),
+            "supply_eta_day": (
+                None
+                if self.driver_supply.config.stock_rule == "integral"
+                else float(self.driver_supply.config.eta_day)
+            ),
             "stock_adjustment_rate": float(
                 self.driver_supply.config.stock_adjustment_rate
             ),
@@ -3622,12 +3635,17 @@ class Core:
             "v3_daily_stock": bool(
                 getattr(supply_config, "v3_daily_stock", False)
             ),
+            "stock_rule": str(getattr(supply_config, "stock_rule", "power")),
             "supply_eta_within": (
                 None
                 if getattr(supply_config, "eta_within", None) is None
                 else float(supply_config.eta_within)
             ),
-            "supply_eta_day": float(getattr(supply_config, "eta_day", 0.40)),
+            "supply_eta_day": (
+                None
+                if getattr(supply_config, "stock_rule", "power") == "integral"
+                else float(getattr(supply_config, "eta_day", 0.40))
+            ),
             "stock_adjustment_rate": float(
                 getattr(supply_config, "stock_adjustment_rate", 0.30)
             ),
@@ -21371,6 +21389,10 @@ def main():
         help="V18 C1 within-day V3 elasticity; None preserves eta_v3.",
     )
     v26r.add_argument(
+        "--stock_rule", choices=("power", "integral"), default="power",
+        help="V18 daily stock update; power preserves the 12 Nov implementation.",
+    )
+    v26r.add_argument(
         "--active_driver_feature_reference",
         choices=("fixed", "run_capacity"),
         default="fixed",
@@ -22785,6 +22807,7 @@ def main():
                 supply_eta_v3=float(args.supply_eta_v3),
                 v3_daily_stock=bool(args.v3_daily_stock),
                 supply_eta_within=args.supply_eta_within,
+                stock_rule=str(args.stock_rule),
                 supply_reference_earnings=float(args.supply_reference_earnings),
                 shortage_willingness_share=float(args.shortage_willingness_share),
                 acceptance_shock_wage=str(args.acceptance_shock_wage),
@@ -22797,6 +22820,7 @@ def main():
                 explicit_supply_settings={key: getattr(args, flag) for flag, key in {
                     'supply_model': 'supply_model', 'supply_eta_day': 'eta_day', 'supply_eta_hour': 'eta_hour',
                     'supply_eta_v3': 'eta_v3',
+                    'stock_rule': 'stock_rule',
                     'stock_adjustment_rate': 'stock_adjustment_rate', 'stock_floor': 'stock_floor',
                     'supply_reference_earnings': 'reference_earnings_per_hour', 'fleet_scale': 'fleet_scale',
                     'shortage_willingness_share': 'shortage_willingness_share',
