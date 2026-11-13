@@ -25,6 +25,17 @@ market:
   driver_pay_rule: linear
   active_driver_feature_reference: run_capacity
 
+calibration:
+  targets:
+    utilization: 0.58
+    utilization_band: [0.52, 0.64]
+    median_wait_min: 4.27
+    trips_per_hour_max: 1.78
+  base_active_drivers_frozen: null
+  fleet_scale: null
+  base_pickup_minutes: null
+  reference_earnings_per_hour: null
+
 population:
   pool: 20000
   customers: null

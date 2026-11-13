@@ -180,6 +180,7 @@ def _apply_v18_common(
         ("--loyalty_pool_size", round(float(population["loyalty_ratio"]) * n_star)),
         ("--fleet_scale", supply["fleet_scale"]),
         ("--base_pickup_minutes", supply["base_pickup_minutes"]),
+        ("--supply_base_active_drivers", supply.get("base_active_drivers", 0)),
     ):
         values = _set_option(values, flag, value)
     if market.get("eta_day") is None:

@@ -17,7 +17,7 @@ Driver pay is intentionally tied to each firm's current rider-facing price so
 supply responds directly to pricing policy rather than a separate rate card.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 import importlib
 import importlib.util
@@ -193,7 +193,9 @@ class FirmDriverBatchState:
     total_wait_minutes: float = 0.0
     total_online_minutes: float = 0.0
     total_engaged_minutes: float = 0.0
+    total_passenger_minutes: float = 0.0
     total_acceptance_probability: float = 0.0
+    completed_pickup_minutes: list[float] = field(default_factory=list)
 
     @property
     def acceptance_rate(self) -> float:
@@ -882,7 +884,9 @@ class DriverSupplyLayer:
         state.busy_drivers += 1
         state.total_driver_pay += driver_pay
         state.total_pickup_minutes += pickup_minutes
+        state.completed_pickup_minutes.append(float(pickup_minutes))
         state.total_pickup_miles += pickup_miles
+        state.total_passenger_minutes += max(0.0, float(duration_minutes))
         engaged = pickup_minutes + max(0.0, float(duration_minutes))
         if (self.supply_v2 or self.supply_v3) and self.config.driver_minute_capacity:
             driver = int(np.argmin(self._available_at[firm]))
@@ -928,6 +932,10 @@ class DriverSupplyLayer:
                 total_wait_minutes=(1.0 - alpha) * prev.total_wait_minutes + alpha * state.total_wait_minutes,
                 total_online_minutes=(1.0 - alpha) * prev.total_online_minutes + alpha * state.total_online_minutes,
                 total_engaged_minutes=(1.0 - alpha) * prev.total_engaged_minutes + alpha * state.total_engaged_minutes,
+                total_passenger_minutes=(
+                    (1.0 - alpha) * prev.total_passenger_minutes
+                    + alpha * state.total_passenger_minutes
+                ),
                 total_acceptance_probability=(
                     (1.0 - alpha) * prev.total_acceptance_probability
                     + alpha * state.total_acceptance_probability

@@ -16,8 +16,10 @@ from driver_supply import DriverPayPolicy, DriverSupplyConfig, DriverSupplyLayer
 from market_shocks import ShockConfig, ShockEvent, ShockProcess, ShockScenario
 from scripts.v18_config import HORIZON_CANDIDATES, load_config, validate_config
 from scripts.v18_fit_pay_rule import DEFAULT_INPUT, fit, load_rows, transfer
-from scripts.v18_fleet_refit import FLEET_GRID, select_fit
-from scripts.v18_p2 import Job, _histogram_median, _measurement, _run_parallel
+from scripts.v18_p2 import (
+    FLEET_GRID, PICKUP_GRID, Job, _histogram_median, _measurement,
+    _run_parallel, _select_joint_calibration,
+)
 from scripts.v18_select import card_grid, count_rule_candidates, reactive_candidates
 from scripts.v18_stats import holm, two_level_bootstrap
 from scripts.v18_value_of_timing import timing
@@ -115,48 +117,20 @@ def test_v18_earnings_helper_is_ratio_of_sums():
         DriverSupplyLayer.earnings_per_online_hour(1.0, 0.0)
 
 
-def test_v18_scaled_fleet_remeasures_reference_without_refitting(monkeypatch):
-    core = Core.__new__(Core)
-    config = DriverSupplyConfig(
-        supply_model="v3", v3_daily_stock=True,
-        reference_earnings_per_hour=20.0,
-    )
-    pay = DriverPayPolicy(rule="linear")
-    resets = []
-    core.driver_supply = SimpleNamespace(
-        config=config,
-        pay_policies={"Firm1": pay, "Firm2": pay},
-        reference_earnings={"Firm1": 20.0, "Firm2": 20.0},
-        reset_stock=lambda: resets.append(True),
-    )
-    core.supply_calibration_customers = 500
-    calls = []
-
-    def measure(subject, **kwargs):
-        calls.append((subject, kwargs))
-        subject.driver_supply.config = DriverSupplyConfig(
-            supply_model="v3", v3_daily_stock=True,
-            reference_earnings_per_hour=20.0,
-        )
-        return {
-            "reference_earnings": 31.5,
-            "opening_stock": {"Firm1": 0.99, "Firm2": 1.01},
-            "measurement_only": True,
-        }
-
-    monkeypatch.setattr("city_supply_calibration.calibrate_capacity", measure)
-    result = core._v18_remeasure_scaled_supply_reference({"fleet_scale": 0.6})
-    assert calls[0][1] == {
-        "sample_size": 500, "measure_reference": True, "verify_only": True,
-    }
-    assert config.reference_earnings_per_hour == 20.0
-    assert core.driver_supply.config.reference_earnings_per_hour == 31.5
-    assert core.driver_supply.config.initial_online_stock == {
-        "Firm1": 0.99, "Firm2": 1.01,
-    }
-    assert core.driver_supply.reference_earnings == {"Firm1": 31.5, "Firm2": 31.5}
-    assert result["post_scale_reference_measurement"]["measurement_only"] is True
-    assert resets == [True]
+def test_v18_batch_state_records_exact_calibration_quantities():
+    layer = DriverSupplyLayer(config=DriverSupplyConfig(
+        supply_model="v3", base_active_drivers=20,
+        hour_profile={hour: 1.0 for hour in range(24)},
+        expected_acceptance_cutoff=0.0,
+    ), seed=3)
+    layer.begin_batch(20, 12, "clear")
+    result = layer.dispatch("Firm1", 20.0, 3.0, 15.0)
+    assert result.fulfilled
+    state = layer.end_batch()["Firm1"]
+    assert state.total_passenger_minutes == pytest.approx(15.0)
+    assert state.completed_pickup_minutes == pytest.approx([
+        result.pickup_minutes
+    ])
 
 
 def test_linear_driver_pay_is_hand_computed():
@@ -201,6 +175,22 @@ def test_run_capacity_feature_is_scale_invariant():
     layer._feature_capacity_reference = 50.0
     large = layer.current_active_driver_feature(50.0)
     assert small == pytest.approx(large, abs=1e-12)
+
+
+def test_frozen_capacity_metadata_preserves_volume_identity():
+    core = Core.__new__(Core)
+    core.v26_settings = {
+        "driver_capacity_calibration": {
+            "enabled": True,
+            "method": "frozen_v26_capacity_anchor",
+            "base_active_drivers": 415,
+            "sample_size": 500,
+        }
+    }
+    core.driver_supply = SimpleNamespace(supply_v2=False, supply_v3=True)
+    core._check_supply_calibration_volume(500)
+    with pytest.raises(ValueError, match="calibrated at 500"):
+        core._check_supply_calibration_volume(499)
 
 
 def test_scripted_hazards_off_adds_no_random_events():
@@ -301,17 +291,8 @@ def test_analysis_helpers_are_deterministic():
 
 
 def test_fleet_grid_and_selection():
-    assert FLEET_GRID == tuple(round(0.6 + 0.1 * i, 1) for i in range(15))
-    rows = [
-        {"fleet_scale": 1.0, "base_pickup_minutes": 3.0,
-         "trips_per_online_driver_hour": 1.5, "median_wait_minutes": 5.0,
-         "fulfillment": 0.9},
-        {"fleet_scale": 1.1, "base_pickup_minutes": 4.0,
-         "trips_per_online_driver_hour": 1.78, "median_wait_minutes": 6.0,
-         "fulfillment": 0.92},
-    ]
-    selected = select_fit(rows, target_trips_per_hour=1.78, target_median_wait=6.0)
-    assert selected["fleet_scale"] == 1.1
+    assert FLEET_GRID == (0.8, 1.0, 1.2, 1.4, 1.6, 1.8)
+    assert PICKUP_GRID == (1.5, 2.0, 2.5, 3.0, 3.5)
 
 
 def test_p2_pickup_grid_reports_infeasible_capacity_candidate(monkeypatch, tmp_path):
@@ -347,21 +328,20 @@ def test_p2_pickup_grid_reports_infeasible_capacity_candidate(monkeypatch, tmp_p
     assert status["infeasible_jobs"][0]["reason"].startswith("capacity target unreachable")
 
 
-def test_fleet_selection_separates_fleet_and_pickup_stages():
-    rows = [
-        {"stage": "fleet", "fleet_scale": 1.0, "base_pickup_minutes": 3.5,
-         "trips_per_online_driver_hour": 1.79, "median_wait_minutes": 4.0,
-         "fulfillment": 0.9},
-        {"stage": "fleet", "fleet_scale": 1.1, "base_pickup_minutes": 3.5,
-         "trips_per_online_driver_hour": 1.6, "median_wait_minutes": 4.0,
-         "fulfillment": 0.9},
-        {"stage": "pickup", "fleet_scale": 1.0, "base_pickup_minutes": 5.0,
-         "trips_per_online_driver_hour": 1.0, "median_wait_minutes": 6.0,
-         "fulfillment": 0.88},
-    ]
-    selected = select_fit(rows, target_trips_per_hour=1.78, target_median_wait=6.0)
-    assert selected["fleet_scale"] == 1.0
-    assert selected["base_pickup_minutes"] == 5.0
+def test_joint_selection_interpolates_and_obeys_trip_ceiling():
+    rows = []
+    for fleet in (1.0, 1.2):
+        for pickup in (2.0, 2.5):
+            rows.append({
+                "fleet_scale": fleet,
+                "base_pickup_minutes": pickup,
+                "utilization": 0.58 + (1.1 - fleet) * 0.2,
+                "median_wait_minutes": 4.27 + (pickup - 2.25),
+                "trips_per_online_driver_hour": 1.7,
+            })
+    selected = _select_joint_calibration(rows, target_wait=4.27)
+    assert selected["fleet_scale"] == pytest.approx(1.1)
+    assert selected["base_pickup_minutes"] == pytest.approx(2.25)
 
 
 def test_wait_histogram_median_and_p2_measurement():
@@ -370,16 +350,37 @@ def test_wait_histogram_median_and_p2_measurement():
     assert _histogram_median(counts) == 4.0
     payload = {
         "traces": {"card": [
-            {"own_share": 0.4, "active_drivers_firm1": 25,
-             "wait": 5.0, "fulfillment": 0.9},
-            {"own_share": 0.5, "active_drivers_firm1": 25,
-             "wait": 7.0, "fulfillment": 1.0},
+            {
+                "step": 24,
+                "completed_rides_firm1": 4, "completed_rides_firm2": 5,
+                "unfulfilled_requests_firm1": 1,
+                "unfulfilled_requests_firm2": 0,
+                "online_minutes_firm1": 120, "online_minutes_firm2": 180,
+                "passenger_minutes_firm1": 60,
+                "passenger_minutes_firm2": 90,
+                "driver_pay_firm1": 40, "driver_pay_firm2": 60,
+                "pickup_minutes_firm1": [5, 5, 5, 5],
+                "pickup_minutes_firm2": [7, 7, 7, 7, 7],
+            },
+            {
+                "step": 25,
+                "completed_rides_firm1": 5, "completed_rides_firm2": 4,
+                "unfulfilled_requests_firm1": 0,
+                "unfulfilled_requests_firm2": 1,
+                "online_minutes_firm1": 180, "online_minutes_firm2": 120,
+                "passenger_minutes_firm1": 90,
+                "passenger_minutes_firm2": 60,
+                "driver_pay_firm1": 60, "driver_pay_firm2": 40,
+                "pickup_minutes_firm1": [5, 5, 5, 5, 5],
+                "pickup_minutes_firm2": [7, 7, 7, 7],
+            },
         ]},
-        "v26r": {"supply_reference_earnings": 20.0},
     }
     row = _measurement(
         payload, "card", stage="fleet", fleet_scale=1.2,
         base_pickup_minutes=3.5,
     )
-    assert row["trips_per_online_driver_hour"] == pytest.approx(2.25)
+    assert row["trips_per_online_driver_hour"] == pytest.approx(1.8)
+    assert row["utilization"] == pytest.approx(0.5)
     assert row["median_wait_minutes"] == pytest.approx(6.0)
+    assert row["reference_earnings_per_hour"] == pytest.approx(20.0)

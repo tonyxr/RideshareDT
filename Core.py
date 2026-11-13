@@ -2839,54 +2839,6 @@ class Core:
         print(f"[v26] driver capacity calibration {json.dumps(result)}")
         return result
 
-    def _v18_remeasure_scaled_supply_reference(
-        self, capacity: Mapping[str, Any],
-    ) -> Dict[str, Any]:
-        """Restore the measured-calm reference after applying V18 fleet scale.
-
-        Capacity fitting is performed at the unscaled anchor and the chosen
-        fleet scale is applied afterwards.  Under the V18 stock plus linear-pay
-        model, retaining the pre-scale earnings reference makes calm stock move
-        mechanically even when both firms post the published card.  Re-measure
-        the reference at the already-scaled fleet without refitting capacity or
-        changing the registered fulfillment target.
-        """
-        config = self.driver_supply.config
-        linear_pay = all(
-            policy.rule == "linear"
-            for policy in self.driver_supply.pay_policies.values()
-        )
-        if not (config.supply_model == "v3" and config.v3_daily_stock and linear_pay):
-            return dict(capacity)
-        from city_supply_calibration import calibrate_capacity
-        measured = calibrate_capacity(
-            self,
-            sample_size=self.supply_calibration_customers,
-            measure_reference=True,
-            verify_only=True,
-        )
-        # calibrate_capacity restores a deep snapshot before returning, which
-        # replaces DriverSupplyLayer.config.  Reacquire the live config rather
-        # than updating the pre-snapshot object captured above.
-        config = self.driver_supply.config
-        reference = float(measured["reference_earnings"])
-        opening_stock = {
-            firm: float(value)
-            for firm, value in measured["opening_stock"].items()
-        }
-        config.reference_earnings_per_hour = reference
-        config.initial_online_stock = opening_stock
-        self.driver_supply.reference_earnings = {
-            firm: reference for firm in ("Firm1", "Firm2")
-        }
-        self.driver_supply.reset_stock()
-        return {
-            **dict(capacity),
-            "reference_earnings": reference,
-            "initial_online_stock": opening_stock,
-            "post_scale_reference_measurement": measured,
-        }
-
     def _reset_rider_memory(self) -> None:
         reputation = getattr(self.choice_model, "reputation", None)
         if reputation is not None:
@@ -3240,6 +3192,7 @@ class Core:
         supply_eta_within: Optional[float] = None,
         stock_rule: str = "power",
         supply_reference_earnings: float = 0.0,
+        supply_base_active_drivers: int = 0,
         shortage_willingness_share: float = 0.0,
         acceptance_shock_wage: str = "legacy",
         active_driver_feature_reference: str = "fixed",
@@ -3411,6 +3364,18 @@ class Core:
                 self.driver_supply.pay_policies = {f: DriverPayPolicy(**p) for f, p in supply_operating_point['pay_policies'].items()}
                 self.driver_supply.reset_stock()
                 capacity = copy.deepcopy(supply_operating_point['calibration'])
+            elif int(supply_base_active_drivers) > 0:
+                frozen_base = int(supply_base_active_drivers)
+                self.driver_supply.config.base_active_drivers = frozen_base
+                capacity = {
+                    "enabled": True,
+                    "method": "frozen_v26_capacity_anchor",
+                    "base_active_drivers": frozen_base,
+                    "sample_size": int(self.supply_calibration_customers),
+                    "reference_customers": float(
+                        self.driver_supply.config.reference_customers
+                    ),
+                }
             else:
                 capacity = self._calibrate_driver_capacity()
             if supply_operating_point is None and self.market_dynamics.fleet_scale != 1.0:
@@ -3418,8 +3383,6 @@ class Core:
                     self.driver_supply.config.base_active_drivers * self.market_dynamics.fleet_scale))
                 capacity["fleet_scale"] = float(self.market_dynamics.fleet_scale)
                 capacity["scaled_base_active_drivers"] = self.driver_supply.config.base_active_drivers
-                if not getattr(self, "_supply_reference_is_explicit", False):
-                    capacity = self._v18_remeasure_scaled_supply_reference(capacity)
             self.v26_settings["driver_capacity_calibration"] = capacity
             self._rescale_all_pricers()
         self.v26r_settings = {
@@ -3578,6 +3541,7 @@ class Core:
                 self.driver_supply.config.shortage_willingness_share
             ),
             "supply_calibration_customers": self.supply_calibration_customers,
+            "supply_base_active_drivers": int(supply_base_active_drivers),
             "effective_supply_config": asdict(self.driver_supply.config),
             "supply_reference_earnings": float(self.driver_supply.config.reference_earnings_per_hour),
             "supply_reference_contract": self.v26_settings['driver_capacity_calibration'].get('reference_contract', 'explicit_reference'),
@@ -3658,6 +3622,9 @@ class Core:
             "driver_pay_policy": asdict(pay_policy) if pay_policy is not None else {},
             "base_pickup_minutes": float(
                 getattr(supply_config, "base_pickup_minutes", 3.5)
+            ),
+            "base_active_drivers": int(
+                getattr(supply_config, "base_active_drivers", 0)
             ),
             "scenario_hazards": str(
                 getattr(shock_config, "scenario_hazards", "natural")
@@ -8209,6 +8176,7 @@ class Core:
         extra_modes: Sequence[str] = (),
         critic_reward_regime: Optional[str] = None,
         evaluation_profiles: bool = True,
+        opening_tariff_randomization: float = 0.15,
     ) -> Dict[str, Any]:
         """Evaluate the actor against configured Firm 2 evaluation rollouts.
 
@@ -8374,7 +8342,7 @@ class Core:
                     for observer_index, observer in enumerate(self.platform_observers.values()):
                         observer.rng = np.random.default_rng(rollout_seed + 7 + observer_index)
                 self._reset_adaptive_episode(
-                    tariff_reset_fraction=0.15,
+                    tariff_reset_fraction=float(opening_tariff_randomization),
                     opponent_mode=mode,
                     episode_seed=rollout_seed + 3,
                     symmetric_tariffs=False,
@@ -11181,6 +11149,7 @@ class Core:
         opponent_interval_steps: int,
         policy_seed: int,
         evaluation_profiles: bool = True,
+        opening_tariff_randomization: float = 0.15,
     ) -> Dict[str, Any]:
         """Evaluate Firm 1 policy specs on identical rollout tapes (Gate 1).
 
@@ -11217,6 +11186,9 @@ class Core:
                 firm1_policy=None if str(spec) == "rl_actor" else str(spec),
                 rollouts_override=list(rollouts),
                 evaluation_profiles=evaluation_profiles,
+                opening_tariff_randomization=float(
+                    opening_tariff_randomization
+                ),
             )
             results[str(spec)] = {
                 name: {
@@ -11246,6 +11218,9 @@ class Core:
             "customers_per_step": int(customers_per_step),
             "steps_per_day": int(steps_per_day),
             "policy_seed": int(policy_seed),
+            "opening_tariff_randomization": float(
+                opening_tariff_randomization
+            ),
             "v26r": dict(self.v26r_settings),
             "model_switches": self._model_switches(),
             "results": results,
@@ -11323,7 +11298,7 @@ class Core:
                 return dict(json.load(fh))
         return dict(json.loads(text))
 
-    def _trace_row(self, *, rollout: str, step: int, hour: int, m1, m2, reward: float = float("nan")) -> Dict[str, float]:
+    def _trace_row(self, *, rollout: str, step: int, hour: int, m1, m2, reward: float = float("nan")) -> Dict[str, Any]:
         supply = self.driver_supply if self.enable_driver_supply else None
         base = self.market.curr_market
         welfare = dict(getattr(self, "last_welfare_stats", {}) or {})
@@ -11376,6 +11351,21 @@ class Core:
             "transit_availability": float(self._regime_last_effect.transit_availability),
             "rival_controller": str(getattr(self.firm2, "_ride_response_mode", type(self.firm2).__name__)),
         }
+        if supply:
+            for firm, suffix in (("Firm1", "firm1"), ("Firm2", "firm2")):
+                state = supply.last_states[firm]
+                row[f"completed_rides_{suffix}"] = int(state.completed_rides)
+                row[f"unfulfilled_requests_{suffix}"] = int(
+                    state.unfulfilled_requests
+                )
+                row[f"driver_pay_{suffix}"] = float(state.total_driver_pay)
+                row[f"online_minutes_{suffix}"] = float(state.total_online_minutes)
+                row[f"passenger_minutes_{suffix}"] = float(
+                    state.total_passenger_minutes
+                )
+                row[f"pickup_minutes_{suffix}"] = list(
+                    map(float, state.completed_pickup_minutes)
+                )
         if getattr(self.firm1, "level_step_actions", False):
             row["firm1_tariff_level"] = self.firm1.current_tariff_level()
         reference_ctx = RideContext(
@@ -21393,6 +21383,13 @@ def main():
         help="V18 daily stock update; power preserves the 12 Nov implementation.",
     )
     v26r.add_argument(
+        "--supply_base_active_drivers", type=int, default=0,
+        help=(
+            "Freeze the unscaled V26 capacity anchor at this count; zero "
+            "retains the registered capacity calibration."
+        ),
+    )
+    v26r.add_argument(
         "--active_driver_feature_reference",
         choices=("fixed", "run_capacity"),
         default="fixed",
@@ -21465,6 +21462,15 @@ def main():
     v26r.add_argument("--policy_sweep_horizon", type=int, default=0,
                       help="Steps per rollout (default: --eval_timesteps).")
     v26r.add_argument("--policy_sweep_seed", type=int, default=99173)
+    v26r.add_argument(
+        "--policy_sweep_opening_tariff_randomization",
+        type=float,
+        default=0.15,
+        help=(
+            "Opening tariff perturbation fraction for policy sweeps; zero "
+            "starts both platforms at the published card."
+        ),
+    )
     args = parser.parse_args()
     if args.demand_calibration_artifact and not (args.regime_market or args.trained_model_in):
         parser.error('--demand_calibration_artifact requires --regime_market')
@@ -22808,6 +22814,9 @@ def main():
                 v3_daily_stock=bool(args.v3_daily_stock),
                 supply_eta_within=args.supply_eta_within,
                 stock_rule=str(args.stock_rule),
+                supply_base_active_drivers=int(
+                    args.supply_base_active_drivers
+                ),
                 supply_reference_earnings=float(args.supply_reference_earnings),
                 shortage_willingness_share=float(args.shortage_willingness_share),
                 acceptance_shock_wage=str(args.acceptance_shock_wage),
@@ -22821,6 +22830,7 @@ def main():
                     'supply_model': 'supply_model', 'supply_eta_day': 'eta_day', 'supply_eta_hour': 'eta_hour',
                     'supply_eta_v3': 'eta_v3',
                     'stock_rule': 'stock_rule',
+                    'supply_base_active_drivers': 'base_active_drivers',
                     'stock_adjustment_rate': 'stock_adjustment_rate', 'stock_floor': 'stock_floor',
                     'supply_reference_earnings': 'reference_earnings_per_hour', 'fleet_scale': 'fleet_scale',
                     'shortage_willingness_share': 'shortage_willingness_share',
@@ -22904,6 +22914,9 @@ def main():
             firm1_interval_steps=int(args.firm1_action_interval_steps) if int(args.firm1_action_interval_steps) > 0 else int(args.train_steps_per_day),
             opponent_interval_steps=int(args.firm2_action_interval_days) if int(args.firm2_action_interval_days) > 0 else 1,
             policy_seed=int(args.policy_sweep_seed),
+            opening_tariff_randomization=float(
+                args.policy_sweep_opening_tariff_randomization
+            ),
         )
         out = str(args.policy_sweep_out or (str(args.report_prefix) + "_policy_sweep.json"))
         os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
