@@ -90,6 +90,9 @@ EFFECT_RIVALS = (
 PUBLISHED = t2.cell_spec(1.0, 1.0)
 EFFECT_ARMS = ("v17_model", "stock", "pay_rule", "calibrated")
 KAPPA_CANDIDATES = (0.03, 0.05, 0.08)
+P2_GATE_REPAIR_PARENT_SOURCE_SHA256 = (
+    "15c2cef005fed811df1d549a77eba559de53facf54b662a308c7c54eba3f9b30"
+)
 
 
 @dataclass(frozen=True)
@@ -1520,6 +1523,143 @@ def _effect_job(
     )
 
 
+def _calm_published_stock_job(
+    config: Mapping[str, Any], output: Path,
+) -> Job:
+    """Build the registered steady-state cell, separate from dynamic rivals.
+
+    The 12 November C1 test and the P2 fix specification define this check as
+    pure calm with both platforms on the published card.  Dynamic-rival C0
+    products remain part of the redesigned effect table, but they are not a
+    steady-state stock test because rival repricing changes focal earnings.
+    """
+    supply = json.loads((PAY_DIR / "nyc/supply.json").read_text())
+    work = output / "effects" / "calm_published_stock_gate"
+    raw = work / "raw.json"
+    command = t1.market_command(
+        config, city="nyc", job="calm_static", output=work,
+        openings=2, customers=CUSTOMERS, pool=PRODUCTION_POOL,
+        seed=20231,
+    )
+    command = set_option(command, "--policy_sweep", PUBLISHED)
+    command = set_option(
+        command, "--policy_sweep_horizon", HORIZON_DAYS * STEPS_PER_DAY
+    )
+    command = set_option(command, "--policy_sweep_seed", 20231)
+    command = set_option(
+        command, "--policy_sweep_opening_tariff_randomization", 0.0
+    )
+    command, expected = _v18_command(
+        command, city="nyc", raw=raw,
+        report_prefix=work / "diagnostics", stock=True,
+        linear_pay=True, fleet_scale=float(supply["fleet_scale"]),
+        base_pickup_minutes=float(supply["base_pickup_minutes"]),
+        production_population=True,
+        reference_earnings=float(supply["reference_earnings_per_hour"]),
+        base_active_drivers=int(supply["base_active_drivers"]),
+        stock_kappa=float(supply["stock_adjustment_rate"]),
+        hour_profile_json=PAY_DIR / "nyc/supply.json",
+    )
+    return Job(
+        name="calm_published_stock_gate", command=tuple(command), raw=raw,
+        manifest=work / "manifest.json", log=work / "job.log",
+        expected=expected,
+    )
+
+
+def _calm_published_stock_gate(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Evaluate focal stock only in the exact both-published calm cell."""
+    traces = dict(payload.get("traces") or {})
+    if set(traces) != {PUBLISHED}:
+        raise ValueError("calm stock gate must contain only the published card")
+    all_rows = list(traces[PUBLISHED])
+    if not all_rows:
+        raise ValueError("calm stock gate has no trace rows")
+    for row in all_rows:
+        if (
+            abs(float(row["firm1_level"]) - 1.0) > 1e-12
+            or abs(float(row["firm2_level"]) - 1.0) > 1e-12
+        ):
+            raise ValueError(
+                "calm stock gate requires both platforms on the exact "
+                "published card"
+            )
+    rows = [
+        row for row in all_rows
+        if 10 <= int(row["step"]) // STEPS_PER_DAY < 40
+    ]
+    if not rows:
+        raise ValueError("calm stock gate has no rows for days 10--40")
+    values = [float(row["stock_firm1"]) for row in rows]
+    rival_values = [float(row["stock_firm2"]) for row in rows]
+    result = {
+        "population": "pure_C0_both_platforms_published_exact",
+        "gated_stock": "stock_firm1",
+        "days": [10, 40],
+        "opening_tariff_randomization": 0.0,
+        "rollouts": len({str(row["rollout"]) for row in rows}),
+        "trace_rows": len(rows),
+        "minimum": min(values),
+        "maximum": max(values),
+        "maximum_absolute_drift": max(abs(value - 1.0) for value in values),
+        "rival_stock_diagnostic": {
+            "minimum": min(rival_values),
+            "maximum": max(rival_values),
+            "maximum_absolute_drift": max(
+                abs(value - 1.0) for value in rival_values
+            ),
+        },
+    }
+    result["pass"] = bool(result["maximum_absolute_drift"] <= 0.03)
+    if not _finite(result):
+        raise ValueError(f"non-finite calm stock gate: {result}")
+    return result
+
+
+def _validate_preserved_effect_job(job: Job) -> None:
+    """Reuse df39287 effect products across this aggregation-only repair.
+
+    Every command, config hash, non-runner source hash, and product hash must
+    still match.  The sole permitted identity difference is the pinned parent
+    hash of this runner, whose change only separates the stock gate from the
+    dynamic-rival effect aggregation.
+    """
+    recorded = json.loads(job.manifest.read_text(encoding="utf-8"))
+    if recorded.get("state") != "completed":
+        raise ValueError(f"preserved effect product is incomplete: {job.raw}")
+    identity = dict(recorded.get("identity") or {})
+    if identity.get("command") != list(job.command):
+        raise ValueError(f"preserved effect command changed: {job.raw}")
+    if identity.get("config_hash") != canonical_hash(load_v18()):
+        raise ValueError(f"preserved effect config changed: {job.raw}")
+    recorded_sources = dict(identity.get("sources") or {})
+    if recorded_sources.get("scripts/v18_p2.py") != (
+        P2_GATE_REPAIR_PARENT_SOURCE_SHA256
+    ):
+        raise ValueError(f"preserved effect runner is not the repair parent: {job.raw}")
+    current_sources = _source_identity()
+    for name, digest in current_sources.items():
+        if name == "scripts/v18_p2.py":
+            continue
+        if recorded_sources.get(name) != digest:
+            raise ValueError(
+                f"preserved effect source changed ({name}): {job.raw}"
+            )
+    expected_hash = recorded.get("product_sha256")
+    if not expected_hash or _sha256_file(job.raw) != expected_hash:
+        raise ValueError(f"preserved effect product hash changed: {job.raw}")
+    t2.validate_t2_product(
+        job.raw, job.command,
+        model_expected={
+            "acceptance_shock_wage": "declared",
+            "rate_upper_multiple": 2.5,
+        },
+    )
+    _validate_product(job.raw, job.expected)
+
+
 def _window_rows(
     rows: Sequence[Mapping[str, Any]], *, case: str, window: str,
 ) -> list[Mapping[str, Any]]:
@@ -1618,25 +1758,6 @@ def _effect_summary(jobs: Sequence[Job]) -> dict[str, Any]:
             raise ValueError(f"non-finite P2 effect row: {row}")
         rows.append(row)
 
-    final_calm = [
-        row
-        for rival in EFFECT_RIVALS
-        for row in payloads[("calibrated", "C0_calm", rival)]["traces"][
-            spec_map["published"]
-        ]
-        if 10 <= int(row["step"]) // STEPS_PER_DAY < 40
-    ]
-    stock_values = [float(row["stock_firm1"]) for row in final_calm]
-    stock_gate = {
-        "minimum": min(stock_values), "maximum": max(stock_values),
-        "maximum_absolute_drift": max(
-            abs(value - 1.0) for value in stock_values
-        ),
-    }
-    stock_gate["pass"] = bool(
-        stock_gate["maximum_absolute_drift"] <= 0.03
-    )
-
     g_approx = []
     for arm in EFFECT_ARMS:
         by_rule: dict[str, list[float]] = {}
@@ -1686,7 +1807,6 @@ def _effect_summary(jobs: Sequence[Job]) -> dict[str, Any]:
         "arms": list(EFFECT_ARMS), "cases": list(EFFECT_CASES),
         "rivals": list(EFFECT_RIVALS), "openings": 2,
         "customers": CUSTOMERS, "rows": rows,
-        "calm_published_stock_gate": stock_gate,
         "surge_brings_drivers_gate": driver_gate,
         "Gapprox": g_approx,
     }
@@ -1694,13 +1814,47 @@ def _effect_summary(jobs: Sequence[Job]) -> dict[str, Any]:
 
 def run_effects(
     config: Mapping[str, Any], output: Path, *, workers: int,
+    reuse_preserved_after_gate_repair: bool = False,
 ) -> dict[str, Any]:
     jobs = [
         _effect_job(config, output, arm=arm, case=case, rival=rival)
         for arm in EFFECT_ARMS for case in EFFECT_CASES for rival in EFFECT_RIVALS
     ]
-    _run_parallel(jobs, workers=workers, output=output, phase="effect_table")
+    if reuse_preserved_after_gate_repair:
+        for job in jobs:
+            _validate_preserved_effect_job(job)
+        atomic_json(output / "status.json", {
+            "step": "P2", "state": "running",
+            "phase": "effect_table_products_revalidated",
+            "completed_jobs": len(jobs),
+            "expected_jobs": len(jobs) + 1,
+            "reused_products": len(jobs),
+            "git_head": subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=BASE, text=True
+            ).strip(),
+        })
+    else:
+        _run_parallel(
+            jobs, workers=workers, output=output, phase="effect_table",
+            expected_total=len(jobs) + 1,
+        )
+    stock_job = _calm_published_stock_job(config, output)
+    _run_parallel(
+        [stock_job], workers=1, output=output,
+        phase="calm_published_stock_gate", completed_before=len(jobs),
+        expected_total=len(jobs) + 1,
+    )
     report = _effect_summary(jobs)
+    report["calm_published_stock_gate"] = _calm_published_stock_gate(
+        _validate_product(stock_job.raw, stock_job.expected)
+    )
+    report["effect_product_provenance"] = {
+        "reused_after_aggregation_only_gate_repair": bool(
+            reuse_preserved_after_gate_repair
+        ),
+        "revalidated_products": len(jobs),
+        "gate_product": str(stock_job.raw),
+    }
     atomic_json(output / "effects/report.json", report)
     if not report["calm_published_stock_gate"]["pass"]:
         raise ValueError("P2 calm published-card stock drift exceeded 3%")
@@ -1870,6 +2024,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=BASE / "runs/v18/preflight/P2_fix",
     )
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument(
+        "--reuse-preserved-effects-after-gate-repair",
+        action="store_true",
+        help=(
+            "revalidate and reuse the 24 df39287 effect products while "
+            "running only the corrected dedicated calm-stock gate cell"
+        ),
+    )
     args = parser.parse_args(argv)
     if not 1 <= int(args.workers) <= 4:
         raise ValueError("Revision 1 P2 workers must be in [1, 4]")
@@ -1888,6 +2050,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "revealed_beta_jobs": 5,
             "market_jobs": len(T1_CITIES) * len(T1_JOBS),
             "effect_jobs": len(EFFECT_ARMS) * len(EFFECT_CASES) * len(EFFECT_RIVALS),
+            "calm_published_stock_gate_jobs": 1,
             "effect_rollouts": len(EFFECT_ARMS) * len(EFFECT_CASES)
             * len(EFFECT_RIVALS) * len(_effect_specs()) * 2,
         }, indent=2, sort_keys=True))
@@ -1915,7 +2078,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.stage in {"all", "market"}:
             run_market_checks(config, output, workers=args.workers)
         if args.stage in {"all", "effects"}:
-            run_effects(config, output, workers=args.workers)
+            run_effects(
+                config, output, workers=args.workers,
+                reuse_preserved_after_gate_repair=bool(
+                    args.reuse_preserved_effects_after_gate_repair
+                ),
+            )
         result = finalize(output) if args.stage in {"all", "finalize"} else {
             "step": "P2", "state": "stage_complete", "stage": args.stage,
         }

@@ -21,12 +21,15 @@ from scripts.v18_config import (
 from scripts.v18_fit_pay_rule import DEFAULT_INPUT, fit, load_rows, transfer
 from scripts.v18_revealed_beta import _interpolated_factor
 from scripts.v18_p2 import (
-    FLEET_GRID, PICKUP_GRID, TRANSFER_FLEET_GRID, Job, _block_waits, _histogram_median,
+    FLEET_GRID, PICKUP_GRID, PUBLISHED, TRANSFER_FLEET_GRID, Job, _block_waits,
+    _histogram_median,
+    _calm_published_stock_gate, _calm_published_stock_job,
     _measurement, _profile_from_factors, _run_parallel,
     _select_joint_calibration, _select_kappa_candidate,
     _select_transfer_service_level,
     _updated_profile_factors,
 )
+from scripts.v17_config import load_config as load_v17_config
 from scripts.v18_select import card_grid, count_rule_candidates, reactive_candidates
 from scripts.v18_stats import holm, two_level_bootstrap
 from scripts.v18_value_of_timing import timing
@@ -124,6 +127,38 @@ def test_v18_earnings_helper_is_ratio_of_sums():
     assert DriverSupplyLayer.earnings_per_online_hour(300.0, 900.0) == 20.0
     with pytest.raises(ValueError, match="positive online minutes"):
         DriverSupplyLayer.earnings_per_online_hour(1.0, 0.0)
+
+
+def test_p2_calm_stock_gate_is_exact_both_published_cell(tmp_path: Path):
+    job = _calm_published_stock_job(load_v17_config(), tmp_path)
+    command = list(job.command)
+    assert command[command.index("--policy_sweep") + 1] == PUBLISHED
+    assert command[command.index("--policy_sweep_rivals") + 1] == "static"
+    assert command[
+        command.index("--policy_sweep_opening_tariff_randomization") + 1
+    ] == "0.0"
+    assert int(command[command.index("--policy_sweep_horizon") + 1]) == 240
+
+    rows = []
+    for opening in (1, 2):
+        for step in range(240):
+            rows.append({
+                "rollout": f"static__opening_{opening}",
+                "step": step,
+                "firm1_level": 1.0,
+                "firm2_level": 1.0,
+                "stock_firm1": 1.02,
+                "stock_firm2": 0.99,
+            })
+    gate = _calm_published_stock_gate({"traces": {PUBLISHED: rows}})
+    assert gate["pass"]
+    assert gate["population"] == "pure_C0_both_platforms_published_exact"
+    assert gate["rollouts"] == 2
+    assert gate["trace_rows"] == 360
+
+    rows[0]["firm2_level"] = 1.1
+    with pytest.raises(ValueError, match="both platforms"):
+        _calm_published_stock_gate({"traces": {PUBLISHED: rows}})
 
 
 def test_v18_batch_state_records_exact_calibration_quantities():

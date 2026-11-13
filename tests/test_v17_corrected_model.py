@@ -174,7 +174,10 @@ def test_flags_reported():
     fake = SimpleNamespace(
         firm1_mode="RL",
         market_name="New York City",
-        driver_supply=SimpleNamespace(config=config),
+        driver_supply=SimpleNamespace(
+            config=config,
+            hour_profile={hour: 1.0 for hour in range(24)},
+        ),
         market_dynamics=SimpleNamespace(
             rate_upper_multiple=2.5, unfulfilled_spillover=True,
         ),
