@@ -62,6 +62,8 @@ HORIZON_DAYS = 40
 CALIBRATION_DAYS = 28
 CALIBRATION_OPENINGS = 2
 CONFIRMATION_OPENINGS = 3
+REFERENCE_FIXED_POINT_RTOL = 1e-4
+REFERENCE_FIXED_POINT_MAX_ITERATIONS = 12
 FLEET_GRID = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
 TRANSFER_FLEET_GRID = (0.6, 0.8, 1.0, 1.2, 1.4, 1.6)
 PICKUP_GRID = (1.0, 1.25, 1.5, 1.75, 2.0)
@@ -1209,76 +1211,130 @@ def run_reference_earnings(
     ratio of sums); all other calibrated quantities remain frozen.  The
     installed city reference is passed explicitly so the frozen-stock cell
     and the dynamic validation cell use the same within-day supply response.
-    Omitting it makes Core fall back to the reservation wage and measures a
-    different model from the one validated by Revision 2.
+    Because that response itself depends on E_ref, the registered ratio of
+    sums is solved to a deterministic numerical fixed point.  Omitting the
+    explicit input makes Core fall back to the reservation wage; stopping
+    after one evaluation leaves the confirmation and validation cells on
+    different operating points.
     """
-    jobs = []
-    for city in REFERENCE_CITIES:
-        supply = json.loads((PAY_DIR / city / "supply.json").read_text())
-        base_job = _calibration_job(
-            config, output,
-            name=f"reference_earnings_rev2/{city}", city=city,
-            fleet_scale=float(supply["fleet_scale"]),
-            pickup=float(supply["base_pickup_minutes"]),
-            openings=CONFIRMATION_OPENINGS,
-            base_active_drivers=int(supply["base_active_drivers"]),
-            hour_profile_json=PAY_DIR / city / "supply.json",
-            reference_earnings=float(supply["reference_earnings_per_hour"]),
-        )
-        command = set_option(base_job.command, "--policy_sweep", PUBLISHED)
-        jobs.append(Job(
-            name=base_job.name, command=tuple(command), raw=base_job.raw,
-            manifest=base_job.manifest, log=base_job.log,
-            expected=base_job.expected,
-        ))
-    _run_parallel(
-        jobs, workers=workers, output=output,
-        phase="reference_earnings_rev2_exact_published",
-    )
     report: dict[str, Any] = {
-        "schema_version": "v18-reference-earnings-rev2-v1",
+        "schema_version": "v18-reference-earnings-rev2-v2",
         "contract": "ratio_of_sums_both_platforms_days_5_28",
         "opening_tariff_randomization": 0.0,
         "published_card_spec": PUBLISHED,
+        "fixed_point_relative_tolerance": REFERENCE_FIXED_POINT_RTOL,
+        "fixed_point_maximum_iterations": (
+            REFERENCE_FIXED_POINT_MAX_ITERATIONS
+        ),
         "cities": {},
     }
     backup_root = output / "reference_earnings_rev2" / "prior_supply"
     backup_root.mkdir(parents=True, exist_ok=True)
-    for city, job in zip(REFERENCE_CITIES, jobs, strict=True):
-        payload = _validate_product(job.raw, job.expected)
+    histories: dict[str, list[dict[str, Any]]] = {
+        city: [] for city in REFERENCE_CITIES
+    }
+    for city in REFERENCE_CITIES:
         supply_path = PAY_DIR / city / "supply.json"
-        supply = json.loads(supply_path.read_text())
-        measured = _measurement(
-            payload, PUBLISHED, stage="reference_earnings_rev2",
-            fleet_scale=float(supply["fleet_scale"]),
-            base_pickup_minutes=float(supply["base_pickup_minutes"]),
-        )
         backup = backup_root / f"{city}.json"
         if not backup.exists():
             shutil.copy2(supply_path, backup)
-        previous = float(supply["reference_earnings_per_hour"])
-        updated = float(measured["reference_earnings_per_hour"])
-        supply["reference_earnings_per_hour"] = updated
-        supply["reference_earnings_contract"] = (
-            "ratio_of_sums_both_platforms_days_5_28"
+
+    converged = False
+    for iteration in range(1, REFERENCE_FIXED_POINT_MAX_ITERATIONS + 1):
+        jobs = []
+        inputs: dict[str, dict[str, Any]] = {}
+        for city in REFERENCE_CITIES:
+            supply = json.loads(
+                (PAY_DIR / city / "supply.json").read_text()
+            )
+            inputs[city] = supply
+            base_job = _calibration_job(
+                config, output,
+                name=f"reference_earnings_rev2/iteration_{iteration}/{city}",
+                city=city, fleet_scale=float(supply["fleet_scale"]),
+                pickup=float(supply["base_pickup_minutes"]),
+                openings=CONFIRMATION_OPENINGS,
+                base_active_drivers=int(supply["base_active_drivers"]),
+                hour_profile_json=PAY_DIR / city / "supply.json",
+                reference_earnings=float(
+                    supply["reference_earnings_per_hour"]
+                ),
+            )
+            command = set_option(base_job.command, "--policy_sweep", PUBLISHED)
+            jobs.append(Job(
+                name=base_job.name, command=tuple(command), raw=base_job.raw,
+                manifest=base_job.manifest, log=base_job.log,
+                expected=base_job.expected,
+            ))
+        _run_parallel(
+            jobs, workers=workers, output=output,
+            phase=f"reference_earnings_rev2_fixed_point_{iteration}",
         )
-        supply["reference_earnings_revision2_validation"] = {
-            "previous_value": previous,
-            "updated_value": updated,
-            "product": str(job.raw),
-            "opening_tariff_randomization": 0.0,
-            "policy_seed": 20231,
-            "openings": CONFIRMATION_OPENINGS,
-            "stock_frozen": True,
-            "measurement": measured,
-        }
-        atomic_json(supply_path, supply)
+
+        iteration_rows: dict[str, dict[str, Any]] = {}
+        for city, job in zip(REFERENCE_CITIES, jobs, strict=True):
+            supply = inputs[city]
+            measured = _measurement(
+                _validate_product(job.raw, job.expected), PUBLISHED,
+                stage=f"reference_earnings_rev2_iteration_{iteration}",
+                fleet_scale=float(supply["fleet_scale"]),
+                base_pickup_minutes=float(supply["base_pickup_minutes"]),
+            )
+            previous = float(supply["reference_earnings_per_hour"])
+            updated = float(measured["reference_earnings_per_hour"])
+            iteration_rows[city] = {
+                "iteration": iteration,
+                "previous_value": previous,
+                "updated_value": updated,
+                "relative_change": updated / previous - 1.0,
+                "product": str(job.raw),
+                "measurement": measured,
+            }
+        if not _finite(iteration_rows):
+            raise ValueError(
+                f"non-finite Revision 2 reference iteration: {iteration_rows}"
+            )
+
+        for city in REFERENCE_CITIES:
+            supply_path = PAY_DIR / city / "supply.json"
+            supply = inputs[city]
+            row = iteration_rows[city]
+            histories[city].append(row)
+            supply["reference_earnings_per_hour"] = row["updated_value"]
+            supply["reference_earnings_contract"] = (
+                "ratio_of_sums_both_platforms_days_5_28_fixed_point"
+            )
+            supply["reference_earnings_revision2_validation"] = {
+                **row,
+                "opening_tariff_randomization": 0.0,
+                "policy_seed": 20231,
+                "openings": CONFIRMATION_OPENINGS,
+                "stock_frozen": True,
+                "fixed_point_relative_tolerance": (
+                    REFERENCE_FIXED_POINT_RTOL
+                ),
+                "history": histories[city],
+            }
+            atomic_json(supply_path, supply)
+
+        converged = all(
+            abs(float(row["relative_change"]))
+            <= REFERENCE_FIXED_POINT_RTOL
+            for row in iteration_rows.values()
+        )
+        if converged:
+            break
+
+    if not converged:
+        raise RuntimeError(
+            "Revision 2 reference-earnings fixed point did not converge "
+            f"in {REFERENCE_FIXED_POINT_MAX_ITERATIONS} iterations"
+        )
+    report["converged"] = True
+    report["iterations"] = max(len(rows) for rows in histories.values())
+    for city in REFERENCE_CITIES:
         report["cities"][city] = {
-            "previous_value": previous,
-            "updated_value": updated,
-            "relative_change": updated / previous - 1.0,
-            "product": str(job.raw),
-            "measurement": measured,
+            **histories[city][-1], "history": histories[city],
         }
     if not _finite(report):
         raise ValueError(f"non-finite Revision 2 reference earnings: {report}")

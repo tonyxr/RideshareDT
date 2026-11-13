@@ -264,10 +264,14 @@ def test_p2_revision2_reference_earnings_remeasures_only_registered_statistic(
     report = run_reference_earnings(
         load_v17_config(), tmp_path / "run", workers=3
     )
+    assert report["converged"]
+    assert report["iterations"] == 2
     assert set(report["cities"]) == {"nyc", "boston", "chicago"}
     for city in report["cities"]:
         updated = json.loads((supply_root / city / "supply.json").read_text())
         assert updated["reference_earnings_per_hour"] == pytest.approx(20.0)
+        assert updated["reference_earnings_contract"].endswith("_fixed_point")
+        assert len(updated["reference_earnings_revision2_validation"]["history"]) == 2
         assert updated["reference_earnings_revision2_validation"][
             "opening_tariff_randomization"
         ] == 0.0
