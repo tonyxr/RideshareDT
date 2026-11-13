@@ -228,6 +228,10 @@ def test_p2_revision2_reference_earnings_remeasures_only_registered_statistic(
         del kwargs
         for job in jobs:
             city = job.name.rsplit("/", 1)[-1]
+            command = list(job.command)
+            assert command[command.index("--seed") + 1] == "20231"
+            assert command[command.index("--experiment_seed") + 1] == "20231"
+            assert command[command.index("--policy_sweep_seed") + 1] == "20231"
             job.raw.parent.mkdir(parents=True, exist_ok=True)
             job.raw.write_text(json.dumps(products[city]))
         return len(jobs), []

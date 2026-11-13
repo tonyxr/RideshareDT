@@ -763,6 +763,7 @@ def _calibration_job(
     command = t1.market_command(
         config, city=city, job="calm_static", output=work,
         openings=openings, customers=CUSTOMERS, pool=PRODUCTION_POOL,
+        seed=20231,
     )
     raw = work / "raw.json"
     command = set_option(command, "--policy_sweep", t1.CARD)
