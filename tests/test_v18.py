@@ -177,6 +177,24 @@ def test_p2_calm_stock_gate_is_exact_both_published_cell(tmp_path: Path):
     assert gate["rollouts"] == 2
     assert gate["trace_rows"] == 360
 
+    # Revision 2 days are one-indexed: trace day 9 is included and trace day
+    # 39 is excluded.
+    boundary_rows = [dict(row) for row in rows]
+    for row in boundary_rows:
+        if row["step"] // 6 == 9:
+            row["stock_firm1"] = 1.031
+    assert not _calm_published_stock_gate(
+        {"traces": {PUBLISHED: boundary_rows}}, city="nyc"
+    )["platforms"]["platform1"]["pass"]
+    for row in boundary_rows:
+        if row["step"] // 6 == 9:
+            row["stock_firm1"] = 1.0
+        if row["step"] // 6 == 39:
+            row["stock_firm1"] = 1.031
+    assert _calm_published_stock_gate(
+        {"traces": {PUBLISHED: boundary_rows}}, city="nyc"
+    )["platforms"]["platform1"]["pass"]
+
     rows[0]["firm2_level"] = 1.1
     with pytest.raises(ValueError, match="both platforms"):
         _calm_published_stock_gate(

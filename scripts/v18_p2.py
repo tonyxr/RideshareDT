@@ -1738,7 +1738,9 @@ def _calm_published_stock_gate(
             )
     rows = [
         row for row in all_rows
-        if 10 <= int(row["step"]) // STEPS_PER_DAY < 40
+        # Protocol days are one-indexed, as in the P2 calibration helper:
+        # days 10--39 correspond to trace-day indices 9--38.
+        if 10 <= int(row["step"]) // STEPS_PER_DAY + 1 <= 39
     ]
     if not rows:
         raise ValueError("calm stock gate has no rows for days 10--39")
