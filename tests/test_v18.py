@@ -2,6 +2,7 @@
 
 from datetime import date, timedelta
 import csv
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -196,6 +197,12 @@ def test_frozen_capacity_metadata_preserves_volume_identity():
     core._check_supply_calibration_volume(500)
     with pytest.raises(ValueError, match="calibrated at 500"):
         core._check_supply_calibration_volume(499)
+
+
+def test_calibration_totals_are_default_off_for_legacy_identity():
+    assert inspect.signature(Core).parameters[
+        "policy_sweep_supply_totals"
+    ].default is False
 
 
 def test_scripted_hazards_off_adds_no_random_events():

@@ -959,6 +959,7 @@ class Core:
         policy_snapshot_every_days: int = 0,
         policy_snapshot_dir: str = "",
         policy_sweep_request_log: str = "",
+        policy_sweep_supply_totals: bool = False,
         v16_action_credit_scale: float = 1.0,
         v16_reward: bool = False,
         current_active_driver_observation: bool = False,
@@ -1080,6 +1081,9 @@ class Core:
             )
         self.policy_sweep_request_log = str(
             policy_sweep_request_log or ""
+        )
+        self.policy_sweep_supply_totals = bool(
+            policy_sweep_supply_totals
         )
         self._v18_mc_pending: Deque[Dict[str, Any]] = deque()
         self.v18_mc_dropped_incomplete = 0
@@ -11351,7 +11355,7 @@ class Core:
             "transit_availability": float(self._regime_last_effect.transit_availability),
             "rival_controller": str(getattr(self.firm2, "_ride_response_mode", type(self.firm2).__name__)),
         }
-        if supply:
+        if supply and self.policy_sweep_supply_totals:
             for firm, suffix in (("Firm1", "firm1"), ("Firm2", "firm2")):
                 state = supply.last_states[firm]
                 row[f"completed_rides_{suffix}"] = int(state.completed_rides)
@@ -21175,6 +21179,11 @@ def main():
     v17.add_argument("--policy_snapshot_dir", type=str, default="")
     v17.add_argument("--policy_sweep_request_log", type=str, default="")
     v17.add_argument(
+        "--policy_sweep_supply_totals",
+        action="store_true",
+        help="Emit exact supply totals needed by registered V18 calibration.",
+    )
+    v17.add_argument(
         "--v16_action_credit_scale",
         type=float,
         default=1.0,
@@ -22489,6 +22498,7 @@ def main():
         policy_snapshot_every_days=args.policy_snapshot_every_days,
         policy_snapshot_dir=args.policy_snapshot_dir,
         policy_sweep_request_log=args.policy_sweep_request_log,
+        policy_sweep_supply_totals=args.policy_sweep_supply_totals,
         v16_action_credit_scale=args.v16_action_credit_scale,
         v16_reward=args.v16_reward,
         current_active_driver_observation=(

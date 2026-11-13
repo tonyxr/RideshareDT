@@ -164,6 +164,7 @@ def _v18_command(
     stock_kappa: float = 0.05,
 ) -> tuple[list[str], dict[str, Any]]:
     result = set_option(command, "--policy_sweep_out", raw.resolve())
+    result = _boolean_flag(result, "--policy_sweep_supply_totals", True)
     result = set_option(result, "--report_prefix", report_prefix)
     result = set_option(result, "--train_customers", CUSTOMERS)
     result = set_option(result, "--eval_customers", CUSTOMERS)
