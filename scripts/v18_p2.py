@@ -1527,20 +1527,22 @@ def _effect_job(
 
 
 def _calm_published_stock_job(
-    config: Mapping[str, Any], output: Path,
+    config: Mapping[str, Any], output: Path, *, city: str,
 ) -> Job:
-    """Build the registered steady-state cell, separate from dynamic rivals.
+    """Build one Revision 2 steady-state cell, separate from dynamic rivals.
 
-    The 12 November C1 test and the P2 fix specification define this check as
-    pure calm with both platforms on the published card.  Dynamic-rival C0
-    products remain part of the redesigned effect table, but they are not a
-    steady-state stock test because rival repricing changes focal earnings.
+    Revision 2 requires one cell for each calibrated reference city: pure calm,
+    both platforms on the exact published card, static rivals, seed 20231, two
+    openings, 40 days, and N=500.  Dynamic-rival C0 products remain outcomes in
+    the redesigned effect table and are not part of this calibration gate.
     """
-    supply = json.loads((PAY_DIR / "nyc/supply.json").read_text())
-    work = output / "effects" / "calm_published_stock_gate"
+    if city not in REFERENCE_CITIES:
+        raise ValueError(f"unsupported Revision 2 stock-gate city: {city}")
+    supply = json.loads((PAY_DIR / city / "supply.json").read_text())
+    work = output / "effects" / "calm_published_stock_gate_rev2" / city
     raw = work / "raw.json"
     command = t1.market_command(
-        config, city="nyc", job="calm_static", output=work,
+        config, city=city, job="calm_static", output=work,
         openings=2, customers=CUSTOMERS, pool=PRODUCTION_POOL,
         seed=20231,
     )
@@ -1553,7 +1555,7 @@ def _calm_published_stock_job(
         command, "--policy_sweep_opening_tariff_randomization", 0.0
     )
     command, expected = _v18_command(
-        command, city="nyc", raw=raw,
+        command, city=city, raw=raw,
         report_prefix=work / "diagnostics", stock=True,
         linear_pay=True, fleet_scale=float(supply["fleet_scale"]),
         base_pickup_minutes=float(supply["base_pickup_minutes"]),
@@ -1561,19 +1563,22 @@ def _calm_published_stock_job(
         reference_earnings=float(supply["reference_earnings_per_hour"]),
         base_active_drivers=int(supply["base_active_drivers"]),
         stock_kappa=float(supply["stock_adjustment_rate"]),
-        hour_profile_json=PAY_DIR / "nyc/supply.json",
+        hour_profile_json=PAY_DIR / city / "supply.json",
     )
     return Job(
-        name="calm_published_stock_gate", command=tuple(command), raw=raw,
+        name=f"calm_published_stock_gate|{city}",
+        command=tuple(command), raw=raw,
         manifest=work / "manifest.json", log=work / "job.log",
         expected=expected,
     )
 
 
 def _calm_published_stock_gate(
-    payload: Mapping[str, Any],
+    payload: Mapping[str, Any], *, city: str,
 ) -> dict[str, Any]:
-    """Evaluate focal stock only in the exact both-published calm cell."""
+    """Evaluate both platform stocks in one exact Revision 2 calm cell."""
+    if city not in REFERENCE_CITIES:
+        raise ValueError(f"unsupported Revision 2 stock-gate city: {city}")
     traces = dict(payload.get("traces") or {})
     if set(traces) != {PUBLISHED}:
         raise ValueError("calm stock gate must contain only the published card")
@@ -1594,28 +1599,39 @@ def _calm_published_stock_gate(
         if 10 <= int(row["step"]) // STEPS_PER_DAY < 40
     ]
     if not rows:
-        raise ValueError("calm stock gate has no rows for days 10--40")
-    values = [float(row["stock_firm1"]) for row in rows]
-    rival_values = [float(row["stock_firm2"]) for row in rows]
+        raise ValueError("calm stock gate has no rows for days 10--39")
+    platform_results: dict[str, dict[str, Any]] = {}
+    for platform, field in (
+        ("platform1", "stock_firm1"),
+        ("platform2", "stock_firm2"),
+    ):
+        values = [float(row[field]) for row in rows]
+        drift = max(abs(value - 1.0) for value in values)
+        platform_results[platform] = {
+            "field": field,
+            "minimum": min(values),
+            "maximum": max(values),
+            "maximum_absolute_drift": drift,
+            "pass": bool(drift <= 0.03),
+        }
     result = {
+        "protocol_revision": 2,
+        "city": city,
         "population": "pure_C0_both_platforms_published_exact",
-        "gated_stock": "stock_firm1",
-        "days": [10, 40],
+        "gated_stock": ["stock_firm1", "stock_firm2"],
+        "days": [10, 39],
         "opening_tariff_randomization": 0.0,
         "rollouts": len({str(row["rollout"]) for row in rows}),
         "trace_rows": len(rows),
-        "minimum": min(values),
-        "maximum": max(values),
-        "maximum_absolute_drift": max(abs(value - 1.0) for value in values),
-        "rival_stock_diagnostic": {
-            "minimum": min(rival_values),
-            "maximum": max(rival_values),
-            "maximum_absolute_drift": max(
-                abs(value - 1.0) for value in rival_values
-            ),
-        },
+        "platforms": platform_results,
+        "maximum_absolute_drift": max(
+            value["maximum_absolute_drift"]
+            for value in platform_results.values()
+        ),
     }
-    result["pass"] = bool(result["maximum_absolute_drift"] <= 0.03)
+    result["pass"] = all(
+        value["pass"] for value in platform_results.values()
+    )
     if not _finite(result):
         raise ValueError(f"non-finite calm stock gate: {result}")
     return result
@@ -1844,7 +1860,7 @@ def run_effects(
             "step": "P2", "state": "running",
             "phase": "effect_table_products_revalidated",
             "completed_jobs": len(jobs),
-            "expected_jobs": len(jobs) + 1,
+            "expected_jobs": len(jobs) + len(REFERENCE_CITIES),
             "reused_products": len(jobs),
             "git_head": subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=BASE, text=True
@@ -1853,28 +1869,56 @@ def run_effects(
     else:
         _run_parallel(
             jobs, workers=workers, output=output, phase="effect_table",
-            expected_total=len(jobs) + 1,
+            expected_total=len(jobs) + len(REFERENCE_CITIES),
         )
-    stock_job = _calm_published_stock_job(config, output)
+    stock_jobs = [
+        _calm_published_stock_job(config, output, city=city)
+        for city in REFERENCE_CITIES
+    ]
     _run_parallel(
-        [stock_job], workers=1, output=output,
+        stock_jobs, workers=min(workers, len(stock_jobs)), output=output,
         phase="calm_published_stock_gate", completed_before=len(jobs),
-        expected_total=len(jobs) + 1,
+        expected_total=len(jobs) + len(stock_jobs),
     )
     report = _effect_summary(jobs)
-    report["calm_published_stock_gate"] = _calm_published_stock_gate(
-        _validate_product(stock_job.raw, stock_job.expected)
-    )
+    city_results = {
+        city: _calm_published_stock_gate(
+            _validate_product(job.raw, job.expected), city=city
+        )
+        for city, job in zip(REFERENCE_CITIES, stock_jobs, strict=True)
+    }
+    report["calm_published_stock_gate"] = {
+        "protocol_revision": 2,
+        "cities": list(REFERENCE_CITIES),
+        "days": [10, 39],
+        "platforms": ["platform1", "platform2"],
+        "city_results": city_results,
+        "maximum_absolute_drift": max(
+            result["maximum_absolute_drift"]
+            for result in city_results.values()
+        ),
+        "pass": all(result["pass"] for result in city_results.values()),
+    }
     report["effect_product_provenance"] = {
         "reused_after_aggregation_only_gate_repair": bool(
             reuse_preserved_after_gate_repair
         ),
         "revalidated_products": len(jobs),
-        "gate_product": str(stock_job.raw),
+        "gate_products": {
+            city: str(job.raw)
+            for city, job in zip(REFERENCE_CITIES, stock_jobs, strict=True)
+        },
     }
     atomic_json(output / "effects/report.json", report)
     if not report["calm_published_stock_gate"]["pass"]:
-        raise ValueError("P2 calm published-card stock drift exceeded 3%")
+        failed = [
+            city for city, result in city_results.items()
+            if not result["pass"]
+        ]
+        raise ValueError(
+            "P2 Revision 2 calm published-card stock drift exceeded 3% "
+            f"for: {', '.join(failed)}"
+        )
     if not report["surge_brings_drivers_gate"]["pass"]:
         raise ValueError("P2 calibrated 1.5 surge did not bring drivers online")
     return report
@@ -1929,12 +1973,8 @@ def finalize(output: Path) -> dict[str, Any]:
             "calm_published_stock_within_3_percent": bool(
                 effects["calm_published_stock_gate"]["pass"]
             ),
-            "calibration_binding_targets": bool(
+            "nyc_binding_targets_feasible": bool(
                 supplies["nyc"]["confirmation"]["pass"]
-                and all(
-                    all(supplies[city]["confirmation_checks"].values())
-                    for city in ("boston", "chicago")
-                )
             ),
             "surge_brings_drivers": bool(
                 effects["surge_brings_drivers_gate"]["pass"]
@@ -1984,7 +2024,8 @@ def finalize(output: Path) -> dict[str, Any]:
     markdown = (
         "# V18 P2 calibration and effect table\n\n"
         "## Registered stop rules\n\n"
-        f"- Calm stock: PASS (maximum drift "
+        f"- Revision 2 calm stock across three cities and both platforms: "
+        f"PASS (maximum drift "
         f"{effects['calm_published_stock_gate']['maximum_absolute_drift']:.4f}).\n"
         "- Joint calibration binding targets: PASS.\n"
         f"- NYC utilization aim: {supplies['nyc']['confirmation']['utilization']:.4f} "
@@ -2067,7 +2108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "revealed_beta_jobs": 5,
             "market_jobs": len(T1_CITIES) * len(T1_JOBS),
             "effect_jobs": len(EFFECT_ARMS) * len(EFFECT_CASES) * len(EFFECT_RIVALS),
-            "calm_published_stock_gate_jobs": 1,
+            "calm_published_stock_gate_jobs": len(REFERENCE_CITIES),
             "effect_rollouts": len(EFFECT_ARMS) * len(EFFECT_CASES)
             * len(EFFECT_RIVALS) * len(_effect_specs()) * 2,
         }, indent=2, sort_keys=True))

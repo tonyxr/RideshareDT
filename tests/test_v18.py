@@ -136,14 +136,21 @@ def test_p2_calm_stock_gate_is_exact_both_published_cell(tmp_path: Path):
     assert _normalized_opening_tariff_randomization(0.0) == 0.0
     assert _normalized_opening_tariff_randomization(0.15) == 0.15
     assert _normalized_opening_tariff_randomization(1.0) == 0.40
-    job = _calm_published_stock_job(load_v17_config(), tmp_path)
-    command = list(job.command)
-    assert command[command.index("--policy_sweep") + 1] == PUBLISHED
-    assert command[command.index("--policy_sweep_rivals") + 1] == "static"
-    assert command[
-        command.index("--policy_sweep_opening_tariff_randomization") + 1
-    ] == "0.0"
-    assert int(command[command.index("--policy_sweep_horizon") + 1]) == 240
+    for city in ("nyc", "boston", "chicago"):
+        job = _calm_published_stock_job(
+            load_v17_config(), tmp_path, city=city
+        )
+        command = list(job.command)
+        assert job.name == f"calm_published_stock_gate|{city}"
+        assert job.raw.parent.name == city
+        assert command[command.index("--policy_sweep") + 1] == PUBLISHED
+        assert command[command.index("--policy_sweep_rivals") + 1] == "static"
+        assert command[
+            command.index("--policy_sweep_opening_tariff_randomization") + 1
+        ] == "0.0"
+        assert int(command[command.index("--policy_sweep_horizon") + 1]) == 240
+        assert int(command[command.index("--policy_sweep_seed") + 1]) == 20231
+        assert int(command[command.index("--train_customers") + 1]) == 500
 
     rows = []
     for opening in (1, 2):
@@ -156,15 +163,35 @@ def test_p2_calm_stock_gate_is_exact_both_published_cell(tmp_path: Path):
                 "stock_firm1": 1.02,
                 "stock_firm2": 0.99,
             })
-    gate = _calm_published_stock_gate({"traces": {PUBLISHED: rows}})
+    gate = _calm_published_stock_gate(
+        {"traces": {PUBLISHED: rows}}, city="nyc"
+    )
     assert gate["pass"]
+    assert gate["protocol_revision"] == 2
+    assert gate["city"] == "nyc"
     assert gate["population"] == "pure_C0_both_platforms_published_exact"
+    assert gate["days"] == [10, 39]
+    assert gate["gated_stock"] == ["stock_firm1", "stock_firm2"]
+    assert set(gate["platforms"]) == {"platform1", "platform2"}
     assert gate["rollouts"] == 2
     assert gate["trace_rows"] == 360
 
     rows[0]["firm2_level"] = 1.1
     with pytest.raises(ValueError, match="both platforms"):
-        _calm_published_stock_gate({"traces": {PUBLISHED: rows}})
+        _calm_published_stock_gate(
+            {"traces": {PUBLISHED: rows}}, city="nyc"
+        )
+
+    rows[0]["firm2_level"] = 1.0
+    for row in rows:
+        if 10 <= row["step"] // 6 < 40:
+            row["stock_firm2"] = 1.031
+    gate = _calm_published_stock_gate(
+        {"traces": {PUBLISHED: rows}}, city="nyc"
+    )
+    assert not gate["pass"]
+    assert gate["platforms"]["platform1"]["pass"]
+    assert not gate["platforms"]["platform2"]["pass"]
 
 
 def test_v18_batch_state_records_exact_calibration_quantities():
