@@ -76,6 +76,7 @@ def _job(
         base_pickup_minutes=float(supply["base_pickup_minutes"]),
         production_population=True,
         base_active_drivers=int(supply["base_active_drivers"]),
+        hour_profile_json=p2.PAY_DIR / "nyc/supply.json",
     )
     return p2.Job(
         name=f"revealed_beta_{factor:g}", command=tuple(command), raw=raw,

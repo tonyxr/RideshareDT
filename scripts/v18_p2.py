@@ -45,7 +45,11 @@ from scripts.v18_fit_pay_rule import (  # noqa: E402
     DEFAULT_INPUT, atomic_json as pay_atomic_json, fit, load_rows, transfer,
 )
 from v17_surge_decay import surge_decay_spec  # noqa: E402
-from driver_supply import DriverSupplyLayer  # noqa: E402
+from driver_supply import (  # noqa: E402
+    DEFAULT_HOUR_PROFILE,
+    DriverSupplyLayer,
+    normalized_hour_profile,
+)
 
 
 STEPS_PER_DAY = 6
@@ -58,9 +62,13 @@ HORIZON_DAYS = 40
 CALIBRATION_DAYS = 28
 CALIBRATION_OPENINGS = 2
 CONFIRMATION_OPENINGS = 3
-FLEET_GRID = (0.8, 1.0, 1.2, 1.4, 1.6, 1.8)
-TRANSFER_FLEET_GRID = (0.6, 0.8, 1.0, 1.2, 1.4, 1.6)
-PICKUP_GRID = (1.5, 2.0, 2.5, 3.0, 3.5)
+FLEET_GRID = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+TRANSFER_FLEET_GRID = (0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+PICKUP_GRID = (1.0, 1.25, 1.5, 1.75, 2.0)
+PROFILE_BLOCKS = tuple(range(6))
+PROFILE_EXPONENT = 0.7
+PROFILE_TOLERANCE_MINUTES = 0.4
+PROFILE_MAX_ITERATIONS = 4
 TARGET_UTILIZATION = 0.58
 UTILIZATION_BAND = (0.52, 0.64)
 WAIT_TOLERANCE = 0.50
@@ -162,6 +170,7 @@ def _v18_command(
     reference_earnings: float | None = None,
     base_active_drivers: int = 0,
     stock_kappa: float = 0.05,
+    hour_profile_json: Path | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     result = set_option(command, "--policy_sweep_out", raw.resolve())
     result = _boolean_flag(result, "--policy_sweep_supply_totals", True)
@@ -190,6 +199,10 @@ def _v18_command(
     result = set_option(
         result, "--supply_base_active_drivers", int(base_active_drivers)
     )
+    if hour_profile_json is not None:
+        result = set_option(
+            result, "--supply_hour_profile_json", Path(hour_profile_json).resolve()
+        )
     result = set_option(result, "--driver_pay_rule", "linear" if linear_pay else "share")
     result = _boolean_flag(result, "--v3_daily_stock", stock)
     if linear_pay:
@@ -213,6 +226,15 @@ def _v18_command(
         expected["base_active_drivers"] = int(round(
             int(base_active_drivers) * float(fleet_scale)
         ))
+    if hour_profile_json is not None:
+        payload = json.loads(Path(hour_profile_json).read_text(encoding="utf-8"))
+        profile = payload.get("hour_profile", payload)
+        normalized = normalized_hour_profile({
+            int(hour): float(value) for hour, value in profile.items()
+        })
+        expected["hour_profile"] = [
+            float(normalized[hour]) for hour in range(24)
+        ]
     return result, expected
 
 
@@ -492,6 +514,105 @@ def _measurement(
     return result
 
 
+def _block_waits(
+    payload: Mapping[str, Any], spec: str,
+) -> dict[int, float]:
+    """Median completed-request pickup wait in each registered four-hour block."""
+    waits: dict[int, list[float]] = {block: [] for block in PROFILE_BLOCKS}
+    for row in payload["traces"][spec]:
+        day = int(row["step"]) // STEPS_PER_DAY + 1
+        if not 5 <= day <= 28:
+            continue
+        block = int(row["hour"]) // 4
+        if block not in waits:
+            raise ValueError(f"unexpected calibration hour {row['hour']!r}")
+        for firm in ("firm1", "firm2"):
+            waits[block].extend(
+                map(float, row[f"pickup_minutes_{firm}"])
+            )
+    missing = [block for block, values in waits.items() if not values]
+    if missing:
+        raise ValueError(f"missing completed pickup waits for blocks {missing}")
+    result = {block: float(median(values)) for block, values in waits.items()}
+    if not _finite(result):
+        raise ValueError(f"non-finite block waits: {result}")
+    return result
+
+
+def _real_block_waits(wait_target: Mapping[str, Any]) -> dict[int, float]:
+    result = {
+        int(row["block"]): float(row["median_wait_minutes"])
+        for row in wait_target["by_four_hour_block"]
+    }
+    if set(result) != set(PROFILE_BLOCKS) or not _finite(result):
+        raise ValueError("wait target must declare six finite four-hour blocks")
+    return result
+
+
+def _profile_from_factors(
+    factors: Mapping[int, float],
+) -> dict[int, float]:
+    """Apply six block factors while preserving the default daily mean."""
+    if set(map(int, factors)) != set(PROFILE_BLOCKS):
+        raise ValueError("hour-profile factors must cover blocks 0--5")
+    base = {int(hour): float(value) for hour, value in DEFAULT_HOUR_PROFILE.items()}
+    raw = {
+        hour: base[hour] * float(factors[hour // 4])
+        for hour in range(24)
+    }
+    if any(not math.isfinite(value) or value <= 0.0 for value in raw.values()):
+        raise ValueError("hour-profile factors must be finite and positive")
+    scale = sum(base.values()) / sum(raw.values())
+    return normalized_hour_profile({
+        hour: value * scale for hour, value in raw.items()
+    })
+
+
+def _updated_profile_factors(
+    factors: Mapping[int, float], simulated: Mapping[int, float],
+    target: Mapping[int, float],
+) -> tuple[dict[int, float], dict[int, float]]:
+    """Revision 1 R1 multiplicative update with daily-mean rescaling."""
+    raw = {
+        block: float(factors[block])
+        * (float(simulated[block]) / float(target[block])) ** PROFILE_EXPONENT
+        for block in PROFILE_BLOCKS
+    }
+    profile = _profile_from_factors(raw)
+    base = {int(hour): float(value) for hour, value in DEFAULT_HOUR_PROFILE.items()}
+    normalized_factors = {
+        block: mean(
+            profile[hour] / base[hour]
+            for hour in range(block * 4, block * 4 + 4)
+        )
+        for block in PROFILE_BLOCKS
+    }
+    return normalized_factors, profile
+
+
+def _profile_artifact(
+    *, city: str, factors: Mapping[int, float],
+    profile: Mapping[int, float], target: Mapping[int, float],
+    history: Sequence[Mapping[str, Any]], state: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "v18-hour-profile-rev1",
+        "revision": "CRISP-Ride_v18_P2_Fix_Spec_Rev1_20261113",
+        "state": state,
+        "city": city,
+        "factors_by_four_hour_block": {
+            str(block): float(factors[block]) for block in PROFILE_BLOCKS
+        },
+        "hour_profile": {
+            str(hour): float(profile[hour]) for hour in range(24)
+        },
+        "target_wait_by_four_hour_block": {
+            str(block): float(target[block]) for block in PROFILE_BLOCKS
+        },
+        "history": list(history),
+    }
+
+
 def _axis_bracket(values: Sequence[float], point: float) -> tuple[float, float]:
     ordered = sorted(set(map(float, values)))
     lower = max((value for value in ordered if value <= point), default=ordered[0])
@@ -531,6 +652,7 @@ def _bilinear(
 
 def _select_joint_calibration(
     measurements: Sequence[Mapping[str, Any]], *, target_wait: float,
+    allow_no_binding: bool = False,
 ) -> dict[str, Any]:
     table = {
         (float(row["fleet_scale"]), float(row["base_pickup_minutes"])): row
@@ -552,16 +674,44 @@ def _select_joint_calibration(
             trips = _bilinear(
                 table, fleet, pickup, "trips_per_online_driver_hour"
             )
-            if trips > MAX_TRIPS_PER_ONLINE_HOUR:
-                continue
             loss = (
                 ((utilization - TARGET_UTILIZATION) / 0.06) ** 2
                 + ((wait - target_wait) / 0.45) ** 2
             )
-            candidates.append((loss, float(fleet), float(pickup), utilization, wait, trips))
-    if not candidates:
-        raise ValueError("joint calibration has no candidate satisfying the trips/hour check")
-    loss, fleet, pickup, utilization, wait, trips = min(candidates)
+            binding = (
+                abs(wait - target_wait) <= WAIT_TOLERANCE
+                and trips <= MAX_TRIPS_PER_ONLINE_HOUR
+            )
+            candidates.append({
+                "loss": float(loss), "fleet": float(fleet),
+                "pickup": float(pickup), "utilization": float(utilization),
+                "wait": float(wait), "trips": float(trips),
+                "binding": bool(binding),
+            })
+    feasible = [row for row in candidates if row["binding"]]
+    if not feasible and not allow_no_binding:
+        raise ValueError(
+            "joint calibration has no point satisfying wait and trips/hour"
+        )
+    pool = feasible or candidates
+    reaches_band = [
+        row for row in pool if row["utilization"] >= UTILIZATION_BAND[0]
+    ]
+    if reaches_band:
+        chosen = min(reaches_band, key=lambda row: row["loss"])
+        fallback = False
+    else:
+        chosen = min(
+            pool,
+            key=lambda row: (-row["utilization"], row["loss"]),
+        )
+        fallback = bool(feasible)
+    loss = chosen["loss"]
+    fleet = chosen["fleet"]
+    pickup = chosen["pickup"]
+    utilization = chosen["utilization"]
+    wait = chosen["wait"]
+    trips = chosen["trips"]
     return {
         "fleet_scale": fleet,
         "base_pickup_minutes": pickup,
@@ -572,6 +722,10 @@ def _select_joint_calibration(
         },
         "normalized_squared_target_loss": loss,
         "candidate_count": len(candidates),
+        "binding_feasible_candidate_count": len(feasible),
+        "binding_targets_pass": bool(chosen["binding"]),
+        "utilization_fallback_used": fallback,
+        "utilization_gap": max(0.0, UTILIZATION_BAND[0] - utilization),
         "coarse_fleet_bounds": [fleets[0], fleets[-1]],
         "coarse_pickup_bounds": [pickups[0], pickups[-1]],
     }
@@ -581,6 +735,7 @@ def _calibration_job(
     config: Mapping[str, Any], output: Path, *, name: str, city: str,
     fleet_scale: float, pickup: float, openings: int = CALIBRATION_OPENINGS,
     base_active_drivers: int = 0,
+    hour_profile_json: Path | None = None,
 ) -> Job:
     work = output / "calibration" / name
     command = t1.market_command(
@@ -601,11 +756,93 @@ def _calibration_job(
         stock=False, linear_pay=True, fleet_scale=fleet_scale,
         base_pickup_minutes=pickup, production_population=True,
         base_active_drivers=base_active_drivers,
+        hour_profile_json=hour_profile_json,
     )
     return Job(
         name=name, command=tuple(command), raw=raw,
         manifest=work / "manifest.json", log=work / "job.log", expected=expected,
     )
+
+
+def _fit_hour_profile(
+    config: Mapping[str, Any], output: Path, *, city: str,
+    base_active_drivers: int, fleet_scale: float, pickup: float,
+    target_waits: Mapping[int, float], workers: int = 1,
+) -> tuple[Path, dict[str, Any], list[Job]]:
+    """Fit Revision 1 four-hour availability factors in at most four jobs."""
+    del workers  # The registered iterations are sequential by construction.
+    profile_root = output / "calibration/hour_profiles"
+    factors = {block: 1.0 for block in PROFILE_BLOCKS}
+    profile = _profile_from_factors(factors)
+    history: list[dict[str, Any]] = []
+    jobs: list[Job] = []
+    converged = False
+    for iteration in range(1, PROFILE_MAX_ITERATIONS + 1):
+        profile_path = profile_root / f"{city}_iteration_{iteration}.json"
+        atomic_json(profile_path, _profile_artifact(
+            city=city, factors=factors, profile=profile,
+            target=target_waits, history=history, state="iteration_input",
+        ))
+        job = _calibration_job(
+            config, output,
+            name=f"{city}_profile_iteration_{iteration}", city=city,
+            fleet_scale=fleet_scale, pickup=pickup,
+            openings=CALIBRATION_OPENINGS,
+            base_active_drivers=base_active_drivers,
+            hour_profile_json=profile_path,
+        )
+        _run_parallel(
+            [job], workers=1, output=output,
+            phase=f"{city}_hour_profile_iteration_{iteration}",
+        )
+        jobs.append(job)
+        payload = _validate_product(job.raw, job.expected)
+        simulated = _block_waits(payload, t1.CARD)
+        gaps = {
+            block: float(simulated[block] - target_waits[block])
+            for block in PROFILE_BLOCKS
+        }
+        converged = all(
+            abs(gaps[block]) <= PROFILE_TOLERANCE_MINUTES
+            for block in PROFILE_BLOCKS
+        )
+        history.append({
+            "iteration": iteration,
+            "input_artifact": str(profile_path),
+            "factors_by_four_hour_block": {
+                str(block): float(factors[block])
+                for block in PROFILE_BLOCKS
+            },
+            "simulated_wait_by_four_hour_block": {
+                str(block): float(simulated[block])
+                for block in PROFILE_BLOCKS
+            },
+            "target_wait_by_four_hour_block": {
+                str(block): float(target_waits[block])
+                for block in PROFILE_BLOCKS
+            },
+            "gap_minutes_by_four_hour_block": {
+                str(block): float(gaps[block])
+                for block in PROFILE_BLOCKS
+            },
+            "within_0.4_minutes_all_blocks": converged,
+            "product": str(job.raw),
+        })
+        if converged:
+            break
+        factors, profile = _updated_profile_factors(
+            factors, simulated, target_waits
+        )
+    final_path = profile_root / f"{city}.json"
+    final_payload = _profile_artifact(
+        city=city, factors=factors, profile=profile,
+        target=target_waits, history=history,
+        state="converged" if converged else "maximum_iterations_reached",
+    )
+    final_payload["converged"] = converged
+    final_payload["iterations"] = len(history)
+    atomic_json(final_path, final_payload)
+    return final_path, final_payload, jobs
 
 
 def _archive_old_supply(city: str) -> None:
@@ -634,28 +871,55 @@ def _base_anchor(
 def _confirm_calibration(
     config: Mapping[str, Any], output: Path, *, city: str,
     base: int, fleet: float, pickup: float, target_wait: float,
+    hour_profile_json: Path | None = None,
+    block_wait_targets: Mapping[int, float] | None = None,
 ) -> tuple[Job, dict[str, Any]]:
     job = _calibration_job(
         config, output, name=f"{city}_confirmation", city=city,
         fleet_scale=fleet, pickup=pickup,
         openings=CONFIRMATION_OPENINGS, base_active_drivers=base,
+        hour_profile_json=hour_profile_json,
     )
     _run_parallel([job], workers=1, output=output, phase=f"{city}_confirmation")
+    payload = _validate_product(job.raw, job.expected)
     measured = _measurement(
-        _validate_product(job.raw, job.expected), t1.CARD,
+        payload, t1.CARD,
         stage="confirmation", fleet_scale=fleet,
         base_pickup_minutes=pickup,
     )
+    if block_wait_targets is not None:
+        simulated = _block_waits(payload, t1.CARD)
+        measured["wait_by_four_hour_block"] = [
+            {
+                "block": block,
+                "hours": [block * 4, block * 4 + 4],
+                "simulated_median_wait_minutes": float(simulated[block]),
+                "target_median_wait_minutes": float(block_wait_targets[block]),
+                "gap_minutes": float(
+                    simulated[block] - block_wait_targets[block]
+                ),
+            }
+            for block in PROFILE_BLOCKS
+        ]
     measured["target_checks"] = {
-        "utilization": bool(
-            UTILIZATION_BAND[0] <= measured["utilization"] <= UTILIZATION_BAND[1]
-        ),
         "median_wait": bool(
             abs(measured["median_wait_minutes"] - target_wait) <= WAIT_TOLERANCE
         ),
         "trips_per_online_driver_hour": bool(
             measured["trips_per_online_driver_hour"]
             <= MAX_TRIPS_PER_ONLINE_HOUR
+        ),
+    }
+    measured["utilization_aim"] = {
+        "target": TARGET_UTILIZATION,
+        "band": list(UTILIZATION_BAND),
+        "within_band": bool(
+            UTILIZATION_BAND[0]
+            <= measured["utilization"]
+            <= UTILIZATION_BAND[1]
+        ),
+        "utilization_gap": max(
+            0.0, UTILIZATION_BAND[0] - measured["utilization"]
         ),
     }
     measured["pass"] = all(measured["target_checks"].values())
@@ -667,8 +931,14 @@ def run_supply_calibration(
 ) -> dict[str, Any]:
     wait_target = derive_wait_target(output)
     target_wait = float(wait_target["median_wait_minutes"])
+    block_wait_targets = _real_block_waits(wait_target)
     _archive_old_supply("nyc")
     anchor_job, base = _base_anchor(config, output, city="nyc")
+    nyc_profile_path, nyc_profile, profile_jobs = _fit_hour_profile(
+        config, output, city="nyc", base_active_drivers=base,
+        fleet_scale=0.8, pickup=1.5,
+        target_waits=block_wait_targets,
+    )
     fleets = list(FLEET_GRID)
     pickups = list(PICKUP_GRID)
 
@@ -679,6 +949,7 @@ def run_supply_calibration(
                 name=f"nyc_{label}_f{fleet:.2f}_p{pickup:.2f}", city="nyc",
                 fleet_scale=float(fleet), pickup=float(pickup),
                 base_active_drivers=base,
+                hour_profile_json=nyc_profile_path,
             )
             for fleet in fleet_values for pickup in pickup_values
         ]
@@ -696,20 +967,20 @@ def run_supply_calibration(
         )
         for job in jobs
     ]
-    selected = _select_joint_calibration(measurements, target_wait=target_wait)
+    selected = _select_joint_calibration(
+        measurements, target_wait=target_wait, allow_no_binding=True
+    )
     extensions: list[dict[str, Any]] = []
     extension_jobs: list[Job] = []
     fleet = float(selected["fleet_scale"])
     pickup = float(selected["base_pickup_minutes"])
-    if fleet in {min(fleets), max(fleets)}:
-        step = fleets[1] - fleets[0]
-        extra = fleet - step if fleet == min(fleets) else fleet + step
+    if fleet == min(fleets):
+        extra = 0.4
         extension_jobs.extend(grid_jobs([extra], pickups, "edge"))
         fleets.append(extra)
         extensions.append({"axis": "fleet", "value": extra})
-    if pickup in {min(pickups), max(pickups)}:
-        step = pickups[1] - pickups[0]
-        extra = pickup - step if pickup == min(pickups) else pickup + step
+    if pickup == min(pickups):
+        extra = 0.75
         extension_jobs.extend(grid_jobs(fleets, [extra], "edge"))
         pickups.append(extra)
         extensions.append({"axis": "pickup", "value": extra})
@@ -734,11 +1005,17 @@ def run_supply_calibration(
         selected = _select_joint_calibration(
             measurements, target_wait=target_wait
         )
+    else:
+        selected = _select_joint_calibration(
+            measurements, target_wait=target_wait
+        )
     confirmation_job, confirmation = _confirm_calibration(
         config, output, city="nyc", base=base,
         fleet=float(selected["fleet_scale"]),
         pickup=float(selected["base_pickup_minutes"]),
         target_wait=target_wait,
+        hour_profile_json=nyc_profile_path,
+        block_wait_targets=block_wait_targets,
     )
     if not confirmation["pass"]:
         raise ValueError(f"NYC joint calibration confirmation failed: {confirmation}")
@@ -747,6 +1024,12 @@ def run_supply_calibration(
         "city": "nyc",
         "base_active_drivers": base,
         "base_anchor_product": str(anchor_job.raw),
+        "hour_profile": dict(nyc_profile["hour_profile"]),
+        "hour_profile_factors_by_four_hour_block": dict(
+            nyc_profile["factors_by_four_hour_block"]
+        ),
+        "hour_profile_fit": nyc_profile,
+        "hour_profile_products": [str(job.raw) for job in profile_jobs],
         "selection": selected,
         "fleet_scale": float(selected["fleet_scale"]),
         "base_pickup_minutes": float(selected["base_pickup_minutes"]),
@@ -772,19 +1055,26 @@ def run_supply_calibration(
         "confirmation": confirmation,
         "confirmation_product": str(confirmation_job.raw),
         "wait_target": wait_target,
+        "service_level_target": "new_york_real_wait_profile",
     }
     atomic_json(PAY_DIR / "nyc/supply.json", nyc)
 
     results = {"nyc": nyc}
-    for city in ("boston", "chicago"):
+    for city in ("chicago", "boston"):
         _archive_old_supply(city)
         city_anchor, city_base = _base_anchor(config, output, city=city)
+        city_profile_path, city_profile, city_profile_jobs = _fit_hour_profile(
+            config, output, city=city, base_active_drivers=city_base,
+            fleet_scale=1.0, pickup=float(nyc["base_pickup_minutes"]),
+            target_waits=block_wait_targets,
+        )
         city_jobs = [
             _calibration_job(
                 config, output, name=f"{city}_fleet_{fleet:.2f}", city=city,
                 fleet_scale=fleet,
                 pickup=float(nyc["base_pickup_minutes"]),
                 base_active_drivers=city_base,
+                hour_profile_json=city_profile_path,
             )
             for fleet in TRANSFER_FLEET_GRID
         ]
@@ -792,26 +1082,40 @@ def run_supply_calibration(
             city_jobs, workers=workers, output=output,
             phase=f"{city}_fleet_grid",
         )
-        city_measurements = [
-            _measurement(
-                _validate_product(job.raw, job.expected), t1.CARD,
-                stage="city_fleet_grid",
+        city_measurements = []
+        for job in city_jobs:
+            payload = _validate_product(job.raw, job.expected)
+            row = _measurement(
+                payload, t1.CARD, stage="city_fleet_grid",
                 fleet_scale=float(_option(job.command, "--fleet_scale")),
                 base_pickup_minutes=float(nyc["base_pickup_minutes"]),
             )
-            for job in city_jobs
-        ]
+            block_waits = _block_waits(payload, t1.CARD)
+            row["wait_by_four_hour_block"] = {
+                str(block): float(block_waits[block])
+                for block in PROFILE_BLOCKS
+            }
+            row["service_level_loss"] = mean(
+                ((block_waits[block] - block_wait_targets[block]) / 0.4) ** 2
+                for block in PROFILE_BLOCKS
+            )
+            city_measurements.append(row)
         feasible = [
             row for row in city_measurements
             if row["trips_per_online_driver_hour"]
             <= MAX_TRIPS_PER_ONLINE_HOUR
+            and abs(row["median_wait_minutes"] - target_wait)
+            <= WAIT_TOLERANCE
         ]
         if not feasible:
-            raise ValueError(f"{city} fleet grid has no feasible candidate")
+            raise ValueError(
+                f"{city} service-level grid has no point satisfying "
+                "wait and trips/hour"
+            )
         choice = min(
             feasible,
             key=lambda row: (
-                abs(float(row["utilization"]) - TARGET_UTILIZATION),
+                float(row["service_level_loss"]),
                 float(row["fleet_scale"]),
             ),
         )
@@ -819,13 +1123,14 @@ def run_supply_calibration(
             config, output, city=city, base=city_base,
             fleet=float(choice["fleet_scale"]),
             pickup=float(nyc["base_pickup_minutes"]),
-            target_wait=float(choice["median_wait_minutes"]),
+            target_wait=target_wait,
+            hour_profile_json=city_profile_path,
+            block_wait_targets=block_wait_targets,
         )
         city_checks = {
-            "utilization": bool(
-                UTILIZATION_BAND[0]
-                <= city_confirmation["utilization"]
-                <= UTILIZATION_BAND[1]
+            "median_wait": bool(
+                abs(city_confirmation["median_wait_minutes"] - target_wait)
+                <= WAIT_TOLERANCE
             ),
             "trips_per_online_driver_hour": bool(
                 city_confirmation["trips_per_online_driver_hour"]
@@ -839,10 +1144,23 @@ def run_supply_calibration(
             "city": city,
             "base_active_drivers": city_base,
             "base_anchor_product": str(city_anchor.raw),
+            "hour_profile": dict(city_profile["hour_profile"]),
+            "hour_profile_factors_by_four_hour_block": dict(
+                city_profile["factors_by_four_hour_block"]
+            ),
+            "hour_profile_fit": city_profile,
+            "hour_profile_products": [
+                str(job.raw) for job in city_profile_jobs
+            ],
             "fleet_scale": float(choice["fleet_scale"]),
             "base_pickup_minutes": float(nyc["base_pickup_minutes"]),
             "pickup_source": "nyc_joint_calibration",
-            "utilization_target_source": "transferred_from_new_york_driver_pay_rule",
+            "service_level_target": "service_level_transferred_from_new_york",
+            "service_level_target_wait_by_four_hour_block": {
+                str(block): float(block_wait_targets[block])
+                for block in PROFILE_BLOCKS
+            },
+            "utilization_role": "reported_outcome_not_target",
             "reference_earnings_per_hour": float(
                 city_confirmation["reference_earnings_per_hour"]
             ),
@@ -897,6 +1215,7 @@ def _kappa_job(
         reference_earnings=float(supply["reference_earnings_per_hour"]),
         base_active_drivers=int(supply["base_active_drivers"]),
         stock_kappa=float(kappa),
+        hour_profile_json=PAY_DIR / "nyc/supply.json",
     )
     return Job(
         name=f"kappa_{kappa:.2f}", command=tuple(command), raw=raw,
@@ -1012,6 +1331,7 @@ def _t1_job(
         reference_earnings=float(supply["reference_earnings_per_hour"]),
         base_active_drivers=int(supply["base_active_drivers"]),
         stock_kappa=float(supply["stock_adjustment_rate"]),
+        hour_profile_json=PAY_DIR / city / "supply.json",
     )
     return Job(
         name=f"market_{city}_{job_name}", command=tuple(command), raw=raw,
@@ -1149,6 +1469,10 @@ def _effect_job(
             if arm == "calibrated" else 0
         ),
         stock_kappa=float(supply["stock_adjustment_rate"]),
+        hour_profile_json=(
+            PAY_DIR / "nyc/supply.json"
+            if arm == "calibrated" else None
+        ),
     )
     return Job(
         name=f"effect|{arm}|{case}|{rival}", command=tuple(command), raw=raw,
@@ -1370,6 +1694,10 @@ def finalize(output: Path) -> dict[str, Any]:
                 "base_active_drivers": int(
                     supplies[city]["base_active_drivers"]
                 ),
+                "hour_profile": dict(supplies[city]["hour_profile"]),
+                "service_level_target": str(
+                    supplies[city]["service_level_target"]
+                ),
             }
             for city in REFERENCE_CITIES
         }
@@ -1391,7 +1719,7 @@ def finalize(output: Path) -> dict[str, Any]:
             "calm_published_stock_within_3_percent": bool(
                 effects["calm_published_stock_gate"]["pass"]
             ),
-            "calibration_targets": bool(
+            "calibration_binding_targets": bool(
                 supplies["nyc"]["confirmation"]["pass"]
                 and all(
                     all(supplies[city]["confirmation_checks"].values())
@@ -1448,7 +1776,10 @@ def finalize(output: Path) -> dict[str, Any]:
         "## Registered stop rules\n\n"
         f"- Calm stock: PASS (maximum drift "
         f"{effects['calm_published_stock_gate']['maximum_absolute_drift']:.4f}).\n"
-        "- Joint calibration: PASS.\n"
+        "- Joint calibration binding targets: PASS.\n"
+        f"- NYC utilization aim: {supplies['nyc']['confirmation']['utilization']:.4f} "
+        f"(gap below 0.52: {supplies['nyc']['confirmation']['utilization_aim']['utilization_gap']:.4f}; "
+        "not a stop rule).\n"
         f"- Surge brings drivers: PASS (paired t "
         f"{effects['surge_brings_drivers_gate']['t']:.3f}).\n"
         "- Finite numbers and identity: PASS.\n\n"
@@ -1475,6 +1806,13 @@ def _archive_failed_p2_roots(output: Path) -> None:
         destination = archive / name
         if source.exists() and not destination.exists():
             shutil.move(str(source), str(destination))
+    revision_archive = preflight / "archive_P2_fix_20261113"
+    revision_archive.mkdir(parents=True, exist_ok=True)
+    for name in ("P2_fix", "P2_fix_attempt2"):
+        source = preflight / name
+        destination = revision_archive / name
+        if source.exists() and not destination.exists():
+            shutil.move(str(source), str(destination))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1487,23 +1825,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         default="all",
     )
-    parser.add_argument("--workers", type=int, default=10)
+    parser.add_argument("--workers", type=int, default=4)
     parser.add_argument(
         "--output", type=Path,
         default=BASE / "runs/v18/preflight/P2_fix",
     )
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args(argv)
-    if not 1 <= int(args.workers) <= 10:
-        raise ValueError("P2 workers must be in [1, 10]")
+    if not 1 <= int(args.workers) <= 4:
+        raise ValueError("Revision 1 P2 workers must be in [1, 4]")
     output = args.output.resolve()
-    output.mkdir(parents=True, exist_ok=True)
     if args.plan_only:
         print(json.dumps({
             "step": "P2", "workers": args.workers,
             "joint_calibration_jobs": len(FLEET_GRID) * len(PICKUP_GRID),
             "city_fleet_jobs": 2 * len(TRANSFER_FLEET_GRID),
             "capacity_anchors": len(REFERENCE_CITIES),
+            "hour_profile_jobs_maximum": (
+                len(REFERENCE_CITIES) * PROFILE_MAX_ITERATIONS
+            ),
             "confirmation_jobs": len(REFERENCE_CITIES),
             "kappa_jobs": len(KAPPA_CANDIDATES),
             "revealed_beta_jobs": 5,
@@ -1516,6 +1856,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.stage == "all":
             _archive_failed_p2_roots(output)
+        output.mkdir(parents=True, exist_ok=True)
         config = load_v17()
         if args.stage in {"all", "pay"}:
             fit_pay_rules()

@@ -211,6 +211,13 @@ def _apply_v18_common(
         values = _set_option(
             values, "--supply_reference_earnings", reference_earnings
         )
+    supply_json = resolve_input(config["city_inputs"][city].get("supply_json", ""))
+    if supply_json.is_file():
+        payload = json.loads(supply_json.read_text(encoding="utf-8"))
+        if "hour_profile" in payload:
+            values = _set_option(
+                values, "--supply_hour_profile_json", supply_json
+            )
     return values
 
 

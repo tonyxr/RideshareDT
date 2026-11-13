@@ -115,7 +115,12 @@ from gpt_threshold_utils import (
     new_gpt_threshold_usage_counts,
     summarize_priced_coldstart_rides,
 )
-from driver_supply import DriverSupplyConfig, DriverSupplyLayer, FirmDriverBatchState
+from driver_supply import (
+    DriverSupplyConfig,
+    DriverSupplyLayer,
+    FirmDriverBatchState,
+    normalized_hour_profile,
+)
 from driver_supply import DriverPayPolicy
 from market_shocks import (
     PUBLIC_SHOCK_FEATURE_KEYS,
@@ -3197,6 +3202,7 @@ class Core:
         stock_rule: str = "power",
         supply_reference_earnings: float = 0.0,
         supply_base_active_drivers: int = 0,
+        supply_hour_profile_json: str = "",
         shortage_willingness_share: float = 0.0,
         acceptance_shock_wage: str = "legacy",
         active_driver_feature_reference: str = "fixed",
@@ -3222,6 +3228,7 @@ class Core:
         self.shock_scenario = shock_scenario
         self.emergency_surge_cap = float(max(0.0, emergency_surge_cap))
         self._install_regime_process(self.market, seed=int(self.seed) + 70_000, training_openings=True)
+        hour_profile_source = ""
         if self.enable_driver_supply:
             cfg = self.driver_supply.config
             model = str(supply_model).lower()
@@ -3387,6 +3394,21 @@ class Core:
                     self.driver_supply.config.base_active_drivers * self.market_dynamics.fleet_scale))
                 capacity["fleet_scale"] = float(self.market_dynamics.fleet_scale)
                 capacity["scaled_base_active_drivers"] = self.driver_supply.config.base_active_drivers
+            if supply_hour_profile_json:
+                profile_path = Path(supply_hour_profile_json).expanduser().resolve()
+                with profile_path.open("r", encoding="utf-8") as handle:
+                    profile_payload = json.load(handle)
+                profile = profile_payload.get("hour_profile", profile_payload)
+                if not isinstance(profile, Mapping) or set(map(int, profile)) != set(range(24)):
+                    raise ValueError(
+                        "supply hour-profile artifact must contain exactly hours 0--23"
+                    )
+                normalized = normalized_hour_profile({
+                    int(hour): float(value) for hour, value in profile.items()
+                })
+                self.driver_supply.config.hour_profile = dict(normalized)
+                self.driver_supply.hour_profile = dict(normalized)
+                hour_profile_source = str(profile_path)
             self.v26_settings["driver_capacity_calibration"] = capacity
             self._rescale_all_pricers()
         self.v26r_settings = {
@@ -3546,6 +3568,7 @@ class Core:
             ),
             "supply_calibration_customers": self.supply_calibration_customers,
             "supply_base_active_drivers": int(supply_base_active_drivers),
+            "supply_hour_profile_source": hour_profile_source,
             "effective_supply_config": asdict(self.driver_supply.config),
             "supply_reference_earnings": float(self.driver_supply.config.reference_earnings_per_hour),
             "supply_reference_contract": self.v26_settings['driver_capacity_calibration'].get('reference_contract', 'explicit_reference'),
@@ -3630,6 +3653,10 @@ class Core:
             "base_active_drivers": int(
                 getattr(supply_config, "base_active_drivers", 0)
             ),
+            "hour_profile": [
+                float(self.driver_supply.hour_profile[hour])
+                for hour in range(24)
+            ],
             "scenario_hazards": str(
                 getattr(shock_config, "scenario_hazards", "natural")
             ),
@@ -21399,6 +21426,13 @@ def main():
         ),
     )
     v26r.add_argument(
+        "--supply_hour_profile_json", default="",
+        help=(
+            "Revision 1 fitted 24-hour driver-availability profile JSON; "
+            "empty preserves the legacy default profile."
+        ),
+    )
+    v26r.add_argument(
         "--active_driver_feature_reference",
         choices=("fixed", "run_capacity"),
         default="fixed",
@@ -22827,6 +22861,7 @@ def main():
                 supply_base_active_drivers=int(
                     args.supply_base_active_drivers
                 ),
+                supply_hour_profile_json=str(args.supply_hour_profile_json),
                 supply_reference_earnings=float(args.supply_reference_earnings),
                 shortage_willingness_share=float(args.shortage_willingness_share),
                 acceptance_shock_wage=str(args.acceptance_shock_wage),

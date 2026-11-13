@@ -21,8 +21,9 @@ from scripts.v18_config import (
 from scripts.v18_fit_pay_rule import DEFAULT_INPUT, fit, load_rows, transfer
 from scripts.v18_revealed_beta import _interpolated_factor
 from scripts.v18_p2 import (
-    FLEET_GRID, PICKUP_GRID, Job, _histogram_median, _measurement,
-    _run_parallel, _select_joint_calibration,
+    FLEET_GRID, PICKUP_GRID, Job, _block_waits, _histogram_median,
+    _measurement, _profile_from_factors, _run_parallel,
+    _select_joint_calibration, _updated_profile_factors,
 )
 from scripts.v18_select import card_grid, count_rule_candidates, reactive_candidates
 from scripts.v18_stats import holm, two_level_bootstrap
@@ -303,8 +304,8 @@ def test_analysis_helpers_are_deterministic():
 
 
 def test_fleet_grid_and_selection():
-    assert FLEET_GRID == (0.8, 1.0, 1.2, 1.4, 1.6, 1.8)
-    assert PICKUP_GRID == (1.5, 2.0, 2.5, 3.0, 3.5)
+    assert FLEET_GRID == (0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+    assert PICKUP_GRID == (1.0, 1.25, 1.5, 1.75, 2.0)
 
 
 def test_p2_pickup_grid_reports_infeasible_capacity_candidate(monkeypatch, tmp_path):
@@ -354,6 +355,69 @@ def test_joint_selection_interpolates_and_obeys_trip_ceiling():
     selected = _select_joint_calibration(rows, target_wait=4.27)
     assert selected["fleet_scale"] == pytest.approx(1.1)
     assert selected["base_pickup_minutes"] == pytest.approx(2.25)
+    assert selected["binding_targets_pass"] is True
+    assert selected["utilization_fallback_used"] is False
+
+
+def test_rev1_grid_and_utilization_fallback_are_registered():
+    assert FLEET_GRID == (0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+    assert PICKUP_GRID == (1.0, 1.25, 1.5, 1.75, 2.0)
+    rows = []
+    for fleet, utilization in ((0.5, 0.49), (0.6, 0.47)):
+        for pickup in (1.0, 1.25):
+            rows.append({
+                "fleet_scale": fleet,
+                "base_pickup_minutes": pickup,
+                "utilization": utilization,
+                "median_wait_minutes": 4.27,
+                "trips_per_online_driver_hour": 1.7,
+            })
+    selected = _select_joint_calibration(rows, target_wait=4.27)
+    assert selected["fleet_scale"] == pytest.approx(0.5)
+    assert selected["utilization_fallback_used"] is True
+    assert selected["utilization_gap"] == pytest.approx(0.03)
+    assert selected["binding_targets_pass"] is True
+
+
+def test_rev1_selection_stops_only_without_binding_feasible_point():
+    rows = [{
+        "fleet_scale": fleet,
+        "base_pickup_minutes": pickup,
+        "utilization": 0.58,
+        "median_wait_minutes": 6.0,
+        "trips_per_online_driver_hour": 1.7,
+    } for fleet in (0.5, 0.6) for pickup in (1.0, 1.25)]
+    with pytest.raises(ValueError, match="wait and trips/hour"):
+        _select_joint_calibration(rows, target_wait=4.27)
+
+
+def test_rev1_hour_profile_update_preserves_mean_and_within_block_shape():
+    factors = {block: 1.0 for block in range(6)}
+    baseline = _profile_from_factors(factors)
+    target = {block: 4.0 for block in range(6)}
+    simulated = {block: (8.0 if block == 0 else 4.0) for block in range(6)}
+    updated, profile = _updated_profile_factors(factors, simulated, target)
+    assert np.mean(list(baseline.values())) == pytest.approx(1.0)
+    assert np.mean(list(profile.values())) == pytest.approx(1.0)
+    assert updated[0] > updated[1]
+    assert profile[1] / profile[0] == pytest.approx(
+        baseline[1] / baseline[0]
+    )
+
+
+def test_rev1_block_waits_use_completed_pickups_by_four_hour_block():
+    traces = []
+    for block in range(6):
+        traces.append({
+            "step": 24 + block,
+            "hour": block * 4,
+            "pickup_minutes_firm1": [float(block + 1)],
+            "pickup_minutes_firm2": [float(block + 2)],
+        })
+    waits = _block_waits({"traces": {"card": traces}}, "card")
+    assert waits == {
+        block: pytest.approx(block + 1.5) for block in range(6)
+    }
 
 
 def test_revealed_beta_interpolates_unit_optimum():
