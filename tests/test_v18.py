@@ -222,7 +222,7 @@ def test_p2_revision2_reference_earnings_remeasures_only_registered_statistic(
                     "pickup_minutes_firm1": [4.0],
                     "pickup_minutes_firm2": [4.0],
                 })
-        products[city] = {"traces": {"static:1": rows}}
+        products[city] = {"traces": {PUBLISHED: rows}}
 
     def fake_parallel(jobs, **kwargs):
         del kwargs
@@ -232,6 +232,7 @@ def test_p2_revision2_reference_earnings_remeasures_only_registered_statistic(
             assert command[command.index("--seed") + 1] == "20231"
             assert command[command.index("--experiment_seed") + 1] == "20231"
             assert command[command.index("--policy_sweep_seed") + 1] == "20231"
+            assert command[command.index("--policy_sweep") + 1] == PUBLISHED
             job.raw.parent.mkdir(parents=True, exist_ok=True)
             job.raw.write_text(json.dumps(products[city]))
         return len(jobs), []

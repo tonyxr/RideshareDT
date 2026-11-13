@@ -1209,7 +1209,7 @@ def run_reference_earnings(
     jobs = []
     for city in REFERENCE_CITIES:
         supply = json.loads((PAY_DIR / city / "supply.json").read_text())
-        jobs.append(_calibration_job(
+        base_job = _calibration_job(
             config, output,
             name=f"reference_earnings_rev2/{city}", city=city,
             fleet_scale=float(supply["fleet_scale"]),
@@ -1217,6 +1217,12 @@ def run_reference_earnings(
             openings=CONFIRMATION_OPENINGS,
             base_active_drivers=int(supply["base_active_drivers"]),
             hour_profile_json=PAY_DIR / city / "supply.json",
+        )
+        command = set_option(base_job.command, "--policy_sweep", PUBLISHED)
+        jobs.append(Job(
+            name=base_job.name, command=tuple(command), raw=base_job.raw,
+            manifest=base_job.manifest, log=base_job.log,
+            expected=base_job.expected,
         ))
     _run_parallel(
         jobs, workers=workers, output=output,
@@ -1226,6 +1232,7 @@ def run_reference_earnings(
         "schema_version": "v18-reference-earnings-rev2-v1",
         "contract": "ratio_of_sums_both_platforms_days_5_28",
         "opening_tariff_randomization": 0.0,
+        "published_card_spec": PUBLISHED,
         "cities": {},
     }
     backup_root = output / "reference_earnings_rev2" / "prior_supply"
@@ -1235,7 +1242,7 @@ def run_reference_earnings(
         supply_path = PAY_DIR / city / "supply.json"
         supply = json.loads(supply_path.read_text())
         measured = _measurement(
-            payload, t1.CARD, stage="reference_earnings_rev2",
+            payload, PUBLISHED, stage="reference_earnings_rev2",
             fleet_scale=float(supply["fleet_scale"]),
             base_pickup_minutes=float(supply["base_pickup_minutes"]),
         )
@@ -1689,6 +1696,7 @@ def _calm_published_stock_gate(
         "gated_stock": ["stock_firm1", "stock_firm2"],
         "days": [10, 39],
         "opening_tariff_randomization": 0.0,
+        "published_card_spec": PUBLISHED,
         "rollouts": len({str(row["rollout"]) for row in rows}),
         "trace_rows": len(rows),
         "platforms": platform_results,
