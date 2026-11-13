@@ -93,6 +93,9 @@ KAPPA_CANDIDATES = (0.03, 0.05, 0.08)
 P2_GATE_REPAIR_PARENT_SOURCE_SHA256 = (
     "15c2cef005fed811df1d549a77eba559de53facf54b662a308c7c54eba3f9b30"
 )
+P2_GATE_REPAIR_PARENT_CORE_SHA256 = (
+    "afdb716341ce8c720d9e40cc15e843601719c262ca4e0a9ad9babf603bdaaff3"
+)
 
 
 @dataclass(frozen=True)
@@ -1621,10 +1624,11 @@ def _calm_published_stock_gate(
 def _validate_preserved_effect_job(job: Job) -> None:
     """Reuse df39287 effect products across this aggregation-only repair.
 
-    Every command, config hash, non-runner source hash, and product hash must
-    still match.  The sole permitted identity difference is the pinned parent
-    hash of this runner, whose change only separates the stock gate from the
-    dynamic-rival effect aggregation.
+    Every command, config hash, unaffected source hash, and product hash must
+    still match.  The permitted source differences are pinned to the exact
+    repair parents: this runner separates the gate aggregation, while Core's
+    zero-randomization repair leaves the effect jobs' default 0.15 opening
+    perturbation unchanged.
     """
     recorded = json.loads(job.manifest.read_text(encoding="utf-8"))
     if recorded.get("state") != "completed":
@@ -1639,9 +1643,22 @@ def _validate_preserved_effect_job(job: Job) -> None:
         P2_GATE_REPAIR_PARENT_SOURCE_SHA256
     ):
         raise ValueError(f"preserved effect runner is not the repair parent: {job.raw}")
+    if recorded_sources.get("Core.py") != P2_GATE_REPAIR_PARENT_CORE_SHA256:
+        raise ValueError(f"preserved effect Core is not the repair parent: {job.raw}")
+    if "--policy_sweep_opening_tariff_randomization" in job.command:
+        opening_randomization = float(_option(
+            job.command, "--policy_sweep_opening_tariff_randomization"
+        ))
+    else:
+        opening_randomization = 0.15
+    if abs(opening_randomization - 0.15) > 1e-12:
+        raise ValueError(
+            "preserved effect reuse requires the unchanged 0.15 opening "
+            f"randomization: {job.raw}"
+        )
     current_sources = _source_identity()
     for name, digest in current_sources.items():
-        if name == "scripts/v18_p2.py":
+        if name in {"scripts/v18_p2.py", "Core.py"}:
             continue
         if recorded_sources.get(name) != digest:
             raise ValueError(

@@ -12,7 +12,10 @@ import pytest
 
 import torch
 
-from Core import Core, build_shock_config_from_args
+from Core import (
+    Core, _normalized_opening_tariff_randomization,
+    build_shock_config_from_args,
+)
 from driver_supply import DriverPayPolicy, DriverSupplyConfig, DriverSupplyLayer, FirmDriverBatchState
 from market_shocks import ShockConfig, ShockEvent, ShockProcess, ShockScenario
 from scripts.v18_config import (
@@ -130,6 +133,9 @@ def test_v18_earnings_helper_is_ratio_of_sums():
 
 
 def test_p2_calm_stock_gate_is_exact_both_published_cell(tmp_path: Path):
+    assert _normalized_opening_tariff_randomization(0.0) == 0.0
+    assert _normalized_opening_tariff_randomization(0.15) == 0.15
+    assert _normalized_opening_tariff_randomization(1.0) == 0.40
     job = _calm_published_stock_job(load_v17_config(), tmp_path)
     command = list(job.command)
     assert command[command.index("--policy_sweep") + 1] == PUBLISHED

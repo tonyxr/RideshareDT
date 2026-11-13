@@ -56,6 +56,11 @@ from v17_value_model import V17ConcaveValueModel
 from v17_surge_decay import surge_decay_cell
 
 
+def _normalized_opening_tariff_randomization(value: float) -> float:
+    """Honor an explicit zero while bounding positive opening perturbations."""
+    return float(sclip(value, 0.0, 0.40))
+
+
 from MarketInteraction import MarketInteraction, RideContext
 from Market_models import CoefficientOverrides
 from GenerateAgent import GenerateAgent
@@ -4297,7 +4302,9 @@ class Core:
                 opponent_mode,
                 self.seed + 10_000 if episode_seed is None else int(episode_seed),
             )
-        fraction = float(sclip(tariff_reset_fraction, 0.02, 0.40))
+        fraction = _normalized_opening_tariff_randomization(
+            tariff_reset_fraction
+        )
         if self.level_step_actions and bool(symmetric_tariffs):
             raise ValueError("symmetric openings are undefined under the level-step contract")
         reset_rng = (
