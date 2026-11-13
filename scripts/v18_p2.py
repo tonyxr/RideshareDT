@@ -1954,23 +1954,47 @@ def run_effects(
             jobs, workers=workers, output=output, phase="effect_table",
             expected_total=len(jobs) + len(REFERENCE_CITIES),
         )
+    stock_gate = run_calm_stock_gate(config, output, workers=workers)
+    report = _effect_summary(jobs)
+    report["calm_published_stock_gate"] = stock_gate
+    report["effect_product_provenance"] = {
+        "reused_after_aggregation_only_gate_repair": bool(
+            reuse_preserved_after_gate_repair
+        ),
+        "revalidated_products": len(jobs),
+        "gate_products": dict(stock_gate["products"]),
+    }
+    atomic_json(output / "effects/report.json", report)
+    if not report["surge_brings_drivers_gate"]["pass"]:
+        raise ValueError("P2 calibrated 1.5 surge did not bring drivers online")
+    return report
+
+
+def run_calm_stock_gate(
+    config: Mapping[str, Any], output: Path, *, workers: int,
+) -> dict[str, Any]:
+    """Run only the three Revision 2 steady-state validation cells.
+
+    Keeping this as an independently callable stage lets a repaired reference
+    be checked before recomputing the 24 reference-sensitive effect products.
+    The cells and the binding +/-3% decision are identical to those used by
+    ``run_effects``.
+    """
     stock_jobs = [
         _calm_published_stock_job(config, output, city=city)
         for city in REFERENCE_CITIES
     ]
     _run_parallel(
         stock_jobs, workers=min(workers, len(stock_jobs)), output=output,
-        phase="calm_published_stock_gate", completed_before=len(jobs),
-        expected_total=len(jobs) + len(stock_jobs),
+        phase="calm_published_stock_gate", expected_total=len(stock_jobs),
     )
-    report = _effect_summary(jobs)
     city_results = {
         city: _calm_published_stock_gate(
             _validate_product(job.raw, job.expected), city=city
         )
         for city, job in zip(REFERENCE_CITIES, stock_jobs, strict=True)
     }
-    report["calm_published_stock_gate"] = {
+    gate = {
         "protocol_revision": 2,
         "cities": list(REFERENCE_CITIES),
         "days": [10, 39],
@@ -1981,19 +2005,13 @@ def run_effects(
             for result in city_results.values()
         ),
         "pass": all(result["pass"] for result in city_results.values()),
-    }
-    report["effect_product_provenance"] = {
-        "reused_after_aggregation_only_gate_repair": bool(
-            reuse_preserved_after_gate_repair
-        ),
-        "revalidated_products": len(jobs),
-        "gate_products": {
+        "products": {
             city: str(job.raw)
             for city, job in zip(REFERENCE_CITIES, stock_jobs, strict=True)
         },
     }
-    atomic_json(output / "effects/report.json", report)
-    if not report["calm_published_stock_gate"]["pass"]:
+    atomic_json(output / "effects/calm_published_stock_gate_rev2_report.json", gate)
+    if not gate["pass"]:
         failed = [
             city for city, result in city_results.items()
             if not result["pass"]
@@ -2002,9 +2020,7 @@ def run_effects(
             "P2 Revision 2 calm published-card stock drift exceeded 3% "
             f"for: {', '.join(failed)}"
         )
-    if not report["surge_brings_drivers_gate"]["pass"]:
-        raise ValueError("P2 calibrated 1.5 surge did not bring drivers online")
-    return report
+    return gate
 
 
 def finalize(output: Path) -> dict[str, Any]:
@@ -2155,7 +2171,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--stage",
         choices=(
             "all", "pay", "wait", "supply", "reference", "kappa",
-            "revealed", "market", "effects", "finalize",
+            "revealed", "market", "gate", "effects", "finalize",
         ),
         default="all",
     )
@@ -2218,6 +2234,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.stage in {"all", "market"}:
             run_market_checks(config, output, workers=args.workers)
+        if args.stage == "gate":
+            run_calm_stock_gate(config, output, workers=args.workers)
         if args.stage in {"all", "effects"}:
             run_effects(
                 config, output, workers=args.workers,

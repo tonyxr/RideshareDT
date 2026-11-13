@@ -28,7 +28,7 @@ from scripts.v18_p2 import (
     _histogram_median,
     _calm_published_stock_gate, _calm_published_stock_job,
     _measurement, _profile_from_factors, _run_parallel,
-    run_reference_earnings,
+    run_calm_stock_gate, run_reference_earnings,
     _select_joint_calibration, _select_kappa_candidate,
     _select_transfer_service_level,
     _updated_profile_factors,
@@ -271,6 +271,51 @@ def test_p2_revision2_reference_earnings_remeasures_only_registered_statistic(
         assert updated["reference_earnings_revision2_validation"][
             "opening_tariff_randomization"
         ] == 0.0
+
+
+def test_p2_revision2_gate_stage_runs_only_registered_city_cells(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    rows = [
+        {
+            "rollout": f"opening_{opening}", "step": step,
+            "firm1_level": 1.0, "firm2_level": 1.0,
+            "stock_firm1": 1.0, "stock_firm2": 1.0,
+        }
+        for opening in (1, 2) for step in range(40 * 6)
+    ]
+
+    def fake_job(config, output, *, city):
+        del config
+        work = output / "effects/calm_published_stock_gate_rev2" / city
+        return Job(
+            name=f"gate|{city}", command=("python", city),
+            raw=work / "raw.json", manifest=work / "manifest.json",
+            log=work / "job.log", expected={},
+        )
+
+    def fake_parallel(jobs, **kwargs):
+        del kwargs
+        assert [job.name for job in jobs] == [
+            "gate|nyc", "gate|boston", "gate|chicago",
+        ]
+        for job in jobs:
+            job.raw.parent.mkdir(parents=True, exist_ok=True)
+            job.raw.write_text(json.dumps({"traces": {PUBLISHED: rows}}))
+        return len(jobs), []
+
+    monkeypatch.setattr("scripts.v18_p2._calm_published_stock_job", fake_job)
+    monkeypatch.setattr("scripts.v18_p2._run_parallel", fake_parallel)
+    monkeypatch.setattr(
+        "scripts.v18_p2._validate_product",
+        lambda raw, expected: json.loads(raw.read_text()),
+    )
+    gate = run_calm_stock_gate({}, tmp_path, workers=3)
+    assert gate["pass"]
+    assert set(gate["city_results"]) == {"nyc", "boston", "chicago"}
+    assert json.loads(
+        (tmp_path / "effects/calm_published_stock_gate_rev2_report.json").read_text()
+    )["pass"]
 
 
 def test_v18_batch_state_records_exact_calibration_quantities():
