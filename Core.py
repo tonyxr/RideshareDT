@@ -2839,6 +2839,54 @@ class Core:
         print(f"[v26] driver capacity calibration {json.dumps(result)}")
         return result
 
+    def _v18_remeasure_scaled_supply_reference(
+        self, capacity: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Restore the measured-calm reference after applying V18 fleet scale.
+
+        Capacity fitting is performed at the unscaled anchor and the chosen
+        fleet scale is applied afterwards.  Under the V18 stock plus linear-pay
+        model, retaining the pre-scale earnings reference makes calm stock move
+        mechanically even when both firms post the published card.  Re-measure
+        the reference at the already-scaled fleet without refitting capacity or
+        changing the registered fulfillment target.
+        """
+        config = self.driver_supply.config
+        linear_pay = all(
+            policy.rule == "linear"
+            for policy in self.driver_supply.pay_policies.values()
+        )
+        if not (config.supply_model == "v3" and config.v3_daily_stock and linear_pay):
+            return dict(capacity)
+        from city_supply_calibration import calibrate_capacity
+        measured = calibrate_capacity(
+            self,
+            sample_size=self.supply_calibration_customers,
+            measure_reference=True,
+            verify_only=True,
+        )
+        # calibrate_capacity restores a deep snapshot before returning, which
+        # replaces DriverSupplyLayer.config.  Reacquire the live config rather
+        # than updating the pre-snapshot object captured above.
+        config = self.driver_supply.config
+        reference = float(measured["reference_earnings"])
+        opening_stock = {
+            firm: float(value)
+            for firm, value in measured["opening_stock"].items()
+        }
+        config.reference_earnings_per_hour = reference
+        config.initial_online_stock = opening_stock
+        self.driver_supply.reference_earnings = {
+            firm: reference for firm in ("Firm1", "Firm2")
+        }
+        self.driver_supply.reset_stock()
+        return {
+            **dict(capacity),
+            "reference_earnings": reference,
+            "initial_online_stock": opening_stock,
+            "post_scale_reference_measurement": measured,
+        }
+
     def _reset_rider_memory(self) -> None:
         reputation = getattr(self.choice_model, "reputation", None)
         if reputation is not None:
@@ -3366,6 +3414,8 @@ class Core:
                     self.driver_supply.config.base_active_drivers * self.market_dynamics.fleet_scale))
                 capacity["fleet_scale"] = float(self.market_dynamics.fleet_scale)
                 capacity["scaled_base_active_drivers"] = self.driver_supply.config.base_active_drivers
+                if not getattr(self, "_supply_reference_is_explicit", False):
+                    capacity = self._v18_remeasure_scaled_supply_reference(capacity)
             self.v26_settings["driver_capacity_calibration"] = capacity
             self._rescale_all_pricers()
         self.v26r_settings = {

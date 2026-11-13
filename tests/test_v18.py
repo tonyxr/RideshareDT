@@ -67,6 +67,50 @@ def test_v3_daily_stock_uses_realized_pay_formula():
     assert value == pytest.approx(0.95 + 0.05 * target)
 
 
+def test_v18_scaled_fleet_remeasures_reference_without_refitting(monkeypatch):
+    core = Core.__new__(Core)
+    config = DriverSupplyConfig(
+        supply_model="v3", v3_daily_stock=True,
+        reference_earnings_per_hour=20.0,
+    )
+    pay = DriverPayPolicy(rule="linear")
+    resets = []
+    core.driver_supply = SimpleNamespace(
+        config=config,
+        pay_policies={"Firm1": pay, "Firm2": pay},
+        reference_earnings={"Firm1": 20.0, "Firm2": 20.0},
+        reset_stock=lambda: resets.append(True),
+    )
+    core.supply_calibration_customers = 500
+    calls = []
+
+    def measure(subject, **kwargs):
+        calls.append((subject, kwargs))
+        subject.driver_supply.config = DriverSupplyConfig(
+            supply_model="v3", v3_daily_stock=True,
+            reference_earnings_per_hour=20.0,
+        )
+        return {
+            "reference_earnings": 31.5,
+            "opening_stock": {"Firm1": 0.99, "Firm2": 1.01},
+            "measurement_only": True,
+        }
+
+    monkeypatch.setattr("city_supply_calibration.calibrate_capacity", measure)
+    result = core._v18_remeasure_scaled_supply_reference({"fleet_scale": 0.6})
+    assert calls[0][1] == {
+        "sample_size": 500, "measure_reference": True, "verify_only": True,
+    }
+    assert config.reference_earnings_per_hour == 20.0
+    assert core.driver_supply.config.reference_earnings_per_hour == 31.5
+    assert core.driver_supply.config.initial_online_stock == {
+        "Firm1": 0.99, "Firm2": 1.01,
+    }
+    assert core.driver_supply.reference_earnings == {"Firm1": 31.5, "Firm2": 31.5}
+    assert result["post_scale_reference_measurement"]["measurement_only"] is True
+    assert resets == [True]
+
+
 def test_linear_driver_pay_is_hand_computed():
     policy = DriverPayPolicy(
         rule="linear", intercept=-0.32, per_mile=0.567,
