@@ -219,7 +219,8 @@ def _run_job(job: Job, *, sources: Mapping[str, str], config_hash: str) -> str:
 def _run_parallel(
     jobs: Sequence[Job], *, workers: int, output: Path, phase: str,
     completed_before: int = 0, expected_total: int | None = None,
-) -> int:
+    allow_capacity_infeasible: bool = False,
+) -> tuple[int, list[dict[str, str]]]:
     sources = _source_identity()
     config_hash = canonical_hash(load_v18())
     completed = int(completed_before)
@@ -233,7 +234,8 @@ def _run_parallel(
         ).strip(),
     })
     if not jobs:
-        return completed
+        return completed, []
+    infeasible: list[dict[str, str]] = []
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=min(max(1, int(workers)), len(jobs))
     ) as executor:
@@ -242,18 +244,35 @@ def _run_parallel(
             for job in jobs
         }
         for future in concurrent.futures.as_completed(futures):
-            future.result()
-            completed += 1
+            job = futures[future]
+            try:
+                future.result()
+            except RuntimeError as exc:
+                if not (
+                    allow_capacity_infeasible
+                    and "capacity target unreachable" in str(exc)
+                ):
+                    raise
+                infeasible.append({
+                    "job": job.name,
+                    "reason": "capacity target unreachable for registered diagnostic candidate",
+                    "manifest": str(job.manifest),
+                    "log": str(job.log),
+                })
+            else:
+                completed += 1
             atomic_json(output / "status.json", {
                 "step": "P2", "state": "running", "phase": phase,
                 "completed_jobs": completed, "expected_jobs": total,
-                "last_completed": futures[future].name,
+                "processed_jobs": completed + len(infeasible),
+                "last_processed": job.name,
+                "infeasible_jobs": infeasible,
                 "workers": min(max(1, workers), len(jobs)),
                 "git_head": subprocess.check_output(
                     ["git", "rev-parse", "HEAD"], cwd=BASE, text=True
                 ).strip(),
             })
-    return completed
+    return completed, infeasible
 
 
 def fit_pay_rules() -> dict[str, Any]:
@@ -457,18 +476,26 @@ def run_supply_calibration(
         )
         for pickup in PICKUP_GRID
     ]
-    _run_parallel(
+    _, infeasible_pickups = _run_parallel(
         pickup_jobs, workers=workers, output=output, phase="pickup_grid",
         completed_before=len(fleet_jobs),
         expected_total=len(fleet_jobs) + len(pickup_jobs),
+        allow_capacity_infeasible=True,
     )
+    completed_pickup_jobs = [
+        job for job in pickup_jobs
+        if job.manifest.is_file()
+        and json.loads(job.manifest.read_text(encoding="utf-8")).get("state") == "completed"
+    ]
+    if not completed_pickup_jobs:
+        raise RuntimeError("P2 pickup grid produced no feasible candidates")
     measurements.extend(
         _measurement(
             _validate_product(job.raw, job.expected), t1.CARD,
             stage="pickup", fleet_scale=selected_scale,
             base_pickup_minutes=float(_option(job.command, "--base_pickup_minutes")),
         )
-        for job in pickup_jobs
+        for job in completed_pickup_jobs
     )
     selected = select_fit(
         measurements,
@@ -483,6 +510,8 @@ def run_supply_calibration(
             "weather": wait_target["weather_source_url"],
         },
         "months": ["2022-10", "2023-03", "2023-06"],
+        "pickup_candidates_completed": [job.name for job in completed_pickup_jobs],
+        "pickup_candidates_infeasible": infeasible_pickups,
         "wait_target": wait_target,
     })
     atomic_json(PAY_DIR / "nyc/supply.json", selected)

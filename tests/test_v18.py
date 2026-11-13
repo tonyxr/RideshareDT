@@ -2,11 +2,13 @@
 
 from datetime import date, timedelta
 import csv
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+
 import torch
 
 from Core import Core, build_shock_config_from_args
@@ -15,7 +17,7 @@ from market_shocks import ShockConfig, ShockEvent, ShockProcess, ShockScenario
 from scripts.v18_config import HORIZON_CANDIDATES, load_config, validate_config
 from scripts.v18_fit_pay_rule import DEFAULT_INPUT, fit, load_rows, transfer
 from scripts.v18_fleet_refit import FLEET_GRID, select_fit
-from scripts.v18_p2 import _histogram_median, _measurement
+from scripts.v18_p2 import Job, _histogram_median, _measurement, _run_parallel
 from scripts.v18_select import card_grid, count_rule_candidates, reactive_candidates
 from scripts.v18_stats import holm, two_level_bootstrap
 from scripts.v18_value_of_timing import timing
@@ -218,6 +220,39 @@ def test_fleet_grid_and_selection():
     ]
     selected = select_fit(rows, target_trips_per_hour=1.78, target_median_wait=6.0)
     assert selected["fleet_scale"] == 1.1
+
+
+def test_p2_pickup_grid_reports_infeasible_capacity_candidate(monkeypatch, tmp_path):
+    jobs = [
+        Job("ok", (), tmp_path / "ok.json", tmp_path / "ok.manifest",
+            tmp_path / "ok.log", {}),
+        Job("pickup_7.5", (), tmp_path / "bad.json", tmp_path / "bad.manifest",
+            tmp_path / "bad.log", {}),
+    ]
+
+    def run(job, **_):
+        if job.name == "pickup_7.5":
+            raise RuntimeError("v3 capacity target unreachable: diagnostic candidate")
+        return "completed"
+
+    monkeypatch.setattr("scripts.v18_p2._run_job", run)
+    monkeypatch.setattr("scripts.v18_p2._source_identity", lambda: {})
+    monkeypatch.setattr("scripts.v18_p2.load_v18", lambda: {})
+    monkeypatch.setattr("scripts.v18_p2.canonical_hash", lambda _: "config")
+    monkeypatch.setattr(
+        "scripts.v18_p2.subprocess.check_output", lambda *_, **__: "head\n",
+    )
+    completed, infeasible = _run_parallel(
+        jobs, workers=2, output=tmp_path, phase="pickup_grid",
+        allow_capacity_infeasible=True,
+    )
+    assert completed == 1
+    assert [row["job"] for row in infeasible] == ["pickup_7.5"]
+    status = json.loads((tmp_path / "status.json").read_text())
+    assert status["state"] == "running"
+    assert status["processed_jobs"] == 2
+    assert status["infeasible_jobs"][0]["job"] == "pickup_7.5"
+    assert status["infeasible_jobs"][0]["reason"].startswith("capacity target unreachable")
 
 
 def test_fleet_selection_separates_fleet_and_pickup_stages():
