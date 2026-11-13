@@ -463,11 +463,17 @@ def _measurement(
         + int(row[f"unfulfilled_requests_{firm}"])
         for row in rows for firm in ("firm1", "firm2")
     )
+    pickup_minutes = sum(pickups)
+    engaged_minutes = passenger_minutes + pickup_minutes
     result = {
         "stage": stage,
         "fleet_scale": float(fleet_scale),
         "base_pickup_minutes": float(base_pickup_minutes),
-        "utilization": passenger_minutes / max(online_minutes, 1e-12),
+        # The TLC utilization target is dispatched time: time carrying a
+        # passenger plus time travelling to the pickup, divided by total
+        # online time.  Passenger-only time understates the registered target
+        # and made an otherwise valid joint calibration fail confirmation.
+        "utilization": engaged_minutes / max(online_minutes, 1e-12),
         "trips_per_online_driver_hour": (
             60.0 * completed / max(online_minutes, 1e-12)
         ),
@@ -481,6 +487,8 @@ def _measurement(
         "completed_rides": int(completed),
         "online_minutes": float(online_minutes),
         "passenger_minutes": float(passenger_minutes),
+        "pickup_minutes": float(pickup_minutes),
+        "engaged_minutes": float(engaged_minutes),
         "driver_pay": float(driver_pay),
         "pickup_observations": len(pickups),
         "trace_rows": len(rows),

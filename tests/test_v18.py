@@ -402,6 +402,10 @@ def test_wait_histogram_median_and_p2_measurement():
         base_pickup_minutes=3.5,
     )
     assert row["trips_per_online_driver_hour"] == pytest.approx(1.8)
-    assert row["utilization"] == pytest.approx(0.5)
+    # TLC utilization includes dispatched pickup time as well as passenger
+    # time: (300 passenger + 108 pickup) / 600 online minutes.
+    assert row["pickup_minutes"] == pytest.approx(108.0)
+    assert row["engaged_minutes"] == pytest.approx(408.0)
+    assert row["utilization"] == pytest.approx(0.68)
     assert row["median_wait_minutes"] == pytest.approx(6.0)
     assert row["reference_earnings_per_hour"] == pytest.approx(20.0)
