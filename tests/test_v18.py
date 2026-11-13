@@ -233,6 +233,13 @@ def test_p2_revision2_reference_earnings_remeasures_only_registered_statistic(
             assert command[command.index("--experiment_seed") + 1] == "20231"
             assert command[command.index("--policy_sweep_seed") + 1] == "20231"
             assert command[command.index("--policy_sweep") + 1] == PUBLISHED
+            supplied_reference = float(
+                command[command.index("--supply_reference_earnings") + 1]
+            )
+            expected_reference = json.loads(
+                (supply_root / city / "supply.json").read_text()
+            )["reference_earnings_per_hour"]
+            assert supplied_reference == pytest.approx(expected_reference)
             job.raw.parent.mkdir(parents=True, exist_ok=True)
             job.raw.write_text(json.dumps(products[city]))
         return len(jobs), []

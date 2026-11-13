@@ -758,6 +758,7 @@ def _calibration_job(
     fleet_scale: float, pickup: float, openings: int = CALIBRATION_OPENINGS,
     base_active_drivers: int = 0,
     hour_profile_json: Path | None = None,
+    reference_earnings: float | None = None,
 ) -> Job:
     work = output / "calibration" / name
     command = t1.market_command(
@@ -780,6 +781,7 @@ def _calibration_job(
         base_pickup_minutes=pickup, production_population=True,
         base_active_drivers=base_active_drivers,
         hour_profile_json=hour_profile_json,
+        reference_earnings=reference_earnings,
     )
     return Job(
         name=name, command=tuple(command), raw=raw,
@@ -1204,7 +1206,11 @@ def run_reference_earnings(
     randomization with 2%, so their E_ref values cannot be used in the exact
     published-card check.  Re-measure only E_ref under the registered Fix A
     contract (stock frozen, seed 20231, three openings, days 5--28, shared
-    ratio of sums); all other calibrated quantities remain frozen.
+    ratio of sums); all other calibrated quantities remain frozen.  The
+    installed city reference is passed explicitly so the frozen-stock cell
+    and the dynamic validation cell use the same within-day supply response.
+    Omitting it makes Core fall back to the reservation wage and measures a
+    different model from the one validated by Revision 2.
     """
     jobs = []
     for city in REFERENCE_CITIES:
@@ -1217,6 +1223,7 @@ def run_reference_earnings(
             openings=CONFIRMATION_OPENINGS,
             base_active_drivers=int(supply["base_active_drivers"]),
             hour_profile_json=PAY_DIR / city / "supply.json",
+            reference_earnings=float(supply["reference_earnings_per_hour"]),
         )
         command = set_option(base_job.command, "--policy_sweep", PUBLISHED)
         jobs.append(Job(
