@@ -23,7 +23,8 @@ from scripts.v18_revealed_beta import _interpolated_factor
 from scripts.v18_p2 import (
     FLEET_GRID, PICKUP_GRID, TRANSFER_FLEET_GRID, Job, _block_waits, _histogram_median,
     _measurement, _profile_from_factors, _run_parallel,
-    _select_joint_calibration, _select_transfer_service_level,
+    _select_joint_calibration, _select_kappa_candidate,
+    _select_transfer_service_level,
     _updated_profile_factors,
 )
 from scripts.v18_select import card_grid, count_rule_candidates, reactive_candidates
@@ -399,6 +400,32 @@ def test_rev1_city_transfer_uses_original_grid_and_only_block_wait_loss():
         },
     ])
     assert selected["fleet_scale"] == pytest.approx(0.6)
+
+
+def test_rev1_kappa_diagnostic_retains_registered_value_when_none_passes():
+    rows = [
+        {"kappa": 0.03, "pass": False},
+        {"kappa": 0.05, "pass": False},
+        {"kappa": 0.08, "pass": False},
+    ]
+    selected, retained = _select_kappa_candidate(
+        rows, registered_kappa=0.05
+    )
+    assert retained is True
+    assert selected["kappa"] == pytest.approx(0.05)
+
+
+def test_rev1_kappa_diagnostic_still_selects_smallest_passing_candidate():
+    rows = [
+        {"kappa": 0.03, "pass": False},
+        {"kappa": 0.05, "pass": True},
+        {"kappa": 0.08, "pass": True},
+    ]
+    selected, retained = _select_kappa_candidate(
+        rows, registered_kappa=0.05
+    )
+    assert retained is False
+    assert selected["kappa"] == pytest.approx(0.05)
 
 
 def test_rev1_selection_stops_only_without_binding_feasible_point():

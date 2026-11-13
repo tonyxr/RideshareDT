@@ -1256,6 +1256,30 @@ def _daily_earnings_paths(
     return path
 
 
+def _select_kappa_candidate(
+    rows: Sequence[Mapping[str, Any]], *, registered_kappa: float,
+) -> tuple[dict[str, Any], bool]:
+    """Apply the registered criterion or retain the predeclared value.
+
+    Revision 1 Section 3 does not make a missed kappa diagnostic a stop.
+    When none of the three registered candidates meets the original
+    re-equilibration criterion, retaining the already registered production
+    value avoids introducing an unregistered scientific fallback.
+    """
+    passing = [dict(row) for row in rows if bool(row["pass"])]
+    if passing:
+        return min(passing, key=lambda row: float(row["kappa"])), False
+    matches = [
+        dict(row) for row in rows
+        if abs(float(row["kappa"]) - float(registered_kappa)) <= 1e-12
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "registered production kappa is absent from the candidate set"
+        )
+    return matches[0], True
+
+
 def run_kappa_test(
     config: Mapping[str, Any], output: Path, *, workers: int,
 ) -> dict[str, Any]:
@@ -1301,15 +1325,19 @@ def run_kappa_test(
             "path": path,
             "product": str(job.raw),
         })
-    passing = [row for row in rows if row["pass"]]
-    if not passing:
-        report = {"candidates": rows, "pass": False}
-        atomic_json(output / "kappa_test/report.json", report)
-        raise ValueError("no registered kappa re-equilibrated the earnings gap")
-    selected = min(passing, key=lambda row: float(row["kappa"]))
+    registered_kappa = float(load_v18()["market"]["stock_adjustment_rate"])
+    selected, fallback_used = _select_kappa_candidate(
+        rows, registered_kappa=registered_kappa
+    )
     report = {
         "candidates": rows, "selected_kappa": float(selected["kappa"]),
-        "pass": True,
+        "criterion_pass": not fallback_used,
+        "registered_value_retained": fallback_used,
+        "selection_reason": (
+            "smallest_candidate_meeting_registered_criterion"
+            if not fallback_used
+            else "revision_1_nonstop_diagnostic_retains_registered_value"
+        ),
         "criterion": "days_63_70_abs_gap_le_20pct_days_14_17",
     }
     atomic_json(output / "kappa_test/report.json", report)
