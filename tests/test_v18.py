@@ -21,9 +21,10 @@ from scripts.v18_config import (
 from scripts.v18_fit_pay_rule import DEFAULT_INPUT, fit, load_rows, transfer
 from scripts.v18_revealed_beta import _interpolated_factor
 from scripts.v18_p2 import (
-    FLEET_GRID, PICKUP_GRID, Job, _block_waits, _histogram_median,
+    FLEET_GRID, PICKUP_GRID, TRANSFER_FLEET_GRID, Job, _block_waits, _histogram_median,
     _measurement, _profile_from_factors, _run_parallel,
-    _select_joint_calibration, _updated_profile_factors,
+    _select_joint_calibration, _select_transfer_service_level,
+    _updated_profile_factors,
 )
 from scripts.v18_select import card_grid, count_rule_candidates, reactive_candidates
 from scripts.v18_stats import holm, two_level_bootstrap
@@ -377,6 +378,27 @@ def test_rev1_grid_and_utilization_fallback_are_registered():
     assert selected["utilization_fallback_used"] is True
     assert selected["utilization_gap"] == pytest.approx(0.03)
     assert selected["binding_targets_pass"] is True
+
+
+def test_rev1_city_transfer_uses_original_grid_and_only_block_wait_loss():
+    assert TRANSFER_FLEET_GRID == (0.6, 0.8, 1.0, 1.2, 1.4, 1.6)
+    selected = _select_transfer_service_level([
+        {
+            "fleet_scale": 0.6,
+            "service_level_loss": 1.0,
+            "median_wait_minutes": 2.2,
+            "trips_per_online_driver_hour": 2.2,
+            "utilization": 0.2,
+        },
+        {
+            "fleet_scale": 0.8,
+            "service_level_loss": 2.0,
+            "median_wait_minutes": 4.27,
+            "trips_per_online_driver_hour": 1.7,
+            "utilization": 0.58,
+        },
+    ])
+    assert selected["fleet_scale"] == pytest.approx(0.6)
 
 
 def test_rev1_selection_stops_only_without_binding_feasible_point():

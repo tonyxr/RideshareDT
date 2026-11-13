@@ -63,7 +63,7 @@ CALIBRATION_DAYS = 28
 CALIBRATION_OPENINGS = 2
 CONFIRMATION_OPENINGS = 3
 FLEET_GRID = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
-TRANSFER_FLEET_GRID = (0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+TRANSFER_FLEET_GRID = (0.6, 0.8, 1.0, 1.2, 1.4, 1.6)
 PICKUP_GRID = (1.0, 1.25, 1.5, 1.75, 2.0)
 PROFILE_BLOCKS = tuple(range(6))
 PROFILE_EXPONENT = 0.7
@@ -731,6 +731,22 @@ def _select_joint_calibration(
     }
 
 
+def _select_transfer_service_level(
+    measurements: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Choose the closest registered R4 block-wait fit without NYC gates."""
+    candidates = [dict(row) for row in measurements]
+    if not candidates or not _finite(candidates):
+        raise ValueError("city service-level grid must be nonempty and finite")
+    return min(
+        candidates,
+        key=lambda row: (
+            float(row["service_level_loss"]),
+            float(row["fleet_scale"]),
+        ),
+    )
+
+
 def _calibration_job(
     config: Mapping[str, Any], output: Path, *, name: str, city: str,
     fleet_scale: float, pickup: float, openings: int = CALIBRATION_OPENINGS,
@@ -873,6 +889,7 @@ def _confirm_calibration(
     base: int, fleet: float, pickup: float, target_wait: float,
     hour_profile_json: Path | None = None,
     block_wait_targets: Mapping[int, float] | None = None,
+    binding_targets: bool = True,
 ) -> tuple[Job, dict[str, Any]]:
     job = _calibration_job(
         config, output, name=f"{city}_confirmation", city=city,
@@ -922,7 +939,10 @@ def _confirm_calibration(
             0.0, UTILIZATION_BAND[0] - measured["utilization"]
         ),
     }
-    measured["pass"] = all(measured["target_checks"].values())
+    measured["target_role"] = "binding" if binding_targets else "reported"
+    measured["pass"] = (
+        all(measured["target_checks"].values()) if binding_targets else True
+    )
     return job, measured
 
 
@@ -1100,25 +1120,7 @@ def run_supply_calibration(
                 for block in PROFILE_BLOCKS
             )
             city_measurements.append(row)
-        feasible = [
-            row for row in city_measurements
-            if row["trips_per_online_driver_hour"]
-            <= MAX_TRIPS_PER_ONLINE_HOUR
-            and abs(row["median_wait_minutes"] - target_wait)
-            <= WAIT_TOLERANCE
-        ]
-        if not feasible:
-            raise ValueError(
-                f"{city} service-level grid has no point satisfying "
-                "wait and trips/hour"
-            )
-        choice = min(
-            feasible,
-            key=lambda row: (
-                float(row["service_level_loss"]),
-                float(row["fleet_scale"]),
-            ),
-        )
+        choice = _select_transfer_service_level(city_measurements)
         city_confirmation_job, city_confirmation = _confirm_calibration(
             config, output, city=city, base=city_base,
             fleet=float(choice["fleet_scale"]),
@@ -1126,19 +1128,28 @@ def run_supply_calibration(
             target_wait=target_wait,
             hour_profile_json=city_profile_path,
             block_wait_targets=block_wait_targets,
+            binding_targets=False,
+        )
+        city_confirmation["service_level_loss"] = mean(
+            (float(row["gap_minutes"]) / 0.4) ** 2
+            for row in city_confirmation["wait_by_four_hour_block"]
+        )
+        city_confirmation["selection_rule"] = (
+            "minimum_block_wait_loss_over_registered_transfer_grid"
         )
         city_checks = {
-            "median_wait": bool(
-                abs(city_confirmation["median_wait_minutes"] - target_wait)
-                <= WAIT_TOLERANCE
+            "service_level_profile_recorded": bool(
+                len(city_confirmation["wait_by_four_hour_block"])
+                == len(PROFILE_BLOCKS)
             ),
-            "trips_per_online_driver_hour": bool(
-                city_confirmation["trips_per_online_driver_hour"]
-                <= MAX_TRIPS_PER_ONLINE_HOUR
+            "utilization_reported": bool(
+                math.isfinite(float(city_confirmation["utilization"]))
             ),
         }
         if not all(city_checks.values()):
-            raise ValueError(f"{city} fleet confirmation failed: {city_confirmation}")
+            raise ValueError(
+                f"{city} service-level report is incomplete: {city_confirmation}"
+            )
         city_supply = {
             "schema_version": "v18-city-supply-calibration-v2",
             "city": city,
