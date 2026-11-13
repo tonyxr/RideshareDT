@@ -28,6 +28,7 @@ from scripts.v18_p2 import (
     _histogram_median,
     _calm_published_stock_gate, _calm_published_stock_job,
     _measurement, _profile_from_factors, _run_parallel,
+    run_reference_earnings,
     _select_joint_calibration, _select_kappa_candidate,
     _select_transfer_service_level,
     _updated_profile_factors,
@@ -192,6 +193,72 @@ def test_p2_calm_stock_gate_is_exact_both_published_cell(tmp_path: Path):
     assert not gate["pass"]
     assert gate["platforms"]["platform1"]["pass"]
     assert not gate["platforms"]["platform2"]["pass"]
+
+
+def test_p2_revision2_reference_earnings_remeasures_only_registered_statistic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    products = {}
+    for city in ("nyc", "boston", "chicago"):
+        supply = json.loads(
+            (Path("calibration_artifacts/v18") / city / "supply.json").read_text()
+        )
+        rows = []
+        for opening in (1, 2, 3):
+            for step in range(168):
+                rows.append({
+                    "rollout": f"static__opening_{opening}",
+                    "step": step,
+                    "completed_rides_firm1": 1,
+                    "completed_rides_firm2": 1,
+                    "unfulfilled_requests_firm1": 0,
+                    "unfulfilled_requests_firm2": 0,
+                    "online_minutes_firm1": 60.0,
+                    "online_minutes_firm2": 60.0,
+                    "passenger_minutes_firm1": 30.0,
+                    "passenger_minutes_firm2": 30.0,
+                    "driver_pay_firm1": 20.0,
+                    "driver_pay_firm2": 20.0,
+                    "pickup_minutes_firm1": [4.0],
+                    "pickup_minutes_firm2": [4.0],
+                })
+        products[city] = {"traces": {"static:1": rows}}
+
+    def fake_parallel(jobs, **kwargs):
+        del kwargs
+        for job in jobs:
+            city = job.name.rsplit("/", 1)[-1]
+            job.raw.parent.mkdir(parents=True, exist_ok=True)
+            job.raw.write_text(json.dumps(products[city]))
+        return len(jobs), []
+
+    monkeypatch.setattr("scripts.v18_p2._run_parallel", fake_parallel)
+    monkeypatch.setattr(
+        "scripts.v18_p2._validate_product",
+        lambda raw, expected: json.loads(raw.read_text()),
+    )
+    monkeypatch.setattr(
+        "scripts.v18_p2.PAY_DIR", Path("calibration_artifacts/v18").resolve()
+    )
+    # Work on temporary supply copies so the test proves the narrow mutation.
+    supply_root = tmp_path / "pay"
+    for city in ("nyc", "boston", "chicago"):
+        target = supply_root / city
+        target.mkdir(parents=True)
+        source = Path("calibration_artifacts/v18") / city
+        for name in ("supply.json", "pay_rule.json"):
+            (target / name).write_bytes((source / name).read_bytes())
+    monkeypatch.setattr("scripts.v18_p2.PAY_DIR", supply_root)
+    report = run_reference_earnings(
+        load_v17_config(), tmp_path / "run", workers=3
+    )
+    assert set(report["cities"]) == {"nyc", "boston", "chicago"}
+    for city in report["cities"]:
+        updated = json.loads((supply_root / city / "supply.json").read_text())
+        assert updated["reference_earnings_per_hour"] == pytest.approx(20.0)
+        assert updated["reference_earnings_revision2_validation"][
+            "opening_tariff_randomization"
+        ] == 0.0
 
 
 def test_v18_batch_state_records_exact_calibration_quantities():

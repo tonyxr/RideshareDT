@@ -1195,13 +1195,80 @@ def run_supply_calibration(
 def run_reference_earnings(
     config: Mapping[str, Any], output: Path, *, workers: int,
 ) -> dict[str, Any]:
-    del config, output, workers
-    return {
-        city: float(json.loads(
-            (PAY_DIR / city / "supply.json").read_text()
-        )["reference_earnings_per_hour"])
-        for city in REFERENCE_CITIES
+    """Measure E_ref in the exact frozen-stock published-card cell.
+
+    Revision 2 says a failed dedicated calm-stock cell diagnoses either the
+    reference earnings or its helper.  The earlier confirmation products were
+    generated while Core silently replaced an explicit zero opening
+    randomization with 2%, so their E_ref values cannot be used in the exact
+    published-card check.  Re-measure only E_ref under the registered Fix A
+    contract (stock frozen, seed 20231, three openings, days 5--28, shared
+    ratio of sums); all other calibrated quantities remain frozen.
+    """
+    jobs = []
+    for city in REFERENCE_CITIES:
+        supply = json.loads((PAY_DIR / city / "supply.json").read_text())
+        jobs.append(_calibration_job(
+            config, output,
+            name=f"reference_earnings_rev2/{city}", city=city,
+            fleet_scale=float(supply["fleet_scale"]),
+            pickup=float(supply["base_pickup_minutes"]),
+            openings=CONFIRMATION_OPENINGS,
+            base_active_drivers=int(supply["base_active_drivers"]),
+            hour_profile_json=PAY_DIR / city / "supply.json",
+        ))
+    _run_parallel(
+        jobs, workers=workers, output=output,
+        phase="reference_earnings_rev2_exact_published",
+    )
+    report: dict[str, Any] = {
+        "schema_version": "v18-reference-earnings-rev2-v1",
+        "contract": "ratio_of_sums_both_platforms_days_5_28",
+        "opening_tariff_randomization": 0.0,
+        "cities": {},
     }
+    backup_root = output / "reference_earnings_rev2" / "prior_supply"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    for city, job in zip(REFERENCE_CITIES, jobs, strict=True):
+        payload = _validate_product(job.raw, job.expected)
+        supply_path = PAY_DIR / city / "supply.json"
+        supply = json.loads(supply_path.read_text())
+        measured = _measurement(
+            payload, t1.CARD, stage="reference_earnings_rev2",
+            fleet_scale=float(supply["fleet_scale"]),
+            base_pickup_minutes=float(supply["base_pickup_minutes"]),
+        )
+        backup = backup_root / f"{city}.json"
+        if not backup.exists():
+            shutil.copy2(supply_path, backup)
+        previous = float(supply["reference_earnings_per_hour"])
+        updated = float(measured["reference_earnings_per_hour"])
+        supply["reference_earnings_per_hour"] = updated
+        supply["reference_earnings_contract"] = (
+            "ratio_of_sums_both_platforms_days_5_28"
+        )
+        supply["reference_earnings_revision2_validation"] = {
+            "previous_value": previous,
+            "updated_value": updated,
+            "product": str(job.raw),
+            "opening_tariff_randomization": 0.0,
+            "policy_seed": 20231,
+            "openings": CONFIRMATION_OPENINGS,
+            "stock_frozen": True,
+            "measurement": measured,
+        }
+        atomic_json(supply_path, supply)
+        report["cities"][city] = {
+            "previous_value": previous,
+            "updated_value": updated,
+            "relative_change": updated / previous - 1.0,
+            "product": str(job.raw),
+            "measurement": measured,
+        }
+    if not _finite(report):
+        raise ValueError(f"non-finite Revision 2 reference earnings: {report}")
+    atomic_json(output / "reference_earnings_rev2/report.json", report)
+    return report
 
 
 def _kappa_job(
