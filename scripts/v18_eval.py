@@ -15,6 +15,7 @@ if str(REPO) not in sys.path:
 
 from scripts.v18_config import BASE, eval_args, load_config, validate_config
 from scripts.v18_runtime import Job, atomic_json, run_jobs
+from scripts.v18_train import RUNS
 
 
 PYTHON = (BASE.parent / ".venv/bin/python").resolve()
@@ -31,29 +32,30 @@ SCENARIOS = {
     "natural_year_2023": BASE / "scenarios/v18/natural_year_2023.json",
 }
 SUITES: dict[str, dict[str, Any]] = {
-    "E1": {"name": "main", "cases": ("C0", "A1", "A3", "S1", "S6"), "cities": ("nyc", "boston", "chicago"), "openings": 3},
-    "E2": {"name": "severity_ladder", "cases": ("i080", "i065", "i050", "i035"), "cities": ("nyc", "boston", "chicago"), "openings": 2},
-    "E3": {"name": "second_seed", "cases": ("C0", "A1"), "cities": ("nyc", "boston", "chicago"), "openings": 2, "seed": 88411},
-    "E4": {"name": "learning_comparison", "cases": ("C0", "A1", "A3", "S6"), "cities": ("nyc",), "openings": 3, "credit_probe": True},
-    "E5": {"name": "natural_year", "cases": ("natural_year_2023",), "cities": ("nyc", "boston", "chicago"), "openings": 2, "request_log": True},
-    "E6": {"name": "scale_confirmation", "cases": ("C0", "A1"), "cities": ("nyc", "chicago"), "openings": 2, "customers": 500},
-    "E7": {"name": "threshold_sources", "cases": ("C0", "A1"), "cities": ("nyc", "chicago"), "openings": 2, "threshold_sources": ("constant_mean", "shuffled", "rubric")},
-    "E8": {"name": "driver_mechanism_map", "cases": ("C0", "A1"), "cities": ("nyc",), "openings": 2, "points": 11},
-    "E9": {"name": "left_out_market", "cases": ("manual_part_D",), "cities": ("nyc", "chicago"), "variants": 7},
-    "E10": {"name": "dataset", "cases": ("C0", "A1", "A3"), "cities": ("nyc", "boston", "chicago"), "openings": 1, "request_log": True},
+    "E1": {"name": "main", "tier": 1, "cases": ("C0", "A1", "A3", "S1", "S6"), "cities": ("nyc", "boston", "chicago"), "openings": 3, "rivals": 10},
+    "E2": {"name": "severity_ladder", "tier": 1, "cases": ("i080", "i065", "i050", "i035"), "cities": ("nyc", "boston", "chicago"), "openings": 1, "rivals": 10},
+    "E4": {"name": "learning_comparison", "tier": 1, "cases": ("C0", "A1", "A3", "S6"), "cities": ("nyc",), "openings": 3, "rivals": 10, "credit_probe": True},
+    "E5": {"name": "natural_year", "tier": 1, "cases": ("natural_year_2023",), "cities": ("nyc", "boston", "chicago"), "openings": 2, "rivals": 3, "request_log": True},
+    "E10": {"name": "dataset", "tier": 1, "cases": ("C0", "A1", "A3"), "cities": ("nyc", "boston", "chicago"), "openings": 1, "rivals": 10, "request_log": True},
+    "E6": {"name": "scale_confirmation", "tier": 2, "cases": ("C0", "A1"), "cities": ("nyc", "chicago"), "openings": 1, "rivals": 10, "customers": 500},
+    "E7": {"name": "threshold_sources", "tier": 2, "cases": ("C0", "A1"), "cities": ("nyc", "chicago"), "openings": 2, "rivals": 3, "threshold_sources": ("constant_mean", "shuffled", "rubric")},
+    "E3": {"name": "second_seed", "tier": 2, "cases": ("C0", "A1"), "cities": ("nyc", "boston", "chicago"), "openings": 1, "rivals": 10, "seed": 88411},
+    "T8": {"name": "credit_probe", "tier": 3, "cases": ("C0", "A1"), "cities": ("nyc",), "openings": 1, "rivals": 3, "credit_probe": True},
 }
+R3 = ("adaptive_best_response_memory", "profit_best_response_myopic", "profit_opt_mpc_grid")
+R5 = ("adaptive_best_response_memory", "profit_best_response_myopic", "profit_best_response_forward", "profit_opt_mpc_grid", "pi_price_gap")
 
 
-def reference_specs(selected: Mapping[str, Any]) -> list[str]:
+def reference_specs(selected: Mapping[str, Any]) -> dict[str, str]:
     keys = (
         "published_card", "best_fixed", "dated_two_lever",
         "count_rule_0step", "count_rule_1step", "reactive_surge",
     )
-    specs: list[str] = []
+    specs: dict[str, str] = {}
     for key in keys:
         value = dict(selected.get(key) or {})
         if "spec" in value:
-            specs.append(str(value["spec"]))
+            specs[key] = str(value["spec"])
     if len(specs) != 6:
         raise ValueError("selection product does not contain all six references")
     return specs
@@ -86,13 +88,18 @@ def policy_runs(suite: str, city: str) -> list[str]:
     if suite in {"E1", "E2", "E3", "E5"}:
         return main + (["nyc_s404", "nyc_s505"] if city == "nyc" else [])
     if suite == "E4":
-        arms = ("", "_ppo", "_ppo_clock", "_mc_clock", "_nocrn",
-                "_no_driver_obs", "_own_profit")
-        return [f"nyc_s{seed}{arm}" for seed in (101, 202) for arm in arms] + ["nyc_s101_halt"]
-    if suite in {"E6", "E7", "E8"}:
+        return [
+            "nyc_s101", "nyc_s202", "nyc_s101_ppo_clock",
+            "nyc_s202_ppo_clock", "nyc_s101_mc_clock", "nyc_s202_mc_clock",
+            "nyc_s101_ppo", "nyc_s101_nocrn",
+            "nyc_s101_no_driver_obs", "nyc_s101_own_profit",
+        ]
+    if suite in {"E6", "E7"}:
         return main
     if suite == "E10":
         return [f"{city}_s101"]
+    if suite == "T8":
+        return ["nyc_s101"]
     return []
 
 
@@ -102,66 +109,61 @@ def build_jobs(config: dict, *, suite: str, root: Path) -> list[Job]:
     for city in definition["cities"]:
         selected_path = BASE / f"runs/v18/select/{city}/selected.json"
         selected = json.loads(selected_path.read_text(encoding="utf-8"))
-        specs = reference_specs(selected)
+        references = reference_specs(selected)
+        if suite in {"E5"}:
+            reference_names = ("published_card", "best_fixed", "dated_two_lever", "count_rule_1step", "reactive_surge")
+        elif suite in {"E10", "E6", "E7"}:
+            reference_names = ("published_card", "best_fixed", "dated_two_lever", "count_rule_1step")
+        elif suite in {"E4", "T8"}:
+            reference_names = ()
+        else:
+            reference_names = tuple(references)
+        rivals = tuple(config["evaluation"]["rivals"][: int(definition["rivals"])])
+        if int(definition["rivals"]) == 3:
+            rivals = R3
+        elif int(definition["rivals"]) == 5:
+            rivals = R5
         for case in definition["cases"]:
-            if case == "manual_part_D":
-                continue
-            leaf = (root / suite / city / case / "references").resolve()
-            values = eval_args(
-                config, city=city, case=case, specs=specs, suite=suite,
-                output=leaf, seed=int(definition.get("seed", 77311)),
-                scenario=SCENARIOS[case],
-            )
-            values = _set(values, "--policy_sweep_openings", definition["openings"])
-            if "customers" in definition:
-                values = _set(values, "--eval_customers", definition["customers"])
-            if definition.get("credit_probe"):
-                values = _set(values, "--v17_eval_credit_probe", 5)
-                values = _set(values, "--v17_eval_credit_horizons", "5,10")
-                values = _set(values, "--v17_eval_credit_rival_planner", "proxy")
-                values = _set(values, "--v17_eval_credit_probe_out", leaf / "credit_probe.jsonl")
-            command = (str(PYTHON), "-u", str(BASE / "Core.py"), *values)
-            jobs.append(Job(
-                name=f"{suite}/{city}/{case}/references", command=tuple(command),
-                output=leaf / "raw.json", log=leaf / "run.log",
-                manifest=leaf / "manifest.json",
-            ))
+            threshold_sources = definition.get("threshold_sources", ("as_loaded",))
+            for threshold_source in threshold_sources:
+              case_key = case if threshold_source == "as_loaded" else f"{case}_{threshold_source}"
+              for reference_name in reference_names:
+                leaf = (root / suite / city / case_key / reference_name).resolve()
+                values = eval_args(
+                    config, city=city, case=case, specs=(references[reference_name],), suite=suite,
+                    output=leaf, seed=int(definition.get("seed", 77311)),
+                    scenario=SCENARIOS[case], customers=definition.get("customers"),
+                )
+                values = _set(values, "--policy_sweep_openings", definition["openings"])
+                values = _set(values, "--policy_sweep_rivals", ",".join(rivals))
+                if threshold_source != "as_loaded":
+                    values = _set(values, "--threshold_ablation", threshold_source)
+                command = (str(PYTHON), "-u", str(BASE / "Core.py"), *values)
+                jobs.append(Job(
+                    name=f"{suite}/{city}/{case_key}/{reference_name}", command=tuple(command),
+                    output=leaf / "raw.json", log=leaf / "run.log",
+                    manifest=leaf / "manifest.json", tier=int(definition["tier"]),
+                ))
             for run_name in policy_runs(suite, city):
-                run_leaf = (root / suite / city / case / run_name).resolve()
+              for threshold_source in threshold_sources:
+                case_key = case if threshold_source == "as_loaded" else f"{case}_{threshold_source}"
+                run_leaf = (root / suite / city / case_key / run_name).resolve()
+                spec = next(item for item in RUNS if item.name == run_name)
                 policy_values = eval_args(
                     config, city=city, case=case, specs=("rl_actor",),
                     suite=suite, output=run_leaf,
                     seed=int(definition.get("seed", 77311)),
-                    scenario=SCENARIOS[case],
+                    scenario=SCENARIOS[case], kind=spec.arm,
+                    policy=BASE / "runs/v18/train" / run_name / "policy.pt",
+                    customers=definition.get("customers"),
                 )
                 policy_values = _set(
                     policy_values, "--policy_sweep_openings",
                     definition["openings"],
                 )
-                if "customers" in definition:
-                    policy_values = _set(
-                        policy_values, "--eval_customers",
-                        definition["customers"],
-                    )
-                if "_ppo" in run_name:
-                    policy_values = _drop(policy_values, (
-                        "--v16_branch_mode", "--v16_branch_horizon_days",
-                        "--v16_branch_design", "--v16_audit_every",
-                        "--v16_store_cap", "--v16_value_head",
-                        "--v17_move_radius", "--v17_temperature_mode",
-                        "--v17_tau_rel_start", "--v17_tau_rel_end",
-                    ))
-                    policy_values = _set(
-                        policy_values, "--v16_policy_mode", "ppo"
-                    )
-                if "_mc_clock" in run_name:
-                    policy_values = _set(
-                        policy_values, "--v17_credit_source", "mc_return"
-                    )
-                if "_nocrn" in run_name:
-                    policy_values = _set(
-                        policy_values, "--v17_branch_noise", "independent"
-                    )
+                policy_values = _set(policy_values, "--policy_sweep_rivals", ",".join(rivals))
+                if threshold_source != "as_loaded":
+                    policy_values = _set(policy_values, "--threshold_ablation", threshold_source)
                 if definition.get("credit_probe"):
                     policy_values = _set(
                         policy_values, "--v17_eval_credit_probe", 5
@@ -176,19 +178,14 @@ def build_jobs(config: dict, *, suite: str, root: Path) -> list[Job]:
                         policy_values, "--v17_eval_credit_probe_out",
                         run_leaf / "credit_probe.jsonl",
                     )
-                policy_values.extend((
-                    "--trained_model_in",
-                    str((BASE / "runs/v18/train" / run_name / "policy.pt").resolve()),
-                    "--eval_only",
-                ))
                 policy_command = (
                     str(PYTHON), "-u", str(BASE / "Core.py"), *policy_values
                 )
                 jobs.append(Job(
-                    name=f"{suite}/{city}/{case}/{run_name}",
+                    name=f"{suite}/{city}/{case_key}/{run_name}",
                     command=tuple(policy_command),
                     output=run_leaf / "raw.json", log=run_leaf / "run.log",
-                    manifest=run_leaf / "manifest.json",
+                    manifest=run_leaf / "manifest.json", tier=int(definition["tier"]),
                 ))
     return jobs
 

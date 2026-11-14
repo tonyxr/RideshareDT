@@ -1,0 +1,19 @@
+[2026-11-14T15:12:51.500430Z] D1 downloads started
+[2026-11-14T15:12:51.833318Z] download fhvhv_tripdata_2023-08.parquet attempt=1 offset=0
+[2026-11-14T15:12:51.834020Z] download fhvhv_tripdata_2023-09.parquet attempt=1 offset=0
+[2026-11-14T15:12:52.155335Z] download fhvhv_tripdata_2023-11.parquet attempt=1 offset=0
+[2026-11-14T15:12:52.161959Z] download fhvhv_tripdata_2023-10.parquet attempt=1 offset=0
+[2026-11-14T15:13:23.033789Z] download fhvhv_tripdata_2023-12.parquet attempt=1 offset=0
+[2026-11-14T15:13:31.114864Z] download fhvhv_tripdata_2024-01.parquet attempt=1 offset=0
+[2026-11-14T15:13:55.498181Z] download fhvhv_tripdata_2024-02.parquet attempt=1 offset=0
+[2026-11-14T15:14:00.315477Z] download data_reports_monthly.csv attempt=1 offset=0
+[2026-11-14T15:14:01.255562Z] download nyc_laguardia_2024.csv attempt=1 offset=0
+[2026-11-14T15:14:01.271468Z] download chicago_ohare_2023.csv attempt=1 offset=0
+[2026-11-14T15:14:02.314579Z] download USW00014732.csv attempt=1 offset=0
+[2026-11-14T15:14:03.834216Z] download chicago_ohare_2024.csv attempt=1 offset=0
+[2026-11-14T15:14:04.292177Z] download USW00094846.csv attempt=1 offset=0
+[2026-11-14T15:16:28.932208Z] JSON retry attempt=1 url=https://data.cityofchicago.org/resource/n26f-ihde.json?%24select=date_trunc_ymd%28trip_start_timestamp%29+as+day%2Ccount%28%2A%29+as+trip_count%2Cavg%28trip_miles%29+as+mean_trip_miles%2Cavg%28trip_seconds%29+as+mean_trip_seconds%2Cavg%28fare%29+as+mean_fare%2Cavg%28additional_charges%29+as+mean_additional_charges&%24where=trip_start_timestamp+%3E%3D+%272023-09-01T00%3A00%3A00.000%27+AND+trip_start_timestamp+%3C+%272024-03-01T00%3A00%3A00.000%27&%24group=date_trunc_ymd%28trip_start_timestamp%29&%24order=day&%24limit=50000: The read operation timed out
+[2026-11-14T15:18:31.328184Z] JSON retry attempt=2 url=https://data.cityofchicago.org/resource/n26f-ihde.json?%24select=date_trunc_ymd%28trip_start_timestamp%29+as+day%2Ccount%28%2A%29+as+trip_count%2Cavg%28trip_miles%29+as+mean_trip_miles%2Cavg%28trip_seconds%29+as+mean_trip_seconds%2Cavg%28fare%29+as+mean_fare%2Cavg%28additional_charges%29+as+mean_additional_charges&%24where=trip_start_timestamp+%3E%3D+%272023-09-01T00%3A00%3A00.000%27+AND+trip_start_timestamp+%3C+%272024-03-01T00%3A00%3A00.000%27&%24group=date_trunc_ymd%28trip_start_timestamp%29&%24order=day&%24limit=50000: The read operation timed out
+[2026-11-14T15:20:35.671293Z] JSON retry attempt=3 url=https://data.cityofchicago.org/resource/n26f-ihde.json?%24select=date_trunc_ymd%28trip_start_timestamp%29+as+day%2Ccount%28%2A%29+as+trip_count%2Cavg%28trip_miles%29+as+mean_trip_miles%2Cavg%28trip_seconds%29+as+mean_trip_seconds%2Cavg%28fare%29+as+mean_fare%2Cavg%28additional_charges%29+as+mean_additional_charges&%24where=trip_start_timestamp+%3E%3D+%272023-09-01T00%3A00%3A00.000%27+AND+trip_start_timestamp+%3C+%272024-03-01T00%3A00%3A00.000%27&%24group=date_trunc_ymd%28trip_start_timestamp%29&%24order=day&%24limit=50000: The read operation timed out
+[2026-11-14T15:37:41.829935Z] D1 downloads finalize started
+[2026-11-14T15:37:53.438159Z] D1 downloads complete: 14 records, 1 failed sources

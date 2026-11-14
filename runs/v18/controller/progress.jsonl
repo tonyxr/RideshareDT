@@ -1,2 +1,7 @@
 {"time":"2026-11-14T15:08:28Z","job":"P2","state":"closed_report_only","attempt":5,"seconds":0}
 {"time":"2026-11-14T15:08:28Z","job":"last_revision_transition","state":"started","attempt":1,"seconds":0}
+{"time":"2026-11-14T15:12:51Z","job":"D1_downloads","state":"running","attempt":1,"seconds":0}
+{"time":"2026-11-14T15:20:35Z","job":"D1_chicago","state":"failed","attempt":3,"seconds":463.8}
+{"time":"2026-11-14T15:37:53Z","job":"D1_downloads","state":"complete_with_failures","attempt":1,"seconds":902}
+{"time":"2026-11-14T15:38:00Z","job":"M1_M9","state":"complete","attempt":1,"seconds":0}
+{"time":"2026-11-14T15:38:05Z","job":"Z1","state":"complete","attempt":1,"seconds":1.66}

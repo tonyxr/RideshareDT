@@ -1,44 +1,16 @@
 {
-  "automation_id": "crisp-ride-v18-experiment-and-validation-controller",
-  "authority": "CRISP-Ride_v18_Last_Revision_20261113.pdf",
+  "protocol": "CRISP-Ride_v18_Last_Revision_20261113",
+  "state": "ready_for_Z2_Z4",
+  "current_phase": "code_checks",
+  "p2": "closed_report_only",
+  "m1_m9": "implemented",
+  "z1": "44_passed",
+  "d1": {
+    "state": "complete_with_failures",
+    "records": 14,
+    "failed_source": "Chicago n26f-ihde aggregate timed out after 3 attempts"
+  },
   "branch": "v18-threats",
-  "head": "280e53fcbffa8cf3be128fa09bc61e97bc7bdae4",
-  "current_phase": "last_revision_transition",
-  "state": "running",
-  "p2": {
-    "state": "closed",
-    "rerun_allowed": false,
-    "attempt": 5,
-    "completed_effect_jobs": 27,
-    "gate_status": "retired_report_only_finding",
-    "nyc_maximum_absolute_drift": 0.026883832469627222,
-    "boston_maximum_absolute_drift": 0.04633528904392559,
-    "chicago_maximum_absolute_drift": 0.05235532536227672,
-    "report": "runs/v18/preflight/P2/report.json"
-  },
-  "plan": {
-    "next": [
-      "commit_current_state",
-      "start_D1_downloads",
-      "implement_M1_M9",
-      "run_Z1_Z4",
-      "launch_v18_run_all"
-    ],
-    "scientific_stops": false,
-    "operational_attempt_limit": 3
-  },
-  "workers": 0,
-  "v18_core_count": 0,
-  "core_pids": [],
-  "resources": {
-    "disk_free_gib": 42.0,
-    "disk_floor_gib": 40,
-    "memory_free_percent": 55
-  },
-  "eta": {
-    "implementation_and_checks_hours": "in progress",
-    "remaining_program_hours": "about 61 at W=10 after code checks, subject to P3/P4",
-    "uncertainty": "high until P3 and P4 fix N*, clock days, W and the queue budget"
-  },
-  "observed_utc": "2026-11-14T15:08:28Z"
+  "workers": 4,
+  "projected_hours_left": null
 }

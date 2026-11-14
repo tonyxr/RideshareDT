@@ -3,28 +3,28 @@ status: preflight
 tree: rideshare_v26r_v17
 branch: v18-threats
 output_root: runs/v18
-execution_order: [P1_P7, freeze, wave_A, wave_B, E1_E10, V1_V7, results]
+execution_order: [code_checks, P3, P4, freeze, queue, realdata, results]
 
 market:
+  variant: production
   supply_model: v3
-  eta_total: 0.6
-  eta_within: 0.6
-  eta_day: null
-  v3_daily_stock: true
-  stock_rule: integral
-  persistent_driver_stock: false
-  stock_adjustment_rate: 0.05
-  stock_floor: 0.4
-  stock_ceiling: 2.0
+  eta_v3: 0.6
+  v3_daily_stock: false
+  driver_pay_rule: share
+  fleet_scale: {nyc: 1.2, chicago: 1.1, boston: 1.0}
+  base_pickup_minutes: 3.5
+  hour_profile: default
+  supply_base_active_drivers: 0
+  reference_earnings: measured_by_core
   shortage_willingness_share: 0.5
   acceptance_shock_wage: declared
   rate_upper_multiple: 2.5
-  price_sensitivity_units: relative
-  fare_model: realistic
-  driver_pay_basis: fare
-  driver_pay_rule: linear
   active_driver_feature_reference: run_capacity
   demand_scale: lyft_prior
+
+sensitivity_inputs:
+  pay_rule_json: calibration_artifacts/v18/nyc/pay_rule.json
+  supply_json: calibration_artifacts/v18/nyc/supply.json
 
 calibration:
   targets:
@@ -47,16 +47,13 @@ population:
 credit:
   source: branches
   branch_noise: crn
-  horizon_days: null
+  horizon_days: 5
   horizon_candidates: [5, 7, 10]
-  branch_design: stencil11
-  audit_every_decisions: 10
-  branch_profit_planner_sample_cap: null
-  branch_profit_planner_horizon_days: null
-  branch_profit_planner_candidate_radius: 1
+  sample_cap: 8
+  planner_horizon_days: 1
 
 learner:
-  value_head: null
+  value_head: concave2d
   policy_mode: q
   move_radius: 1
   temperature_mode: relative
@@ -95,13 +92,17 @@ evaluation:
 
 decisions:
   N_star: null
-  H_star: null
-  threshold_outcome: null
-  branch_planner: null
   ppo_clock_days: null
   mc_clock_days: null
-  value_head: null
-  fitted_supply: null
+  workers: null
+  projection: null
+
+fixed:
+  H_star: 5
+  value_head: concave2d
+  branch_planner: {sample_cap: 8, horizon_days: 1}
+  threshold_outcome: e7_ablation_only
+  market_variant: production
 
 city_inputs:
   nyc:

@@ -32,16 +32,14 @@ class RunSpec:
 RUNS = (
     *(RunSpec(f"{city}_s{seed}", city, seed, "main", "A")
       for city in ("nyc", "chicago", "boston") for seed in (101, 202, 303)),
-    RunSpec("nyc_s404", "nyc", 404, "main", "B"),
-    RunSpec("nyc_s505", "nyc", 505, "main", "B"),
-    *(RunSpec(f"nyc_s{seed}_ppo", "nyc", seed, "ppo", "B") for seed in (101, 202)),
     *(RunSpec(f"nyc_s{seed}_ppo_clock", "nyc", seed, "ppo_clock", "B") for seed in (101, 202)),
     *(RunSpec(f"nyc_s{seed}_mc_clock", "nyc", seed, "mc_clock", "B") for seed in (101, 202)),
-    *(RunSpec(f"nyc_s{seed}_nocrn", "nyc", seed, "nocrn", "B") for seed in (101, 202)),
-    *(RunSpec(f"nyc_s{seed}_no_driver_obs", "nyc", seed, "no_driver_obs", "B") for seed in (101, 202)),
-    *(RunSpec(f"nyc_s{seed}_own_profit", "nyc", seed, "own_profit", "B") for seed in (101, 202)),
-    RunSpec("nyc_s101_halt", "nyc", 101, "halt", "B"),
-    RunSpec("nyc_s101_rubric", "nyc", 101, "rubric", "B_optional"),
+    RunSpec("nyc_s404", "nyc", 404, "main", "B"),
+    RunSpec("nyc_s505", "nyc", 505, "main", "B"),
+    RunSpec("nyc_s101_nocrn", "nyc", 101, "nocrn", "B"),
+    RunSpec("nyc_s101_no_driver_obs", "nyc", 101, "no_driver_obs", "B"),
+    RunSpec("nyc_s101_own_profit", "nyc", 101, "own_profit", "B"),
+    RunSpec("nyc_s101_ppo", "nyc", 101, "ppo", "B"),
 )
 
 
@@ -71,14 +69,14 @@ def jobs(config: dict, *, waves: set[str], root: Path) -> list[Job]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=BASE / "configs/v18_production.yaml")
-    parser.add_argument("--wave", choices=("A", "B", "B_optional", "all"), default="A")
+    parser.add_argument("--wave", choices=("A", "B", "all"), default="A")
     parser.add_argument("--workers", type=int, default=9)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--root", type=Path, default=BASE / "runs/v18/train")
     args = parser.parse_args()
     config = load_config(args.config)
     validate_config(config, require_frozen=True)
-    waves = {"A", "B", "B_optional"} if args.wave == "all" else {args.wave}
+    waves = {"A", "B"} if args.wave == "all" else {args.wave}
     planned = jobs(config, waves=waves, root=args.root)
     plan_path = BASE / "runs/v18/train/plan.json"
     atomic_json(plan_path, {

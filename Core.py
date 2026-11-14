@@ -102,6 +102,15 @@ from pricing_models import (
     snap_tariff_level,
     validate_tariff_structure,
 )
+
+
+def _v18_card_clear_quote(market, distance: float, duration: float, context: RideContext) -> float:
+    """Return the logging-only clear-weather card quote without an RNG input."""
+    clear_context = RideContext(
+        day_of_week=context.day_of_week, weather="clear", hour=context.hour,
+        airport=context.airport, service=context.service,
+    )
+    return float(market.quote_price(distance, duration, clear_context, overrides=None))
 from coeff_utils import get_coeff, set_coeff
 from calibration_utils import derive_calibration, load_calibration_json, load_calibration_preset
 from city_data_pipeline import (
@@ -11295,6 +11304,7 @@ class Core:
                 "Day": int(day),
                 "Block": int(step),
                 "RequestIndex": int(request_index),
+                "RequestStep": int(step),
                 "Hour": int(hour),
                 "DayOfWeek": int(day_of_week),
                 "Weather": str(weather),
@@ -17612,6 +17622,22 @@ class Core:
                 service=service,
             )
 
+            # V18 Last Revision M8: logging-only deterministic card quotes.
+            # quote_price has no stochastic path; computing these values must
+            # not advance rider, trip, policy, or shock generators.
+            reference_fare = (
+                float(self.market.quote_price(
+                    travel_distance, duration, ctx, overrides=None
+                ))
+                if collect_rows or hasattr(self.choice_model, "demand_spec")
+                else None
+            )
+            card_clear_quote = None
+            if collect_rows:
+                card_clear_quote = _v18_card_clear_quote(
+                    self.market, travel_distance, duration, ctx
+                )
+
             quote1 = self.market.quote_components(
                 travel_distance, duration, ctx, overrides=self.firm1.overrides
             )
@@ -17683,8 +17709,7 @@ class Core:
                 scenario["ShockAirportPriceSensitivityMultiplier"] = float(regime_effect.airport_price_sensitivity_multiplier)
                 scenario["ShockTransitAvailability"] = float(regime_effect.transit_availability)
             if hasattr(self.choice_model, 'demand_spec'):
-                scenario['ReferenceFare'] = float(self.market.quote_price(
-                    travel_distance, duration, ctx, overrides=None))
+                scenario['ReferenceFare'] = reference_fare
             
             threshold = float(sclip(float(profile.get("PriceThreshold", 1.50) or 1.50), 0.25, 8.00))
             if hasattr(self.choice_model, 'demand_spec'):
@@ -17908,6 +17933,7 @@ class Core:
             
             if collect_rows:
                 rows.append({
+                    "RequestStep": int(step),
                     "City": str(getattr(self.market, "current_city", self.market_name)),
                     "DayOfWeek": day_of_week,
                     "Weather": weather,
@@ -17915,6 +17941,9 @@ class Core:
                     "Airport": airport,
                     "Service": service,
                     "TravelDistance": travel_distance,
+                    "DurationMinutes": float(duration),
+                    "ReferenceFare": reference_fare,
+                    "CardClearQuote": card_clear_quote,
                     "Price_Firm1": p1,
                     "Price_Firm2": p2,
                     "Choice": choice,

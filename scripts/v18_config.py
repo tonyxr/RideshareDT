@@ -18,6 +18,8 @@ if str(BASE) not in sys.path:
 
 from scripts import v17_config
 from scripts import v17_results_eval
+from scripts.v17_results_train import RunSpec as V17RunSpec
+from scripts.v18_market import market_flags
 
 DEFAULT_CONFIG = BASE / "configs/v18_production.yaml"
 CITY_SLUGS = ("nyc", "boston", "chicago")
@@ -53,26 +55,25 @@ def validate_config(
     if config.get("schema_version") != "v18-production-v1":
         raise ValueError("unexpected V18 production schema")
     if tuple(config.get("execution_order", ())) != (
-        "P1_P7", "freeze", "wave_A", "wave_B", "E1_E10", "V1_V7", "results"
+        "code_checks", "P3", "P4", "freeze", "queue", "realdata", "results"
     ):
         raise ValueError("V18 execution order drifted")
     market = dict(config["market"])
     expected = {
-        "supply_model": "v3", "eta_total": 0.6, "eta_within": 0.6,
-        "eta_day": None, "v3_daily_stock": True, "stock_rule": "integral",
-        "persistent_driver_stock": False,
-        "stock_floor": 0.4, "stock_ceiling": 2.0,
-        "driver_pay_rule": "linear",
+        "variant": "production", "supply_model": "v3", "eta_v3": 0.6,
+        "v3_daily_stock": False, "driver_pay_rule": "share",
+        "fleet_scale": {"nyc": 1.2, "chicago": 1.1, "boston": 1.0},
+        "base_pickup_minutes": 3.5, "hour_profile": "default",
+        "supply_base_active_drivers": 0,
+        "reference_earnings": "measured_by_core",
         "active_driver_feature_reference": "run_capacity",
         "acceptance_shock_wage": "declared", "rate_upper_multiple": 2.5,
     }
     for key, wanted in expected.items():
         if market.get(key) != wanted:
             raise ValueError(f"V18 market contract drifted for {key}")
-    if market.get("demand_scale") not in {"lyft_prior", "revealed_foc"}:
-        raise ValueError("V18 demand scale must be lyft_prior or revealed_foc")
-    if float(market.get("stock_adjustment_rate", -1.0)) not in (0.03, 0.05, 0.08):
-        raise ValueError("V18 stock adjustment rate is outside the registered P2 candidates")
+    if market.get("demand_scale") != "lyft_prior":
+        raise ValueError("V18 production demand scale must be lyft_prior")
     population = dict(config["population"])
     if int(population.get("pool", 0)) != 20_000:
         raise ValueError("V18 must load all 20,000 riders")
@@ -81,6 +82,18 @@ def validate_config(
     credit = dict(config["credit"])
     if tuple(credit.get("horizon_candidates", ())) != HORIZON_CANDIDATES:
         raise ValueError("V18 horizon candidates must be 5, 7 and 10")
+    if {key: credit.get(key) for key in ("source", "branch_noise", "horizon_days", "sample_cap", "planner_horizon_days")} != {
+        "source": "branches", "branch_noise": "crn", "horizon_days": 5,
+        "sample_cap": 8, "planner_horizon_days": 1,
+    }:
+        raise ValueError("V18 credit contract drifted")
+    fixed = dict(config.get("fixed") or {})
+    if fixed != {
+        "H_star": 5, "value_head": "concave2d",
+        "branch_planner": {"sample_cap": 8, "horizon_days": 1},
+        "threshold_outcome": "e7_ablation_only", "market_variant": "production",
+    }:
+        raise ValueError("V18 fixed decision block drifted")
     if tuple(config["training"]["seeds_by_city"]["nyc"]) != (
         101, 202, 303, 404, 505
     ):
@@ -95,8 +108,7 @@ def validate_config(
     if require_frozen:
         decisions = dict(config.get("decisions") or {})
         required = (
-            "N_star", "H_star", "threshold_outcome", "branch_planner",
-            "ppo_clock_days", "mc_clock_days", "value_head", "fitted_supply",
+            "N_star", "ppo_clock_days", "mc_clock_days", "workers", "projection",
         )
         missing = [key for key in required if decisions.get(key) is None]
         if config.get("status") != "frozen" or missing:
@@ -105,14 +117,12 @@ def validate_config(
             )
         if int(decisions["N_star"]) not in (100, 150, 250):
             raise ValueError("N_star is outside the registered set")
-        if int(decisions["H_star"]) not in HORIZON_CANDIDATES:
-            raise ValueError("H_star is outside the registered set")
-        for city in CITY_SLUGS:
-            for key in ("pay_rule_json", "supply_json"):
-                if not resolve_input(config["city_inputs"][city][key]).is_file():
-                    raise FileNotFoundError(
-                        resolve_input(config["city_inputs"][city][key])
-                    )
+        if not 1 <= int(decisions["workers"]) <= 10:
+            raise ValueError("workers must lie in [1, 10]")
+        for key in ("ppo_clock_days", "mc_clock_days"):
+            value = int(decisions[key])
+            if value < 1200 or value % 30:
+                raise ValueError(f"{key} must be a multiple of 30 and at least 1200")
 
 
 def _set_option(values: Sequence[str], flag: str, value: Any) -> list[str]:
@@ -176,63 +186,30 @@ def _apply_v18_common(
     values: Sequence[str], config: Mapping[str, Any], *, city: str,
     scenario_hazards: str,
 ) -> list[str]:
-    market = config["market"]
     population = config["population"]
     decisions = dict(config.get("decisions") or {})
     n_star = int(decisions.get("N_star") or population.get("customers") or 50)
-    supply = _supply_values(config, city)
-    values = _ensure_flag(values, "--v3_daily_stock")
-    for flag, value in (
-        ("--supply_eta_v3", market["eta_total"]),
-        ("--supply_eta_within", market["eta_within"]),
-        ("--stock_rule", market["stock_rule"]),
-        ("--stock_adjustment_rate", market["stock_adjustment_rate"]),
-        ("--stock_floor", market["stock_floor"]),
-        ("--driver_pay_rule", market["driver_pay_rule"]),
-        ("--pay_rule_json", resolve_input(config["city_inputs"][city]["pay_rule_json"])),
-        ("--active_driver_feature_reference", market["active_driver_feature_reference"]),
-        ("--scenario_hazards", scenario_hazards),
-        ("--pool", population["pool"]),
-        ("--train_customers", n_star),
-        ("--eval_customers", n_star),
-        ("--loyalty_pool_size", round(float(population["loyalty_ratio"]) * n_star)),
-        ("--fleet_scale", supply["fleet_scale"]),
-        ("--base_pickup_minutes", supply["base_pickup_minutes"]),
-        ("--supply_base_active_drivers", supply.get("base_active_drivers", 0)),
-        ("--demand_calibration_artifact", demand_artifact(config, city)),
-    ):
-        values = _set_option(values, flag, value)
-    if market.get("eta_day") is None:
-        values = _drop_options(values, ("--supply_eta_day",))
-    else:
-        values = _set_option(values, "--supply_eta_day", market["eta_day"])
-    reference_earnings = float(supply.get("reference_earnings_per_hour") or 0.0)
-    if reference_earnings > 0.0:
-        values = _set_option(
-            values, "--supply_reference_earnings", reference_earnings
-        )
-    supply_json = resolve_input(config["city_inputs"][city].get("supply_json", ""))
-    if supply_json.is_file():
-        payload = json.loads(supply_json.read_text(encoding="utf-8"))
-        if "hour_profile" in payload:
-            values = _set_option(
-                values, "--supply_hour_profile_json", supply_json
-            )
-    return values
+    values, _ = market_flags(
+        values, variant=str(config["market"]["variant"]),
+        city=city, customers=n_star,
+    )
+    return _set_option(values, "--scenario_hazards", scenario_hazards)
 
 
 def train_args(
     config: Mapping[str, Any], *, city: str, seed: int, arm: str,
-    output: Path,
+    output: Path, days_override: int | None = None,
+    require_frozen: bool = True,
 ) -> list[str]:
-    validate_config(config, require_frozen=True)
+    validate_config(config, require_frozen=require_frozen)
     if city not in CITY_SLUGS:
         raise ValueError(f"unknown V18 city {city}")
     decisions = config["decisions"]
-    days = int(config["training"]["days"])
-    if arm == "ppo_clock":
+    fixed = config["fixed"]
+    days = int(days_override if days_override is not None else config["training"]["days"])
+    if days_override is None and arm == "ppo_clock":
         days = int(decisions["ppo_clock_days"])
-    elif arm == "mc_clock":
+    elif days_override is None and arm == "mc_clock":
         days = int(decisions["mc_clock_days"])
     base = v17_config.core_args(
         v17_config.load_config(), city=city, seed=int(seed), output=Path(output),
@@ -241,9 +218,9 @@ def train_args(
     values = _apply_v18_common(
         base, config, city=city, scenario_hazards="natural"
     )
-    values = _set_option(values, "--v16_branch_horizon_days", decisions["H_star"])
-    values = _set_option(values, "--v16_value_head", decisions["value_head"])
-    planner = dict(decisions["branch_planner"])
+    values = _set_option(values, "--v16_branch_horizon_days", fixed["H_star"])
+    values = _set_option(values, "--v16_value_head", fixed["value_head"])
+    planner = dict(fixed["branch_planner"])
     values = _set_option(values, "--branch_profit_planner_sample_cap", planner["sample_cap"])
     values = _set_option(values, "--branch_profit_planner_horizon_days", planner["horizon_days"])
     values = _set_option(values, "--policy_snapshot_every_days", config["learner"]["policy_snapshot_every_days"])
@@ -254,19 +231,20 @@ def train_args(
         values = _drop_options(values, (
             "--v16_branch_mode", "--v16_branch_horizon_days", "--v16_branch_design",
             "--v16_audit_every", "--v16_store_cap", "--v16_value_head",
+            "--v16_policy_mode", "--v16_tau_start", "--v16_tau_end",
+            "--v16_policy_epsilon",
             "--v17_move_radius", "--v17_temperature_mode",
             "--v17_tau_rel_start", "--v17_tau_rel_end",
         ))
         values = _set_option(values, "--v16_policy_mode", "ppo")
+        values = _set_option(values, "--ppo_rollout_episodes", 1)
+        values = _set_option(values, "--ppo_min_rollout_transitions", 30)
+        values = _set_option(values, "--ppo_batch_size", 32)
     if arm == "no_driver_obs":
+        values = _ensure_flag(values, "--current_active_driver_observation", False)
         values = _ensure_flag(values, "--v17_ablate_driver_observation")
     if arm == "own_profit":
         values = _ensure_flag(values, "--v17_ablate_profit_lead")
-    if arm == "halt":
-        alternate = 10 if int(decisions["H_star"]) == 5 else 5
-        values = _set_option(values, "--v16_branch_horizon_days", alternate)
-    if arm == "rubric":
-        values = _set_option(values, "--threshold_ablation", "rubric")
     return values
 
 
@@ -274,16 +252,36 @@ def eval_args(
     config: Mapping[str, Any], *, city: str, case: str,
     specs: Sequence[str], suite: str, output: Path,
     seed: int = 77_311, scenario: Path | None = None,
+    kind: str | None = None, policy: Path | None = None,
+    customers: int | None = None,
 ) -> list[str]:
     validate_config(config, require_frozen=True)
     raw = Path(output) / "raw.json"
     prefix = Path(output) / "diagnostics"
-    base_case = case if case in v17_results_eval.CASES else "C0_calm"
-    command = v17_results_eval._base_command(
+    aliases = {"C0": "C0_calm", "A1": "A1_shortage_severe",
+               "A3": "A3_storm_transit_late", "S1": "S1_promotion_bait",
+               "S6": "S6_shortage_during_promotion"}
+    base_case = aliases.get(case, case)
+    if base_case not in v17_results_eval.CASES:
+        base_case = "C0_calm"
+    kind_map = {
+        "main": "main", "mc_clock": "main", "nocrn": "main",
+        "ppo": "plain_ppo", "ppo_clock": "plain_ppo",
+        "no_driver_obs": "no_driver_observation", "own_profit": "own_profit",
+    }
+    run = None
+    if kind is not None:
+        run = V17RunSpec("v18_eval", city, 101, kind_map[kind])
+    command = v17_results_eval.evaluation_command(
         v17_config.load_config(), city=city, case=base_case, specs=specs,
-        raw=raw, report_prefix=prefix,
+        raw=raw, report_prefix=prefix, run=run, policy=policy,
     )[3:]
     natural = case == "natural_year_2023"
+    if customers is not None:
+        temp = dict(config)
+        temp["decisions"] = dict(config["decisions"])
+        temp["decisions"]["N_star"] = int(customers)
+        config = temp
     values = _apply_v18_common(
         command, config, city=city,
         scenario_hazards="natural" if natural else "off",
@@ -291,8 +289,12 @@ def eval_args(
     values = _set_option(values, "--seed", seed)
     values = _set_option(values, "--experiment_seed", seed)
     values = _set_option(values, "--policy_sweep_seed", seed)
-    values = _set_option(values, "--v16_branch_horizon_days", config["decisions"]["H_star"])
-    values = _set_option(values, "--v16_value_head", config["decisions"]["value_head"])
+    values = _set_option(values, "--v16_branch_horizon_days", config["fixed"]["H_star"])
+    values = _set_option(values, "--v16_value_head", config["fixed"]["value_head"])
+    if kind == "mc_clock":
+        values = _set_option(values, "--v17_credit_source", "mc_return")
+    if kind == "nocrn":
+        values = _set_option(values, "--v17_branch_noise", "independent")
     if scenario is not None:
         values = _set_option(values, "--shock_scenario", Path(scenario).resolve())
     if natural:
@@ -304,21 +306,16 @@ def eval_args(
 
 
 def model_flags(config: Mapping[str, Any], *, city: str) -> dict[str, Any]:
-    market = config["market"]
-    return {
-        "v3_daily_stock": True,
-        "stock_rule": str(market["stock_rule"]),
-        "supply_eta_within": float(market["eta_within"]),
-        "supply_eta_day": (
-            None if market.get("eta_day") is None else float(market["eta_day"])
-        ),
-        "stock_adjustment_rate": float(market["stock_adjustment_rate"]),
-        "stock_floor": float(market["stock_floor"]),
-        "driver_pay_rule": str(market["driver_pay_rule"]),
-        "active_driver_feature_reference": str(market["active_driver_feature_reference"]),
-        "acceptance_shock_wage": str(market["acceptance_shock_wage"]),
-        "rate_upper_multiple": float(market["rate_upper_multiple"]),
-    }
+    customers = int(dict(config.get("decisions") or {}).get("N_star") or 50)
+    _, expected = market_flags(
+        (), variant=str(config["market"]["variant"]),
+        city=city, customers=customers,
+    )
+    expected.update({
+        "acceptance_shock_wage": str(config["market"]["acceptance_shock_wage"]),
+        "rate_upper_multiple": float(config["market"]["rate_upper_multiple"]),
+    })
+    return expected
 
 
 def check_model(payload: Mapping[str, Any], config: Mapping[str, Any], *, city: str) -> None:
@@ -334,9 +331,10 @@ def check_model(payload: Mapping[str, Any], config: Mapping[str, Any], *, city: 
 
 def check_command_model(command: Sequence[str], config: Mapping[str, Any], *, city: str) -> None:
     values = list(map(str, command))
-    if values.count("--v3_daily_stock") != 1:
-        raise ValueError("V18 command must declare v3_daily_stock exactly once")
+    if values.count("--no-v3_daily_stock") != 1:
+        raise ValueError("V18 production command must disable v3_daily_stock exactly once")
     mapping = {
+        "supply_eta_v3": "--supply_eta_v3",
         "stock_rule": "--stock_rule",
         "supply_eta_within": "--supply_eta_within",
         "supply_eta_day": "--supply_eta_day",
@@ -346,6 +344,8 @@ def check_command_model(command: Sequence[str], config: Mapping[str, Any], *, ci
         "active_driver_feature_reference": "--active_driver_feature_reference",
         "acceptance_shock_wage": "--acceptance_shock_wage",
         "rate_upper_multiple": "--rate_upper_multiple",
+        "base_pickup_minutes": "--base_pickup_minutes",
+        "supply_base_active_drivers": "--supply_base_active_drivers",
     }
     for key, flag in mapping.items():
         wanted = model_flags(config, city=city)[key]
