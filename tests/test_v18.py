@@ -357,6 +357,105 @@ def test_p2_joint_calibration_reference_loop_refits_until_stable(
     assert (output / "reference_earnings_rev2/report.json").is_file()
 
 
+def test_p2_joint_calibration_bisects_reference_residual_sign_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    supply_root = tmp_path / "pay"
+    initial = {"nyc": 30.0, "boston": 24.0, "chicago": 22.0}
+    for city, reference in initial.items():
+        target = supply_root / city
+        target.mkdir(parents=True)
+        (target / "supply.json").write_text(json.dumps({
+            "city": city, "reference_earnings_per_hour": reference,
+        }))
+    monkeypatch.setattr("scripts.v18_p2.PAY_DIR", supply_root)
+
+    calls = []
+
+    def fake_calibration(config, output, *, workers, reference_earnings_by_city):
+        del config, output, workers
+        supplied = dict(reference_earnings_by_city)
+        calls.append(supplied)
+        factor = (0.998, 1.006, 1.0005)[len(calls) - 1]
+        results = {}
+        for city, reference in supplied.items():
+            payload = {
+                "city": city,
+                "reference_earnings_per_hour": reference * factor,
+                "selection": {"fleet_scale": 0.7, "base_pickup_minutes": 1.5},
+                "confirmation": {"pass": True},
+            }
+            results[city] = payload
+            (supply_root / city / "supply.json").write_text(
+                json.dumps(payload)
+            )
+        return results
+
+    monkeypatch.setattr(
+        "scripts.v18_p2.run_supply_calibration", fake_calibration
+    )
+    report = run_consistent_supply_calibration(
+        load_v17_config(), tmp_path / "run", workers=4
+    )
+    assert report["converged"]
+    assert report["iterations"] == 3
+    assert calls[1]["nyc"] == pytest.approx(29.94)
+    assert calls[2]["nyc"] == pytest.approx(29.97)
+    assert report["history"][1]["reference_solver_update"]["nyc"] == (
+        "sign_bracket_bisection"
+    )
+
+
+def test_p2_joint_calibration_restores_supply_artifacts_on_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    supply_root = tmp_path / "pay"
+    original = {}
+    for city, reference in {"nyc": 30.0, "boston": 24.0, "chicago": 22.0}.items():
+        payload = {
+            "city": city,
+            "reference_earnings_per_hour": reference,
+            "stock_adjustment_rate": 0.05,
+        }
+        original[city] = payload
+        target = supply_root / city
+        target.mkdir(parents=True)
+        (target / "supply.json").write_text(json.dumps(payload))
+    monkeypatch.setattr("scripts.v18_p2.PAY_DIR", supply_root)
+    monkeypatch.setattr(
+        "scripts.v18_p2.CALIBRATION_REFERENCE_MAX_ITERATIONS", 1
+    )
+
+    def fake_calibration(config, output, *, workers, reference_earnings_by_city):
+        del config, output, workers
+        results = {}
+        for city, reference in reference_earnings_by_city.items():
+            payload = {
+                "city": city,
+                "reference_earnings_per_hour": reference * 1.10,
+                "selection": {"fleet_scale": 0.7, "base_pickup_minutes": 1.5},
+                "confirmation": {"pass": True},
+            }
+            results[city] = payload
+            (supply_root / city / "supply.json").write_text(
+                json.dumps(payload)
+            )
+        return results
+
+    monkeypatch.setattr(
+        "scripts.v18_p2.run_supply_calibration", fake_calibration
+    )
+    with pytest.raises(RuntimeError, match="did not converge"):
+        run_consistent_supply_calibration(
+            load_v17_config(), tmp_path / "run", workers=4
+        )
+    for city, payload in original.items():
+        restored = json.loads(
+            (supply_root / city / "supply.json").read_text()
+        )
+        assert restored == payload
+
+
 def test_p2_revision2_gate_stage_runs_only_registered_city_cells(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ):

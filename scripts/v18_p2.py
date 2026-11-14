@@ -68,7 +68,7 @@ CONFIRMATION_OPENINGS = 3
 # unchanged +/-3% scientific stock gate.
 REFERENCE_FIXED_POINT_RTOL = 1e-3
 REFERENCE_FIXED_POINT_MAX_ITERATIONS = 12
-CALIBRATION_REFERENCE_MAX_ITERATIONS = 6
+CALIBRATION_REFERENCE_MAX_ITERATIONS = 12
 FLEET_GRID = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
 TRANSFER_FLEET_GRID = (0.6, 0.8, 1.0, 1.2, 1.4, 1.6)
 PICKUP_GRID = (1.0, 1.25, 1.5, 1.75, 2.0)
@@ -1228,7 +1228,7 @@ def run_supply_calibration(
     return results
 
 
-def run_consistent_supply_calibration(
+def _run_consistent_supply_calibration_impl(
     config: Mapping[str, Any], output: Path, *, workers: int,
 ) -> dict[str, Any]:
     """Jointly stabilize the calibrated operating point and its E_ref.
@@ -1297,6 +1297,12 @@ def run_consistent_supply_calibration(
             for city in REFERENCE_CITIES:
                 supply_path = PAY_DIR / city / "supply.json"
                 supply = json.loads(supply_path.read_text())
+                prior_supply = json.loads(
+                    (archive / f"{city}.json").read_text()
+                )
+                for key in ("stock_adjustment_rate", "stock_adjustment_source"):
+                    if key in prior_supply:
+                        supply[key] = prior_supply[key]
                 supply["reference_earnings_per_hour"] = updated[city]
                 supply["reference_earnings_contract"] = (
                     "ratio_of_sums_both_platforms_days_5_28_"
@@ -1325,12 +1331,67 @@ def run_consistent_supply_calibration(
             # Keep the established report location for downstream provenance.
             atomic_json(output / "reference_earnings_rev2/report.json", report)
             return report
-        references = updated
+        # The registered grid is discrete, so a direct Picard update can jump
+        # across a fleet-selection boundary and alternate between two valid
+        # operating points.  When the fixed-point residual changes sign, keep
+        # the scientific calibration untouched and bisect the numerical input
+        # bracket instead.  This is purely a solver safeguard: the registered
+        # grid, targets, tolerance, and confirmation checks are unchanged.
+        next_references: dict[str, float] = {}
+        update_strategy: dict[str, str] = {}
+        for city in REFERENCE_CITIES:
+            current_input = references[city]
+            current_residual = updated[city] - current_input
+            opposite_inputs = []
+            for prior in history[:-1]:
+                prior_input = float(
+                    prior["input_reference_earnings_per_hour"][city]
+                )
+                prior_measured = float(
+                    prior["measured_reference_earnings_per_hour"][city]
+                )
+                prior_residual = prior_measured - prior_input
+                if current_residual * prior_residual < 0.0:
+                    opposite_inputs.append(prior_input)
+            if opposite_inputs:
+                bracket_input = min(
+                    opposite_inputs,
+                    key=lambda value: abs(value - current_input),
+                )
+                next_references[city] = 0.5 * (
+                    current_input + bracket_input
+                )
+                update_strategy[city] = "sign_bracket_bisection"
+            else:
+                next_references[city] = updated[city]
+                update_strategy[city] = "direct_picard"
+        row["next_reference_earnings_per_hour"] = dict(next_references)
+        row["reference_solver_update"] = dict(update_strategy)
+        references = next_references
 
     raise RuntimeError(
         "joint supply calibration/reference fixed point did not converge "
         f"in {CALIBRATION_REFERENCE_MAX_ITERATIONS} iterations: {history}"
     )
+
+
+def run_consistent_supply_calibration(
+    config: Mapping[str, Any], output: Path, *, workers: int,
+) -> dict[str, Any]:
+    """Run the joint solver without leaving failed partial artifacts active."""
+    try:
+        return _run_consistent_supply_calibration_impl(
+            config, output, workers=workers
+        )
+    except Exception:
+        archive = output / "calibration_consistency/prior_supply"
+        for city in REFERENCE_CITIES:
+            saved = archive / f"{city}.json"
+            if saved.is_file():
+                target = PAY_DIR / city / "supply.json"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(saved, target)
+        raise
 
 
 def run_reference_earnings(
