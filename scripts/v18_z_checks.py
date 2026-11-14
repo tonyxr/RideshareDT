@@ -18,6 +18,7 @@ if str(REPO) not in sys.path:
 
 from scripts.v17_robust_common import set_option
 from scripts.v18_config import eval_args, load_config, train_args
+from scripts.v18_eval import SCENARIOS
 from scripts.v18_market import market_flags
 from scripts.v18_runtime import Job, atomic_json, run_jobs
 from scripts.v18_select import cell_spec, reactive_candidates
@@ -139,7 +140,7 @@ def z4(workers: int) -> dict:
         leaf = ROOT / "Z4" / ("logged" if logged else "plain")
         values = eval_args(config, city="nyc", case="A3", specs=(PUBLISHED,),
             suite="E10" if logged else "Z4", output=leaf,
-            scenario=REPO / "scenarios/v17_t2_storm_transit_late.json")
+            scenario=SCENARIOS["A3"])
         values = set_option(values, "--policy_sweep_rivals", "adaptive_best_response_memory")
         values = set_option(values, "--policy_sweep_openings", 1)
         jobs.append(Job(f"Z4/{'logged' if logged else 'plain'}",
@@ -167,9 +168,17 @@ def main() -> int:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--code-revision", default="", help="controller cache identity")
+    parser.add_argument("--only", choices=("Z4",))
     args = parser.parse_args()
     if not args.execute:
         print(json.dumps({"checks": ["Z1", "Z2", "Z3", "Z4"]}, indent=2)); return 0
+    if args.only == "Z4":
+        report_path = REPO / "runs/v18/controller/Z_checks_report.json"
+        report = json.loads(report_path.read_text()) if report_path.is_file() else {}
+        report["Z4"] = z4(args.workers)
+        atomic_json(report_path, report)
+        print(json.dumps(report["Z4"], indent=2, sort_keys=True))
+        return 0
     report = {"Z1": z1()}
     if report["Z1"]["state"] == "pass": report["Z2"] = z2()
     if report.get("Z2", {}).get("state") == "pass": report["Z3"] = z3(args.workers)

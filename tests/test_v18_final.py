@@ -11,6 +11,7 @@ from Core import _v18_card_clear_quote
 from MarketInteraction import RideContext
 from scripts.v18_config import eval_args, load_config, train_args
 from scripts.v18_market import market_flags
+from scripts.v18_eval import SCENARIOS
 from scripts.v18_runtime import Job, run_job, run_jobs
 from scripts.v18_select import _stage3_count_rules, card_grid, reactive_candidates
 
@@ -108,6 +109,10 @@ def test_cards_are_static_tariffs():
     cards = card_grid()
     assert len(cards) == 36
     assert all(row["spec"].startswith("static_tariff:") for row in cards)
+
+
+def test_registered_scenario_paths_exist():
+    assert all(path.is_file() for path in SCENARIOS.values())
 
 
 def test_count_rule_norm_shift_and_candidate_counts():

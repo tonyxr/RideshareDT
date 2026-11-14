@@ -2,13 +2,13 @@
   "counts": {
     "cached": 0,
     "complete": 0,
-    "failed": 11,
+    "failed": 2,
     "pending": 0,
     "skipped": 0
   },
-  "current_phase": "Z_checks",
+  "current_phase": "P3",
   "projected_hours_left": null,
-  "state": "relaunching_after_Z3_code_repair",
-  "updated_utc": "2026-11-14T16:00:34.320289Z",
-  "workers": 4
+  "state": "running",
+  "updated_utc": "2026-11-14T16:06:16.508218Z",
+  "workers": 2
 }
