@@ -141,3 +141,8 @@
 {"attempt":1,"job":"P3/nyc/C0/N250","seconds":0.0,"state":"running","time":"2026-11-14T16:06:16.894548Z"}
 {"attempt":1,"job":"P3/nyc/C0/N50","seconds":0.0,"state":"running","time":"2026-11-14T16:06:16.894640Z"}
 {"time":"2026-11-14T16:23:00Z","job":"Z4_scenario_path_repair","state":"complete_pending_rerun","attempt":1,"seconds":0}
+{"attempt":1,"job":"P3/nyc/C0/N50","seconds":2354.642,"state":"complete","time":"2026-11-14T16:45:31.596561Z"}
+{"attempt":1,"job":"P3/nyc/C0/N500","seconds":0.0,"state":"running","time":"2026-11-14T16:45:31.604697Z"}
+{"attempt":1,"job":"P3/nyc/C0/N100","seconds":2578.256,"state":"complete","time":"2026-11-14T16:49:15.203048Z"}
+{"attempt":1,"job":"P3/nyc/A1/N50","seconds":0.0,"state":"running","time":"2026-11-14T16:49:15.207588Z"}
+{"time":"2026-11-14T16:51:34Z","job":"controller","state":"paused_by_user","attempt":1,"seconds":0}

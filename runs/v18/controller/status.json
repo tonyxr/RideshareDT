@@ -1,14 +1,37 @@
 {
+  "branch": "v18-threats",
   "counts": {
     "cached": 0,
-    "complete": 0,
-    "failed": 2,
-    "pending": 0,
+    "complete": 2,
+    "failed": 0,
+    "pending": 14,
+    "running_at_pause": 4,
     "skipped": 0
   },
   "current_phase": "P3",
+  "head": "830ce1e56392ead6f96304f06b8d95b3623618cb",
+  "paused_at_utc": "2026-11-14T16:51:34Z",
+  "process_checkpoint": {
+    "core_pids": [21244, 21246, 26253, 27113],
+    "process_group": 21048,
+    "screen_name": "v18_lastrev_90590fd_controller",
+    "screen_pid": 21047,
+    "state_verified": "SIGSTOP"
+  },
   "projected_hours_left": null,
-  "state": "running",
-  "updated_utc": "2026-11-14T16:06:16.508218Z",
-  "workers": 2
+  "remote": "ridesharedt/v18-threats",
+  "resource_checkpoint": {
+    "disk_available_gib": 35,
+    "swap_free_mib": 1222.88
+  },
+  "resume_note": "Resume screen PID 21047 and process group 21048 with SIGCONT only after verifying these saved PIDs still belong to this checkout.",
+  "state": "paused_by_user",
+  "updated_utc": "2026-11-14T16:51:34Z",
+  "workers": 4,
+  "z_checks": {
+    "Z1": "passed",
+    "Z2": "passed",
+    "Z3": "passed",
+    "Z4": "code_repaired_rerun_pending"
+  }
 }
