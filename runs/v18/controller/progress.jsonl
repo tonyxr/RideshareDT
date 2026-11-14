@@ -5,3 +5,10 @@
 {"time":"2026-11-14T15:37:53Z","job":"D1_downloads","state":"complete_with_failures","attempt":1,"seconds":902}
 {"time":"2026-11-14T15:38:00Z","job":"M1_M9","state":"complete","attempt":1,"seconds":0}
 {"time":"2026-11-14T15:38:05Z","job":"Z1","state":"complete","attempt":1,"seconds":1.66}
+{"attempt":1,"job":"Z_checks","seconds":0.0,"state":"running","time":"2026-11-14T15:39:43.064568Z"}
+{"attempt":1,"job":"Z_checks","seconds":0.201,"state":"retrying","time":"2026-11-14T15:39:43.267078Z"}
+{"attempt":2,"job":"Z_checks","seconds":0.0,"state":"running","time":"2026-11-14T15:39:43.267469Z"}
+{"attempt":2,"job":"Z_checks","seconds":0.176,"state":"retrying","time":"2026-11-14T15:39:43.443839Z"}
+{"attempt":3,"job":"Z_checks","seconds":0.0,"state":"running","time":"2026-11-14T15:39:43.444184Z"}
+{"attempt":3,"job":"Z_checks","seconds":0.15,"state":"failed","time":"2026-11-14T15:39:43.595057Z"}
+{"time":"2026-11-14T15:41:00Z","job":"Z_checks_python_path_repair","state":"complete","attempt":1,"seconds":0}

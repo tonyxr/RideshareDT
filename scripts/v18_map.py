@@ -17,7 +17,7 @@ from scripts.v18_config import eval_args, load_config, validate_config
 from scripts.v18_eval import R3, SCENARIOS, reference_specs
 from scripts.v18_runtime import Job, atomic_json, run_jobs
 
-PYTHON = (REPO.parent / ".venv/bin/python").resolve()
+PYTHON = (REPO.parent / ".venv/bin/python").absolute()
 ETAS = (0.3, 0.6, 1.0)
 OMEGAS = (0.25, 0.5, 0.75)
 

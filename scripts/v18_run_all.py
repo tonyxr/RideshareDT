@@ -23,7 +23,7 @@ from scripts.v18_runtime import Job, append_progress, atomic_json, run_job, run_
 from scripts.v18_train import jobs as training_jobs
 
 
-PYTHON = (REPO.parent / ".venv/bin/python").resolve()
+PYTHON = (REPO.parent / ".venv/bin/python").absolute()
 CONTROLLER = REPO / "runs/v18/controller"
 DROP_ORDER = (
     "T8", "E8", "E9", "E3", "S3", "S1", "E7/chicago", "E6/chicago",

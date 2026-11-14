@@ -84,7 +84,11 @@ def run_job(
         prior = json.loads(job.manifest.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         prior = {}
-    attempts = list(prior.get("attempts") or [])
+    attempts = (
+        list(prior.get("attempts") or [])
+        if prior.get("command_hash") == command_hash(job.command)
+        else []
+    )
     payload = {
         "name": job.name, "state": "planned" if dry_run else "running",
         "command": list(job.command), "command_hash": command_hash(job.command),

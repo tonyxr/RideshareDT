@@ -23,7 +23,7 @@ from scripts.v18_runtime import Job, atomic_json, run_jobs
 from scripts.v18_select import cell_spec, reactive_candidates
 from v17_surge_decay import scenario_windows, surge_decay_spec
 
-PYTHON = (REPO.parent / ".venv/bin/python").resolve()
+PYTHON = (REPO.parent / ".venv/bin/python").absolute()
 ROOT = REPO / "runs/v18/controller/Z_checks"
 PUBLISHED = cell_spec(1.0, 1.0)
 

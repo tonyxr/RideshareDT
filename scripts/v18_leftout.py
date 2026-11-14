@@ -18,7 +18,7 @@ from scripts.v18_eval import SCENARIOS, reference_specs
 from scripts.v18_runtime import Job, atomic_json, run_jobs
 from scripts.v18_select import run_selection
 
-PYTHON = (REPO.parent / ".venv/bin/python").resolve()
+PYTHON = (REPO.parent / ".venv/bin/python").absolute()
 VARIANTS = ("drivers_fixed", "no_loyalty", "static_rival", "no_spillover")
 
 

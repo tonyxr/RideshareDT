@@ -18,7 +18,7 @@ from scripts.v18_runtime import Job, atomic_json, run_jobs
 from scripts.v18_train import RUNS
 
 
-PYTHON = (BASE.parent / ".venv/bin/python").resolve()
+PYTHON = (BASE.parent / ".venv/bin/python").absolute()
 SCENARIOS = {
     "C0": BASE / "scenarios/calm.json",
     "A1": BASE / "scenarios/v17_t2_shortage_severe.json",

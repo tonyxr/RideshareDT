@@ -20,7 +20,7 @@ from scripts.v18_runtime import Job, atomic_json, run_jobs
 from scripts.v18_select import run_selection
 from scripts.v18_train import RUNS
 
-PYTHON = (REPO.parent / ".venv/bin/python").resolve()
+PYTHON = (REPO.parent / ".venv/bin/python").absolute()
 ARMS = {"S0": "production", "S1": "s1", "S2": "s2", "S3": "s3"}
 SCENARIOS = {"C0": REPO / "scenarios/calm.json", "A1": REPO / "scenarios/v17_t2_shortage_severe.json"}
 

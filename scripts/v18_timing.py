@@ -23,7 +23,7 @@ from scripts.v18_config import load_config, train_args, validate_config
 from scripts.v18_runtime import Job, atomic_json, run_jobs
 
 
-PYTHON = (REPO.parent / ".venv/bin/python").resolve()
+PYTHON = (REPO.parent / ".venv/bin/python").absolute()
 SPECS = (
     ("agent_nyc_s101", "nyc", 101, "main"),
     ("agent_nyc_s202", "nyc", 202, "main"),

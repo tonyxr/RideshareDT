@@ -1,16 +1,16 @@
 {
-  "protocol": "CRISP-Ride_v18_Last_Revision_20261113",
-  "state": "ready_for_Z2_Z4",
-  "current_phase": "code_checks",
-  "p2": "closed_report_only",
-  "m1_m9": "implemented",
-  "z1": "44_passed",
-  "d1": {
-    "state": "complete_with_failures",
-    "records": 14,
-    "failed_source": "Chicago n26f-ihde aggregate timed out after 3 attempts"
-  },
   "branch": "v18-threats",
+  "current_phase": "Z_checks",
+  "d1": {
+    "failed_source": "Chicago n26f-ihde aggregate timed out after 3 attempts",
+    "records": 14,
+    "state": "complete_with_failures"
+  },
+  "m1_m9": "implemented",
+  "p2": "closed_report_only",
+  "projected_hours_left": null,
+  "protocol": "CRISP-Ride_v18_Last_Revision_20261113",
+  "state": "relaunching_after_code_repair",
   "workers": 4,
-  "projected_hours_left": null
+  "z1": "44_passed"
 }

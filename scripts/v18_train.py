@@ -17,7 +17,7 @@ from scripts.v18_config import BASE, load_config, train_args, validate_config
 from scripts.v18_runtime import Job, atomic_json, run_jobs
 
 
-PYTHON = (BASE.parent / ".venv/bin/python").resolve()
+PYTHON = (BASE.parent / ".venv/bin/python").absolute()
 
 
 @dataclass(frozen=True)

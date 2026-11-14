@@ -23,7 +23,7 @@ from scripts.v18_runtime import Job, atomic_json, run_jobs
 from v17_surge_decay import scenario_windows, surge_decay_spec
 
 
-PYTHON = (REPO.parent / ".venv/bin/python").resolve()
+PYTHON = (REPO.parent / ".venv/bin/python").absolute()
 SIZES = (50, 100, 150, 250, 500)
 CITIES = ("nyc", "chicago")
 CASES = {
