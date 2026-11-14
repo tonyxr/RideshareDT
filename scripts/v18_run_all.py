@@ -25,6 +25,9 @@ from scripts.v18_train import jobs as training_jobs
 
 PYTHON = (REPO.parent / ".venv/bin/python").absolute()
 CONTROLLER = REPO / "runs/v18/controller"
+CODE_REVISION = subprocess.check_output(
+    ["git", "rev-parse", "HEAD"], cwd=REPO, text=True
+).strip()
 DROP_ORDER = (
     "T8", "E8", "E9", "E3", "S3", "S1", "E7/chicago", "E6/chicago",
     "nyc_s505", "nyc_s404", "E4/mc_clock_curves",
@@ -155,7 +158,8 @@ def main() -> int:
     if not args.skip_z:
         z = _phase_job(
             "Z_checks",
-            (str(PYTHON), "-u", str(REPO / "scripts/v18_z_checks.py"), "--execute"),
+            (str(PYTHON), "-u", str(REPO / "scripts/v18_z_checks.py"), "--execute",
+             "--code-revision", CODE_REVISION),
             CONTROLLER / "Z_checks_report.json",
         )
         if _run_phase(z) not in {"complete", "cached"}:

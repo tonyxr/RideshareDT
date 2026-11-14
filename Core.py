@@ -22917,7 +22917,10 @@ def main():
                     'shortage_willingness_share': 'shortage_willingness_share',
                     'acceptance_shock_wage': 'acceptance_shock_wage',
                     'persistent_driver_stock': 'persistent_stock',
-                }.items() if '--'+flag in argv_flag_names},
+                }.items() if '--'+flag in argv_flag_names and not (
+                    flag == 'supply_base_active_drivers'
+                    and int(getattr(args, flag)) == 0
+                )},
                 supply_operating_point=(artifact_header.get('supply_operating_point') if args.trained_model_in else
                                         city_artifact['supply_operating_point'] if city_artifact else None),
             )

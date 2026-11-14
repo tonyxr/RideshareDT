@@ -9,7 +9,7 @@ import numpy as np
 
 from Core import _v18_card_clear_quote
 from MarketInteraction import RideContext
-from scripts.v18_config import load_config, train_args
+from scripts.v18_config import eval_args, load_config, train_args
 from scripts.v18_market import market_flags
 from scripts.v18_runtime import Job, run_job, run_jobs
 from scripts.v18_select import _stage3_count_rules, card_grid, reactive_candidates
@@ -83,6 +83,25 @@ def test_training_arm_flags(tmp_path):
     no_driver = train_args(config, city="nyc", seed=101, arm="no_driver_obs", output=tmp_path / "no_driver")
     assert "--v17_ablate_driver_observation" in no_driver
     assert "--current_active_driver_observation" not in no_driver
+
+
+def test_evaluation_policy_kinds_do_not_leak_value_flags(tmp_path):
+    config = _frozen()
+    scenario = BASE / "scenarios/calm.json"
+    reference = eval_args(config, city="nyc", case="C0", specs=("opening_hold",),
+                          suite="Z3", output=tmp_path / "ref", scenario=scenario)
+    assert "--v16_value_head" not in reference
+    main = eval_args(config, city="nyc", case="C0", specs=("rl_actor",), suite="Z3",
+                     output=tmp_path / "main", scenario=scenario, kind="main",
+                     policy=tmp_path / "main.pt")
+    assert main[main.index("--v16_policy_mode") + 1] == "q"
+    assert main[main.index("--v16_value_head") + 1] == "concave2d"
+    assert main[main.index("--v16_store_cap") + 1] == "20000"
+    ppo = eval_args(config, city="nyc", case="C0", specs=("rl_actor",), suite="Z3",
+                    output=tmp_path / "ppo", scenario=scenario, kind="ppo",
+                    policy=tmp_path / "ppo.pt")
+    assert ppo[ppo.index("--v16_policy_mode") + 1] == "ppo"
+    assert "--v16_value_head" not in ppo and "--v16_store_cap" not in ppo
 
 
 def test_cards_are_static_tariffs():

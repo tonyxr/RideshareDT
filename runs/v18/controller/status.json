@@ -1,16 +1,14 @@
 {
-  "branch": "v18-threats",
-  "current_phase": "Z_checks",
-  "d1": {
-    "failed_source": "Chicago n26f-ihde aggregate timed out after 3 attempts",
-    "records": 14,
-    "state": "complete_with_failures"
+  "counts": {
+    "cached": 0,
+    "complete": 0,
+    "failed": 11,
+    "pending": 0,
+    "skipped": 0
   },
-  "m1_m9": "implemented",
-  "p2": "closed_report_only",
+  "current_phase": "Z_checks",
   "projected_hours_left": null,
-  "protocol": "CRISP-Ride_v18_Last_Revision_20261113",
-  "state": "relaunching_after_code_repair",
-  "workers": 4,
-  "z1": "44_passed"
+  "state": "relaunching_after_Z3_code_repair",
+  "updated_utc": "2026-11-14T16:00:34.320289Z",
+  "workers": 4
 }

@@ -166,6 +166,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--code-revision", default="", help="controller cache identity")
     args = parser.parse_args()
     if not args.execute:
         print(json.dumps({"checks": ["Z1", "Z2", "Z3", "Z4"]}, indent=2)); return 0

@@ -289,8 +289,6 @@ def eval_args(
     values = _set_option(values, "--seed", seed)
     values = _set_option(values, "--experiment_seed", seed)
     values = _set_option(values, "--policy_sweep_seed", seed)
-    values = _set_option(values, "--v16_branch_horizon_days", config["fixed"]["H_star"])
-    values = _set_option(values, "--v16_value_head", config["fixed"]["value_head"])
     if kind == "mc_clock":
         values = _set_option(values, "--v17_credit_source", "mc_return")
     if kind == "nocrn":
