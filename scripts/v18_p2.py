@@ -68,6 +68,7 @@ CONFIRMATION_OPENINGS = 3
 # unchanged +/-3% scientific stock gate.
 REFERENCE_FIXED_POINT_RTOL = 1e-3
 REFERENCE_FIXED_POINT_MAX_ITERATIONS = 12
+CALIBRATION_REFERENCE_MAX_ITERATIONS = 6
 FLEET_GRID = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
 TRANSFER_FLEET_GRID = (0.6, 0.8, 1.0, 1.2, 1.4, 1.6)
 PICKUP_GRID = (1.0, 1.25, 1.5, 1.75, 2.0)
@@ -799,6 +800,7 @@ def _fit_hour_profile(
     config: Mapping[str, Any], output: Path, *, city: str,
     base_active_drivers: int, fleet_scale: float, pickup: float,
     target_waits: Mapping[int, float], workers: int = 1,
+    reference_earnings: float | None = None,
 ) -> tuple[Path, dict[str, Any], list[Job]]:
     """Fit Revision 1 four-hour availability factors in at most four jobs."""
     del workers  # The registered iterations are sequential by construction.
@@ -821,6 +823,7 @@ def _fit_hour_profile(
             openings=CALIBRATION_OPENINGS,
             base_active_drivers=base_active_drivers,
             hour_profile_json=profile_path,
+            reference_earnings=reference_earnings,
         )
         _run_parallel(
             [job], workers=1, output=output,
@@ -905,12 +908,14 @@ def _confirm_calibration(
     hour_profile_json: Path | None = None,
     block_wait_targets: Mapping[int, float] | None = None,
     binding_targets: bool = True,
+    reference_earnings: float | None = None,
 ) -> tuple[Job, dict[str, Any]]:
     job = _calibration_job(
         config, output, name=f"{city}_confirmation", city=city,
         fleet_scale=fleet, pickup=pickup,
         openings=CONFIRMATION_OPENINGS, base_active_drivers=base,
         hour_profile_json=hour_profile_json,
+        reference_earnings=reference_earnings,
     )
     _run_parallel([job], workers=1, output=output, phase=f"{city}_confirmation")
     payload = _validate_product(job.raw, job.expected)
@@ -963,7 +968,21 @@ def _confirm_calibration(
 
 def run_supply_calibration(
     config: Mapping[str, Any], output: Path, *, workers: int,
+    reference_earnings_by_city: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
+    references = {
+        str(city): float(value)
+        for city, value in (reference_earnings_by_city or {}).items()
+    }
+    unknown = set(references) - set(REFERENCE_CITIES)
+    if unknown:
+        raise ValueError(f"unknown reference-earnings cities: {sorted(unknown)}")
+    if any(not math.isfinite(value) or value <= 0.0 for value in references.values()):
+        raise ValueError("calibration reference earnings must be finite and positive")
+
+    def city_reference(city: str) -> float | None:
+        return references.get(city)
+
     wait_target = derive_wait_target(output)
     target_wait = float(wait_target["median_wait_minutes"])
     block_wait_targets = _real_block_waits(wait_target)
@@ -973,6 +992,7 @@ def run_supply_calibration(
         config, output, city="nyc", base_active_drivers=base,
         fleet_scale=0.8, pickup=1.5,
         target_waits=block_wait_targets,
+        reference_earnings=city_reference("nyc"),
     )
     fleets = list(FLEET_GRID)
     pickups = list(PICKUP_GRID)
@@ -985,6 +1005,7 @@ def run_supply_calibration(
                 fleet_scale=float(fleet), pickup=float(pickup),
                 base_active_drivers=base,
                 hour_profile_json=nyc_profile_path,
+                reference_earnings=city_reference("nyc"),
             )
             for fleet in fleet_values for pickup in pickup_values
         ]
@@ -1051,6 +1072,7 @@ def run_supply_calibration(
         target_wait=target_wait,
         hour_profile_json=nyc_profile_path,
         block_wait_targets=block_wait_targets,
+        reference_earnings=city_reference("nyc"),
     )
     if not confirmation["pass"]:
         raise ValueError(f"NYC joint calibration confirmation failed: {confirmation}")
@@ -1071,6 +1093,7 @@ def run_supply_calibration(
         "reference_earnings_per_hour": float(
             confirmation["reference_earnings_per_hour"]
         ),
+        "reference_earnings_input_per_hour": city_reference("nyc"),
         "reference_earnings_contract": "ratio_of_sums_both_platforms_days_5_28",
         "targets": {
             "utilization": TARGET_UTILIZATION,
@@ -1102,6 +1125,7 @@ def run_supply_calibration(
             config, output, city=city, base_active_drivers=city_base,
             fleet_scale=1.0, pickup=float(nyc["base_pickup_minutes"]),
             target_waits=block_wait_targets,
+            reference_earnings=city_reference(city),
         )
         city_jobs = [
             _calibration_job(
@@ -1110,6 +1134,7 @@ def run_supply_calibration(
                 pickup=float(nyc["base_pickup_minutes"]),
                 base_active_drivers=city_base,
                 hour_profile_json=city_profile_path,
+                reference_earnings=city_reference(city),
             )
             for fleet in TRANSFER_FLEET_GRID
         ]
@@ -1144,6 +1169,7 @@ def run_supply_calibration(
             hour_profile_json=city_profile_path,
             block_wait_targets=block_wait_targets,
             binding_targets=False,
+            reference_earnings=city_reference(city),
         )
         city_confirmation["service_level_loss"] = mean(
             (float(row["gap_minutes"]) / 0.4) ** 2
@@ -1190,6 +1216,7 @@ def run_supply_calibration(
             "reference_earnings_per_hour": float(
                 city_confirmation["reference_earnings_per_hour"]
             ),
+            "reference_earnings_input_per_hour": city_reference(city),
             "reference_earnings_contract": "ratio_of_sums_both_platforms_days_5_28",
             "measurements": city_measurements,
             "confirmation": city_confirmation,
@@ -1199,6 +1226,111 @@ def run_supply_calibration(
         atomic_json(PAY_DIR / city / "supply.json", city_supply)
         results[city] = city_supply
     return results
+
+
+def run_consistent_supply_calibration(
+    config: Mapping[str, Any], output: Path, *, workers: int,
+) -> dict[str, Any]:
+    """Jointly stabilize the calibrated operating point and its E_ref.
+
+    Fix A measures ``E_ref`` only after selecting fleet and pickup, while Fix B
+    also uses ``E_ref`` in the within-day supply response.  Consequently a
+    newly measured reference changes the operating point that produced it.
+    Calibration and reference measurement must therefore be iterated together;
+    remeasuring only the reference silently invalidates the registered wait and
+    trips-per-hour checks.
+
+    Every iteration reruns the registered Revision 1 profile/grid/confirmation
+    procedure with the previous iteration's references installed.  No target,
+    grid, tolerance, or scientific gate changes.  The loop stops only when all
+    three confirmation references are stable to the existing numerical
+    tolerance and the NYC binding confirmation still passes.
+    """
+    archive = output / "calibration_consistency/prior_supply"
+    archive.mkdir(parents=True, exist_ok=True)
+    references: dict[str, float] = {}
+    for city in REFERENCE_CITIES:
+        source = PAY_DIR / city / "supply.json"
+        if not source.is_file():
+            raise FileNotFoundError(
+                f"missing initial supply calibration for {city}: {source}"
+            )
+        destination = archive / f"{city}.json"
+        if not destination.exists():
+            shutil.copy2(source, destination)
+        payload = json.loads(source.read_text())
+        references[city] = float(payload["reference_earnings_per_hour"])
+    if any(not math.isfinite(value) or value <= 0.0 for value in references.values()):
+        raise ValueError("initial calibration references must be finite and positive")
+
+    history: list[dict[str, Any]] = []
+    results: dict[str, Any] | None = None
+    for iteration in range(1, CALIBRATION_REFERENCE_MAX_ITERATIONS + 1):
+        iteration_output = output / "calibration_consistency" / f"iteration_{iteration}"
+        results = run_supply_calibration(
+            config, iteration_output, workers=workers,
+            reference_earnings_by_city=references,
+        )
+        updated = {
+            city: float(results[city]["reference_earnings_per_hour"])
+            for city in REFERENCE_CITIES
+        }
+        relative_changes = {
+            city: updated[city] / references[city] - 1.0
+            for city in REFERENCE_CITIES
+        }
+        row = {
+            "iteration": iteration,
+            "input_reference_earnings_per_hour": dict(references),
+            "measured_reference_earnings_per_hour": dict(updated),
+            "relative_changes": relative_changes,
+            "nyc_selection": dict(results["nyc"]["selection"]),
+            "nyc_confirmation": dict(results["nyc"]["confirmation"]),
+            "output": str(iteration_output),
+        }
+        history.append(row)
+        stable = all(
+            abs(change) <= REFERENCE_FIXED_POINT_RTOL
+            for change in relative_changes.values()
+        )
+        if stable and bool(results["nyc"]["confirmation"]["pass"]):
+            for city in REFERENCE_CITIES:
+                supply_path = PAY_DIR / city / "supply.json"
+                supply = json.loads(supply_path.read_text())
+                supply["reference_earnings_per_hour"] = updated[city]
+                supply["reference_earnings_contract"] = (
+                    "ratio_of_sums_both_platforms_days_5_28_"
+                    "joint_calibration_fixed_point"
+                )
+                supply["calibration_reference_consistency"] = {
+                    "converged": True,
+                    "iterations": iteration,
+                    "fixed_point_relative_tolerance": REFERENCE_FIXED_POINT_RTOL,
+                    "input_value": references[city],
+                    "measured_value": updated[city],
+                    "relative_change": relative_changes[city],
+                    "history": history,
+                }
+                atomic_json(supply_path, supply)
+            report = {
+                "schema_version": "v18-supply-reference-consistency-v1",
+                "converged": True,
+                "iterations": iteration,
+                "fixed_point_relative_tolerance": REFERENCE_FIXED_POINT_RTOL,
+                "reference_earnings_per_hour": updated,
+                "history": history,
+                "nyc_binding_confirmation_pass": True,
+            }
+            atomic_json(output / "calibration_consistency/report.json", report)
+            # Keep the established report location for downstream provenance.
+            atomic_json(output / "reference_earnings_rev2/report.json", report)
+            return report
+        references = updated
+
+    raise RuntimeError(
+        "joint supply calibration/reference fixed point did not converge "
+        f"in {CALIBRATION_REFERENCE_MAX_ITERATIONS} iterations: {history}"
+    )
 
 
 def run_reference_earnings(
@@ -2270,6 +2402,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "market_jobs": len(T1_CITIES) * len(T1_JOBS),
             "effect_jobs": len(EFFECT_ARMS) * len(EFFECT_CASES) * len(EFFECT_RIVALS),
             "calm_published_stock_gate_jobs": len(REFERENCE_CITIES),
+            "calibration_reference_iterations_maximum": (
+                CALIBRATION_REFERENCE_MAX_ITERATIONS
+            ),
             "effect_rollouts": len(EFFECT_ARMS) * len(EFFECT_CASES)
             * len(EFFECT_RIVALS) * len(_effect_specs()) * 2,
         }, indent=2, sort_keys=True))
@@ -2283,10 +2418,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             fit_pay_rules()
         if args.stage in {"all", "wait"}:
             derive_wait_target(output)
-        if args.stage in {"all", "supply"}:
-            run_supply_calibration(config, output, workers=args.workers)
-        if args.stage in {"all", "reference"}:
-            run_reference_earnings(config, output, workers=args.workers)
+        if args.stage in {"all", "supply", "reference"}:
+            run_consistent_supply_calibration(
+                config, output, workers=args.workers
+            )
         if args.stage in {"all", "kappa"}:
             run_kappa_test(config, output, workers=args.workers)
         if args.stage in {"all", "revealed"}:

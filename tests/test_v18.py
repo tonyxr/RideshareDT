@@ -28,7 +28,8 @@ from scripts.v18_p2 import (
     _histogram_median,
     _calm_published_stock_gate, _calm_published_stock_job,
     _measurement, _profile_from_factors, _run_parallel,
-    run_calm_stock_gate, run_reference_earnings,
+    run_calm_stock_gate, run_consistent_supply_calibration,
+    run_reference_earnings,
     _select_joint_calibration, _select_kappa_candidate,
     _select_transfer_service_level,
     _updated_profile_factors,
@@ -293,6 +294,67 @@ def test_p2_revision2_reference_earnings_remeasures_only_registered_statistic(
         assert updated["reference_earnings_revision2_validation"][
             "opening_tariff_randomization"
         ] == 0.0
+
+
+def test_p2_joint_calibration_reference_loop_refits_until_stable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    supply_root = tmp_path / "pay"
+    initial = {"nyc": 30.0, "boston": 24.0, "chicago": 22.0}
+    for city, reference in initial.items():
+        target = supply_root / city
+        target.mkdir(parents=True)
+        (target / "supply.json").write_text(json.dumps({
+            "city": city, "reference_earnings_per_hour": reference,
+        }))
+    monkeypatch.setattr("scripts.v18_p2.PAY_DIR", supply_root)
+
+    calls = []
+
+    def fake_calibration(config, output, *, workers, reference_earnings_by_city):
+        del config, workers
+        supplied = dict(reference_earnings_by_city)
+        calls.append((Path(output), supplied))
+        factor = 1.10 if len(calls) == 1 else 1.0005
+        results = {}
+        for city, reference in supplied.items():
+            measured = reference * factor
+            payload = {
+                "city": city,
+                "reference_earnings_per_hour": measured,
+                "selection": {"fleet_scale": 0.7, "base_pickup_minutes": 1.5},
+                "confirmation": {"pass": True},
+            }
+            results[city] = payload
+            (supply_root / city / "supply.json").write_text(
+                json.dumps(payload)
+            )
+        return results
+
+    monkeypatch.setattr(
+        "scripts.v18_p2.run_supply_calibration", fake_calibration
+    )
+    output = tmp_path / "run"
+    report = run_consistent_supply_calibration(
+        load_v17_config(), output, workers=4
+    )
+    assert report["converged"]
+    assert report["iterations"] == 2
+    assert len(calls) == 2
+    assert calls[0][1] == initial
+    assert calls[1][1]["nyc"] == pytest.approx(33.0)
+    assert calls[0][0].name == "iteration_1"
+    assert calls[1][0].name == "iteration_2"
+    for city in initial:
+        supply = json.loads(
+            (supply_root / city / "supply.json").read_text()
+        )
+        assert supply["calibration_reference_consistency"]["converged"]
+        assert supply["reference_earnings_contract"].endswith(
+            "joint_calibration_fixed_point"
+        )
+    assert (output / "calibration_consistency/report.json").is_file()
+    assert (output / "reference_earnings_rev2/report.json").is_file()
 
 
 def test_p2_revision2_gate_stage_runs_only_registered_city_cells(
