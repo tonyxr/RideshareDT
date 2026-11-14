@@ -1,0 +1,130 @@
+{
+  "protocol_revision": 2,
+  "cities": [
+    "nyc",
+    "boston",
+    "chicago"
+  ],
+  "days": [
+    10,
+    39
+  ],
+  "platforms": [
+    "platform1",
+    "platform2"
+  ],
+  "city_results": {
+    "nyc": {
+      "protocol_revision": 2,
+      "city": "nyc",
+      "population": "pure_C0_both_platforms_published_exact",
+      "gated_stock": [
+        "stock_firm1",
+        "stock_firm2"
+      ],
+      "days": [
+        10,
+        39
+      ],
+      "opening_tariff_randomization": 0.0,
+      "published_card_spec": "static_tariff:{\"airport_fee\":1.0,\"base_fare\":1.0,\"booking_fee\":1.0,\"per_mile\":1.0,\"per_minute\":1.0}",
+      "rollouts": 2,
+      "trace_rows": 360,
+      "platforms": {
+        "platform1": {
+          "field": "stock_firm1",
+          "minimum": 0.9754563802101556,
+          "maximum": 1.0217483698977736,
+          "maximum_absolute_drift": 0.02454361978984443,
+          "pass": true
+        },
+        "platform2": {
+          "field": "stock_firm2",
+          "minimum": 0.9763377301853274,
+          "maximum": 1.0268838324696272,
+          "maximum_absolute_drift": 0.026883832469627222,
+          "pass": true
+        }
+      },
+      "maximum_absolute_drift": 0.026883832469627222,
+      "pass": true
+    },
+    "boston": {
+      "protocol_revision": 2,
+      "city": "boston",
+      "population": "pure_C0_both_platforms_published_exact",
+      "gated_stock": [
+        "stock_firm1",
+        "stock_firm2"
+      ],
+      "days": [
+        10,
+        39
+      ],
+      "opening_tariff_randomization": 0.0,
+      "published_card_spec": "static_tariff:{\"airport_fee\":1.0,\"base_fare\":1.0,\"booking_fee\":1.0,\"per_mile\":1.0,\"per_minute\":1.0}",
+      "rollouts": 2,
+      "trace_rows": 360,
+      "platforms": {
+        "platform1": {
+          "field": "stock_firm1",
+          "minimum": 0.9554322424628418,
+          "maximum": 1.0290090138490549,
+          "maximum_absolute_drift": 0.04456775753715825,
+          "pass": false
+        },
+        "platform2": {
+          "field": "stock_firm2",
+          "minimum": 0.9536647109560744,
+          "maximum": 1.0199929416352935,
+          "maximum_absolute_drift": 0.04633528904392559,
+          "pass": false
+        }
+      },
+      "maximum_absolute_drift": 0.04633528904392559,
+      "pass": false
+    },
+    "chicago": {
+      "protocol_revision": 2,
+      "city": "chicago",
+      "population": "pure_C0_both_platforms_published_exact",
+      "gated_stock": [
+        "stock_firm1",
+        "stock_firm2"
+      ],
+      "days": [
+        10,
+        39
+      ],
+      "opening_tariff_randomization": 0.0,
+      "published_card_spec": "static_tariff:{\"airport_fee\":1.0,\"base_fare\":1.0,\"booking_fee\":1.0,\"per_mile\":1.0,\"per_minute\":1.0}",
+      "rollouts": 2,
+      "trace_rows": 360,
+      "platforms": {
+        "platform1": {
+          "field": "stock_firm1",
+          "minimum": 0.9563624343572327,
+          "maximum": 1.0195581504689242,
+          "maximum_absolute_drift": 0.04363756564276733,
+          "pass": false
+        },
+        "platform2": {
+          "field": "stock_firm2",
+          "minimum": 0.9476446746377233,
+          "maximum": 1.0154069868793167,
+          "maximum_absolute_drift": 0.05235532536227672,
+          "pass": false
+        }
+      },
+      "maximum_absolute_drift": 0.05235532536227672,
+      "pass": false
+    }
+  },
+  "maximum_absolute_drift": 0.05235532536227672,
+  "pass": false,
+  "products": {
+    "nyc": "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/preflight/P2_fix_attempt5_consistent/effects/calm_published_stock_gate_rev2/nyc/raw.json",
+    "boston": "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/preflight/P2_fix_attempt5_consistent/effects/calm_published_stock_gate_rev2/boston/raw.json",
+    "chicago": "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/preflight/P2_fix_attempt5_consistent/effects/calm_published_stock_gate_rev2/chicago/raw.json"
+  }
+}

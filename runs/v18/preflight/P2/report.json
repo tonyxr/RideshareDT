@@ -1,0 +1,31 @@
+{
+  "step": "P2",
+  "state": "closed",
+  "authority": "CRISP-Ride_v18_Last_Revision_20261113.pdf",
+  "production_market": "v17_corrected",
+  "rerun_allowed": false,
+  "attempt": 5,
+  "attempt_root": "runs/v18/preflight/P2_fix_attempt5_consistent",
+  "completed_effect_jobs": 27,
+  "calibration_consistency_iterations": 7,
+  "nyc_binding_confirmation": {
+    "wait_minutes": 3.8972440694,
+    "trips_per_online_hour": 1.7121545769,
+    "passenger_only_utilization": 0.4727291528
+  },
+  "revision_2_calm_stock_findings": {
+    "status": "report_only_retired_protocol_finding",
+    "source_report": "runs/v18/preflight/P2_fix_attempt5_consistent/effects/calm_published_stock_gate_rev2_report.json",
+    "source_report_sha256": "317098aa158f9fb1bef21ac8c9758632afa37005abadd25210b01af703ee4de7",
+    "nyc_maximum_absolute_drift": 0.026883832469627222,
+    "boston_maximum_absolute_drift": 0.04633528904392559,
+    "chicago_maximum_absolute_drift": 0.05235532536227672,
+    "scientific_stop": false
+  },
+  "notes": [
+    "The Last Revision supersedes Revision 2 and retires its calm-stock gate.",
+    "P2 is closed and must not be rerun.",
+    "All subsequent scientific checks are report-only; only Section 4 code defects are repaired before continuing."
+  ],
+  "recorded_utc": "2026-11-14T15:08:28Z"
+}
