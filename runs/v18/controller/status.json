@@ -1,37 +1,16 @@
 {
-  "branch": "v18-threats",
   "counts": {
     "cached": 0,
-    "complete": 2,
+    "complete": 13,
     "failed": 0,
-    "pending": 14,
-    "running": 4,
+    "pending": 7,
     "skipped": 0
   },
+  "controller_attempt": 2,
   "current_phase": "P3",
-  "head": "c07b041ce15ac175555f933b914ad1b47c05ff3f",
-  "paused_at_utc": "2026-11-14T16:51:34Z",
-  "process_checkpoint": {
-    "core_pids": [21244, 21246, 26253, 27113],
-    "process_group": 21048,
-    "screen_name": "v18_lastrev_90590fd_controller",
-    "screen_pid": 21047,
-    "state_verified": "running"
-  },
+  "last_operational_failure": "screen and controller tree vanished without a recorded job failure; completed products preserved",
   "projected_hours_left": null,
-  "remote": "ridesharedt/v18-threats",
-  "resource_checkpoint": {
-    "disk_available_gib": 42,
-    "swap_free_mib": 808.69
-  },
-  "resumed_at_utc": "2026-11-15T01:54:01Z",
-  "state": "running",
-  "updated_utc": "2026-11-15T01:55:04Z",
-  "workers": 4,
-  "z_checks": {
-    "Z1": "passed",
-    "Z2": "passed",
-    "Z3": "passed",
-    "Z4": "code_repaired_rerun_pending"
-  }
+  "state": "retrying",
+  "updated_utc": "2026-11-15T08:03:47Z",
+  "workers": 4
 }
