@@ -1,17 +1,26 @@
 schema_version: v18-production-v1
-status: preflight
+status: frozen
 tree: rideshare_v26r_v17
 branch: v18-threats
 output_root: runs/v18
-execution_order: [code_checks, P3, P4, freeze, queue, realdata, results]
-
+execution_order:
+- code_checks
+- P3
+- P4
+- freeze
+- queue
+- realdata
+- results
 market:
   variant: production
   supply_model: v3
   eta_v3: 0.6
   v3_daily_stock: false
   driver_pay_rule: share
-  fleet_scale: {nyc: 1.2, chicago: 1.1, boston: 1.0}
+  fleet_scale:
+    nyc: 1.2
+    chicago: 1.1
+    boston: 1.0
   base_pickup_minutes: 3.5
   hour_profile: default
   supply_base_active_drivers: 0
@@ -21,89 +30,103 @@ market:
   rate_upper_multiple: 2.5
   active_driver_feature_reference: run_capacity
   demand_scale: lyft_prior
-
 sensitivity_inputs:
   pay_rule_json: calibration_artifacts/v18/nyc/pay_rule.json
   supply_json: calibration_artifacts/v18/nyc/supply.json
-
 calibration:
   targets:
     utilization: 0.58
-    utilization_band: [0.52, 0.64]
+    utilization_band:
+    - 0.52
+    - 0.64
     median_wait_min: 4.27
     trips_per_hour_max: 1.78
   base_active_drivers_frozen: null
   fleet_scale: null
   base_pickup_minutes: null
   reference_earnings_per_hour: null
-
 population:
   pool: 20000
   customers: null
   confirmation_customers: 500
   loyalty_ratio: 3.6
   training_fraction: 0.8
-
 credit:
   source: branches
   branch_noise: crn
   horizon_days: 5
-  horizon_candidates: [5, 7, 10]
+  horizon_candidates:
+  - 5
+  - 7
+  - 10
   sample_cap: 8
   planner_horizon_days: 1
-
 learner:
   value_head: concave2d
   policy_mode: q
   move_radius: 1
   temperature_mode: relative
-  tau_relative: [0.5, 0.15]
+  tau_relative:
+  - 0.5
+  - 0.15
   store_rows: 20000
   fit_steps_per_day: 50
   batch_size: 64
   policy_snapshot_every_days: 200
-
 training:
   days: 1200
   seeds_by_city:
-    nyc: [101, 202, 303, 404, 505]
-    boston: [101, 202, 303]
-    chicago: [101, 202, 303]
+    nyc:
+    - 101
+    - 202
+    - 303
+    - 404
+    - 505
+    boston:
+    - 101
+    - 202
+    - 303
+    chicago:
+    - 101
+    - 202
+    - 303
   ppo_clock_days: null
   mc_clock_days: null
-
 evaluation:
-  seeds: [77311, 88411]
+  seeds:
+  - 77311
+  - 88411
   days: 40
   steps_per_day: 6
-  scripted_scenario_hazards: off
+  scripted_scenario_hazards: false
   natural_scenario_hazards: natural
   rivals:
-    - adaptive_best_response_memory
-    - profit_best_response_myopic
-    - profit_best_response_forward
-    - profit_best_response_anticipating
-    - profit_opt_mpc_grid
-    - pi_price_gap
-    - region_supply_demand
-    - queue_service_threshold
-    - pi_price_gap@perturbed0
-    - queue_service_threshold@perturbed0
-
+  - adaptive_best_response_memory
+  - profit_best_response_myopic
+  - profit_best_response_forward
+  - profit_best_response_anticipating
+  - profit_opt_mpc_grid
+  - pi_price_gap
+  - region_supply_demand
+  - queue_service_threshold
+  - pi_price_gap@perturbed0
+  - queue_service_threshold@perturbed0
 decisions:
-  N_star: null
-  ppo_clock_days: null
-  mc_clock_days: null
-  workers: null
-  projection: null
-
+  N_star: 150
+  ppo_clock_days: 7980
+  mc_clock_days: 5790
+  workers: 10
+  projection:
+    wave_a_hours: 7.710222222222222
+    source: /Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/P4_timing/report.json
 fixed:
   H_star: 5
   value_head: concave2d
-  branch_planner: {sample_cap: 8, horizon_days: 1}
+  branch_planner:
+    sample_cap: 8
+    horizon_days: 1
   threshold_outcome: e7_ablation_only
   market_variant: production
-
 city_inputs:
   nyc:
     market_name: New York City
