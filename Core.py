@@ -111,6 +111,20 @@ def _v18_card_clear_quote(market, distance: float, duration: float, context: Rid
         airport=context.airport, service=context.service,
     )
     return float(market.quote_price(distance, duration, clear_context, overrides=None))
+
+
+def _v18_request_step(
+    request_step: Optional[int],
+    tape_position: Optional[Tuple[int, int, int]],
+) -> int:
+    """Resolve the lossless request-log step without relying on a local loop name."""
+    if request_step is not None:
+        return int(request_step)
+    if tape_position is not None:
+        return int(tape_position[1])
+    return 0
+
+
 from coeff_utils import get_coeff, set_coeff
 from calibration_utils import derive_calibration, load_calibration_json, load_calibration_preset
 from city_data_pipeline import (
@@ -8600,6 +8614,7 @@ class Core:
                         sampled_profiles=profiles,
                         collect_rows=bool(self.policy_sweep_request_log),
                         supply_reference_customers=customers_per_step,
+                        request_step=int(step_index),
                     )
                     if self.policy_sweep_request_log:
                         self._write_policy_request_rows(
@@ -17471,6 +17486,7 @@ class Core:
         sampled_profiles: Optional[List[Dict[str, Any]]] = None,
         collect_rows: bool = True,
         supply_reference_customers: Optional[int] = None,
+        request_step: Optional[int] = None,
     ) -> Tuple[List[Dict[str, Any]], FirmMetrics, FirmMetrics, float, float, float]:
         """Simulate one market step.
 
@@ -17480,6 +17496,9 @@ class Core:
         Operational trips come from the city's empirical trip bank.
         """
         rows: List[Dict[str, Any]] = []
+        request_step_value = _v18_request_step(
+            request_step, self._v16_tape_position
+        )
         v26_dynamics = bool(self.market_dynamics.enabled)
         reference_customers = int(max(
             1,
@@ -17933,7 +17952,7 @@ class Core:
             
             if collect_rows:
                 rows.append({
-                    "RequestStep": int(step),
+                    "RequestStep": request_step_value,
                     "City": str(getattr(self.market, "current_city", self.market_name)),
                     "DayOfWeek": day_of_week,
                     "Weather": weather,

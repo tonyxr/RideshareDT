@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 from pathlib import Path
 import sys
 
 import numpy as np
 
-from Core import _v18_card_clear_quote
+from Core import Core, _v18_card_clear_quote, _v18_request_step
 from MarketInteraction import RideContext
 from scripts.v18_config import eval_args, load_config, train_args
 from scripts.v18_market import market_flags
@@ -156,3 +157,10 @@ def test_clear_quote_is_rng_free():
     context = RideContext(1, "rain", 8, False, "standard")
     assert _v18_card_clear_quote(market, 2.0, 7.0, context) == 9.0
     assert json.dumps(market.rng.bit_generator.state, sort_keys=True) == before
+
+
+def test_request_step_is_explicit_and_has_a_deterministic_fallback():
+    assert "request_step" in inspect.signature(Core.simulate_batch).parameters
+    assert _v18_request_step(17, None) == 17
+    assert _v18_request_step(None, (3, 4, 0)) == 4
+    assert _v18_request_step(None, None) == 0
