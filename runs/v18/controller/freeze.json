@@ -1,0 +1,14 @@
+{
+  "config": "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/configs/v18_production.yaml",
+  "decisions": {
+    "N_star": 150,
+    "mc_clock_days": 5790,
+    "ppo_clock_days": 7980,
+    "projection": {
+      "source": "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/P4_timing/report.json",
+      "wave_a_hours": 7.710222222222222
+    },
+    "workers": 10
+  },
+  "state": "complete"
+}

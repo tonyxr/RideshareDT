@@ -1,0 +1,56 @@
+{
+  "N_star": 150,
+  "jobs": {
+    "P4/N150/agent_boston_s101": {
+      "peak_memory_bytes": 578224128,
+      "wall_seconds": 1405.35
+    },
+    "P4/N150/agent_chicago_s101": {
+      "peak_memory_bytes": 588996608,
+      "wall_seconds": 1348.91
+    },
+    "P4/N150/agent_nyc_s101": {
+      "peak_memory_bytes": 573595648,
+      "wall_seconds": 1387.84
+    },
+    "P4/N150/agent_nyc_s202": {
+      "peak_memory_bytes": 587886592,
+      "wall_seconds": 1412.79
+    },
+    "P4/N150/agent_nyc_s303": {
+      "peak_memory_bytes": 585240576,
+      "wall_seconds": 1382.7
+    },
+    "P4/N150/mc_nyc_s101": {
+      "peak_memory_bytes": 499679232,
+      "wall_seconds": 288.71
+    },
+    "P4/N150/mc_nyc_s202": {
+      "peak_memory_bytes": 532246528,
+      "wall_seconds": 289.43
+    },
+    "P4/N150/ppo_nyc_s101": {
+      "peak_memory_bytes": 471977984,
+      "wall_seconds": 209.22
+    },
+    "P4/N150/ppo_nyc_s202": {
+      "peak_memory_bytes": 462196736,
+      "wall_seconds": 209.2
+    }
+  },
+  "largest_peak_memory_bytes": 588996608,
+  "mc_clock_days": 5790,
+  "median_wall_seconds": {
+    "agent": 1387.84,
+    "mc": 289.07,
+    "ppo": 209.20999999999998
+  },
+  "physical_cores": 10,
+  "physical_memory_bytes": 17179869184,
+  "ppo_clock_days": 7980,
+  "projected_wave_a_hours": 7.710222222222222,
+  "requires_N_step_down": false,
+  "state": "complete",
+  "step": "P4",
+  "workers": 10
+}
