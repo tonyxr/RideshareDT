@@ -1,16 +1,13 @@
 {
   "counts": {
     "cached": 0,
-    "complete": 13,
+    "complete": 2,
     "failed": 0,
-    "pending": 7,
+    "pending": 0,
     "skipped": 0
   },
-  "controller_attempt": 2,
-  "current_phase": "P3",
-  "last_operational_failure": "screen and controller tree vanished without a recorded job failure; completed products preserved",
   "projected_hours_left": null,
-  "state": "retrying",
-  "updated_utc": "2026-11-15T08:03:47Z",
-  "workers": 4
+  "state": "complete",
+  "updated_utc": "2026-11-15T08:29:29.609181Z",
+  "workers": 2
 }

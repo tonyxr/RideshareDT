@@ -1,0 +1,50 @@
+{
+  "Z1": {
+    "output": "...............................................                          [100%]\n47 passed in 1.18s\n",
+    "returncode": 0,
+    "seconds": 3.667166499999894,
+    "state": "pass"
+  },
+  "Z2": {
+    "expected": 0.3187048000915823,
+    "job_state": "complete",
+    "objective": 0.3187048000915823,
+    "source": "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/preflight/P2_fix/effects/v17_model/C0_calm/adaptive_best_response_memory/manifest.json",
+    "state": "pass"
+  },
+  "Z3": {
+    "jobs": {
+      "Z3/eval/main": "complete",
+      "Z3/eval/main_snapshot_day10": "complete",
+      "Z3/eval/mc_clock": "complete",
+      "Z3/eval/no_driver_obs": "complete",
+      "Z3/eval/nocrn": "complete",
+      "Z3/eval/own_profit": "complete",
+      "Z3/eval/ppo": "complete",
+      "Z3/reference/0": "complete",
+      "Z3/reference/1": "complete",
+      "Z3/reference/2": "complete",
+      "Z3/reference/3": "complete",
+      "Z3/train/main": "complete",
+      "Z3/train/mc_clock": "complete",
+      "Z3/train/no_driver_obs": "complete",
+      "Z3/train/nocrn": "complete",
+      "Z3/train/own_profit": "complete",
+      "Z3/train/ppo": "complete"
+    },
+    "state": "pass"
+  },
+  "Z4": {
+    "daily_fare_match": false,
+    "daily_trips_match": false,
+    "jobs": {
+      "Z4/logged": "complete",
+      "Z4/plain": "complete"
+    },
+    "logged_rows": 0,
+    "results_match": true,
+    "state": "report",
+    "traces_match": true
+  },
+  "state": "pass"
+}
