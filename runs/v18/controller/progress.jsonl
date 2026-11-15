@@ -282,3 +282,4 @@
 {"attempt":1,"job":"chicago_s303","seconds":0.0,"state":"running","time":"2026-11-15T10:30:03.786150Z"}
 {"attempt":1,"job":"boston_s202","seconds":0.0,"state":"running","time":"2026-11-15T10:30:03.778991Z"}
 {"attempt":1,"job":"boston_s303","seconds":0.0,"state":"running","time":"2026-11-15T10:30:03.811849Z"}
+{"attempt":1,"job":"wave_A","seconds":0.0,"state":"paused_disk_floor","time":"2026-11-15T12:15:50Z"}

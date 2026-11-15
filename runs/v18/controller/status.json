@@ -1,14 +1,14 @@
 {
   "counts": {
     "cached": 0,
-    "complete": 9,
+    "complete": 0,
     "failed": 0,
-    "pending": 0,
+    "pending": 9,
     "skipped": 0
   },
   "current_phase": "wave_A",
-  "projected_hours_left": null,
-  "state": "complete",
-  "updated_utc": "2026-11-15T10:30:03.610189Z",
+  "projected_hours_left": 60.0,
+  "state": "paused_disk_floor",
+  "updated_utc": "2026-11-15T12:15:50Z",
   "workers": 10
 }
