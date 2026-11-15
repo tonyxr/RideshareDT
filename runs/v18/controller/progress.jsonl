@@ -146,3 +146,4 @@
 {"attempt":1,"job":"P3/nyc/C0/N100","seconds":2578.256,"state":"complete","time":"2026-11-14T16:49:15.203048Z"}
 {"attempt":1,"job":"P3/nyc/A1/N50","seconds":0.0,"state":"running","time":"2026-11-14T16:49:15.207588Z"}
 {"time":"2026-11-14T16:51:34Z","job":"controller","state":"paused_by_user","attempt":1,"seconds":0}
+{"time":"2026-11-15T01:54:01Z","job":"controller","state":"resumed_by_user","attempt":1,"seconds":0}
