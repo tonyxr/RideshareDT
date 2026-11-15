@@ -8,7 +8,7 @@
   },
   "current_phase": "wave_A",
   "projected_hours_left": 60.0,
-  "state": "paused_disk_floor",
-  "updated_utc": "2026-11-15T12:15:50Z",
+  "state": "running",
+  "updated_utc": "2026-11-15T16:08:25Z",
   "workers": 10
 }
