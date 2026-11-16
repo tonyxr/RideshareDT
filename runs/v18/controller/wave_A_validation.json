@@ -1,0 +1,21 @@
+{
+  "validated_utc": "2026-11-16T06:33:09Z",
+  "source_head": "7ca3114f30ed70db4fda5b9cf5ededca9f81c1d6",
+  "jobs": 9,
+  "complete": 9,
+  "failed": 0,
+  "json_files_checked": 27,
+  "json_parse_errors": 0,
+  "nonfinite_values": 0,
+  "policies": {
+    "boston_s101": "b64c92097e32b1a765917c5bd72e8d44af589d9cffc9814119103f9e90ad32a0",
+    "boston_s202": "0d5f41638bc5d351e988185f4768b84f8351ad6e97752c5a8581ebad1f234e36",
+    "boston_s303": "a382679a6b0e0f880a262b961a38142f57a36d6829fd66e2a9c29ce083994cd5",
+    "chicago_s101": "76df7975874a8a7551952662037513e05ff6a9b17d889008be17aa831d5e0680",
+    "chicago_s202": "c97c4d6f062a50fe97f4c852071d17da8ee132883a2644809ddd60a635d8411c",
+    "chicago_s303": "25f860550633de70d46d3ff175dbefc7105dcd074fb437f73323a4969eff83ca",
+    "nyc_s101": "055246947dca9e4a393f2c17eb821dd8b6a02a955ab681f3984da342a5b07a7b",
+    "nyc_s202": "fe74992a8445e1b6d18a6070c98eb7242f7c38b14f0753af76db7786cd48aea8",
+    "nyc_s303": "5adea584755ee39b066ebe530b1081f5acc9e79fce088d826ac49f08feff843d"
+  }
+}
