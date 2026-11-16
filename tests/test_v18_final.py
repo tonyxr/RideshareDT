@@ -15,7 +15,8 @@ from scripts.v18_market import market_flags
 from scripts.v18_eval import SCENARIOS
 from scripts.v18_runtime import Job, run_job, run_jobs
 from scripts.v18_select import (
-    _grid_edge_selected, _stage3_count_rules, card_grid, reactive_candidates,
+    _grid_edge_selected, _selection_plan, _stage3_count_rules, card_grid,
+    reactive_candidates,
 )
 
 
@@ -118,6 +119,14 @@ def test_grid_edge_selected_is_a_boolean_membership_check():
     assert _grid_edge_selected({"distance": 2.5, "time": 1.0}, (1.0, 1.0)) is True
     assert _grid_edge_selected({"distance": 1.0, "time": 1.0}, (1.25, 2.5)) is True
     assert _grid_edge_selected({"distance": 1.0, "time": 1.0}, (1.25, 1.5)) is False
+
+
+def test_selection_plan_matches_registered_m4_counts():
+    plan = _selection_plan()
+    assert len(plan["cards"]) == 36
+    assert plan["openings"] == 2
+    assert plan["stage3_count_rules"] == 14
+    assert plan["stage3_reactive_rules"] == 24
 
 
 def test_registered_scenario_paths_exist():

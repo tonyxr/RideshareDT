@@ -54,6 +54,20 @@ def _grid_edge_selected(best_row: Mapping[str, Any], event: Sequence[float]) -> 
     )
 
 
+def _selection_plan() -> dict[str, Any]:
+    return {
+        "cards": card_grid(),
+        "selection_rivals": SELECTION_RIVALS,
+        "stage3_rivals": STAGE3_RIVALS,
+        "stage3_count_rules": 14,
+        "stage3_reactive_rules": 24,
+        "cases": CASES,
+        "seed": 20_231,
+        "days": 28,
+        "openings": 2,
+    }
+
+
 def count_rule_candidates(
     *, normal: Sequence[float], event_cards: Sequence[Sequence[float]],
     norm: Sequence[float],
@@ -376,8 +390,7 @@ def main() -> int:
             customers=args.customers, seed=args.seed,
         )
     elif args.emit_plan:
-        payload = {"cards": card_grid(), "selection_rivals": SELECTION_RIVALS,
-                   "cases": CASES, "seed": 20231, "days": 28, "openings": 3}
+        payload = _selection_plan()
     else:
         if args.landscape is None:
             raise ValueError("--landscape is required unless --emit-plan is used")
