@@ -299,3 +299,9 @@
 {"attempt":1,"job":"selection/chicago/stage1","seconds":0.0,"state":"running","time":"2026-11-16T06:23:56.822660Z"}
 {"attempt":1,"job":"selection/nyc/stage1","seconds":0.0,"state":"running","time":"2026-11-16T06:23:56.823836Z"}
 {"attempt":1,"job":"selection/boston/stage1","seconds":0.0,"state":"running","time":"2026-11-16T06:23:56.825680Z"}
+{"attempt":1,"job":"selection/nyc/stage1","seconds":9345.551,"state":"complete","time":"2026-11-16T08:59:42.461254Z"}
+{"attempt":1,"job":"selection/nyc/stage2","seconds":0.0,"state":"running","time":"2026-11-16T08:59:43.908500Z"}
+{"attempt":1,"job":"selection/boston/stage1","seconds":9706.76,"state":"complete","time":"2026-11-16T09:05:43.659977Z"}
+{"attempt":1,"job":"selection/boston/stage2","seconds":0.0,"state":"running","time":"2026-11-16T09:05:45.062954Z"}
+{"attempt":1,"job":"selection/chicago/stage1","seconds":9790.161,"state":"complete","time":"2026-11-16T09:07:07.055717Z"}
+{"attempt":1,"job":"selection/chicago/stage2","seconds":0.0,"state":"running","time":"2026-11-16T09:07:08.561016Z"}

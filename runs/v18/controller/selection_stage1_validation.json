@@ -1,0 +1,33 @@
+{
+  "schema_version": "v18-selection-stage1-validation-v1",
+  "validated_utc": "2026-11-16T09:14:39Z",
+  "expected_cities": 3,
+  "expected_traces_per_city": 36,
+  "products": {
+    "boston": {
+      "path": "runs/v18/select/boston/stage1_calm_cards.json",
+      "bytes": 138487339,
+      "sha256": "d59c130038f7e0d70dfdac5755ffb1e734e483c5003ec4e87d1aa58e89a64ebf",
+      "traces": 36,
+      "numeric_values": 2688522,
+      "nonfinite_values": 0
+    },
+    "chicago": {
+      "path": "runs/v18/select/chicago/stage1_calm_cards.json",
+      "bytes": 138573818,
+      "sha256": "8035f2eda8f10eada9bdf81d63ec631124dee5ec84b885ad876e92e006dcabe1",
+      "traces": 36,
+      "numeric_values": 2688522,
+      "nonfinite_values": 0
+    },
+    "nyc": {
+      "path": "runs/v18/select/nyc/stage1_calm_cards.json",
+      "bytes": 138261781,
+      "sha256": "711c256113b25ed7efeec98685b5a7d362a013af77f20f5ff0a319618f3779fe",
+      "traces": 36,
+      "numeric_values": 2688522,
+      "nonfinite_values": 0
+    }
+  },
+  "valid": true
+}
