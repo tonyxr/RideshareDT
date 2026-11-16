@@ -1,0 +1,24 @@
+{
+  "schema_version": "v18-selection-stage3-validation-v1",
+  "validated_utc": "2026-11-16T15:54:09Z",
+  "expected_cities": 3,
+  "expected_cases_per_city": 3,
+  "expected_traces_per_case": 38,
+  "landscapes": {
+    "boston/A1_shortage_severe": {"bytes": 74386809, "traces": 38, "numeric_values": 1419031, "nonfinite_values": 0, "sha256": "0555eb7144080ba0e5c765f40ed6268bece400a7d2528b03d23e52298cce8491"},
+    "boston/C0_calm": {"bytes": 72758888, "traces": 38, "numeric_values": 1419030, "nonfinite_values": 0, "sha256": "30a67d907453debd35bffadd81856ba30ae20e514bcb41d9a23670736f29038a"},
+    "boston/v17_shortage_i065": {"bytes": 74275787, "traces": 38, "numeric_values": 1419031, "nonfinite_values": 0, "sha256": "bc1d7022dde53075ff0c61985da8b94aa7c2980f627e9ff22ad240925a06100b"},
+    "chicago/A1_shortage_severe": {"bytes": 74512972, "traces": 38, "numeric_values": 1419031, "nonfinite_values": 0, "sha256": "d6e248485fef3ffe0ff5ef56460e2bb5a8d0560701c1b3fed1f36aad1c181874"},
+    "chicago/C0_calm": {"bytes": 72842246, "traces": 38, "numeric_values": 1419030, "nonfinite_values": 0, "sha256": "26d92286d12571537c443aa4d0d707f066b8a0eebd81e6e2c1fd10958f29f7dc"},
+    "chicago/v17_shortage_i065": {"bytes": 74430861, "traces": 38, "numeric_values": 1419031, "nonfinite_values": 0, "sha256": "e5306793c24a09dad39067ce2012a5f4a25e670f5b540d9fcf3e6dde2677eab4"},
+    "nyc/A1_shortage_severe": {"bytes": 74359052, "traces": 38, "numeric_values": 1419031, "nonfinite_values": 0, "sha256": "ae448885824cf75be91ec2c32ef03049ac9ec7340ac420cc98ac5a6817bf2773"},
+    "nyc/C0_calm": {"bytes": 72745488, "traces": 38, "numeric_values": 1419030, "nonfinite_values": 0, "sha256": "563599ac9a4bfa921d16664b4c051eed663d790bf755d24b70cc52240a72b4c8"},
+    "nyc/v17_shortage_i065": {"bytes": 74311363, "traces": 38, "numeric_values": 1419031, "nonfinite_values": 0, "sha256": "c477283535913ca7f72f6c4e61f65213a9dae4193863399342da6ea1e4c35666"}
+  },
+  "selected": {
+    "boston": {"bytes": 2538, "missing_required_keys": [], "nonfinite_values": 0, "sha256": "587db4c22705e1ee0e56fadd1eb795044a8d8f289134c207e9fd1f6299008abc"},
+    "chicago": {"bytes": 2543, "missing_required_keys": [], "nonfinite_values": 0, "sha256": "8a2d6a46902c5c20afb561275311c9711b30115bff763a09b5a8fc95fd941ade"},
+    "nyc": {"bytes": 2476, "missing_required_keys": [], "nonfinite_values": 0, "sha256": "0adfe25e817bd48bd3d43b0bfc99e04cc4452e1d3a541da753503c67b3bfa02a"}
+  },
+  "valid": true
+}

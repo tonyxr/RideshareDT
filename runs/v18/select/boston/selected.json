@@ -1,0 +1,56 @@
+{
+  "best_fixed": {
+    "distance": 1.0,
+    "objective": 0.301861307742697,
+    "spec": "static_tariff:{\"airport_fee\":1.0,\"base_fare\":1.0,\"booking_fee\":1.0,\"per_mile\":1.0,\"per_minute\":0.8}",
+    "time": 0.8
+  },
+  "city": "boston",
+  "count_norm_shifted": [
+    8.931159420289855,
+    4.384057971014493,
+    7.681159420289855,
+    12.431159420289855,
+    11.768115942028986,
+    13.456521739130435
+  ],
+  "count_rule_0step": {
+    "objective": 0.24182271830206412,
+    "spec": "count_rule:{\"event\":[2.0,2.5],\"mode\":\"ramp\",\"move_limit\":0,\"norm\":[8.931159420289855,4.384057971014493,7.681159420289855,12.431159420289855,11.768115942028986,13.456521739130435],\"normal\":[1.0,0.8],\"theta\":0.9,\"theta_lo\":0.4}"
+  },
+  "count_rule_1step": {
+    "objective": 0.26582150056184245,
+    "spec": "count_rule:{\"event\":[2.0,2.5],\"mode\":\"ramp\",\"move_limit\":1,\"norm\":[8.931159420289855,4.384057971014493,7.681159420289855,12.431159420289855,11.768115942028986,13.456521739130435],\"normal\":[1.0,0.8],\"theta\":0.9,\"theta_lo\":0.4}"
+  },
+  "dated_two_lever": {
+    "objective": 0.3005080826096304,
+    "spec": "surge_decay:{\"decay_days\":0,\"event\":[2.0,2.5],\"hold_days\":0,\"normal\":[1.0,0.8],\"windows\":[[10,15]]}"
+  },
+  "grid_edge_selected": true,
+  "landscapes": {
+    "stage1": "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/boston/stage1_calm_cards.json",
+    "stage2": "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/boston/stage2_dated_cards.json",
+    "stage3": [
+      "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/boston/stage3_C0_calm.json",
+      "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/boston/stage3_A1_shortage_severe.json",
+      "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/boston/stage3_v17_shortage_i065.json"
+    ]
+  },
+  "published_card": {
+    "spec": "static_tariff:{\"airport_fee\":1.0,\"base_fare\":1.0,\"booking_fee\":1.0,\"per_mile\":1.0,\"per_minute\":1.0}"
+  },
+  "published_drivers_by_block": [
+    4.384057971014493,
+    7.681159420289855,
+    12.431159420289855,
+    11.768115942028986,
+    13.456521739130435,
+    8.931159420289855
+  ],
+  "reactive_surge": {
+    "objective": 0.2804967010994269,
+    "spec": "reactive_surge:{\"fill_gain\":2.0,\"fill_ref\":0.9,\"max_level\":1.5,\"normal\":[1.0,0.8],\"storm_gain\":0.25,\"wait_gain\":0.5,\"wait_ref\":8.0}"
+  },
+  "schema_version": "v18-reference-selection-last-revision-v1",
+  "variant": "production"
+}

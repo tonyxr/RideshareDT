@@ -1,0 +1,32 @@
+{
+  "attempt": 1,
+  "attempts": [
+    {
+      "attempt": 1,
+      "error": "",
+      "finished_utc": "2026-11-16T15:47:45.798177Z",
+      "returncode": 0,
+      "seconds": 13762.018
+    }
+  ],
+  "command": [
+    "/Users/huali/Desktop/RideResponse/.venv/bin/python",
+    "-u",
+    "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/scripts/v18_select.py",
+    "--city",
+    "nyc",
+    "--run",
+    "--workers",
+    "1"
+  ],
+  "command_hash": "d25455727f89b1fea2ae1db25922ecf6fc15c0d948d0c7e9a2b1eb2caa5df473",
+  "error": "",
+  "log": "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/controller/selection_nyc_recovery_ffd2bc8.log",
+  "name": "selection/nyc/recovery_ffd2bc8",
+  "output": "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/nyc/selected.json",
+  "requires": [],
+  "returncode": 0,
+  "state": "complete",
+  "tier": 0,
+  "updated_utc": "2026-11-16T15:47:45.798268Z"
+}

@@ -1,0 +1,56 @@
+{
+  "best_fixed": {
+    "distance": 0.8,
+    "objective": 0.2316381719956492,
+    "spec": "static_tariff:{\"airport_fee\":1.0,\"base_fare\":1.0,\"booking_fee\":1.0,\"per_mile\":0.8,\"per_minute\":2.0}",
+    "time": 2.0
+  },
+  "city": "chicago",
+  "count_norm_shifted": [
+    11.572463768115941,
+    5.572463768115942,
+    8.93840579710145,
+    13.93840579710145,
+    14.427536231884059,
+    16.583333333333332
+  ],
+  "count_rule_0step": {
+    "objective": 0.21281477618145553,
+    "spec": "count_rule:{\"event\":[2.0,2.5],\"mode\":\"step\",\"move_limit\":0,\"norm\":[11.572463768115941,5.572463768115942,8.93840579710145,13.93840579710145,14.427536231884059,16.583333333333332],\"normal\":[0.8,2.0],\"theta\":0.7,\"theta_lo\":0.5}"
+  },
+  "count_rule_1step": {
+    "objective": 0.22538937763774838,
+    "spec": "count_rule:{\"event\":[2.0,2.5],\"mode\":\"ramp\",\"move_limit\":1,\"norm\":[11.572463768115941,5.572463768115942,8.93840579710145,13.93840579710145,14.427536231884059,16.583333333333332],\"normal\":[0.8,2.0],\"theta\":0.9,\"theta_lo\":0.6}"
+  },
+  "dated_two_lever": {
+    "objective": 0.24819192586952868,
+    "spec": "surge_decay:{\"decay_days\":0,\"event\":[2.0,2.5],\"hold_days\":0,\"normal\":[0.8,2.0],\"windows\":[[10,15]]}"
+  },
+  "grid_edge_selected": true,
+  "landscapes": {
+    "stage1": "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/chicago/stage1_calm_cards.json",
+    "stage2": "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/chicago/stage2_dated_cards.json",
+    "stage3": [
+      "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/chicago/stage3_C0_calm.json",
+      "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/chicago/stage3_A1_shortage_severe.json",
+      "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/chicago/stage3_v17_shortage_i065.json"
+    ]
+  },
+  "published_card": {
+    "spec": "static_tariff:{\"airport_fee\":1.0,\"base_fare\":1.0,\"booking_fee\":1.0,\"per_mile\":1.0,\"per_minute\":1.0}"
+  },
+  "published_drivers_by_block": [
+    5.572463768115942,
+    8.93840579710145,
+    13.93840579710145,
+    14.427536231884059,
+    16.583333333333332,
+    11.572463768115941
+  ],
+  "reactive_surge": {
+    "objective": 0.23612935017468475,
+    "spec": "reactive_surge:{\"fill_gain\":2.0,\"fill_ref\":0.9,\"max_level\":2.5,\"normal\":[0.8,2.0],\"storm_gain\":0.25,\"wait_gain\":0.5,\"wait_ref\":8.0}"
+  },
+  "schema_version": "v18-reference-selection-last-revision-v1",
+  "variant": "production"
+}

@@ -1,0 +1,56 @@
+{
+  "best_fixed": {
+    "distance": 1.0,
+    "objective": 0.48439817496932797,
+    "spec": "static_tariff:{\"airport_fee\":1.0,\"base_fare\":1.0,\"booking_fee\":1.0,\"per_mile\":1.0,\"per_minute\":1.5}",
+    "time": 1.5
+  },
+  "city": "nyc",
+  "count_norm_shifted": [
+    12.177536231884059,
+    5.8768115942028984,
+    9.644927536231885,
+    14.891304347826088,
+    15.192028985507246,
+    17.5
+  ],
+  "count_rule_0step": {
+    "objective": 0.4474650817563619,
+    "spec": "count_rule:{\"event\":[1.25,2.5],\"mode\":\"step\",\"move_limit\":0,\"norm\":[12.177536231884059,5.8768115942028984,9.644927536231885,14.891304347826088,15.192028985507246,17.5],\"normal\":[1.0,1.5],\"theta\":0.8,\"theta_lo\":0.5}"
+  },
+  "count_rule_1step": {
+    "objective": 0.4526609396413026,
+    "spec": "count_rule:{\"event\":[1.25,2.5],\"mode\":\"ramp\",\"move_limit\":1,\"norm\":[12.177536231884059,5.8768115942028984,9.644927536231885,14.891304347826088,15.192028985507246,17.5],\"normal\":[1.0,1.5],\"theta\":0.9,\"theta_lo\":0.6}"
+  },
+  "dated_two_lever": {
+    "objective": 0.4981642945260533,
+    "spec": "surge_decay:{\"decay_days\":0,\"event\":[1.25,2.5],\"hold_days\":0,\"normal\":[1.0,1.5],\"windows\":[[10,15]]}"
+  },
+  "grid_edge_selected": true,
+  "landscapes": {
+    "stage1": "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/nyc/stage1_calm_cards.json",
+    "stage2": "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/nyc/stage2_dated_cards.json",
+    "stage3": [
+      "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/nyc/stage3_C0_calm.json",
+      "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/nyc/stage3_A1_shortage_severe.json",
+      "/Users/huali/Desktop/RideResponse/rideshare_v26r_v17/runs/v18/select/nyc/stage3_v17_shortage_i065.json"
+    ]
+  },
+  "published_card": {
+    "spec": "static_tariff:{\"airport_fee\":1.0,\"base_fare\":1.0,\"booking_fee\":1.0,\"per_mile\":1.0,\"per_minute\":1.0}"
+  },
+  "published_drivers_by_block": [
+    5.8768115942028984,
+    9.644927536231885,
+    14.891304347826088,
+    15.192028985507246,
+    17.5,
+    12.177536231884059
+  ],
+  "reactive_surge": {
+    "objective": 0.42761052386136916,
+    "spec": "reactive_surge:{\"fill_gain\":2.0,\"fill_ref\":0.9,\"max_level\":2.0,\"normal\":[1.0,1.5],\"storm_gain\":0.25,\"wait_gain\":0.5,\"wait_ref\":8.0}"
+  },
+  "schema_version": "v18-reference-selection-last-revision-v1",
+  "variant": "production"
+}
