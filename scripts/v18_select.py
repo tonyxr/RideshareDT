@@ -48,6 +48,12 @@ def card_grid() -> list[dict[str, Any]]:
     ]
 
 
+def _grid_edge_selected(best_row: Mapping[str, Any], event: Sequence[float]) -> bool:
+    return 2.5 in (
+        float(best_row["distance"]), float(best_row["time"]), *map(float, event)
+    )
+
+
 def count_rule_candidates(
     *, normal: Sequence[float], event_cards: Sequence[Sequence[float]],
     norm: Sequence[float],
@@ -300,9 +306,7 @@ def run_selection(
         "dated_two_lever": {"spec": dated_spec, "objective": _objective(p2, dated_spec)},
         "published_drivers_by_block": published_drivers,
         "count_norm_shifted": norm,
-        "grid_edge_selected": any(
-            2.5 in (float(best_row["distance"]), float(best_row["time"]), *map(float, event))
-        ),
+        "grid_edge_selected": _grid_edge_selected(best_row, event),
         "landscapes": {"stage1": str(stage1_raw), "stage2": str(stage2_raw)},
     }
     if not stage3:

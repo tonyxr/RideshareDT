@@ -14,7 +14,9 @@ from scripts.v18_config import eval_args, load_config, train_args
 from scripts.v18_market import market_flags
 from scripts.v18_eval import SCENARIOS
 from scripts.v18_runtime import Job, run_job, run_jobs
-from scripts.v18_select import _stage3_count_rules, card_grid, reactive_candidates
+from scripts.v18_select import (
+    _grid_edge_selected, _stage3_count_rules, card_grid, reactive_candidates,
+)
 
 
 BASE = Path(__file__).resolve().parents[1]
@@ -110,6 +112,12 @@ def test_cards_are_static_tariffs():
     cards = card_grid()
     assert len(cards) == 36
     assert all(row["spec"].startswith("static_tariff:") for row in cards)
+
+
+def test_grid_edge_selected_is_a_boolean_membership_check():
+    assert _grid_edge_selected({"distance": 2.5, "time": 1.0}, (1.0, 1.0)) is True
+    assert _grid_edge_selected({"distance": 1.0, "time": 1.0}, (1.25, 2.5)) is True
+    assert _grid_edge_selected({"distance": 1.0, "time": 1.0}, (1.25, 1.5)) is False
 
 
 def test_registered_scenario_paths_exist():
