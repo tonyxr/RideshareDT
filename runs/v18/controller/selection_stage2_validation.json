@@ -1,0 +1,33 @@
+{
+  "schema_version": "v18-selection-stage2-validation-v1",
+  "validated_utc": "2026-11-16T11:59:07Z",
+  "expected_cities": 3,
+  "expected_traces_per_city": 36,
+  "products": {
+    "boston": {
+      "path": "runs/v18/select/boston/stage2_dated_cards.json",
+      "bytes": 141279090,
+      "sha256": "248ff8847dc36025de2021108d1d0cfba871b00e54ccd08def078be1603cdcd6",
+      "traces": 36,
+      "numeric_values": 2688523,
+      "nonfinite_values": 0
+    },
+    "chicago": {
+      "path": "runs/v18/select/chicago/stage2_dated_cards.json",
+      "bytes": 141504384,
+      "sha256": "fa01c647630f2c3183feda322eb779c04732f05269ea1a55e9a50bc779b21a87",
+      "traces": 36,
+      "numeric_values": 2688523,
+      "nonfinite_values": 0
+    },
+    "nyc": {
+      "path": "runs/v18/select/nyc/stage2_dated_cards.json",
+      "bytes": 141286680,
+      "sha256": "52c4e3208514e441cd9f27dddb8f2854cb205b21e33d62ad39ef4924a37cea0b",
+      "traces": 36,
+      "numeric_values": 2688523,
+      "nonfinite_values": 0
+    }
+  },
+  "valid": true
+}
