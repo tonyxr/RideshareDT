@@ -682,3 +682,9 @@
 {"attempt":1,"job":"E1/chicago/A1/best_fixed/validation","seconds":2.6,"state":"validated","time":"2026-11-17T18:21:30Z"}
 {"attempt":1,"job":"E1/chicago/A1/count_rule_0step/validation","seconds":2.6,"state":"validated","time":"2026-11-17T18:21:30Z"}
 {"attempt":1,"job":"E1/chicago/A1/dated_two_lever/validation","seconds":2.6,"state":"validated","time":"2026-11-17T18:21:30Z"}
+{"attempt":1,"job":"E1/chicago/A1/reactive_surge","seconds":1340.38,"state":"complete","time":"2026-11-17T18:30:30.323700Z"}
+{"attempt":1,"job":"E1/chicago/A3/best_fixed","seconds":0.0,"state":"running","time":"2026-11-17T18:30:30.331437Z"}
+{"attempt":1,"job":"E1/chicago/A1/count_rule_1step","seconds":1735.496,"state":"complete","time":"2026-11-17T18:31:02.433581Z"}
+{"attempt":1,"job":"E1/chicago/A3/dated_two_lever","seconds":0.0,"state":"running","time":"2026-11-17T18:31:02.437117Z"}
+{"attempt":1,"job":"E1/chicago/A1/reactive_surge/validation","seconds":2.8,"state":"validated","time":"2026-11-17T18:41:30Z"}
+{"attempt":1,"job":"E1/chicago/A1/count_rule_1step/validation","seconds":2.8,"state":"validated","time":"2026-11-17T18:41:30Z"}
