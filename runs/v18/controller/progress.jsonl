@@ -453,3 +453,4 @@
 {"attempt":1,"job":"E1/nyc/S1/count_rule_0step/validation","seconds":5.5,"state":"validated","time":"2026-11-17T12:34:44Z"}
 {"attempt":1,"job":"nyc_s101_own_profit","seconds":74359.491,"state":"complete","time":"2026-11-17T12:35:12.342516Z"}
 {"attempt":1,"job":"E1/nyc/S1/reactive_surge","seconds":0.0,"state":"running","time":"2026-11-17T12:35:12.354371Z"}
+{"attempt":1,"job":"nyc_s101_own_profit/validation","seconds":11.8,"state":"validated_with_findings","time":"2026-11-17T12:36:14Z"}
