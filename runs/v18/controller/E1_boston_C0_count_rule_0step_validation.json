@@ -1,0 +1,13 @@
+{
+  "attempt": 1,
+  "bytes": 13692334,
+  "command_hash": "9fdf4d2db6931860ce87a6db1af7356187366da77ca72cda49149f8fb90563c7",
+  "completed_utc": "2026-11-17T14:02:52.238023Z",
+  "job": "E1/boston/C0/count_rule_0step",
+  "nonfinite_count": 0,
+  "numeric_values_checked": 281271,
+  "operational_returncode": 0,
+  "output_sha256": "e2c222d37e806c2e4fa75095dc44219bca5a2d6e7c7eda46f4e423beecca553a",
+  "state": "validated",
+  "validated_utc": "2026-11-17T14:16:00Z"
+}
