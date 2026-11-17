@@ -1,0 +1,13 @@
+{
+  "attempt": 1,
+  "bytes": 13997245,
+  "command_hash": "e347a1782f3c26c9395bdcd46939b8182f1efc33915956ae4042508141d02c0f",
+  "completed_utc": "2026-11-17T13:52:58.175055Z",
+  "job": "E1/nyc/S6/nyc_s303",
+  "nonfinite_count": 0,
+  "numeric_values_checked": 281277,
+  "operational_returncode": 0,
+  "output_sha256": "deda2e4ae029f103e4e2f50a9d759cb16be436b1532862ec2d5d8ebeadf2e59d",
+  "state": "validated",
+  "validated_utc": "2026-11-17T13:56:30Z"
+}
