@@ -373,3 +373,6 @@
 {"attempt":1,"job":"E1/nyc/C0/count_rule_1step","seconds":1795.273,"state":"complete","time":"2026-11-16T23:31:37.185561Z"}
 {"attempt":1,"job":"E1/nyc/C0/reactive_surge","seconds":0.0,"state":"running","time":"2026-11-16T23:31:37.227154Z"}
 {"attempt":1,"job":"E1/nyc/C0/count_rule_1step/validation","seconds":9.7,"state":"validated","time":"2026-11-16T23:34:30.714076Z"}
+{"attempt":1,"job":"E1/nyc/C0/reactive_surge","seconds":1769.91,"state":"complete","time":"2026-11-17T00:01:07.112093Z"}
+{"attempt":1,"job":"E1/nyc/C0/nyc_s101","seconds":0.0,"state":"running","time":"2026-11-17T00:01:07.133393Z"}
+{"attempt":1,"job":"E1/nyc/C0/reactive_surge/validation","seconds":8.5,"state":"validated","time":"2026-11-17T00:14:28.817765Z"}
