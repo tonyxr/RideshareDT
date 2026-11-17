@@ -1,20 +1,13 @@
 {
   "counts": {
     "cached": 0,
-    "complete": 31,
+    "complete": 33,
     "failed": 0,
-    "pending": 513,
-    "running": 10,
+    "pending": 521,
     "skipped": 0
   },
-  "current_phase": "wave_B_and_evaluations",
-  "projected_hours_left": 44.0,
-  "projection_uncertainty_hours": [
-    18.0,
-    70.0
-  ],
-  "queued_jobs": 554,
+  "projected_hours_left": null,
   "state": "running",
-  "updated_utc": "2026-11-17T12:14:32Z",
+  "updated_utc": "2026-11-17T12:35:12.348720Z",
   "workers": 10
 }
