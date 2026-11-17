@@ -1,0 +1,13 @@
+{
+  "attempt": 1,
+  "bytes": 13770340,
+  "command_hash": "df21bf456087584de65580b60783b2b26df3752980860542f15c035c3277ae74",
+  "completed_utc": "2026-11-17T07:58:56.171477Z",
+  "job": "E1/nyc/A3/dated_two_lever",
+  "nonfinite_count": 0,
+  "numeric_values_checked": 281274,
+  "operational_returncode": 0,
+  "output_sha256": "eebf932532aa11a21146c80b28c252ea4b9d6d8394c89cc8a0f688bdc7f8e33f",
+  "state": "validated",
+  "validated_utc": "2026-11-17T08:14:27Z"
+}
