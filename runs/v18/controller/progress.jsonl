@@ -651,3 +651,16 @@
 {"attempt":1,"job":"E1/chicago/C0/best_fixed/validation","seconds":3.1,"state":"validated","time":"2026-11-17T17:41:30Z"}
 {"attempt":1,"job":"E1/chicago/C0/dated_two_lever","seconds":1162.758,"state":"complete","time":"2026-11-17T17:40:27.991442Z"}
 {"attempt":1,"job":"E1/chicago/C0/chicago_s303","seconds":0.0,"state":"running","time":"2026-11-17T17:40:28.005132Z"}
+{"attempt":1,"job":"E1/chicago/C0/count_rule_0step","seconds":1098.499,"state":"complete","time":"2026-11-17T17:40:46.760636Z"}
+{"attempt":1,"job":"E1/chicago/A1/published_card","seconds":0.0,"state":"running","time":"2026-11-17T17:40:46.765284Z"}
+{"attempt":1,"job":"E1/chicago/C0/count_rule_1step","seconds":1153.975,"state":"complete","time":"2026-11-17T17:41:51.843836Z"}
+{"attempt":1,"job":"E1/chicago/A1/best_fixed","seconds":0.0,"state":"running","time":"2026-11-17T17:41:51.848817Z"}
+{"attempt":1,"job":"E1/chicago/C0/reactive_surge","seconds":1247.59,"state":"complete","time":"2026-11-17T17:44:42.808734Z"}
+{"attempt":1,"job":"E1/chicago/A1/dated_two_lever","seconds":0.0,"state":"running","time":"2026-11-17T17:44:42.814600Z"}
+{"attempt":1,"job":"E1/chicago/C0/chicago_s101","seconds":1134.535,"state":"complete","time":"2026-11-17T17:46:35.355368Z"}
+{"attempt":1,"job":"E1/chicago/A1/count_rule_0step","seconds":0.0,"state":"running","time":"2026-11-17T17:46:35.361051Z"}
+{"attempt":1,"job":"E1/chicago/C0/dated_two_lever/validation","seconds":3.0,"state":"validated","time":"2026-11-17T18:01:30Z"}
+{"attempt":1,"job":"E1/chicago/C0/count_rule_0step/validation","seconds":3.0,"state":"validated","time":"2026-11-17T18:01:30Z"}
+{"attempt":1,"job":"E1/chicago/C0/count_rule_1step/validation","seconds":3.0,"state":"validated","time":"2026-11-17T18:01:30Z"}
+{"attempt":1,"job":"E1/chicago/C0/reactive_surge/validation","seconds":3.0,"state":"validated","time":"2026-11-17T18:01:30Z"}
+{"attempt":1,"job":"E1/chicago/C0/chicago_s101/validation","seconds":3.0,"state":"validated","time":"2026-11-17T18:01:30Z"}
