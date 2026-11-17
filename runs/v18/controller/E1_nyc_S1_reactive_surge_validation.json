@@ -1,0 +1,13 @@
+{
+  "attempt": 1,
+  "bytes": 13766135,
+  "command_hash": "84578c8dea82e4464f2fbf2980500b6265d270cf9fc6a1f074cbc14ff116465f",
+  "completed_utc": "2026-11-17T13:00:43.929798Z",
+  "job": "E1/nyc/S1/reactive_surge",
+  "nonfinite_count": 0,
+  "numeric_values_checked": 281274,
+  "operational_returncode": 0,
+  "output_sha256": "6feccc4ff7db3a46186f844401a8889b3febcdf9552dbd31b212553bf4a515e7",
+  "state": "validated",
+  "validated_utc": "2026-11-17T13:14:44Z"
+}
