@@ -400,3 +400,6 @@
 {"attempt":1,"job":"E1/nyc/A1/count_rule_1step","seconds":2205.901,"state":"complete","time":"2026-11-17T03:57:19.047421Z"}
 {"attempt":1,"job":"E1/nyc/A1/reactive_surge","seconds":0.0,"state":"running","time":"2026-11-17T03:57:19.096310Z"}
 {"attempt":1,"job":"E1/nyc/A1/count_rule_1step/validation","seconds":1.3,"state":"validated","time":"2026-11-17T04:14:27Z"}
+{"attempt":1,"job":"E1/nyc/A1/reactive_surge","seconds":1716.058,"state":"complete","time":"2026-11-17T04:25:55.225219Z"}
+{"attempt":1,"job":"E1/nyc/A1/nyc_s101","seconds":0.0,"state":"running","time":"2026-11-17T04:25:55.251060Z"}
+{"attempt":1,"job":"E1/nyc/A1/reactive_surge/validation","seconds":1.1,"state":"validated","time":"2026-11-17T04:33:56Z"}
