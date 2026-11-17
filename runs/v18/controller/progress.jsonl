@@ -409,3 +409,6 @@
 {"attempt":1,"job":"E1/nyc/A1/nyc_s202","seconds":2087.628,"state":"complete","time":"2026-11-17T05:34:26.839216Z"}
 {"attempt":1,"job":"E1/nyc/A1/nyc_s303","seconds":0.0,"state":"running","time":"2026-11-17T05:34:26.867448Z"}
 {"attempt":1,"job":"E1/nyc/A1/nyc_s202/validation","seconds":1.4,"state":"validated","time":"2026-11-17T05:54:00Z"}
+{"attempt":1,"job":"E1/nyc/A1/nyc_s303","seconds":2204.828,"state":"complete","time":"2026-11-17T06:11:11.700712Z"}
+{"attempt":1,"job":"E1/nyc/A3/published_card","seconds":0.0,"state":"running","time":"2026-11-17T06:11:11.722787Z"}
+{"attempt":1,"job":"E1/nyc/A1/nyc_s303/validation","seconds":1.1,"state":"validated","time":"2026-11-17T06:14:01Z"}
