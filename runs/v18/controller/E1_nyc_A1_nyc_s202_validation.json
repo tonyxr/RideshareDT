@@ -1,0 +1,13 @@
+{
+  "attempt": 1,
+  "bytes": 13890040,
+  "command_hash": "ccb72a53263488713c7665979625a81dd8e78223063d5d913840ed49da07f20a",
+  "completed_utc": "2026-11-17T05:34:26.814812Z",
+  "job": "E1/nyc/A1/nyc_s202",
+  "nonfinite_count": 0,
+  "numeric_values_checked": 281274,
+  "operational_returncode": 0,
+  "output_sha256": "f340258078b9e9fb7c5514791a63a5556d5c907710fadfc4592329ee1d24d62e",
+  "state": "validated",
+  "validated_utc": "2026-11-17T05:54:00Z"
+}
