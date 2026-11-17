@@ -1,0 +1,26 @@
+{
+  "attempt": 1,
+  "command_hash": "544d94936fbed89a1ff8f9d7709bf9f407f32e72935fd7a6c26df1c3d6932d29",
+  "completed_utc": "2026-11-17T12:37:27.058785Z",
+  "job": "nyc_s101_no_driver_obs",
+  "operational_returncode": 0,
+  "policy": {
+    "bytes": 14622050,
+    "nonfinite": 0,
+    "numeric_values_checked": 1665091,
+    "sha256": "67bec17df6d58f50f2589719f2343ae3c7890e126e55f8e47c71157cc520a405",
+    "tensors_checked": 132
+  },
+  "structured_outputs": {
+    "csv_nonfinite": 82102,
+    "csv_numeric_values_checked": 458956,
+    "episodes_csv_sha256": "e5825b23802e14b3067cddc8d1ea8a4cb5299fa22f34cd6f02b37fb8d22eeab4",
+    "episodes_jsonl_sha256": "e49731143628a2f5a4f560cde39162f3448815024de0e73b87d2f956f9b2638d",
+    "json_nonfinite": 0,
+    "json_numeric_values_checked": 604848,
+    "training_diagnostics_sha256": "c727f8ddccdb40c850e88141d74354262a6f332af461385655bfdcdd23850147"
+  },
+  "finding": "nyc_training_diagnostics.csv contains 82102 nonfinite cells in sparse or update-only diagnostic fields; policy tensors and all JSON/JSONL numeric values are finite. Per protocol this finding does not stop execution.",
+  "state": "validated_with_findings",
+  "validated_utc": "2026-11-17T12:55:12Z"
+}
