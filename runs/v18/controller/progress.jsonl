@@ -421,3 +421,6 @@
 {"attempt":1,"job":"E1/nyc/A3/dated_two_lever","seconds":2096.336,"state":"complete","time":"2026-11-17T07:58:56.194645Z"}
 {"attempt":1,"job":"E1/nyc/A3/count_rule_0step","seconds":0.0,"state":"running","time":"2026-11-17T07:58:56.209345Z"}
 {"attempt":1,"job":"E1/nyc/A3/dated_two_lever/validation","seconds":0.8,"state":"validated","time":"2026-11-17T08:14:27Z"}
+{"attempt":1,"job":"E1/nyc/A3/count_rule_0step","seconds":1630.606,"state":"complete","time":"2026-11-17T08:26:07.027301Z"}
+{"attempt":1,"job":"E1/nyc/A3/count_rule_1step","seconds":0.0,"state":"running","time":"2026-11-17T08:26:07.070469Z"}
+{"attempt":1,"job":"E1/nyc/A3/count_rule_0step/validation","seconds":1.3,"state":"validated","time":"2026-11-17T08:34:31Z"}
