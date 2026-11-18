@@ -1,0 +1,1 @@
+{"attempts":3,"command_hash":"fe56e32a00439c38929fe079df6a2cb36c2c0adb20b05719bec2f2fbe28e7c42","dependents_skipped":[],"disposition":"failed_continue","failed_utc":"2026-11-18T16:00:18.549511Z","job":"E6/chicago/A1/chicago_s303","operational_cause":"ValueError: saved supply calibration request volume differs from this run","returncode":1,"state":"failed"}
