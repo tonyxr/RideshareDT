@@ -1165,3 +1165,11 @@
 {"attempt":1,"job":"E4/nyc/C0/nyc_s101/validation","seconds":2.0,"state":"validated_with_findings","time":"2026-11-18T13:01:00Z"}
 {"attempt":1,"job":"E4/nyc/C0/nyc_s202/validation","seconds":2.0,"state":"validated_with_findings","time":"2026-11-18T13:01:00Z"}
 {"attempt":1,"job":"E4/nyc/A1/nyc_s202/validation","seconds":2.0,"state":"validated_with_findings","time":"2026-11-18T13:01:00Z"}
+{"attempt":1,"job":"E4/nyc/A3/nyc_s101","seconds":41515.37,"state":"complete","time":"2026-11-18T13:04:07.222400Z"}
+{"attempt":1,"job":"E5/chicago/natural_year_2023/count_rule_1step","seconds":0.0,"state":"running","time":"2026-11-18T13:04:07.229558Z"}
+{"attempt":1,"job":"E4/nyc/A1/nyc_s101","seconds":42290.944,"state":"complete","time":"2026-11-18T13:13:21.707482Z"}
+{"attempt":1,"job":"E5/chicago/natural_year_2023/reactive_surge","seconds":0.0,"state":"running","time":"2026-11-18T13:13:21.714755Z"}
+{"attempt":1,"job":"E4/nyc/A3/nyc_s101/validation","seconds":1.0,"state":"validated_with_findings","time":"2026-11-18T13:21:00Z"}
+{"attempt":1,"job":"E4/nyc/A1/nyc_s101/validation","seconds":1.0,"state":"validated_with_findings","time":"2026-11-18T13:21:00Z"}
+{"attempt":1,"job":"E5/boston/natural_year_2023/boston_s202","seconds":3308.788,"state":"complete","time":"2026-11-18T13:21:14.912917Z"}
+{"attempt":1,"job":"E5/chicago/natural_year_2023/chicago_s101","seconds":0.0,"state":"running","time":"2026-11-18T13:21:14.918499Z"}
