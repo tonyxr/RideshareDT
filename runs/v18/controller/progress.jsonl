@@ -1102,3 +1102,9 @@
 {"attempt":1,"job":"E2/chicago/i035/chicago_s101/validation","seconds":4.4,"state":"validated","time":"2026-11-18T01:42:00Z"}
 {"attempt":1,"job":"E2/chicago/i035/chicago_s202/validation","seconds":4.4,"state":"validated","time":"2026-11-18T01:42:00Z"}
 {"attempt":1,"job":"E2/chicago/i035/chicago_s303/validation","seconds":4.4,"state":"validated","time":"2026-11-18T01:42:00Z"}
+{"attempt":1,"job":"nyc_s101_mc_clock","seconds":117555.405,"state":"complete","time":"2026-11-18T03:08:58.709425Z"}
+{"attempt":1,"job":"E4/nyc/S6/nyc_s101","seconds":0.0,"state":"running","time":"2026-11-18T03:08:58.722102Z"}
+{"attempt":1,"job":"nyc_s202_mc_clock","seconds":118166.118,"state":"complete","time":"2026-11-18T03:19:09.406102Z"}
+{"attempt":1,"job":"E4/nyc/S6/nyc_s202","seconds":0.0,"state":"running","time":"2026-11-18T03:19:09.416234Z"}
+{"attempt":1,"job":"nyc_s101_mc_clock/validation","seconds":45.0,"state":"validated_with_findings","time":"2026-11-18T03:24:00Z"}
+{"attempt":1,"job":"nyc_s202_mc_clock/validation","seconds":45.0,"state":"validated_with_findings","time":"2026-11-18T03:24:00Z"}
