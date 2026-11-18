@@ -3,11 +3,13 @@
     "cached": 0,
     "complete": 290,
     "failed": 0,
-    "pending": 264,
+    "pending": 254,
     "skipped": 0
   },
-  "projected_hours_left": null,
+  "projected_hours_left": 2.0,
+  "projected_hours_uncertainty": [0.7, 7.0],
   "state": "running",
-  "updated_utc": "2026-11-18T14:24:01.925010Z",
+  "updated_utc": "2026-11-18T14:25:00Z",
+  "running": 10,
   "workers": 10
 }
