@@ -1144,3 +1144,9 @@
 {"attempt":1,"job":"E5/boston/natural_year_2023/count_rule_1step","seconds":0.0,"state":"running","time":"2026-11-18T10:29:40.032483Z"}
 {"attempt":1,"job":"E5/boston/natural_year_2023/published_card/validation","seconds":18.0,"state":"validated","time":"2026-11-18T10:41:00Z"}
 {"attempt":1,"job":"E5/boston/natural_year_2023/best_fixed/validation","seconds":18.0,"state":"validated","time":"2026-11-18T10:41:00Z"}
+{"attempt":1,"job":"E5/boston/natural_year_2023/count_rule_1step","seconds":3547.236,"state":"complete","time":"2026-11-18T11:28:47.438178Z"}
+{"attempt":1,"job":"E5/boston/natural_year_2023/reactive_surge","seconds":0.0,"state":"running","time":"2026-11-18T11:28:47.444427Z"}
+{"attempt":1,"job":"E5/boston/natural_year_2023/dated_two_lever","seconds":3757.15,"state":"complete","time":"2026-11-18T11:31:24.107781Z"}
+{"attempt":1,"job":"E5/boston/natural_year_2023/boston_s101","seconds":0.0,"state":"running","time":"2026-11-18T11:31:24.114058Z"}
+{"attempt":1,"job":"E5/boston/natural_year_2023/count_rule_1step/validation","seconds":15.0,"state":"validated","time":"2026-11-18T11:41:00Z"}
+{"attempt":1,"job":"E5/boston/natural_year_2023/dated_two_lever/validation","seconds":15.0,"state":"validated","time":"2026-11-18T11:41:00Z"}
