@@ -246,6 +246,10 @@ def test_retry_and_dependency_skip(tmp_path):
                 tmp_path / "child.log", tmp_path / "child.manifest", requires=("bad",))
     states = run_jobs((bad, child), cwd=BASE, workers=1, progress=tmp_path / "progress.jsonl")
     assert states == {"bad": "failed", "child": "skipped"}
+    assert run_job(bad, cwd=BASE, max_attempts=3) == "failed"
+    exhausted = json.loads(bad.manifest.read_text(encoding="utf-8"))
+    assert exhausted["state"] == "failed"
+    assert len(exhausted["attempts"]) == 3
 
 
 def test_clear_quote_is_rng_free():
