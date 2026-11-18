@@ -11422,19 +11422,23 @@ class Core:
         if bool(getattr(self, "_gated_rl_gate_open", False)):
             return int(actor_action)
         base = self.market.curr_market
-        current = tuple(
-            float(get_coeff(base, self.firm1.overrides, key))
-            / max(1e-12, float(getattr(base, key)))
-            for key in ("per_mile", "per_minute")
+        targets = {
+            "airport_fee": 1.0,
+            "base_fare": 1.0,
+            "booking_fee": 1.0,
+            "per_mile": calm[0],
+            "per_minute": calm[1],
+        }
+        changed = any(
+            abs(
+                float(get_coeff(base, self.firm1.overrides, key))
+                / max(1e-12, float(getattr(base, key)))
+                - float(target)
+            ) > 1e-12
+            for key, target in targets.items()
         )
-        if any(abs(current[index] - calm[index]) > 1e-12 for index in range(2)):
-            self._post_firm1_coefficient_targets({
-                "airport_fee": 1.0,
-                "base_fare": 1.0,
-                "booking_fee": 1.0,
-                "per_mile": calm[0],
-                "per_minute": calm[1],
-            })
+        if changed:
+            self._post_firm1_coefficient_targets(targets)
         return -1 if getattr(self.firm1, "two_lever_actions", False) else 0
 
     @staticmethod
