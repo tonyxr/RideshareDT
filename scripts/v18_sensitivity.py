@@ -7,6 +7,7 @@ import argparse
 import copy
 import json
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any
 
@@ -23,6 +24,29 @@ from scripts.v18_train import RUNS
 PYTHON = (REPO.parent / ".venv/bin/python").absolute()
 ARMS = {"S0": "production", "S1": "s1", "S2": "s2", "S3": "s3"}
 SCENARIOS = {"C0": REPO / "scenarios/calm.json", "A1": REPO / "scenarios/v17_t2_shortage_severe.json"}
+
+
+def ensure_gated_evaluation(workers: int) -> None:
+    """Enforce the registered H-before-S dependency for live old controllers."""
+    report = REPO / "runs/v18/eval/H_report.json"
+    try:
+        payload = json.loads(report.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        payload = {}
+    if payload.get("state") == "complete":
+        return
+    process = subprocess.run(
+        (
+            str(PYTHON), "-u", str(REPO / "scripts/v18_gated.py"),
+            "--execute", "--workers", str(int(workers)),
+        ),
+        cwd=REPO,
+        check=False,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"gated H prerequisite failed with return code {process.returncode}"
+        )
 
 
 def frozen_at_500(config: dict[str, Any]) -> dict[str, Any]:
@@ -69,11 +93,13 @@ def main() -> int:
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
     config = frozen_at_500(load_config())
-    plan = {"arms": ARMS, "selection_seed": 77311, "customers": 500, "report_only": True}
+    plan = {"arms": ARMS, "selection_seed": 77311, "customers": 500,
+            "report_only": True, "requires": "runs/v18/eval/H_report.json"}
     atomic_json(args.root / "plan.json", plan)
     if not args.execute:
         print(json.dumps(plan, indent=2))
         return 0
+    ensure_gated_evaluation(args.workers)
     states: dict[str, str] = {}
     for arm, variant in ARMS.items():
         selected = run_selection(config, city="nyc", output=args.root / arm / "selection",

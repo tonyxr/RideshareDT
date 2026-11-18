@@ -32,7 +32,7 @@ DROP_ORDER = (
     "T8", "E8", "E9", "E3", "S3", "S1", "E7/chicago", "E6/chicago",
     "nyc_s505", "nyc_s404", "E4/mc_clock_curves",
 )
-NEVER_DROP = ("P3", "P4", "selection", "wave_A", "E1", "E2", "E4/ladder", "E5", "E10", "V1", "V2", "V3", "V4", "V5", "V6", "V7")
+NEVER_DROP = ("P3", "P4", "selection", "wave_A", "E1", "E2", "E4/ladder", "E5", "E10", "H", "V1", "V2", "V3", "V4", "V5", "V6", "V7")
 
 
 def _status(**updates: Any) -> None:
@@ -155,9 +155,10 @@ def main() -> int:
         print(json.dumps({
             "stages": [
                 "Z1-Z4", "P3", "P4", "freeze", "wave_A", "selection",
-                "wave_B_and_evaluations", "S", "V3", "E9", "E8",
+                "wave_B_and_evaluations", "H", "S", "V3", "E9", "E8",
             ],
             "post_queue": [
+                {"name": "H", "tier": 1},
                 {"name": "S", "tier": 2},
                 {"name": "V3", "tier": 1},
                 {"name": "E9", "tier": 3},
@@ -196,6 +197,10 @@ def main() -> int:
     results = _queue(config)
     workers = int(config["decisions"]["workers"])
     post_queue = (
+        (
+            "H", REPO / "scripts/v18_gated.py",
+            REPO / "runs/v18/eval/H_report.json", 1,
+        ),
         (
             "S", REPO / "scripts/v18_sensitivity.py",
             REPO / "runs/v18/sensitivity/report.json", 2,
