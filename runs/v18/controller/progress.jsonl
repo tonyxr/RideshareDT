@@ -1132,3 +1132,9 @@
 {"attempt":1,"job":"E5/nyc/natural_year_2023/nyc_s303","seconds":0.0,"state":"running","time":"2026-11-18T08:30:11.718862Z"}
 {"attempt":1,"job":"E5/nyc/natural_year_2023/reactive_surge/validation","seconds":16.0,"state":"validated","time":"2026-11-18T08:41:00Z"}
 {"attempt":1,"job":"E5/nyc/natural_year_2023/nyc_s101/validation","seconds":16.0,"state":"validated","time":"2026-11-18T08:41:00Z"}
+{"attempt":1,"job":"E5/nyc/natural_year_2023/nyc_s202","seconds":3728.403,"state":"complete","time":"2026-11-18T09:29:55.740328Z"}
+{"attempt":1,"job":"E5/boston/natural_year_2023/published_card","seconds":0.0,"state":"running","time":"2026-11-18T09:29:55.746840Z"}
+{"attempt":1,"job":"E5/nyc/natural_year_2023/nyc_s303","seconds":3692.101,"state":"complete","time":"2026-11-18T09:31:43.812695Z"}
+{"attempt":1,"job":"E5/boston/natural_year_2023/best_fixed","seconds":0.0,"state":"running","time":"2026-11-18T09:31:43.819588Z"}
+{"attempt":1,"job":"E5/nyc/natural_year_2023/nyc_s202/validation","seconds":12.0,"state":"validated","time":"2026-11-18T09:41:00Z"}
+{"attempt":1,"job":"E5/nyc/natural_year_2023/nyc_s303/validation","seconds":12.0,"state":"validated","time":"2026-11-18T09:41:00Z"}
