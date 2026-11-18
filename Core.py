@@ -125,6 +125,27 @@ def _v18_request_step(
     return 0
 
 
+def _gated_rl_transition(
+    *, gate_open: bool, off_streak: int, ratio: float,
+    theta_on: float, theta_off: float, off_days: int,
+) -> Tuple[bool, int]:
+    """Advance the registered daily hysteresis gate by one decision."""
+    if not np.isfinite([ratio, theta_on, theta_off]).all():
+        raise ValueError("gated_rl_actor thresholds and ratio must be finite")
+    if float(theta_off) < float(theta_on):
+        raise ValueError("gated_rl_actor requires theta_off >= theta_on")
+    if int(off_days) < 1:
+        raise ValueError("gated_rl_actor off_days must be positive")
+    if not bool(gate_open):
+        return (bool(float(ratio) < float(theta_on)), 0)
+    if float(ratio) >= float(theta_off):
+        next_streak = int(off_streak) + 1
+        if next_streak >= int(off_days):
+            return (False, 0)
+        return (True, next_streak)
+    return (True, 0)
+
+
 from coeff_utils import get_coeff, set_coeff
 from calibration_utils import derive_calibration, load_calibration_json, load_calibration_preset
 from city_data_pipeline import (
@@ -3682,6 +3703,9 @@ class Core:
             "base_active_drivers": int(
                 getattr(supply_config, "base_active_drivers", 0)
             ),
+            "supply_reference_earnings": float(
+                getattr(supply_config, "reference_earnings_per_hour", 0.0)
+            ),
             "hour_profile": [
                 float(self.driver_supply.hour_profile[hour])
                 for hour in range(24)
@@ -4315,6 +4339,8 @@ class Core:
             "_count_rule_last_cell",
             "_reactive_surge_last_cell",
             "_surge_decay_last_cell",
+            "_gated_rl_gate_open",
+            "_gated_rl_off_streak",
         ):
             if hasattr(self, name):
                 delattr(self, name)
@@ -8532,6 +8558,11 @@ class Core:
                                 _,
                                 _,
                             ) = policy_result
+                            if str(firm1_policy).startswith("gated_rl_actor:"):
+                                action = self._gated_rl_actor_action(
+                                    str(firm1_policy), actor_action=int(action),
+                                    step_index=int(step_index),
+                                )
                         else:
                             action = self._baseline_firm1_action(
                                 str(firm1_policy),
@@ -8597,7 +8628,9 @@ class Core:
                         actions.append(int(action))
                         mode_actions.append(int(action))
                         firm1_decision_count += 1
-                    elif firm1_policy is None:
+                    elif firm1_policy is None or str(firm1_policy).startswith(
+                        "gated_rl_actor:"
+                    ):
                         self.firm1.agent.observe_recurrent_state(
                             state, critic_state=critic_state
                         )
@@ -11352,9 +11385,57 @@ class Core:
         matched ``rl_actor_frozen`` control is queried only for decision zero;
         later decisions return hold through ``_baseline_firm1_action``.
         """
-        return firm1_policy is None or (
+        return firm1_policy is None or str(firm1_policy).startswith(
+            "gated_rl_actor:"
+        ) or (
             str(firm1_policy) == "rl_actor_frozen" and int(decision_count) == 0
         )
+
+    def _gated_rl_actor_action(
+        self, spec: str, *, actor_action: int, step_index: int,
+    ) -> int:
+        """Apply the registered calm/actor gate without mutating actor history."""
+        name = str(spec)
+        if not name.startswith("gated_rl_actor:"):
+            return int(actor_action)
+        table = self._parse_policy_table(name.split(":", 1)[1])
+        calm = tuple(float(value) for value in table.get("calm", ()))
+        norm = tuple(float(value) for value in table.get("norm", ()))
+        if len(calm) != 2 or not np.isfinite(calm).all():
+            raise ValueError("gated_rl_actor calm must contain two finite values")
+        if len(norm) != 6 or not np.isfinite(norm).all() or min(norm) <= 0.0:
+            raise ValueError("gated_rl_actor norm must contain six positive values")
+        theta_on = float(table["theta_on"])
+        theta_off = float(table["theta_off"])
+        off_days = int(table["off_days"])
+        steps_per_day = int(max(1, self.shared_steps_per_day))
+        if int(step_index) % steps_per_day == 0:
+            ratio = self._firm1_current_active_drivers() / norm[0]
+            gate_open, off_streak = _gated_rl_transition(
+                gate_open=bool(getattr(self, "_gated_rl_gate_open", False)),
+                off_streak=int(getattr(self, "_gated_rl_off_streak", 0)),
+                ratio=float(ratio), theta_on=theta_on,
+                theta_off=theta_off, off_days=off_days,
+            )
+            self._gated_rl_gate_open = bool(gate_open)
+            self._gated_rl_off_streak = int(off_streak)
+        if bool(getattr(self, "_gated_rl_gate_open", False)):
+            return int(actor_action)
+        base = self.market.curr_market
+        current = tuple(
+            float(get_coeff(base, self.firm1.overrides, key))
+            / max(1e-12, float(getattr(base, key)))
+            for key in ("per_mile", "per_minute")
+        )
+        if any(abs(current[index] - calm[index]) > 1e-12 for index in range(2)):
+            self._post_firm1_coefficient_targets({
+                "airport_fee": 1.0,
+                "base_fare": 1.0,
+                "booking_fee": 1.0,
+                "per_mile": calm[0],
+                "per_minute": calm[1],
+            })
+        return -1 if getattr(self.firm1, "two_lever_actions", False) else 0
 
     @staticmethod
     def _parse_policy_table(text: str) -> Dict[str, Any]:
@@ -11380,8 +11461,15 @@ class Core:
             float(get_coeff(base, self.firm2.overrides, key)) / max(1e-6, float(getattr(base, key)))
             for key in self.shared_edit_keys if float(getattr(base, key)) > 0.0
         ]
+        active_spec = str(getattr(self, "_active_policy_sweep_spec", ""))
+        gate_open = (
+            int(bool(getattr(self, "_gated_rl_gate_open", False)))
+            if active_spec.startswith("gated_rl_actor:")
+            else int(active_spec == "rl_actor")
+        )
         row = {
             "rollout": rollout, "step": int(step), "hour": int(hour),
+            "gate_open": gate_open,
             "firm1_level": float(np.mean(ratios)) if ratios else 1.0,
             "firm2_level": float(np.mean(rival_ratios)) if rival_ratios else 1.0,
             "firm2_level_effective": (float(np.mean(rival_ratios)) if rival_ratios else 1.0) * float(self._firm2_regime_price_multiplier),
@@ -21590,7 +21678,8 @@ def main():
     v26r.add_argument("--policy_sweep", type=str, default="",
                       help="Gate-1 mode: ';'-separated Firm 1 policy specs (static:<m>[@inc], "
                            "oracle:<json|@file>, rule:<json|@file>, rl_actor, "
-                           "rl_actor_frozen, opening_hold, myopic_greedy) "
+                           "rl_actor_frozen, gated_rl_actor:<json|@file>, "
+                           "opening_hold, myopic_greedy) "
                            "evaluated on common-random-number rollouts; no training.")
     v26r.add_argument("--policy_sweep_out", type=str, default="", help="JSON output path for --policy_sweep.")
     v26r.add_argument("--policy_sweep_openings", type=int, default=10,
