@@ -9,7 +9,8 @@ import sys
 import numpy as np
 
 from Core import (
-    Core, _evaluation_supply_operating_point, _v18_card_clear_quote,
+    Core, _evaluation_supply_operating_point, _gated_rl_transition,
+    _v18_card_clear_quote,
     _v18_request_step,
 )
 from MarketInteraction import RideContext
@@ -24,6 +25,7 @@ from scripts.v18_select import (
 from scripts.v18_validation.sim_events import (
     build_jobs as build_v3_jobs, validate_pairs as validate_v3_pairs,
 )
+from scripts import v18_gated
 
 
 BASE = Path(__file__).resolve().parents[1]
@@ -194,6 +196,71 @@ def test_recalibrate_supply_on_eval_ignores_only_the_saved_operating_point():
             city_artifact=None, eval_only=False,
             recalibrate_supply_on_eval=True,
         )
+
+
+def test_gated_actor_hysteresis_scripted_driver_sequence():
+    gate_open = False
+    streak = 0
+    observed = []
+    for ratio in (0.85, 0.69, 0.75, 0.81, 0.82, 0.68, 0.85, 0.86):
+        gate_open, streak = _gated_rl_transition(
+            gate_open=gate_open, off_streak=streak, ratio=ratio,
+            theta_on=0.7, theta_off=0.8, off_days=2,
+        )
+        observed.append((gate_open, streak))
+    assert observed == [
+        (False, 0), (True, 0), (True, 0), (True, 1),
+        (False, 0), (True, 0), (True, 1), (False, 0),
+    ]
+    assert _gated_rl_transition(
+        gate_open=False, off_streak=0, ratio=0.0,
+        theta_on=-1.0, theta_off=-0.9, off_days=2,
+    ) == (False, 0)
+    assert _gated_rl_transition(
+        gate_open=False, off_streak=0, ratio=1.0,
+        theta_on=99.0, theta_off=99.1, off_days=2,
+    ) == (True, 0)
+
+
+def test_gated_selection_and_evaluation_plans(monkeypatch, tmp_path):
+    config = _frozen()
+    selection = v18_gated.selection_jobs(config)
+    assert len(selection) == 18
+    assert len({job.name for job in selection}) == 18
+    assert all("--trained_model_in" in job.command for job in selection)
+    assert all("--recalibrate_supply_on_eval" in job.command for job in selection)
+    assert all("--run_experiment" not in job.command for job in selection)
+    assert all(
+        job.command[job.command.index("--policy_sweep_seed") + 1] == "20231"
+        for job in selection
+    )
+    specs = {
+        city: v18_gated.gated_spec(city, 0.8)
+        for city in ("nyc", "boston", "chicago")
+    }
+    monkeypatch.setattr(v18_gated, "REPO", tmp_path)
+    for city, spec in specs.items():
+        path = tmp_path / f"runs/v18/select/{city}/gated.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"state": "complete", "spec": spec}))
+    evaluations = v18_gated.build_jobs(config)
+    assert len(evaluations) == 90
+    assert sum(job.name.startswith("H1/") for job in evaluations) == 45
+    assert sum(job.name.startswith("H2/") for job in evaluations) == 36
+    assert sum(job.name.startswith("H5/") for job in evaluations) == 9
+    assert all("--trained_model_in" in job.command for job in evaluations)
+    assert all("--recalibrate_supply_on_eval" in job.command for job in evaluations)
+    assert all("--run_experiment" not in job.command for job in evaluations)
+    assert all("/runs/v18/eval/H" in str(job.output) for job in evaluations)
+
+
+def test_gated_queue_precedes_sensitivity():
+    source = (BASE / "scripts/v18_run_all.py").read_text(encoding="utf-8")
+    assert source.index('"H", REPO / "scripts/v18_gated.py"') < source.index(
+        '"S", REPO / "scripts/v18_sensitivity.py"'
+    )
+    sensitivity = (BASE / "scripts/v18_sensitivity.py").read_text(encoding="utf-8")
+    assert "ensure_gated_evaluation(args.workers)" in sensitivity
 
 
 def test_v3_event_twins_are_declared_paired_and_request_logged(tmp_path):
