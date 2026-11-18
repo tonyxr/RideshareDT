@@ -1,5 +1,4 @@
 {
-  "attempt": 3,
   "attempts": [
     {
       "attempt": 1,
@@ -151,5 +150,5 @@
   "returncode": 1,
   "state": "failed",
   "tier": 1,
-  "updated_utc": "2026-11-18T15:26:34.481789Z"
+  "updated_utc": "2026-11-18T17:53:44.904498Z"
 }
