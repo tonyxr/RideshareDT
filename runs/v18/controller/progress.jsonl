@@ -1120,3 +1120,9 @@
 {"attempt":1,"job":"E5/nyc/natural_year_2023/count_rule_1step","seconds":0.0,"state":"running","time":"2026-11-18T06:30:27.320531Z"}
 {"attempt":1,"job":"E5/nyc/natural_year_2023/published_card/validation","seconds":18.0,"state":"validated","time":"2026-11-18T06:44:00Z"}
 {"attempt":1,"job":"E5/nyc/natural_year_2023/best_fixed/validation","seconds":18.0,"state":"validated","time":"2026-11-18T06:44:00Z"}
+{"attempt":1,"job":"E5/nyc/natural_year_2023/count_rule_1step","seconds":3639.173,"state":"complete","time":"2026-11-18T07:31:06.677513Z"}
+{"attempt":1,"job":"E5/nyc/natural_year_2023/reactive_surge","seconds":0.0,"state":"running","time":"2026-11-18T07:31:06.682756Z"}
+{"attempt":1,"job":"E5/nyc/natural_year_2023/dated_two_lever","seconds":3879.244,"state":"complete","time":"2026-11-18T07:32:31.998937Z"}
+{"attempt":1,"job":"E5/nyc/natural_year_2023/nyc_s101","seconds":0.0,"state":"running","time":"2026-11-18T07:32:32.005050Z"}
+{"attempt":1,"job":"E5/nyc/natural_year_2023/count_rule_1step/validation","seconds":19.0,"state":"validated","time":"2026-11-18T07:41:00Z"}
+{"attempt":1,"job":"E5/nyc/natural_year_2023/dated_two_lever/validation","seconds":19.0,"state":"validated","time":"2026-11-18T07:41:00Z"}
