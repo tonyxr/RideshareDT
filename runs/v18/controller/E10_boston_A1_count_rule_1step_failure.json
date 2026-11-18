@@ -1,0 +1,1 @@
+{"attempts":3,"command_hash":"301b7b00804b4e1fdd584f7658e51246aae59858e1ef2f564b17b23cf9b428a5","dependents_skipped":[],"disposition":"failed_continue","failed_utc":"2026-11-18T15:17:53.816390Z","job":"E10/boston/A1/count_rule_1step","operational_cause":"OSError [Errno 63] File name too long while creating a request-log gzip file","returncode":1,"state":"failed"}
