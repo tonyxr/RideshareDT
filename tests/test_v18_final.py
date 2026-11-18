@@ -8,15 +8,21 @@ import sys
 
 import numpy as np
 
-from Core import Core, _v18_card_clear_quote, _v18_request_step
+from Core import (
+    Core, _evaluation_supply_operating_point, _v18_card_clear_quote,
+    _v18_request_step,
+)
 from MarketInteraction import RideContext
 from scripts.v18_config import eval_args, load_config, train_args
 from scripts.v18_market import market_flags
-from scripts.v18_eval import SCENARIOS
+from scripts.v18_eval import SCENARIOS, build_jobs as build_evaluation_jobs
 from scripts.v18_runtime import Job, run_job, run_jobs
 from scripts.v18_select import (
     _grid_edge_selected, _selection_plan, _stage3_count_rules, card_grid,
     reactive_candidates,
+)
+from scripts.v18_validation.sim_events import (
+    build_jobs as build_v3_jobs, validate_pairs as validate_v3_pairs,
 )
 
 
@@ -131,6 +137,86 @@ def test_selection_plan_matches_registered_m4_counts():
 
 def test_registered_scenario_paths_exist():
     assert all(path.is_file() for path in SCENARIOS.values())
+
+
+def test_e4_uses_recalibrated_e1_rows_and_has_no_credit_probe(tmp_path):
+    jobs = build_evaluation_jobs(
+        _frozen(), suite="E4", root=tmp_path / "eval",
+    )
+    assert len(jobs) == 40
+    assert all("--v17_eval_credit_probe" not in job.command for job in jobs)
+    assert all("--v17_eval_credit_horizons" not in job.command for job in jobs)
+    assert all(
+        "--v17_eval_credit_rival_planner" not in job.command for job in jobs
+    )
+    assert all(
+        "--v17_eval_credit_probe_out" not in job.command for job in jobs
+    )
+    e1_rows = [
+        job for job in jobs
+        if job.name.rsplit("/", 1)[-1] in {"nyc_s101", "nyc_s202"}
+    ]
+    assert len(e1_rows) == 8
+    assert all("--recalibrate_supply_on_eval" in job.command for job in e1_rows)
+    assert all("E1_recalibrated_supply" in str(job.output) for job in e1_rows)
+    wave_b = [job for job in jobs if job not in e1_rows]
+    assert len(wave_b) == 32
+    assert all("--recalibrate_supply_on_eval" not in job.command for job in wave_b)
+    assert all("E4_no_probe" in str(job.output) for job in wave_b)
+    assert all("/E4/" not in str(job.output) for job in jobs)
+
+
+def test_t8_is_the_only_probe_suite_and_is_diagnostic(tmp_path):
+    jobs = build_evaluation_jobs(
+        _frozen(), suite="T8", root=tmp_path / "eval",
+    )
+    assert len(jobs) == 2
+    assert all("--v17_eval_credit_probe" in job.command for job in jobs)
+    assert all("--v17_eval_credit_probe_out" in job.command for job in jobs)
+
+
+def test_recalibrate_supply_on_eval_ignores_only_the_saved_operating_point():
+    saved = {"city": "New York City", "calibration": {"sample_size": 150}}
+    artifact = {"supply_operating_point": saved}
+    assert _evaluation_supply_operating_point(
+        trained_model_in="policy.pt", artifact_header=artifact,
+        city_artifact=None, eval_only=True,
+        recalibrate_supply_on_eval=False,
+    ) is saved
+    assert _evaluation_supply_operating_point(
+        trained_model_in="policy.pt", artifact_header=artifact,
+        city_artifact=None, eval_only=True,
+        recalibrate_supply_on_eval=True,
+    ) is None
+    with np.testing.assert_raises_regex(ValueError, "evaluation-only"):
+        _evaluation_supply_operating_point(
+            trained_model_in="policy.pt", artifact_header=artifact,
+            city_artifact=None, eval_only=False,
+            recalibrate_supply_on_eval=True,
+        )
+
+
+def test_v3_event_twins_are_declared_paired_and_request_logged(tmp_path):
+    validate_v3_pairs()
+    jobs = build_v3_jobs(_frozen(), root=tmp_path / "v3")
+    assert len(jobs) == 126
+    assert len({job.name for job in jobs}) == 126
+    assert all("--scenario_hazards" in job.command for job in jobs)
+    assert all(
+        job.command[job.command.index("--scenario_hazards") + 1] == "off"
+        for job in jobs
+    )
+    assert all("--policy_sweep_request_log" in job.command for job in jobs)
+    assert all(
+        job.command[job.command.index("--policy_sweep_openings") + 1] == "2"
+        for job in jobs
+    )
+    assert all(
+        job.command[job.command.index("--policy_sweep_rivals") + 1]
+        == "adaptive_best_response_memory,profit_best_response_myopic,"
+           "profit_best_response_forward,profit_opt_mpc_grid,pi_price_gap"
+        for job in jobs
+    )
 
 
 def test_count_rule_norm_shift_and_candidate_counts():

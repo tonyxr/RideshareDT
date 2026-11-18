@@ -35,6 +35,7 @@ DEFAULT_SWITCHES = {
     "active_driver_feature_reference": "fixed",
     "driver_pay_rule": "share",
     "scenario_hazards": "natural",
+    "recalibrate_supply_on_eval": False,
 }
 DEFAULT_V26R = {
     "v17_credit_source": "branches",

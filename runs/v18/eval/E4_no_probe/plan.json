@@ -1,0 +1,23 @@
+{
+  "cases": [
+    "C0",
+    "A1",
+    "A3",
+    "S6"
+  ],
+  "cities": [
+    "nyc"
+  ],
+  "legacy_probe_output": "E4",
+  "name": "learning_comparison",
+  "openings": 3,
+  "output_subdir": "E4_no_probe",
+  "rivals": 10,
+  "row_sources": {
+    "nyc_s101": "E1_recalibrated_supply",
+    "nyc_s202": "E1_recalibrated_supply",
+    "wave_b": "E4_no_probe"
+  },
+  "suite": "E4",
+  "tier": 1
+}

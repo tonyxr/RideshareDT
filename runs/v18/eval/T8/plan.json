@@ -1,0 +1,17 @@
+{
+  "cases": [
+    "C0",
+    "A1"
+  ],
+  "cities": [
+    "nyc"
+  ],
+  "credit_probe": true,
+  "diagnostic_only": true,
+  "name": "credit_probe_diagnostic",
+  "openings": 1,
+  "rivals": 3,
+  "suite": "T8",
+  "tier": 3,
+  "trajectories_used": false
+}

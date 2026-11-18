@@ -1,0 +1,9 @@
+{
+  "start_date": "2023-12-02",
+  "events": [{
+    "kind": "winter_storm", "start_day": 16, "end_day": 16,
+    "intensity": 1.0, "announced": true,
+    "detail": {"transit_suspended": false, "label": "E4_rain_20231218"}
+  }],
+  "forecasts": {"16": true}
+}

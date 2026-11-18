@@ -34,13 +34,29 @@ SCENARIOS = {
 SUITES: dict[str, dict[str, Any]] = {
     "E1": {"name": "main", "tier": 1, "cases": ("C0", "A1", "A3", "S1", "S6"), "cities": ("nyc", "boston", "chicago"), "openings": 3, "rivals": 10},
     "E2": {"name": "severity_ladder", "tier": 1, "cases": ("i080", "i065", "i050", "i035"), "cities": ("nyc", "boston", "chicago"), "openings": 1, "rivals": 10},
-    "E4": {"name": "learning_comparison", "tier": 1, "cases": ("C0", "A1", "A3", "S6"), "cities": ("nyc",), "openings": 3, "rivals": 10, "credit_probe": True},
+    "E4": {
+        "name": "learning_comparison", "tier": 1,
+        "cases": ("C0", "A1", "A3", "S6"), "cities": ("nyc",),
+        "openings": 3, "rivals": 10,
+        "output_subdir": "E4_no_probe",
+        "legacy_probe_output": "E4",
+        "row_sources": {
+            "nyc_s101": "E1_recalibrated_supply",
+            "nyc_s202": "E1_recalibrated_supply",
+            "wave_b": "E4_no_probe",
+        },
+    },
     "E5": {"name": "natural_year", "tier": 1, "cases": ("natural_year_2023",), "cities": ("nyc", "boston", "chicago"), "openings": 2, "rivals": 3, "request_log": True},
     "E10": {"name": "dataset", "tier": 1, "cases": ("C0", "A1", "A3"), "cities": ("nyc", "boston", "chicago"), "openings": 1, "rivals": 10, "request_log": True},
     "E6": {"name": "scale_confirmation", "tier": 2, "cases": ("C0", "A1"), "cities": ("nyc", "chicago"), "openings": 1, "rivals": 10, "customers": 500},
     "E7": {"name": "threshold_sources", "tier": 2, "cases": ("C0", "A1"), "cities": ("nyc", "chicago"), "openings": 2, "rivals": 3, "threshold_sources": ("constant_mean", "shuffled", "rubric")},
     "E3": {"name": "second_seed", "tier": 2, "cases": ("C0", "A1"), "cities": ("nyc", "boston", "chicago"), "openings": 1, "rivals": 10, "seed": 88411},
-    "T8": {"name": "credit_probe", "tier": 3, "cases": ("C0", "A1"), "cities": ("nyc",), "openings": 1, "rivals": 3, "credit_probe": True},
+    "T8": {
+        "name": "credit_probe_diagnostic", "tier": 3,
+        "cases": ("C0", "A1"), "cities": ("nyc",),
+        "openings": 1, "rivals": 3, "credit_probe": True,
+        "diagnostic_only": True, "trajectories_used": False,
+    },
 }
 R3 = ("adaptive_best_response_memory", "profit_best_response_myopic", "profit_opt_mpc_grid")
 R5 = ("adaptive_best_response_memory", "profit_best_response_myopic", "profit_best_response_forward", "profit_opt_mpc_grid", "pi_price_gap")
@@ -147,11 +163,19 @@ def build_jobs(config: dict, *, suite: str, root: Path) -> list[Job]:
             for run_name in policy_runs(suite, city):
               for threshold_source in threshold_sources:
                 case_key = case if threshold_source == "as_loaded" else f"{case}_{threshold_source}"
-                run_leaf = (root / suite / city / case_key / run_name).resolve()
+                if suite == "E4" and run_name in {"nyc_s101", "nyc_s202"}:
+                    output_suite = "E1_recalibrated_supply"
+                    command_suite = "E1"
+                else:
+                    output_suite = str(definition.get("output_subdir", suite))
+                    command_suite = suite
+                run_leaf = (
+                    root / output_suite / city / case_key / run_name
+                ).resolve()
                 spec = next(item for item in RUNS if item.name == run_name)
                 policy_values = eval_args(
                     config, city=city, case=case, specs=("rl_actor",),
-                    suite=suite, output=run_leaf,
+                    suite=command_suite, output=run_leaf,
                     seed=int(definition.get("seed", 77311)),
                     scenario=SCENARIOS[case], kind=spec.arm,
                     policy=BASE / "runs/v18/train" / run_name / "policy.pt",
@@ -164,6 +188,12 @@ def build_jobs(config: dict, *, suite: str, root: Path) -> list[Job]:
                 policy_values = _set(policy_values, "--policy_sweep_rivals", ",".join(rivals))
                 if threshold_source != "as_loaded":
                     policy_values = _set(policy_values, "--threshold_ablation", threshold_source)
+                if suite == "E4" and run_name in {"nyc_s101", "nyc_s202"}:
+                    if "--recalibrate_supply_on_eval" in policy_values:
+                        raise ValueError(
+                            "duplicate --recalibrate_supply_on_eval"
+                        )
+                    policy_values.append("--recalibrate_supply_on_eval")
                 if definition.get("credit_probe"):
                     policy_values = _set(
                         policy_values, "--v17_eval_credit_probe", 5
@@ -200,7 +230,8 @@ def main() -> int:
     args = parser.parse_args()
     definition = SUITES[args.suite]
     plan = {"suite": args.suite, **definition}
-    atomic_json(args.root / args.suite / "plan.json", plan)
+    plan_root = args.root / str(definition.get("output_subdir", args.suite))
+    atomic_json(plan_root / "plan.json", plan)
     if not args.execute:
         print(json.dumps(plan, indent=2, sort_keys=True))
         return 0

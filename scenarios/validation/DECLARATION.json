@@ -1,0 +1,49 @@
+{
+  "protocol": "CRISP-Ride V18 Last Revision Section 6; inherited V17 out-of-sample manual Part G3",
+  "window": {
+    "nyc": ["2023-09-01", "2024-02-29"],
+    "chicago": ["2023-09-01", "2024-02-29"]
+  },
+  "ghcn_units": {
+    "PRCP": "tenths of millimetres",
+    "SNOW": "millimetres"
+  },
+  "e4_rule": {
+    "precipitation_threshold_raw": 380,
+    "snowfall_threshold_raw": 50,
+    "excluded_windows": [
+      ["2023-09-28", "2023-10-01"],
+      ["2023-11-21", "2023-11-26"],
+      ["2023-12-22", "2024-01-03"]
+    ],
+    "tie_break": "earliest event when the maximum measurement is tied"
+  },
+  "qualifying_days": {
+    "nyc": [
+      {"date": "2023-09-10", "prcp_raw": 533, "snow_raw": 0},
+      {"date": "2023-09-11", "prcp_raw": 462, "snow_raw": 0},
+      {"date": "2023-12-18", "prcp_raw": 541, "snow_raw": 0},
+      {"date": "2024-01-09", "prcp_raw": 495, "snow_raw": 0},
+      {"date": "2024-01-16", "prcp_raw": 84, "snow_raw": 51},
+      {"date": "2024-02-13", "prcp_raw": 163, "snow_raw": 84},
+      {"date": "2024-02-17", "prcp_raw": 58, "snow_raw": 84}
+    ],
+    "chicago": [
+      {"date": "2023-09-17", "prcp_raw": 406, "snow_raw": 0},
+      {"date": "2024-01-06", "prcp_raw": 53, "snow_raw": 66},
+      {"date": "2024-01-09", "prcp_raw": 236, "snow_raw": 71},
+      {"date": "2024-01-12", "prcp_raw": 196, "snow_raw": 119},
+      {"date": "2024-01-13", "prcp_raw": 23, "snow_raw": 61}
+    ]
+  },
+  "kept_e4_events": {
+    "nyc": [
+      {"label": "snow", "start": "2024-02-13", "end": "2024-02-13"},
+      {"label": "rain", "start": "2023-12-18", "end": "2023-12-18"}
+    ],
+    "chicago": [
+      {"label": "snow", "start": "2024-01-12", "end": "2024-01-13"},
+      {"label": "rain", "start": "2023-09-17", "end": "2023-09-17"}
+    ]
+  }
+}

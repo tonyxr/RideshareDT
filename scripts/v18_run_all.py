@@ -45,11 +45,13 @@ def _status(**updates: Any) -> None:
     atomic_json(path, value)
 
 
-def _phase_job(name: str, command: Sequence[str], output: Path) -> Job:
+def _phase_job(
+    name: str, command: Sequence[str], output: Path, *, tier: int = 0,
+) -> Job:
     leaf = CONTROLLER / "phases" / name
     return Job(
         name=name, command=tuple(map(str, command)), output=output,
-        log=leaf / "run.log", manifest=leaf / "manifest.json", tier=0,
+        log=leaf / "run.log", manifest=leaf / "manifest.json", tier=tier,
     )
 
 
@@ -151,7 +153,16 @@ def main() -> int:
     args = parser.parse_args()
     if args.plan_only:
         print(json.dumps({
-            "stages": ["Z1-Z4", "P3", "P4", "freeze", "wave_A", "selection", "wave_B_and_evaluations"],
+            "stages": [
+                "Z1-Z4", "P3", "P4", "freeze", "wave_A", "selection",
+                "wave_B_and_evaluations", "S", "V3", "E9", "E8",
+            ],
+            "post_queue": [
+                {"name": "S", "tier": 2},
+                {"name": "V3", "tier": 1},
+                {"name": "E9", "tier": 3},
+                {"name": "E8", "tier": 3},
+            ],
             "drop_order": DROP_ORDER, "never_drop": NEVER_DROP,
         }, indent=2))
         return 0
@@ -184,11 +195,32 @@ def main() -> int:
     config = freeze(args.config, p3_report, p4_report)
     results = _queue(config)
     workers = int(config["decisions"]["workers"])
-    for name, script in (("S", "v18_sensitivity.py"), ("E9", "v18_leftout.py"), ("E8", "v18_map.py")):
+    post_queue = (
+        (
+            "S", REPO / "scripts/v18_sensitivity.py",
+            REPO / "runs/v18/sensitivity/report.json", 2,
+        ),
+        (
+            "V3", REPO / "scripts/v18_validation/sim_events.py",
+            REPO / "runs/v18/realdata/v3_events/report.json", 1,
+        ),
+        (
+            "E9", REPO / "scripts/v18_leftout.py",
+            REPO / "runs/v18/eval/E9/report.json", 3,
+        ),
+        (
+            "E8", REPO / "scripts/v18_map.py",
+            REPO / "runs/v18/eval/E8/report.json", 3,
+        ),
+    )
+    for name, script, output, tier in post_queue:
         phase = _phase_job(
             name,
-            (str(PYTHON), "-u", str(REPO / "scripts" / script), "--execute", "--workers", str(workers)),
-            REPO / ("runs/v18/sensitivity/report.json" if name == "S" else f"runs/v18/eval/{name}/report.json"),
+            (
+                str(PYTHON), "-u", str(script), "--execute",
+                "--workers", str(workers),
+            ),
+            output, tier=tier,
         )
         results[name] = _run_phase(phase)
     counts = {

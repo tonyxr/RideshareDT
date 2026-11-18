@@ -1104,6 +1104,7 @@ class Core:
             raise ValueError(
                 "v17_eval_credit_probe requires v17_eval_credit_probe_out"
             )
+        self.recalibrate_supply_on_eval = False
         self.policy_snapshot_every_days = int(
             max(0, policy_snapshot_every_days)
         )
@@ -3696,6 +3697,9 @@ class Core:
                 self.market_dynamics.unfulfilled_spillover
             ),
             "threshold_ablation": str(self.threshold_ablation_mode),
+            "recalibrate_supply_on_eval": bool(
+                getattr(self, "recalibrate_supply_on_eval", False)
+            ),
         }
 
     def _install_regime_process(self, market: MarketInteraction, *, seed: int, training_openings: bool) -> None:
@@ -20473,6 +20477,34 @@ def load_shock_scenario(path: str) -> ShockScenario:
     return ShockScenario(start_date=start, events=events, forecasts=forecasts)
 
 
+def _evaluation_supply_operating_point(
+    *,
+    trained_model_in: str,
+    artifact_header: Mapping[str, Any],
+    city_artifact: Optional[Mapping[str, Any]],
+    eval_only: bool,
+    recalibrate_supply_on_eval: bool,
+) -> Optional[Mapping[str, Any]]:
+    """Choose the capacity anchor without mutating a trained policy.
+
+    Evaluation normally restores the supply operating point embedded in the
+    policy (or city artifact).  The explicit V18 correction instead asks Core
+    to refit capacity at ``--eval_customers`` while leaving policy weights,
+    demand, tariffs, and every other scientific setting frozen.
+    """
+    if recalibrate_supply_on_eval and not eval_only:
+        raise ValueError(
+            "--recalibrate_supply_on_eval is evaluation-only"
+        )
+    if recalibrate_supply_on_eval:
+        return None
+    if trained_model_in:
+        return artifact_header.get("supply_operating_point")
+    if city_artifact is not None:
+        return city_artifact["supply_operating_point"]
+    return None
+
+
 def load_training_scenario_manifest(path: str) -> Tuple[Tuple[str, Optional[ShockScenario]], ...]:
     """Load a fixed, auditable episode curriculum; ``scenario: null`` is natural."""
     manifest = os.path.abspath(os.path.expanduser(str(path)))
@@ -21257,6 +21289,14 @@ def main():
         default="proxy",
     )
     v17.add_argument("--v17_eval_credit_probe_out", type=str, default="")
+    v17.add_argument(
+        "--recalibrate_supply_on_eval",
+        action="store_true",
+        help=(
+            "Evaluation only: ignore the saved supply operating point and "
+            "refit capacity at --eval_customers without changing the policy."
+        ),
+    )
     v17.add_argument("--policy_snapshot_every_days", type=int, default=0)
     v17.add_argument("--policy_snapshot_dir", type=str, default="")
     v17.add_argument("--policy_sweep_request_log", type=str, default="")
@@ -21645,6 +21685,7 @@ def main():
             "--external_evaluation_only is a training-only option and cannot "
             "be combined with --eval_only"
         )
+    artifact_header: Mapping[str, Any] = {}
     if args.trained_model_in:
         args.firm1_mode = "RL"
         args.run_experiment = True
@@ -22899,6 +22940,18 @@ def main():
                 demand_spec = requested_demand
             if demand_spec is not None:
                 core.configure_joint_demand(demand_spec)
+            core.recalibrate_supply_on_eval = bool(
+                args.recalibrate_supply_on_eval
+            )
+            supply_operating_point = _evaluation_supply_operating_point(
+                trained_model_in=str(args.trained_model_in or ""),
+                artifact_header=artifact_header,
+                city_artifact=city_artifact,
+                eval_only=bool(args.eval_only),
+                recalibrate_supply_on_eval=bool(
+                    args.recalibrate_supply_on_eval
+                ),
+            )
             core.configure_v26r(
                 shock_config=build_shock_config_from_args(args, core.active_calibration),
                 shock_scenario=load_shock_scenario(args.shock_scenario) if args.shock_scenario else None,
@@ -22940,9 +22993,18 @@ def main():
                     flag == 'supply_base_active_drivers'
                     and int(getattr(args, flag)) == 0
                 )},
-                supply_operating_point=(artifact_header.get('supply_operating_point') if args.trained_model_in else
-                                        city_artifact['supply_operating_point'] if city_artifact else None),
+                supply_operating_point=supply_operating_point,
             )
+            core.v26r_settings = {
+                **dict(core.v26r_settings),
+                "recalibrate_supply_on_eval": bool(
+                    args.recalibrate_supply_on_eval
+                ),
+            }
+            core.v26_settings = {
+                **dict(core.v26_settings or {}),
+                "v26r": core.v26r_settings,
+            }
             if args.training_scenario_manifest:
                 if args.shock_scenario:
                     parser.error('--training_scenario_manifest and --shock_scenario are mutually exclusive')
