@@ -105,10 +105,15 @@ def run_job(
     environment.update(THREAD_ENV)
     first_attempt = len(attempts) + 1
     if first_attempt > int(max_attempts):
+        terminal = attempts[-1] if attempts else {}
         payload.update({
             "state": "failed",
-            "returncode": prior.get("returncode"),
-            "error": prior.get("error", "attempt budget exhausted"),
+            "returncode": prior.get(
+                "returncode", terminal.get("returncode")
+            ),
+            "error": prior.get(
+                "error", terminal.get("error", "attempt budget exhausted")
+            ),
             "updated_utc": utc_now(),
         })
         atomic_json(job.manifest, payload)

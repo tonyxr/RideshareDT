@@ -249,6 +249,7 @@ def test_retry_and_dependency_skip(tmp_path):
     assert run_job(bad, cwd=BASE, max_attempts=3) == "failed"
     exhausted = json.loads(bad.manifest.read_text(encoding="utf-8"))
     assert exhausted["state"] == "failed"
+    assert exhausted["returncode"] == 4
     assert len(exhausted["attempts"]) == 3
 
 
