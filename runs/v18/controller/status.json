@@ -1,15 +1,13 @@
 {
   "counts": {
-    "cached": 0,
-    "complete": 404,
+    "cached": 421,
+    "complete": 0,
     "failed": 15,
-    "pending": 125,
+    "pending": 118,
     "skipped": 0
   },
-  "projected_hours_left": 3.0,
-  "projected_hours_uncertainty": [1.7, 8.0],
+  "projected_hours_left": null,
   "state": "running",
-  "updated_utc": "2026-11-18T17:23:00Z",
-  "running": 10,
+  "updated_utc": "2026-11-18T17:50:34.906695Z",
   "workers": 10
 }
