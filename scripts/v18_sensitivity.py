@@ -49,12 +49,15 @@ def ensure_gated_evaluation(workers: int) -> None:
         )
 
 
-def frozen_at_500(config: dict[str, Any]) -> dict[str, Any]:
+def frozen_for_sensitivity(config: dict[str, Any]) -> dict[str, Any]:
+    """Keep the registered production decisions while evaluating S at N=500.
+
+    The S builders pass ``customers=500`` explicitly.  Changing ``N_star`` here
+    would turn the registered S sample size into a production decision and make
+    the frozen-config validator reject the suite before its first selection.
+    """
     value = copy.deepcopy(config)
     value["status"] = "frozen"
-    value["decisions"].update({"N_star": 500, "ppo_clock_days": 1200,
-                                "mc_clock_days": 1200, "workers": 1,
-                                "projection": {"source": "S", "wave_a_hours": 0}})
     return value
 
 
@@ -92,7 +95,7 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
-    config = frozen_at_500(load_config())
+    config = frozen_for_sensitivity(load_config())
     plan = {"arms": ARMS, "selection_seed": 77311, "customers": 500,
             "report_only": True, "requires": "runs/v18/eval/H_report.json"}
     atomic_json(args.root / "plan.json", plan)

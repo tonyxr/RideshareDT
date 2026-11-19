@@ -22,6 +22,7 @@ from scripts.v18_select import (
     _grid_edge_selected, _selection_plan, _stage3_count_rules, card_grid,
     reactive_candidates,
 )
+from scripts.v18_sensitivity import frozen_for_sensitivity
 from scripts.v18_validation.sim_events import (
     build_jobs as build_v3_jobs, validate_pairs as validate_v3_pairs,
 )
@@ -76,6 +77,19 @@ def test_s3_flags_equal_registered_p2_calibrated_arm():
     stored = _stored_command(path)
     rebuilt, _ = market_flags(stored, variant="s3", city="nyc", customers=500)
     assert _market(rebuilt) == _market(stored)
+
+
+def test_sensitivity_keeps_registered_n_star_while_using_n500_jobs():
+    config = _frozen()
+    sensitivity = frozen_for_sensitivity(config)
+    assert sensitivity["decisions"]["N_star"] == 150
+    values = eval_args(
+        sensitivity, city="nyc", case="C0", specs=("opening_hold",),
+        suite="S", output=BASE / "runs/v18/tests/sensitivity", customers=500,
+    )
+    assert values[values.index("--train_customers") + 1] == "500"
+    assert values[values.index("--eval_customers") + 1] == "500"
+    assert values[values.index("--loyalty_pool_size") + 1] == "1800"
 
 
 def test_training_arm_flags(tmp_path):
