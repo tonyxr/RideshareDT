@@ -22,7 +22,7 @@ from scripts.v18_select import (
     _grid_edge_selected, _selection_plan, _stage3_count_rules, card_grid,
     reactive_candidates,
 )
-from scripts.v18_sensitivity import frozen_for_sensitivity
+from scripts.v18_sensitivity import evaluation_jobs as sensitivity_evaluation_jobs, frozen_for_sensitivity
 from scripts.v18_validation.sim_events import (
     build_jobs as build_v3_jobs, validate_pairs as validate_v3_pairs,
 )
@@ -90,6 +90,22 @@ def test_sensitivity_keeps_registered_n_star_while_using_n500_jobs():
     assert values[values.index("--train_customers") + 1] == "500"
     assert values[values.index("--eval_customers") + 1] == "500"
     assert values[values.index("--loyalty_pool_size") + 1] == "1800"
+
+
+def test_sensitivity_actor_jobs_refit_supply_at_n500(tmp_path):
+    config = frozen_for_sensitivity(_frozen())
+    selected = {
+        name: {"spec": "static_tariff:[1.0,1.0]"}
+        for name in ("published_card", "best_fixed", "dated_two_lever", "count_rule_1step")
+    }
+    jobs = sensitivity_evaluation_jobs(
+        config, arm="S0", selected=selected, root=tmp_path,
+    )
+    actors = [job for job in jobs if "/nyc_s" in job.name]
+    references = [job for job in jobs if job not in actors]
+    assert len(actors) == 6
+    assert all("--recalibrate_supply_on_eval" in job.command for job in actors)
+    assert all("--recalibrate_supply_on_eval" not in job.command for job in references)
 
 
 def test_training_arm_flags(tmp_path):

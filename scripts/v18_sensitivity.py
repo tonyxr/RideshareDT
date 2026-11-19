@@ -83,6 +83,8 @@ def evaluation_jobs(config: dict[str, Any], *, arm: str, selected: dict[str, Any
                              output=leaf, scenario=scenario, kind="main",
                              policy=REPO / "runs/v18/train" / run.name / "policy.pt", customers=500)
             args, _ = market_flags(args, variant=variant, city="nyc", customers=500)
+            if "--recalibrate_supply_on_eval" not in args:
+                args.append("--recalibrate_supply_on_eval")
             result.append(Job(f"S/{arm}/{case}/{run.name}",
                               (str(PYTHON), "-u", str(REPO / "Core.py"), *args),
                               leaf / "raw.json", leaf / "run.log", leaf / "manifest.json", tier=2))
