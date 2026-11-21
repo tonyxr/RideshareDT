@@ -33,6 +33,8 @@ def rankdata(values: Sequence[float]) -> np.ndarray:
 def _corr(x: np.ndarray, y: np.ndarray) -> float:
     if x.size < 2:
         return float("nan")
+    if float(np.ptp(x)) <= 1e-12 or float(np.ptp(y)) <= 1e-12:
+        return float("nan")
     xc, yc = x - x.mean(), y - y.mean()
     denom = float(np.sqrt(np.dot(xc, xc) * np.dot(yc, yc)))
     return float(np.dot(xc, yc) / denom) if denom > 0 else float("nan")
@@ -55,7 +57,7 @@ def fare_metrics(actual: Sequence[float], quote: Sequence[float]) -> dict[str, f
         "median_ape": float(np.median(np.abs(error) / np.maximum(np.abs(actual_a), 1e-12))),
         "bias": float(np.mean(error)),
         "slope": float(np.dot(q_center, actual_a - actual_a.mean()) / slope_denom)
-        if slope_denom > 0 else float("nan"),
+        if float(np.ptp(quote_a)) > 1e-12 and slope_denom > 0 else float("nan"),
     }
 
 

@@ -30,6 +30,13 @@ def test_perfect_fare_metrics() -> None:
     assert result["slope"] == 1.0
 
 
+def test_constant_baseline_has_undefined_correlation_and_slope() -> None:
+    result = fare_metrics([1.0, 2.0, 3.0, 4.0], [2.5, 2.5, 2.5, 2.5])
+    assert math.isnan(result["r"])
+    assert math.isnan(result["rho"])
+    assert math.isnan(result["slope"])
+
+
 def test_day_block_bootstrap_is_deterministic_and_finite() -> None:
     actual = np.arange(1.0, 13.0)
     quote = actual * 1.1 + np.tile([0.1, -0.1], 6)
