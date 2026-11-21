@@ -5,10 +5,10 @@
     "pending": 1,
     "skipped": 0
   },
-  "current_job": "Generating and validating Section 9 products",
+  "current_job": "Regenerating Section 9 products after reporting-code fixes",
   "current_phase": "results_reporting",
   "projected_hours_left": 1.0,
   "state": "running",
-  "updated_utc": "2026-11-21T15:35:00Z",
+  "updated_utc": "2026-11-21T15:42:00Z",
   "workers": 10
 }

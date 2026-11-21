@@ -401,11 +401,15 @@ def figures(out: Path, tables: Mapping[str, Sequence[Mapping[str, Any]]], raw: M
 
     sensitivity = raw.get("S", [])
     def f2(ax):
-        grouped = _group(sensitivity, "variant", "policy")
-        for (variant, policy), group in grouped.items():
-            if policy not in {"published_card", "best_fixed", "nyc_s101", "nyc_s202", "nyc_s303"}:
-                continue
-            ax.scatter([variant], [finite_mean(row.get("objective") for row in group)], label=policy if variant == "S0" else None)
+        grouped = _group(sensitivity, "policy")
+        for policy in ("published_card", "best_fixed", "nyc_s101", "nyc_s202", "nyc_s303"):
+            by_variant = _group(grouped.get(policy, []), "variant")
+            variants = [variant for variant in ("S0", "S1", "S2", "S3") if variant in by_variant]
+            ax.plot(
+                variants,
+                [finite_mean(row.get("objective") for row in by_variant[variant]) for variant in variants],
+                marker="o", label=policy,
+            )
         ax.set(xlabel="Realism variant", ylabel="Mean objective", title="F2. Realism sensitivity panel")
         ax.legend(fontsize=7)
     paths.append(out / "F2_realism_panel.png"); save_figure(paths[-1], f2)

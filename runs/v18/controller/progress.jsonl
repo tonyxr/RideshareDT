@@ -3197,3 +3197,5 @@
 {"attempt":1,"job":"realdata_V6_V7","seconds":95.395,"state":"complete","time":"2026-11-21T15:00:40.021017Z"}
 {"attempt":1,"job":"results_reporting_code","seconds":0.0,"state":"complete","time":"2026-11-21T15:33:00Z"}
 {"attempt":1,"job":"results_reporting_products","seconds":0.0,"state":"running","time":"2026-11-21T15:35:00Z"}
+{"attempt":1,"job":"results_reporting_products","seconds":55.0,"state":"failed_code_validation","time":"2026-11-21T15:36:00Z"}
+{"attempt":2,"job":"results_reporting_products","seconds":0.0,"state":"running","time":"2026-11-21T15:42:00Z"}
