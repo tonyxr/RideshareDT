@@ -1,0 +1,6 @@
+{
+  "one_numerical_thread_per_process": true,
+  "paired_files": 630,
+  "state": "complete",
+  "workers": 4
+}

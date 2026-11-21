@@ -1,0 +1,1393 @@
+{
+  "checks": 63,
+  "rows": [
+    {
+      "allowed_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "chicago",
+      "difference_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E2_thanksgiving_2023",
+      "policy": "best_fixed",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "chicago",
+      "difference_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E2_thanksgiving_2023",
+      "policy": "chicago_s101",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "chicago",
+      "difference_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E2_thanksgiving_2023",
+      "policy": "chicago_s202",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "chicago",
+      "difference_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E2_thanksgiving_2023",
+      "policy": "chicago_s303",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "chicago",
+      "difference_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E2_thanksgiving_2023",
+      "policy": "count_rule_1step",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "chicago",
+      "difference_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E2_thanksgiving_2023",
+      "policy": "dated_two_lever",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "chicago",
+      "difference_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E2_thanksgiving_2023",
+      "policy": "published_card",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "city": "chicago",
+      "difference_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "event": "E3_christmas_2023",
+      "policy": "best_fixed",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "city": "chicago",
+      "difference_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "event": "E3_christmas_2023",
+      "policy": "chicago_s101",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "city": "chicago",
+      "difference_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "event": "E3_christmas_2023",
+      "policy": "chicago_s202",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "city": "chicago",
+      "difference_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "event": "E3_christmas_2023",
+      "policy": "chicago_s303",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "city": "chicago",
+      "difference_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "event": "E3_christmas_2023",
+      "policy": "count_rule_1step",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "city": "chicago",
+      "difference_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "event": "E3_christmas_2023",
+      "policy": "dated_two_lever",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "city": "chicago",
+      "difference_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "event": "E3_christmas_2023",
+      "policy": "published_card",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "chicago",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_rain_20230917",
+      "policy": "best_fixed",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "chicago",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_rain_20230917",
+      "policy": "chicago_s101",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "chicago",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_rain_20230917",
+      "policy": "chicago_s202",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "chicago",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_rain_20230917",
+      "policy": "chicago_s303",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "chicago",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_rain_20230917",
+      "policy": "count_rule_1step",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "chicago",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_rain_20230917",
+      "policy": "dated_two_lever",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "chicago",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_rain_20230917",
+      "policy": "published_card",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "chicago",
+      "difference_days": [
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E4_snow_20240112",
+      "policy": "best_fixed",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "chicago",
+      "difference_days": [
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E4_snow_20240112",
+      "policy": "chicago_s101",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "chicago",
+      "difference_days": [
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E4_snow_20240112",
+      "policy": "chicago_s202",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "chicago",
+      "difference_days": [
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E4_snow_20240112",
+      "policy": "chicago_s303",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "chicago",
+      "difference_days": [
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E4_snow_20240112",
+      "policy": "count_rule_1step",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "chicago",
+      "difference_days": [
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E4_snow_20240112",
+      "policy": "dated_two_lever",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "chicago",
+      "difference_days": [
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E4_snow_20240112",
+      "policy": "published_card",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E1_flood_20230929",
+      "policy": "best_fixed",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E1_flood_20230929",
+      "policy": "count_rule_1step",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E1_flood_20230929",
+      "policy": "dated_two_lever",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E1_flood_20230929",
+      "policy": "nyc_s101",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E1_flood_20230929",
+      "policy": "nyc_s202",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E1_flood_20230929",
+      "policy": "nyc_s303",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E1_flood_20230929",
+      "policy": "published_card",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "nyc",
+      "difference_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E2_thanksgiving_2023",
+      "policy": "best_fixed",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "nyc",
+      "difference_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E2_thanksgiving_2023",
+      "policy": "count_rule_1step",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "nyc",
+      "difference_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E2_thanksgiving_2023",
+      "policy": "dated_two_lever",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "nyc",
+      "difference_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E2_thanksgiving_2023",
+      "policy": "nyc_s101",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "nyc",
+      "difference_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E2_thanksgiving_2023",
+      "policy": "nyc_s202",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "nyc",
+      "difference_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E2_thanksgiving_2023",
+      "policy": "nyc_s303",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "city": "nyc",
+      "difference_days": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "event": "E2_thanksgiving_2023",
+      "policy": "published_card",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "city": "nyc",
+      "difference_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "event": "E3_christmas_2023",
+      "policy": "best_fixed",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "city": "nyc",
+      "difference_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "event": "E3_christmas_2023",
+      "policy": "count_rule_1step",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "city": "nyc",
+      "difference_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "event": "E3_christmas_2023",
+      "policy": "dated_two_lever",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "city": "nyc",
+      "difference_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "event": "E3_christmas_2023",
+      "policy": "nyc_s101",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "city": "nyc",
+      "difference_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "event": "E3_christmas_2023",
+      "policy": "nyc_s202",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "city": "nyc",
+      "difference_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "event": "E3_christmas_2023",
+      "policy": "nyc_s303",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "city": "nyc",
+      "difference_days": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "event": "E3_christmas_2023",
+      "policy": "published_card",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_rain_20231218",
+      "policy": "best_fixed",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_rain_20231218",
+      "policy": "count_rule_1step",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_rain_20231218",
+      "policy": "dated_two_lever",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_rain_20231218",
+      "policy": "nyc_s101",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_rain_20231218",
+      "policy": "nyc_s202",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_rain_20231218",
+      "policy": "nyc_s303",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_rain_20231218",
+      "policy": "published_card",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_snow_20240213",
+      "policy": "best_fixed",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_snow_20240213",
+      "policy": "count_rule_1step",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_snow_20240213",
+      "policy": "dated_two_lever",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_snow_20240213",
+      "policy": "nyc_s101",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_snow_20240213",
+      "policy": "nyc_s202",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_snow_20240213",
+      "policy": "nyc_s303",
+      "unexpected_days": []
+    },
+    {
+      "allowed_days": [
+        16,
+        17,
+        18
+      ],
+      "city": "nyc",
+      "difference_days": [
+        16,
+        17,
+        18
+      ],
+      "event": "E4_snow_20240213",
+      "policy": "published_card",
+      "unexpected_days": []
+    }
+  ],
+  "state": "complete",
+  "unexpected_checks": 0
+}
