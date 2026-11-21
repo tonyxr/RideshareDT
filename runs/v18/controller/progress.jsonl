@@ -3191,3 +3191,7 @@
 {"attempt":2,"job":"realdata_V2","seconds":77.863,"state":"complete","time":"2026-11-21T14:48:52.120205Z"}
 {"attempt":1,"job":"realdata_V3_V4_sim","seconds":0.0,"state":"running","time":"2026-11-21T14:49:06.931887Z"}
 {"attempt":1,"job":"realdata_V3_V4_sim","seconds":306.65,"state":"complete","time":"2026-11-21T14:54:13.548476Z"}
+{"attempt":1,"job":"realdata_V5","seconds":0.0,"state":"running","time":"2026-11-21T14:58:25.423271Z"}
+{"attempt":1,"job":"realdata_V5","seconds":26.501,"state":"complete","time":"2026-11-21T14:58:51.923668Z"}
+{"attempt":1,"job":"realdata_V6_V7","seconds":0.0,"state":"running","time":"2026-11-21T14:59:04.626097Z"}
+{"attempt":1,"job":"realdata_V6_V7","seconds":95.395,"state":"complete","time":"2026-11-21T15:00:40.021017Z"}

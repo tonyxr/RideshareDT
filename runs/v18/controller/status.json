@@ -1,14 +1,14 @@
 {
   "counts": {
-    "complete": 5,
+    "complete": 8,
     "failed": 1,
-    "pending": 3,
+    "pending": 1,
     "skipped": 0
   },
-  "current_job": "Section 6 V5-V7 outcome analysis",
-  "current_phase": "realdata_V1_V7",
-  "projected_hours_left": 2.5,
+  "current_job": "Final results products and audit",
+  "current_phase": "results_reporting",
+  "projected_hours_left": 1.5,
   "state": "running",
-  "updated_utc": "2026-11-21T14:54:28Z",
+  "updated_utc": "2026-11-21T15:01:01Z",
   "workers": 10
 }
