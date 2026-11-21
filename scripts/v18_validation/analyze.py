@@ -188,8 +188,8 @@ def nyc_sample() -> pd.DataFrame:
     return frame
 
 
-def stage_guards() -> dict[str, Any]:
-    append_progress(PROGRESS, job="realdata_guards", state="running", attempt=1, seconds=0)
+def stage_guards(*, attempt: int = 1) -> dict[str, Any]:
+    append_progress(PROGRESS, job="realdata_guards", state="running", attempt=attempt, seconds=0)
     raw_kaggle = DATA / "raw/rides/nyc_kaggle/rideshare_data.parquet"
     nyc_bank = DATA / "processed/nyc/trip_bank.csv"
     connection = duckdb.connect()
@@ -249,7 +249,7 @@ def stage_guards() -> dict[str, Any]:
         "path_guard_passed": not contamination,
     }
     atomic_json(RUN / "guards.json", result)
-    append_progress(PROGRESS, job="realdata_guards", state="complete", attempt=1, seconds=0)
+    append_progress(PROGRESS, job="realdata_guards", state="complete", attempt=attempt, seconds=0)
     return result
 
 
@@ -407,8 +407,8 @@ def _fit_only_boston_tariff(fit: pd.DataFrame) -> dict[str, Any]:
     return tariff
 
 
-def stage_v1() -> dict[str, Any]:
-    append_progress(PROGRESS, job="realdata_V1", state="running", attempt=1, seconds=0)
+def stage_v1(*, attempt: int = 1) -> dict[str, Any]:
+    append_progress(PROGRESS, job="realdata_V1", state="running", attempt=attempt, seconds=0)
     declaration = load_declaration()
     nyc = nyc_sample()
     nyc["card_quote"] = quote_rows("nyc", nyc)
@@ -460,7 +460,7 @@ def stage_v1() -> dict[str, Any]:
     })
     result = {"nyc": nyc_result["state"], "boston": "complete", "chicago": "skipped_dependency_failed"}
     atomic_json(RUN / "v1_fare/status.json", result)
-    append_progress(PROGRESS, job="realdata_V1", state="complete", attempt=1, seconds=0)
+    append_progress(PROGRESS, job="realdata_V1", state="complete", attempt=attempt, seconds=0)
     return result
 
 
@@ -641,8 +641,8 @@ def _normal_days(daily: pd.DataFrame) -> pd.DataFrame:
     return daily[np.asarray(keep, dtype=bool)].copy()
 
 
-def stage_real() -> dict[str, Any]:
-    append_progress(PROGRESS, job="realdata_V2_V4_real", state="running", attempt=1, seconds=0)
+def stage_real(*, attempt: int = 1) -> dict[str, Any]:
+    append_progress(PROGRESS, job="realdata_V2_V4_real", state="running", attempt=attempt, seconds=0)
     daily, blocks = prepare_nyc_real()
     write_csv(RUN / "prepared/nyc_daily.csv", [{key: (value.isoformat() if isinstance(value, date) else value) for key, value in row.items()} for row in daily.to_dict("records")])
     write_csv(RUN / "prepared/nyc_blocks.csv", [{key: (value.isoformat() if isinstance(value, date) else value) for key, value in row.items()} for row in blocks.to_dict("records")])
@@ -673,20 +673,21 @@ def stage_real() -> dict[str, Any]:
     })
     result = {"daily_rows": len(daily), "block_rows": len(blocks), "event_rows": len(event_rows)}
     atomic_json(RUN / "prepared/status.json", result)
-    append_progress(PROGRESS, job="realdata_V2_V4_real", state="complete", attempt=1, seconds=0)
+    append_progress(PROGRESS, job="realdata_V2_V4_real", state="complete", attempt=attempt, seconds=0)
     return result
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("guards", "v1", "real", "stage1"))
+    parser.add_argument("--attempt", type=int, default=1)
     args = parser.parse_args()
     if args.stage in ("guards", "stage1"):
-        print(json.dumps(stage_guards(), indent=2, default=str))
+        print(json.dumps(stage_guards(attempt=args.attempt), indent=2, default=str))
     if args.stage in ("v1", "stage1"):
-        print(json.dumps(stage_v1(), indent=2, default=str))
+        print(json.dumps(stage_v1(attempt=args.attempt), indent=2, default=str))
     if args.stage in ("real", "stage1"):
-        print(json.dumps(stage_real(), indent=2, default=str))
+        print(json.dumps(stage_real(attempt=args.attempt), indent=2, default=str))
     return 0
 
 
