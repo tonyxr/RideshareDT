@@ -11,6 +11,7 @@ from scripts.v18_validation.metrics import (
     finite_tree,
     ols_hc1,
     rankdata,
+    sanitize_tree,
     total_variation,
 )
 
@@ -54,3 +55,10 @@ def test_ols_hc1_recovers_linear_coefficients() -> None:
     assert math.isclose(result["coefficients"][0], 2.0, abs_tol=1e-10)
     assert math.isclose(result["coefficients"][1], 3.0, abs_tol=1e-10)
     assert result["n"] == 10
+
+
+def test_sanitize_tree_records_undefined_statistics_as_null() -> None:
+    assert sanitize_tree({"r": float("nan"), "ci": [float("inf"), 1.0]}) == {
+        "r": None,
+        "ci": [None, 1.0],
+    }

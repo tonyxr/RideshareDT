@@ -42,6 +42,7 @@ from scripts.v18_validation.metrics import (  # noqa: E402
     day_block_bootstrap,
     fare_metrics,
     finite_tree,
+    sanitize_tree,
     total_variation,
     variability,
 )
@@ -66,6 +67,7 @@ def utc_now() -> str:
 
 
 def atomic_json(path: Path, value: Any) -> None:
+    value = sanitize_tree(value)
     if not finite_tree(value):
         raise ValueError(f"non-finite output for {path}")
     path.parent.mkdir(parents=True, exist_ok=True)

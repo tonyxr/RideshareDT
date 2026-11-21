@@ -66,7 +66,7 @@ def day_block_bootstrap(
     *,
     draws: int,
     seed: int,
-) -> dict[str, list[float]]:
+) -> dict[str, list[float | None]]:
     """Day-block intervals using sufficient statistics.
 
     Pearson r, R2, MAE, bias and slope are exact for each day resample.  Rho
@@ -121,10 +121,15 @@ def day_block_bootstrap(
         values["median_ape"].append(float(np.median(ape_medians_a[chosen])))
         values["bias"].append(se / n)
         values["slope"].append(cov / varx if varx > 0 else np.nan)
-    return {
-        name: [float(np.nanquantile(sample, 0.025)), float(np.nanquantile(sample, 0.975))]
-        for name, sample in values.items()
-    }
+    intervals: dict[str, list[float | None]] = {}
+    for name, sample in values.items():
+        finite = np.asarray(sample, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        intervals[name] = (
+            [float(np.quantile(finite, 0.025)), float(np.quantile(finite, 0.975))]
+            if finite.size else [None, None]
+        )
+    return intervals
 
 
 def wasserstein1(a: Sequence[float], b: Sequence[float]) -> float:
@@ -237,3 +242,16 @@ def finite_tree(value: Any) -> bool:
     if isinstance(value, (float, np.floating)):
         return bool(np.isfinite(value))
     return True
+
+
+def sanitize_tree(value: Any) -> Any:
+    """Represent undefined numerical statistics as JSON null, never NaN."""
+    if isinstance(value, Mapping):
+        return {key: sanitize_tree(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [sanitize_tree(item) for item in value]
+    if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+        return None
+    if isinstance(value, np.integer):
+        return int(value)
+    return value
