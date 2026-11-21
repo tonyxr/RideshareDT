@@ -1,0 +1,15 @@
+all_airport_gap,all_ks_distance,all_ks_duration,all_tvd_hour,all_w1_distance,bank_rows_excluded,bias,ci_overlap_rate,city,common_months,comparisons,completed_airport_gap,completed_ks_distance,completed_ks_duration,completed_tvd_hour,completed_w1_distance,label_inconclusive,label_opposite,label_real not distinguishable,label_same direction,label_within band,mae,mean_ratio,procedure_r,published_wait_ks,published_wait_median_ratio,r,r2,reason,rho,rows,sign_agreement_rate,simulator_same_period_r,slope,state,trend_agreement,uplift_rows,validation,variability_rows
+,,,,,,4.0144625000000005,,nyc,,,,,,,,,,,,,7.03495072222222,,,,,0.8894628818326258,0.7369541710005401,,0.9130526509801052,,,,0.8728749103268216,complete_with_price_definition_limitation,,,V1,
+,,,,,15530,,,boston,,,,,,,,,,,,,,,0.6661641718272856,,,,,,,,,0.6667449799647089,,complete,,,V1,
+-0.0044588507975222985,0.013603956001053241,0.017305648239456906,0.009917973927354905,0.06776788272011285,,,,nyc,,,-0.01700583869233402,0.08735409902455715,0.11245411194201804,0.017574779879483575,1.1085063379528968,,,,,,,,,,,,,,,,,,,complete,,,V2,
+,,,,,,,,nyc,,1232,,,,,,258,106,632,111,125,,,,,,,,,,,,,,complete,,,V3,
+,,,,,,,,nyc,,,,,,,,,,,,,,,,,,,,,,,,,,complete,,1056,V4,42
+,,,,,,,,nyc,,,,,,,,,,,,,,,,0.4760692397028494,1.565114789120367,,,,,15,,,,complete,,,V5,
+,,,,,,,0.2222222222222222,nyc,,,,,,,,,,,,,,,,,,,,,,144,0.6736111111111112,,,complete,,,V6,
+,,,,,,,,nyc,4,,,,,,,,,,,,,0.7105375652954153,,,,,,,,,,,,complete_with_calendar_limitation,False,,V7,
+,,,,,,,,chicago,,,,,,,,,,,,,,,,,,,,Chicago D1 Socrata source exhausted three operational attempts,,,,,,skipped,,,V1,
+,,,,,,,,chicago,,,,,,,,,,,,,,,,,,,,Chicago D1 Socrata source exhausted three operational attempts,,,,,,skipped,,,V2,
+,,,,,,,,chicago,,,,,,,,,,,,,,,,,,,,Chicago D1 Socrata source exhausted three operational attempts,,,,,,skipped,,,V3,
+,,,,,,,,chicago,,,,,,,,,,,,,,,,,,,,Chicago D1 Socrata source exhausted three operational attempts,,,,,,skipped,,,V4,
+,,,,,,,,chicago,,,,,,,,,,,,,,,,,,,,Chicago D1 Socrata source exhausted three operational attempts,,,,,,skipped,,,V5,
+,,,,,,,,chicago,,,,,,,,,,,,,,,,,,,,Chicago D1 Socrata source exhausted three operational attempts,,,,,,skipped,,,V6,

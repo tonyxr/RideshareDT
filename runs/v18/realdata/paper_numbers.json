@@ -1,0 +1,122 @@
+{
+  "calm_stock_drifts_report_only": {
+    "boston": 0.046335289,
+    "chicago": 0.0523553254,
+    "nyc": 0.0268838325
+  },
+  "generated_utc": "2026-11-21T15:18:04.251616+00:00",
+  "validation_rows": [
+    {
+      "bias": 4.0144625000000005,
+      "city": "nyc",
+      "mae": 7.03495072222222,
+      "r": 0.8894628818326258,
+      "r2": 0.7369541710005401,
+      "rho": 0.9130526509801052,
+      "slope": 0.8728749103268216,
+      "state": "complete_with_price_definition_limitation",
+      "validation": "V1"
+    },
+    {
+      "bank_rows_excluded": 15530,
+      "city": "boston",
+      "procedure_r": 0.6661641718272856,
+      "simulator_same_period_r": 0.6667449799647089,
+      "state": "complete",
+      "validation": "V1"
+    },
+    {
+      "all_airport_gap": -0.0044588507975222985,
+      "all_ks_distance": 0.013603956001053241,
+      "all_ks_duration": 0.017305648239456906,
+      "all_tvd_hour": 0.009917973927354905,
+      "all_w1_distance": 0.06776788272011285,
+      "city": "nyc",
+      "completed_airport_gap": -0.01700583869233402,
+      "completed_ks_distance": 0.08735409902455715,
+      "completed_ks_duration": 0.11245411194201804,
+      "completed_tvd_hour": 0.017574779879483575,
+      "completed_w1_distance": 1.1085063379528968,
+      "state": "complete",
+      "validation": "V2"
+    },
+    {
+      "city": "nyc",
+      "comparisons": 1232,
+      "label_inconclusive": 258,
+      "label_opposite": 106,
+      "label_real not distinguishable": 632,
+      "label_same direction": 111,
+      "label_within band": 125,
+      "state": "complete",
+      "validation": "V3"
+    },
+    {
+      "city": "nyc",
+      "state": "complete",
+      "uplift_rows": 1056,
+      "validation": "V4",
+      "variability_rows": 42
+    },
+    {
+      "city": "nyc",
+      "published_wait_ks": 0.4760692397028494,
+      "published_wait_median_ratio": 1.565114789120367,
+      "rows": 15,
+      "state": "complete",
+      "validation": "V5"
+    },
+    {
+      "ci_overlap_rate": 0.2222222222222222,
+      "city": "nyc",
+      "rows": 144,
+      "sign_agreement_rate": 0.6736111111111112,
+      "state": "complete",
+      "validation": "V6"
+    },
+    {
+      "city": "nyc",
+      "common_months": 4,
+      "mean_ratio": 0.7105375652954153,
+      "state": "complete_with_calendar_limitation",
+      "trend_agreement": false,
+      "validation": "V7"
+    },
+    {
+      "city": "chicago",
+      "reason": "Chicago D1 Socrata source exhausted three operational attempts",
+      "state": "skipped",
+      "validation": "V1"
+    },
+    {
+      "city": "chicago",
+      "reason": "Chicago D1 Socrata source exhausted three operational attempts",
+      "state": "skipped",
+      "validation": "V2"
+    },
+    {
+      "city": "chicago",
+      "reason": "Chicago D1 Socrata source exhausted three operational attempts",
+      "state": "skipped",
+      "validation": "V3"
+    },
+    {
+      "city": "chicago",
+      "reason": "Chicago D1 Socrata source exhausted three operational attempts",
+      "state": "skipped",
+      "validation": "V4"
+    },
+    {
+      "city": "chicago",
+      "reason": "Chicago D1 Socrata source exhausted three operational attempts",
+      "state": "skipped",
+      "validation": "V5"
+    },
+    {
+      "city": "chicago",
+      "reason": "Chicago D1 Socrata source exhausted three operational attempts",
+      "state": "skipped",
+      "validation": "V6"
+    }
+  ]
+}

@@ -3199,3 +3199,7 @@
 {"attempt":1,"job":"results_reporting_products","seconds":0.0,"state":"running","time":"2026-11-21T15:35:00Z"}
 {"attempt":1,"job":"results_reporting_products","seconds":55.0,"state":"failed_code_validation","time":"2026-11-21T15:36:00Z"}
 {"attempt":2,"job":"results_reporting_products","seconds":0.0,"state":"running","time":"2026-11-21T15:42:00Z"}
+{"attempt":2,"job":"results_reporting_products","seconds":63.0,"state":"failed_code_validation","time":"2026-11-21T15:46:00Z"}
+{"attempt":3,"job":"results_reporting_products","seconds":0.0,"state":"running","time":"2026-11-21T15:50:00Z"}
+{"attempt":3,"job":"results_reporting_products","seconds":56.0,"state":"complete","time":"2026-11-21T15:51:00Z"}
+{"attempt":1,"job":"final_audit","seconds":0.0,"state":"running","time":"2026-11-21T15:55:00Z"}

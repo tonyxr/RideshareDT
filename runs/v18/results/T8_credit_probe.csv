@@ -1,0 +1,5 @@
+case,city,decisions,finite_selected_credits,horizon_days,mean_selected_credit,policy
+A1,nyc,24,24,5,0.02789592742919922,nyc_s101
+A1,nyc,24,24,10,0.0468893845876058,nyc_s101
+C0,nyc,24,24,5,-0.0056842366854349775,nyc_s101
+C0,nyc,24,24,10,0.01834448178609212,nyc_s101

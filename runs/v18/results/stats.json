@@ -1,0 +1,363 @@
+{
+  "bootstrap_draws": 10000,
+  "comparisons": {
+    "E1/boston/A1/agent_minus_published": {
+      "ci95": [
+        -0.002643434091570133,
+        0.02620354541375594
+      ],
+      "draws": 10000,
+      "mean": 0.01204493292852817,
+      "p_two_sided_bootstrap": 0.07268,
+      "seed_differences": {
+        "boston_s101": 0.02368253193518955,
+        "boston_s202": 0.0128798116033133,
+        "boston_s303": -0.00042754475291834255
+      },
+      "seed_range": [
+        -0.00042754475291834255,
+        0.02368253193518955
+      ]
+    },
+    "E1/boston/A3/agent_minus_published": {
+      "ci95": [
+        -0.08103410723807458,
+        -0.033017862273369177
+      ],
+      "draws": 10000,
+      "mean": -0.05796134126878366,
+      "p_two_sided_bootstrap": 0.0,
+      "seed_differences": {
+        "boston_s101": -0.03267291807774149,
+        "boston_s202": -0.06132692390737766,
+        "boston_s303": -0.07988418182123183
+      },
+      "seed_range": [
+        -0.07988418182123183,
+        -0.03267291807774149
+      ]
+    },
+    "E1/boston/C0/agent_minus_published": {
+      "ci95": [
+        -0.07124990122081103,
+        -0.03278945820133515
+      ],
+      "draws": 10000,
+      "mean": -0.0526583914929852,
+      "p_two_sided_bootstrap": 0.0,
+      "seed_differences": {
+        "boston_s101": -0.03282228317268687,
+        "boston_s202": -0.05736856138420601,
+        "boston_s303": -0.06778432992206271
+      },
+      "seed_range": [
+        -0.06778432992206271,
+        -0.03282228317268687
+      ]
+    },
+    "E1/boston/S1/agent_minus_published": {
+      "ci95": [
+        -0.07692609929847061,
+        -0.036180199908090516
+      ],
+      "draws": 10000,
+      "mean": -0.057900815562820805,
+      "p_two_sided_bootstrap": 0.0,
+      "seed_differences": {
+        "boston_s101": -0.03537057186050569,
+        "boston_s202": -0.06991403364091654,
+        "boston_s303": -0.06841784118704015
+      },
+      "seed_range": [
+        -0.06991403364091654,
+        -0.03537057186050569
+      ]
+    },
+    "E1/boston/S6/agent_minus_published": {
+      "ci95": [
+        0.0018206065139383348,
+        0.029344491948436982
+      ],
+      "draws": 10000,
+      "mean": 0.015016876639436802,
+      "p_two_sided_bootstrap": 0.0,
+      "seed_differences": {
+        "boston_s101": 0.02836323897697004,
+        "boston_s202": 0.009542066660498552,
+        "boston_s303": 0.007145324280841817
+      },
+      "seed_range": [
+        0.007145324280841817,
+        0.02836323897697004
+      ]
+    },
+    "E1/chicago/A1/agent_minus_published": {
+      "ci95": [
+        0.13623872759571548,
+        0.17462007234074525
+      ],
+      "draws": 10000,
+      "mean": 0.15440240078375353,
+      "p_two_sided_bootstrap": 0.0,
+      "seed_differences": {
+        "chicago_s101": 0.14272521803119267,
+        "chicago_s202": 0.1657970764893281,
+        "chicago_s303": 0.15468490783073982
+      },
+      "seed_range": [
+        0.14272521803119267,
+        0.1657970764893281
+      ]
+    },
+    "E1/chicago/A3/agent_minus_published": {
+      "ci95": [
+        0.1039047553172909,
+        0.14997531337369305
+      ],
+      "draws": 10000,
+      "mean": 0.12617423846626935,
+      "p_two_sided_bootstrap": 0.0,
+      "seed_differences": {
+        "chicago_s101": 0.12065426342646472,
+        "chicago_s202": 0.14334630587511293,
+        "chicago_s303": 0.11452214609723038
+      },
+      "seed_range": [
+        0.11452214609723038,
+        0.14334630587511293
+      ]
+    },
+    "E1/chicago/C0/agent_minus_published": {
+      "ci95": [
+        0.08675632333224359,
+        0.1302407559428983
+      ],
+      "draws": 10000,
+      "mean": 0.10735575740872975,
+      "p_two_sided_bootstrap": 0.0,
+      "seed_differences": {
+        "chicago_s101": 0.09729749498897498,
+        "chicago_s202": 0.12079977657689629,
+        "chicago_s303": 0.10397000066031796
+      },
+      "seed_range": [
+        0.09729749498897498,
+        0.12079977657689629
+      ]
+    },
+    "E1/chicago/S1/agent_minus_published": {
+      "ci95": [
+        0.08114975211638863,
+        0.12958169968890576
+      ],
+      "draws": 10000,
+      "mean": 0.10391336675270864,
+      "p_two_sided_bootstrap": 0.0,
+      "seed_differences": {
+        "chicago_s101": 0.08777721823636314,
+        "chicago_s202": 0.12380371634846954,
+        "chicago_s303": 0.10015916567329326
+      },
+      "seed_range": [
+        0.08777721823636314,
+        0.12380371634846954
+      ]
+    },
+    "E1/chicago/S6/agent_minus_published": {
+      "ci95": [
+        0.1418901301523367,
+        0.178240752972572
+      ],
+      "draws": 10000,
+      "mean": 0.15930136797438907,
+      "p_two_sided_bootstrap": 0.0,
+      "seed_differences": {
+        "chicago_s101": 0.14716225537648522,
+        "chicago_s202": 0.16880545958063362,
+        "chicago_s303": 0.1619363889660484
+      },
+      "seed_range": [
+        0.14716225537648522,
+        0.16880545958063362
+      ]
+    },
+    "E1/nyc/A1/agent_minus_published": {
+      "ci95": [
+        0.1549036787410311,
+        0.18942327059838124
+      ],
+      "draws": 10000,
+      "mean": 0.1721410357475464,
+      "p_two_sided_bootstrap": 0.0,
+      "seed_differences": {
+        "nyc_s101": 0.15845459896896769,
+        "nyc_s202": 0.17872109363920644,
+        "nyc_s303": 0.18512227610903148,
+        "nyc_s404": 0.16737316311701395,
+        "nyc_s505": 0.17103404690351262
+      },
+      "seed_range": [
+        0.15845459896896769,
+        0.18512227610903148
+      ]
+    },
+    "E1/nyc/A3/agent_minus_published": {
+      "ci95": [
+        0.06232646681665808,
+        0.11007353538457673
+      ],
+      "draws": 10000,
+      "mean": 0.08689112317928846,
+      "p_two_sided_bootstrap": 0.0,
+      "seed_differences": {
+        "nyc_s101": 0.06841744529336458,
+        "nyc_s202": 0.09771993891371956,
+        "nyc_s303": 0.10088344336402465,
+        "nyc_s404": 0.05719305648369439,
+        "nyc_s505": 0.1102417318416391
+      },
+      "seed_range": [
+        0.05719305648369439,
+        0.1102417318416391
+      ]
+    },
+    "E1/nyc/C0/agent_minus_published": {
+      "ci95": [
+        0.007029246895583272,
+        0.05194758922576228
+      ],
+      "draws": 10000,
+      "mean": 0.030592798927330595,
+      "p_two_sided_bootstrap": 0.0,
+      "seed_differences": {
+        "nyc_s101": 0.003390004266052997,
+        "nyc_s202": 0.045194712165146686,
+        "nyc_s303": 0.045190709004603695,
+        "nyc_s404": 0.01347071936196379,
+        "nyc_s505": 0.045717849838885806
+      },
+      "seed_range": [
+        0.003390004266052997,
+        0.045717849838885806
+      ]
+    },
+    "E1/nyc/S1/agent_minus_published": {
+      "ci95": [
+        0.01640789259179804,
+        0.059364919284470595
+      ],
+      "draws": 10000,
+      "mean": 0.03884976098884082,
+      "p_two_sided_bootstrap": 0.0,
+      "seed_differences": {
+        "nyc_s101": 0.0155745844804472,
+        "nyc_s202": 0.05212110272294384,
+        "nyc_s303": 0.05270329982913761,
+        "nyc_s404": 0.014793272760939643,
+        "nyc_s505": 0.05905654515073579
+      },
+      "seed_range": [
+        0.014793272760939643,
+        0.05905654515073579
+      ]
+    },
+    "E1/nyc/S6/agent_minus_published": {
+      "ci95": [
+        0.154503557525993,
+        0.19147583443056732
+      ],
+      "draws": 10000,
+      "mean": 0.17293407913502473,
+      "p_two_sided_bootstrap": 0.0,
+      "seed_differences": {
+        "nyc_s101": 0.16410410508934223,
+        "nyc_s202": 0.19598869054742826,
+        "nyc_s303": 0.1762001875839676,
+        "nyc_s404": 0.16974437527844094,
+        "nyc_s505": 0.1586330371759447
+      },
+      "seed_range": [
+        0.1586330371759447,
+        0.19598869054742826
+      ]
+    }
+  },
+  "holm_alpha_0_05": {
+    "E1/boston/A1/agent_minus_published": {
+      "p": 0.07268,
+      "reject": false,
+      "threshold": 0.05
+    },
+    "E1/boston/A3/agent_minus_published": {
+      "p": 0.0,
+      "reject": true,
+      "threshold": 0.0033333333333333335
+    },
+    "E1/boston/C0/agent_minus_published": {
+      "p": 0.0,
+      "reject": true,
+      "threshold": 0.0035714285714285718
+    },
+    "E1/boston/S1/agent_minus_published": {
+      "p": 0.0,
+      "reject": true,
+      "threshold": 0.0038461538461538464
+    },
+    "E1/boston/S6/agent_minus_published": {
+      "p": 0.0,
+      "reject": true,
+      "threshold": 0.004166666666666667
+    },
+    "E1/chicago/A1/agent_minus_published": {
+      "p": 0.0,
+      "reject": true,
+      "threshold": 0.004545454545454546
+    },
+    "E1/chicago/A3/agent_minus_published": {
+      "p": 0.0,
+      "reject": true,
+      "threshold": 0.005
+    },
+    "E1/chicago/C0/agent_minus_published": {
+      "p": 0.0,
+      "reject": true,
+      "threshold": 0.005555555555555556
+    },
+    "E1/chicago/S1/agent_minus_published": {
+      "p": 0.0,
+      "reject": true,
+      "threshold": 0.00625
+    },
+    "E1/chicago/S6/agent_minus_published": {
+      "p": 0.0,
+      "reject": true,
+      "threshold": 0.0071428571428571435
+    },
+    "E1/nyc/A1/agent_minus_published": {
+      "p": 0.0,
+      "reject": true,
+      "threshold": 0.008333333333333333
+    },
+    "E1/nyc/A3/agent_minus_published": {
+      "p": 0.0,
+      "reject": true,
+      "threshold": 0.01
+    },
+    "E1/nyc/C0/agent_minus_published": {
+      "p": 0.0,
+      "reject": true,
+      "threshold": 0.0125
+    },
+    "E1/nyc/S1/agent_minus_published": {
+      "p": 0.0,
+      "reject": true,
+      "threshold": 0.016666666666666666
+    },
+    "E1/nyc/S6/agent_minus_published": {
+      "p": 0.0,
+      "reject": true,
+      "threshold": 0.025
+    }
+  },
+  "method": "training seed unit; two-level bootstrap over seeds and matched rival-opening cells"
+}
