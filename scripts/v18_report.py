@@ -93,10 +93,10 @@ def raw_identity(path: Path) -> dict[str, Any]:
     parts = rel.parts
     if parts[0] == "eval" and len(parts) >= 6:
         return {"suite": parts[1], "city": parts[2], "case": parts[3], "policy": parts[4]}
-    if parts[0] == "sensitivity" and len(parts) >= 7:
+    if parts[0] == "sensitivity" and len(parts) >= 6:
         return {
-            "suite": parts[1], "city": "nyc", "case": parts[4],
-            "policy": parts[5], "variant": parts[1],
+            "suite": parts[1], "city": "nyc", "case": parts[3],
+            "policy": parts[4], "variant": parts[1],
         }
     return {"suite": parts[0], "city": None, "case": None, "policy": path.parent.name}
 
@@ -139,7 +139,10 @@ def cell_map(row: Mapping[str, Any], metric: str = "objective") -> dict[str, flo
     for cell in row.get("cells", []):
         value = cell.get(metric)
         if value is not None:
-            output[f"{cell['variant']}::{cell['rollout']}"] = float(value)
+            # Every raw product contains one candidate policy. Rival and
+            # opening are the paired cell; the candidate-policy label can
+            # differ across products and is intentionally not part of the key.
+            output[str(cell["rollout"])] = float(value)
     return output
 
 
@@ -249,12 +252,27 @@ def build_t2() -> list[dict[str, Any]]:
     v6 = read_csv(base / "v6_regression/comparison.csv")
     v7 = read_json(base / "v7_supply/nyc_metrics.json", {})
     rows: list[dict[str, Any]] = []
-    card = v1n.get("out_of_time", {}).get("card", v1n.get("card", {}))
-    rows.append({"validation": "V1", "city": "nyc", "state": "complete", **{key: card.get(key) for key in ("r", "rho", "r2", "mae", "bias", "slope")}})
-    rows.append({"validation": "V1", "city": "boston", "state": v1b.get("state", "complete"), "r": v1b.get("r") or v1b.get("procedure", {}).get("r")})
-    completed = v2.get("completed_requests", v2.get("completed", {}))
-    all_requests = v2.get("all_requests", v2.get("all", {}))
-    rows.append({"validation": "V2", "city": "nyc", "state": "complete", "completed_ks_distance": completed.get("ks_distance"), "all_ks_distance": all_requests.get("ks_distance")})
+    card = next((row for row in v1n.get("metrics", []) if row.get("name") == "Card_out_of_time"), {})
+    procedure = next((row for row in v1b.get("metrics", []) if row.get("name") == "Procedure_out_of_time"), {})
+    simulator = next((row for row in v1b.get("metrics", []) if row.get("name") == "Simulator_card_rows_outside_bank_same_period"), {})
+    rows.append({"validation": "V1", "city": "nyc", "state": v1n.get("state", "complete"), **{key: card.get(key) for key in ("r", "rho", "r2", "mae", "bias", "slope")}})
+    rows.append({"validation": "V1", "city": "boston", "state": v1b.get("state", "complete"), "procedure_r": procedure.get("r"), "simulator_same_period_r": simulator.get("r"), "bank_rows_excluded": v1b.get("bank_rows_excluded")})
+    v2rows = {row.get("comparison"): row for row in v2.get("rows", [])}
+    completed = v2rows.get("simulated_completed_vs_window", {})
+    all_requests = v2rows.get("simulated_all_requests_vs_window", {})
+    rows.append({
+        "validation": "V2", "city": "nyc", "state": v2.get("state", "complete"),
+        "completed_ks_distance": completed.get("distance", {}).get("ks"),
+        "completed_ks_duration": completed.get("duration", {}).get("ks"),
+        "completed_w1_distance": completed.get("distance", {}).get("wasserstein1"),
+        "completed_tvd_hour": completed.get("tvd_hour"),
+        "completed_airport_gap": completed.get("airport_share_gap"),
+        "all_ks_distance": all_requests.get("distance", {}).get("ks"),
+        "all_ks_duration": all_requests.get("duration", {}).get("ks"),
+        "all_w1_distance": all_requests.get("distance", {}).get("wasserstein1"),
+        "all_tvd_hour": all_requests.get("tvd_hour"),
+        "all_airport_gap": all_requests.get("airport_share_gap"),
+    })
     labels = Counter(row.get("label", "") for row in v3)
     rows.append({"validation": "V3", "city": "nyc", "state": "complete", "comparisons": len(v3), **{f"label_{key}": value for key, value in sorted(labels.items())}})
     rows.append({"validation": "V4", "city": "nyc", "state": "complete", "variability_rows": len(v4v), "uplift_rows": len(v4u)})
@@ -576,6 +594,16 @@ def main() -> int:
         "T9": [public_record(row) for row in raw["E5"]],
         "T10": [public_record(row) for row in raw["S"]],
     }
+    h_report = read_json(REPO / "runs/v18/eval/H_report.json", {})
+    equivalence = h_report.get("equivalence", {})
+    tables["T6"].append({
+        "suite": "H_external_check", "city": "nyc", "case": "A1",
+        "policy": "always_open_and_never_open",
+        "state": "complete" if equivalence.get("passed") else "reported_nonpass",
+        "always_open_matches_rl_actor": equivalence.get("always_open_matches_rl_actor"),
+        "never_open_matches_best_fixed": equivalence.get("never_open_matches_best_fixed"),
+        "days": equivalence.get("days"),
+    })
     for row in [*raw["E1"], *raw["E4"]]:
         for weight in WEIGHTS:
             own, rival = row.get("own_profit"), row.get("rival_profit")

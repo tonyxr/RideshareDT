@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 
-from scripts.v18_report import finite_mean, parse_seed, summarize_raw
+from scripts.v18_report import cell_map, finite_mean, paired_values, parse_seed, summarize_raw
 
 
 def test_parse_seed_and_finite_mean() -> None:
@@ -41,3 +41,10 @@ def test_summarize_raw_uses_rollout_cells(tmp_path, monkeypatch) -> None:
     assert row["seed"] == 101
     assert row["n_cells"] == 2
     assert math.isclose(row["objective"], 2.0)
+
+
+def test_pairing_uses_rival_opening_not_candidate_variant() -> None:
+    left = {"cells": [{"variant": "learned", "rollout": "rival__opening_1", "objective": 2.0}]}
+    right = {"cells": [{"variant": "static", "rollout": "rival__opening_1", "objective": 1.0}]}
+    assert cell_map(left) == {"rival__opening_1": 2.0}
+    assert paired_values(left, right) == ([2.0], [1.0])
