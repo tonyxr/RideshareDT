@@ -1,10 +1,11 @@
 {
-  "completed_utc": "2026-11-14T15:37:53.424406Z",
+  "completed_utc": "2026-11-21T14:06:50.958624Z",
   "failures": [
     {
       "dataset": "n26f-ihde",
-      "reason": "aggregate query timed out on all 3 attempts",
-      "source": "https://data.cityofchicago.org/resource/n26f-ihde.json"
+      "reason": "initial D1 aggregate query timed out on all 3 attempts; source was not retried beyond the protocol attempt limit",
+      "source": "https://data.cityofchicago.org/resource/n26f-ihde.json",
+      "state": "skipped_after_exhausted_attempts"
     }
   ],
   "protocol": "CRISP-Ride_v18_Last_Revision_20261113 Section 6 D1",
@@ -17,94 +18,94 @@
     },
     {
       "bytes": 10956048,
-      "downloaded_utc": null,
+      "downloaded_utc": "2026-11-21T14:06:48.677654Z",
       "path": "/Users/huali/Desktop/RideResponse/data/raw/validation/ghcnd/USW00014732.csv",
       "sha256": "0de4ffc5aea28d87978f443e8f5f01e275664d74f02684eddea1f343abc62410",
       "url": "https://www.ncei.noaa.gov/data/global-historical-climatology-network-daily/access/USW00014732.csv"
     },
     {
       "bytes": 10969749,
-      "downloaded_utc": null,
+      "downloaded_utc": "2026-11-21T14:06:48.695813Z",
       "path": "/Users/huali/Desktop/RideResponse/data/raw/validation/ghcnd/USW00094846.csv",
       "sha256": "b271731e860445557fe66acd33400aea0e5755b955fd5118f0368d0d31c3adcf",
       "url": "https://www.ncei.noaa.gov/data/global-historical-climatology-network-daily/access/USW00094846.csv"
     },
     {
       "bytes": 79774,
-      "downloaded_utc": null,
+      "downloaded_utc": "2026-11-21T14:06:48.642905Z",
       "path": "/Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/data_reports_monthly.csv",
       "sha256": "47fa867bf3a72416b3eaca7770b44313fa5645fb5e8102f77f14c797c38ebf94",
       "url": "https://www.nyc.gov/assets/tlc/downloads/csv/data_reports_monthly.csv"
     },
     {
       "bytes": 450263712,
-      "downloaded_utc": null,
+      "downloaded_utc": "2026-11-21T14:06:45.724748Z",
       "path": "/Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2023-08.parquet",
       "sha256": "1f657d06e9465217005104c594578100ab1b5c846f353efd87372f991709d6fd",
       "url": "https://d37ci6vzurychx.cloudfront.net/trip-data/fhvhv_tripdata_2023-08.parquet"
     },
     {
       "bytes": 478067839,
-      "downloaded_utc": null,
+      "downloaded_utc": "2026-11-21T14:06:45.724517Z",
       "path": "/Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2023-09.parquet",
       "sha256": "3f3fb7b6f62bf1a7ed07bfd1af7a23be0f798d101f27b77331e9a52b4d4a10f4",
       "url": "https://d37ci6vzurychx.cloudfront.net/trip-data/fhvhv_tripdata_2023-09.parquet"
     },
     {
       "bytes": 485826227,
-      "downloaded_utc": null,
+      "downloaded_utc": "2026-11-21T14:06:45.724652Z",
       "path": "/Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2023-10.parquet",
       "sha256": "fd577706331f37f6470945af6c268b27af036cf51eaa5689bc84481a1e0579f0",
       "url": "https://d37ci6vzurychx.cloudfront.net/trip-data/fhvhv_tripdata_2023-10.parquet"
     },
     {
       "bytes": 464926008,
-      "downloaded_utc": null,
+      "downloaded_utc": "2026-11-21T14:06:47.090931Z",
       "path": "/Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2023-11.parquet",
       "sha256": "a48486cfb760c0839a8f7b507f3b89d5ac5fc5433c67233dcb6a89c91ea08e1c",
       "url": "https://d37ci6vzurychx.cloudfront.net/trip-data/fhvhv_tripdata_2023-11.parquet"
     },
     {
       "bytes": 490453634,
-      "downloaded_utc": null,
+      "downloaded_utc": "2026-11-21T14:06:47.168953Z",
       "path": "/Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2023-12.parquet",
       "sha256": "ff23e07001de2ec2d2e44f82d748c3a2ec88efdc5df7532248248cca59cc0dd9",
       "url": "https://d37ci6vzurychx.cloudfront.net/trip-data/fhvhv_tripdata_2023-12.parquet"
     },
     {
       "bytes": 472757547,
-      "downloaded_utc": null,
+      "downloaded_utc": "2026-11-21T14:06:47.210926Z",
       "path": "/Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2024-01.parquet",
       "sha256": "9897de352aa52cea36b70348cc6721b8d4494327ce39c85f0dba83d86ecaa098",
       "url": "https://d37ci6vzurychx.cloudfront.net/trip-data/fhvhv_tripdata_2024-01.parquet"
     },
     {
       "bytes": 462475428,
-      "downloaded_utc": null,
+      "downloaded_utc": "2026-11-21T14:06:48.513641Z",
       "path": "/Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2024-02.parquet",
       "sha256": "54bafa7bcf3f06e7833fcbccf7ef158eb793a72ee1c4bb8bf080e56ae71a15d6",
       "url": "https://d37ci6vzurychx.cloudfront.net/trip-data/fhvhv_tripdata_2024-02.parquet"
     },
     {
-      "bytes": 36822,
-      "downloaded_utc": null,
+      "bytes": 8300022,
+      "downloaded_utc": "2026-11-21T14:06:48.649652Z",
       "path": "/Users/huali/Desktop/RideResponse/data/raw/weather/noaa/chicago_ohare_2023.csv",
-      "sha256": "48661c476a2bde160781f149d112592fa9ef719376f181049b351a585491d9a2",
-      "url": "https://www.ncei.noaa.gov/data/global-hourly/access/2023/72530094846.csv"
+      "sha256": "8e3c175a879f9355a663ae3f5496762b5c19edee2f71e7300b8b9a0024e8b0af",
+      "url": "https://noaa-global-hourly-pds.s3.amazonaws.com/2023/72530094846.csv"
     },
     {
-      "bytes": 36822,
-      "downloaded_utc": null,
+      "bytes": 8451465,
+      "downloaded_utc": "2026-11-21T14:06:48.669249Z",
       "path": "/Users/huali/Desktop/RideResponse/data/raw/weather/noaa/chicago_ohare_2024.csv",
-      "sha256": "48661c476a2bde160781f149d112592fa9ef719376f181049b351a585491d9a2",
-      "url": "https://www.ncei.noaa.gov/data/global-hourly/access/2024/72530094846.csv"
+      "sha256": "1f21901ce9998830e7078d28fbad99fc626d409d413d7d34c986b66a3df70176",
+      "url": "https://noaa-global-hourly-pds.s3.amazonaws.com/2024/72530094846.csv"
     },
     {
-      "bytes": 36822,
-      "downloaded_utc": null,
+      "bytes": 7965128,
+      "downloaded_utc": "2026-11-21T14:06:48.644038Z",
       "path": "/Users/huali/Desktop/RideResponse/data/raw/weather/noaa/nyc_laguardia_2024.csv",
-      "sha256": "48661c476a2bde160781f149d112592fa9ef719376f181049b351a585491d9a2",
-      "url": "https://www.ncei.noaa.gov/data/global-hourly/access/2024/72503014732.csv"
+      "sha256": "ea2d3858502e476ddea25f9165dfd378b64f3d0bc4f5090be872cd9730b54150",
+      "url": "https://noaa-global-hourly-pds.s3.amazonaws.com/2024/72503014732.csv"
     }
   ],
   "state": "complete_with_failures"

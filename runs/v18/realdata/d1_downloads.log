@@ -17,3 +17,36 @@
 [2026-11-14T15:20:35.671293Z] JSON retry attempt=3 url=https://data.cityofchicago.org/resource/n26f-ihde.json?%24select=date_trunc_ymd%28trip_start_timestamp%29+as+day%2Ccount%28%2A%29+as+trip_count%2Cavg%28trip_miles%29+as+mean_trip_miles%2Cavg%28trip_seconds%29+as+mean_trip_seconds%2Cavg%28fare%29+as+mean_fare%2Cavg%28additional_charges%29+as+mean_additional_charges&%24where=trip_start_timestamp+%3E%3D+%272023-09-01T00%3A00%3A00.000%27+AND+trip_start_timestamp+%3C+%272024-03-01T00%3A00%3A00.000%27&%24group=date_trunc_ymd%28trip_start_timestamp%29&%24order=day&%24limit=50000: The read operation timed out
 [2026-11-14T15:37:41.829935Z] D1 downloads finalize started
 [2026-11-14T15:37:53.438159Z] D1 downloads complete: 14 records, 1 failed sources
+[2026-11-21T14:04:20.512226Z] D1 downloads started
+[2026-11-21T14:04:20.513669Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2023-08.parquet (450263712 bytes)
+[2026-11-21T14:04:20.513762Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2023-09.parquet (478067839 bytes)
+[2026-11-21T14:04:20.513801Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2023-10.parquet (485826227 bytes)
+[2026-11-21T14:04:21.849570Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2023-11.parquet (464926008 bytes)
+[2026-11-21T14:04:21.944527Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2023-12.parquet (490453634 bytes)
+[2026-11-21T14:04:21.974119Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2024-01.parquet (472757547 bytes)
+[2026-11-21T14:04:23.275616Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2024-02.parquet (462475428 bytes)
+[2026-11-21T14:04:23.417202Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/data_reports_monthly.csv (79774 bytes)
+[2026-11-21T14:04:23.420494Z] preserve invalid NOAA response as nyc_laguardia_2024.csv.invalid_html
+[2026-11-21T14:04:23.438147Z] preserve invalid NOAA response as chicago_ohare_2023.csv.invalid_html
+[2026-11-21T14:04:23.947920Z] download chicago_ohare_2023.csv attempt=1 offset=0
+[2026-11-21T14:04:23.958337Z] download nyc_laguardia_2024.csv attempt=1 offset=0
+[2026-11-21T14:04:24.661272Z] preserve invalid NOAA response as chicago_ohare_2024.csv.invalid_html
+[2026-11-21T14:04:24.897378Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/ghcnd/USW00014732.csv (10956048 bytes)
+[2026-11-21T14:04:24.930321Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/ghcnd/USW00094846.csv (10969749 bytes)
+[2026-11-21T14:04:25.079305Z] download chicago_ohare_2024.csv attempt=1 offset=0
+[2026-11-21T14:04:27.031100Z] D1 downloads complete: 14 records, 0 failed sources
+[2026-11-21T14:06:45.722713Z] D1 downloads started
+[2026-11-21T14:06:45.724318Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2023-09.parquet (478067839 bytes)
+[2026-11-21T14:06:45.724369Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2023-10.parquet (485826227 bytes)
+[2026-11-21T14:06:45.724399Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2023-08.parquet (450263712 bytes)
+[2026-11-21T14:06:47.090671Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2023-11.parquet (464926008 bytes)
+[2026-11-21T14:06:47.168762Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2023-12.parquet (490453634 bytes)
+[2026-11-21T14:06:47.210729Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2024-01.parquet (472757547 bytes)
+[2026-11-21T14:06:48.513454Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/fhvhv_tripdata_2024-02.parquet (462475428 bytes)
+[2026-11-21T14:06:48.642707Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/nyc_tlc/data_reports_monthly.csv (79774 bytes)
+[2026-11-21T14:06:48.643880Z] reuse /Users/huali/Desktop/RideResponse/data/raw/weather/noaa/nyc_laguardia_2024.csv (7965128 bytes)
+[2026-11-21T14:06:48.649469Z] reuse /Users/huali/Desktop/RideResponse/data/raw/weather/noaa/chicago_ohare_2023.csv (8300022 bytes)
+[2026-11-21T14:06:48.669038Z] reuse /Users/huali/Desktop/RideResponse/data/raw/weather/noaa/chicago_ohare_2024.csv (8451465 bytes)
+[2026-11-21T14:06:48.677401Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/ghcnd/USW00014732.csv (10956048 bytes)
+[2026-11-21T14:06:48.695665Z] reuse /Users/huali/Desktop/RideResponse/data/raw/validation/ghcnd/USW00094846.csv (10969749 bytes)
+[2026-11-21T14:06:50.959936Z] D1 downloads complete: 14 records, 1 failed sources
