@@ -1,0 +1,5 @@
+{
+  "dependency": "D1 Chicago source failed after 3 attempts",
+  "rounding_limit": "Fares nearest $2.50, tips nearest $1, time nearest 15 minutes",
+  "state": "skipped_dependency_failed"
+}

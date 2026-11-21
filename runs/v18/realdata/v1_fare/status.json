@@ -1,0 +1,5 @@
+{
+  "boston": "complete",
+  "chicago": "skipped_dependency_failed",
+  "nyc": "complete_with_price_definition_limitation"
+}

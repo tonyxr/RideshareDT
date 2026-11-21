@@ -1,0 +1,35 @@
+{
+  "boston": {
+    "fit_end": "2018-12-09",
+    "raw_max": "2018-12-18 19:15:10",
+    "raw_min": "2018-11-26 03:40:46",
+    "test_rows_before_bank_exclusion": 257208,
+    "test_rows_in_bank_excluded": 18653,
+    "test_start": "2018-12-10"
+  },
+  "checked_utc": "2026-11-21T14:17:13Z",
+  "chicago": {
+    "dependent_real_side_checks": [
+      "V1",
+      "V2",
+      "V3",
+      "V4",
+      "V6"
+    ],
+    "state": "failed_after_3_attempts"
+  },
+  "nyc": {
+    "after_fit_proxy": true,
+    "excluded_rows": 0,
+    "fit_proxy_max": "2023-08-31 20:00:00",
+    "guard_basis": "processed_trip_bank_conservative_proxy",
+    "limitation": "Raw NYC Kaggle parquet is absent; exact source-date and August price-definition join cannot be computed.",
+    "raw_kaggle_available": false,
+    "raw_kaggle_source": "/Users/huali/Desktop/RideResponse/data/raw/rides/nyc_kaggle/rideshare_data.parquet",
+    "validation_min": "2023-09-01 00:00:00"
+  },
+  "path_guard_passed": true,
+  "schema": "v18-realdata-guards-v1",
+  "state": "complete_with_exclusions",
+  "validation_paths_in_training_or_evaluation_products": []
+}

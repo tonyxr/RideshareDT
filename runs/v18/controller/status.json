@@ -1,14 +1,15 @@
 {
   "counts": {
-    "complete": 2,
+    "complete": 3,
     "failed": 1,
-    "pending": 6,
+    "partial": 3,
+    "pending": 3,
     "skipped": 0
   },
-  "current_job": "Section 6 V1-V7 real-data analysis",
+  "current_job": "Section 6 V2-V7 simulation and outcome analysis",
   "current_phase": "realdata_V1_V7",
-  "projected_hours_left": 6.0,
+  "projected_hours_left": 4.5,
   "state": "running",
-  "updated_utc": "2026-11-21T14:08:00Z",
+  "updated_utc": "2026-11-21T14:29:28Z",
   "workers": 10
 }
