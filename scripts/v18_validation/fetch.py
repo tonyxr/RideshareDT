@@ -34,6 +34,7 @@ USER_AGENT = "CRISP-Ride-v18-validation/1.0 (research download)"
 CHICAGO_DATASET = "n26f-ihde"
 CHICAGO_API = f"https://data.cityofchicago.org/resource/{CHICAGO_DATASET}.json"
 CHICAGO_META = f"https://data.cityofchicago.org/api/views/{CHICAGO_DATASET}"
+NOAA_GLOBAL_HOURLY = "https://noaa-global-hourly-pds.s3.amazonaws.com"
 CHICAGO_COLUMNS = {
     "trip_id",
     "trip_start_timestamp",
@@ -89,6 +90,18 @@ def _write_json(path: Path, payload: Any) -> None:
 def _download(url: str, destination: Path, *, retries: int = 3) -> dict[str, Any]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_suffix(destination.suffix + ".part")
+    expects_noaa_csv = "global-hourly" in url
+    if destination.exists() and expects_noaa_csv:
+        header = destination.open("rb").read(256)
+        if b'"STATION","DATE"' not in header:
+            backup = destination.with_suffix(destination.suffix + ".invalid_html")
+            if not backup.exists():
+                destination.replace(backup)
+                _log(f"preserve invalid NOAA response as {backup.name}")
+            else:
+                raise RuntimeError(
+                    f"invalid NOAA response and preserved backup already exists: {destination}"
+                )
     if destination.exists() and destination.stat().st_size > 0:
         _log(f"reuse {destination} ({destination.stat().st_size} bytes)")
     else:
@@ -115,6 +128,8 @@ def _download(url: str, destination: Path, *, retries: int = 3) -> dict[str, Any
                 if attempt == retries:
                     raise
                 time.sleep(min(30, 2**attempt))
+    if expects_noaa_csv and b'"STATION","DATE"' not in destination.open("rb").read(256):
+        raise RuntimeError(f"NOAA source did not return Global Hourly CSV: {url}")
     return {
         "url": url,
         "path": str(destination),
@@ -141,15 +156,15 @@ def _static_downloads() -> list[tuple[str, Path]]:
                 RAW_VALIDATION / "nyc_tlc" / "data_reports_monthly.csv",
             ),
             (
-                "https://www.ncei.noaa.gov/data/global-hourly/access/2024/72503014732.csv",
+                f"{NOAA_GLOBAL_HOURLY}/2024/72503014732.csv",
                 DATA / "raw" / "weather" / "noaa" / "nyc_laguardia_2024.csv",
             ),
             (
-                "https://www.ncei.noaa.gov/data/global-hourly/access/2023/72530094846.csv",
+                f"{NOAA_GLOBAL_HOURLY}/2023/72530094846.csv",
                 DATA / "raw" / "weather" / "noaa" / "chicago_ohare_2023.csv",
             ),
             (
-                "https://www.ncei.noaa.gov/data/global-hourly/access/2024/72530094846.csv",
+                f"{NOAA_GLOBAL_HOURLY}/2024/72530094846.csv",
                 DATA / "raw" / "weather" / "noaa" / "chicago_ohare_2024.csv",
             ),
             (

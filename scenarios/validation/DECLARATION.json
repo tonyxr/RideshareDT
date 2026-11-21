@@ -1,5 +1,25 @@
 {
+  "schema_version": "v18-realdata-declaration-v1",
+  "declared_before_metrics": true,
+  "declared_utc": "2026-11-18T17:48:43Z",
   "protocol": "CRISP-Ride V18 Last Revision Section 6; inherited V17 out-of-sample manual Part G3",
+  "seeds": {
+    "evaluation": 77311,
+    "trip_sample": 20261112,
+    "bootstrap": 20261112
+  },
+  "bootstrap_draws": 1000,
+  "v6_regressors": [
+    "rain",
+    "snow",
+    "temperature_below_0",
+    "temperature_0_to_10",
+    "temperature_10_to_25",
+    "block",
+    "weekday",
+    "holiday_week"
+  ],
+  "baseline_rule": "same weekday in four weeks before and after; widen to six weeks if fewer than four eligible days",
   "window": {
     "nyc": ["2023-09-01", "2024-02-29"],
     "chicago": ["2023-09-01", "2024-02-29"]
