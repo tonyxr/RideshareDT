@@ -5,10 +5,10 @@
     "pending": 1,
     "skipped": 0
   },
-  "current_job": "Final results products and audit",
+  "current_job": "Section 9 report builder validated; product generation pending",
   "current_phase": "results_reporting",
-  "projected_hours_left": 1.5,
+  "projected_hours_left": 1.0,
   "state": "running",
-  "updated_utc": "2026-11-21T15:01:01Z",
+  "updated_utc": "2026-11-21T15:33:00Z",
   "workers": 10
 }
