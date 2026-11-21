@@ -319,6 +319,16 @@ def main() -> int:
                 records.extend(_chicago_downloads())
             except Exception as exc:
                 failures.append({"source": CHICAGO_API, "dataset": CHICAGO_DATASET, "reason": repr(exc)})
+        else:
+            failures.append({
+                "source": CHICAGO_API,
+                "dataset": CHICAGO_DATASET,
+                "state": "skipped_after_exhausted_attempts",
+                "reason": (
+                    "initial D1 aggregate query timed out on all 3 attempts; "
+                    "source was not retried beyond the protocol attempt limit"
+                ),
+            })
 
     boston = DATA / "raw" / "rides" / "boston_kaggle" / "rideshare_kaggle.csv"
     if not boston.exists():
