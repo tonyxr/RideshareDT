@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import csv
 import gzip
+from datetime import date
 
 import numpy as np
 
@@ -18,6 +19,7 @@ from scripts.v18_validation.metrics import (
     wasserstein1,
 )
 from scripts.v18_validation.sim_analysis import _aggregate_log, _scenario
+from scripts.v18_validation.outcome_analysis import _holiday_week, _regression
 
 
 def test_rankdata_averages_ties() -> None:
@@ -110,3 +112,18 @@ def test_request_log_aggregate_uses_fulfilled_market_rows(tmp_path) -> None:
     assert result["m2_mean_duration"] == 10
     assert result["m3_median_speed"] == 12
     assert math.isclose(result["m5_price_index"], 1.2)
+
+
+def test_v6_weather_regression_contract_and_holiday_windows() -> None:
+    rows = []
+    for index in range(30):
+        rows.append({
+            "rain": index % 2, "snow": int(index % 7 == 0), "block": index % 6,
+            "weekday": index % 7, "holiday_week": int(index % 11 == 0),
+            "outcome": 1.0 + 0.2 * (index % 2) + 0.01 * index,
+        })
+    result = _regression(rows, "outcome")
+    assert result["regressors"] == ["intercept", "rain", "snow", "block", "weekday", "holiday_week"]
+    assert result["n"] == 30
+    assert _holiday_week(date(2023, 11, 23)) == 1
+    assert _holiday_week(date(2023, 11, 10)) == 0
