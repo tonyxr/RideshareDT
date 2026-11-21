@@ -140,8 +140,17 @@ def wasserstein1(a: Sequence[float], b: Sequence[float]) -> float:
     x, y = x[np.isfinite(x)], y[np.isfinite(y)]
     if not x.size or not y.size:
         raise ValueError("Wasserstein inputs cannot be empty")
-    q = np.linspace(0.0, 1.0, max(x.size, y.size))
-    return float(np.mean(np.abs(np.quantile(x, q) - np.quantile(y, q))))
+    # Exact 1-D empirical Wasserstein distance: integrate |F_x - F_y|
+    # between consecutive pooled observations.  This is O((n+m) log(n+m))
+    # and avoids the superlinear millions-of-quantiles implementation.
+    pooled = np.sort(np.concatenate((x, y)))
+    if pooled.size < 2:
+        return 0.0
+    left = pooled[:-1]
+    widths = np.diff(pooled)
+    cdf_x = np.searchsorted(x, left, side="right") / x.size
+    cdf_y = np.searchsorted(y, left, side="right") / y.size
+    return float(np.dot(np.abs(cdf_x - cdf_y), widths))
 
 
 def ks(a: Sequence[float], b: Sequence[float]) -> float:

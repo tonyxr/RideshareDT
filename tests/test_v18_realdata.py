@@ -15,6 +15,7 @@ from scripts.v18_validation.metrics import (
     rankdata,
     sanitize_tree,
     total_variation,
+    wasserstein1,
 )
 from scripts.v18_validation.sim_analysis import _aggregate_log, _scenario
 
@@ -57,6 +58,7 @@ def test_distribution_metrics_and_total_variation() -> None:
     assert result["wasserstein1"] == 0.0
     assert result["ks"] == 0.0
     assert total_variation({0: 0.5, 1: 0.5}, {0: 0.25, 1: 0.75}) == 0.25
+    assert math.isclose(wasserstein1([0.0, 1.0], [2.0, 3.0]), 2.0)
 
 
 def test_ols_hc1_recovers_linear_coefficients() -> None:
