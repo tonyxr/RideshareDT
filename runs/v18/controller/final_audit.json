@@ -1,0 +1,93 @@
+{
+  "audit_state": "complete",
+  "audit_utc": "2026-11-21T15:20:36Z",
+  "protocol": "/Users/huali/Desktop/RideResponse/Claude outputs/plans_20261113/CRISP-Ride_v18_Last_Revision_20261113.pdf",
+  "branch": "v18-threats",
+  "product_commit": "b297d8c16251bd0429adc23f0a846988b48f634c",
+  "ridesharedt_remote_parity_at_product_commit": true,
+  "tests": {
+    "command": "python -m pytest -q tests/test_v18_report.py tests/test_v18_realdata.py tests/test_v18_final.py",
+    "passed": 34,
+    "failed": 0
+  },
+  "execution": {
+    "core_processes": 0,
+    "controller_processes": 0,
+    "numerical_threads_per_process": 1,
+    "workers_limit": 10,
+    "queue_counts": {
+      "cached": 431,
+      "complete": 113,
+      "failed": 26,
+      "skipped": 0
+    },
+    "manifests_observed": 2594,
+    "section9_attempts": [
+      {
+        "attempt": 1,
+        "state": "failed_code_validation",
+        "preserved_at": "runs/v18/results/archive_attempt1_code_defect"
+      },
+      {
+        "attempt": 2,
+        "state": "failed_code_validation",
+        "preserved_at": "runs/v18/results/archive_attempt2_visual_defect"
+      },
+      {
+        "attempt": 3,
+        "state": "complete"
+      }
+    ]
+  },
+  "resource_snapshot": {
+    "disk_free_gib": 26,
+    "memory_reclaimable_or_available_gib_approx": 5.3,
+    "swap_total_mib": 14336.0,
+    "swap_used_mib": 12730.56,
+    "swap_free_mib": 1605.44
+  },
+  "scientific_findings": {
+    "calm_stock_drifts_report_only": {
+      "boston": 0.046335289,
+      "chicago": 0.0523553254,
+      "nyc": 0.0268838325
+    },
+    "p2_closed_not_rerun": true,
+    "chicago_d1_source": "failed after three operational attempts; dependent real-side validations skipped and simulation products retained",
+    "nyc_august_price_definition": "exact match undefined because the raw Kaggle August source was unavailable; conservative date guard passed",
+    "v7_calendar": "January-February 2024 have no E5 synthetic counterpart"
+  },
+  "output_validation": {
+    "final_section9_products": 21,
+    "json_parse_checks": "passed",
+    "index_required_fields": "passed",
+    "nonfinite_json_products": 0,
+    "figure_visual_qa": "passed for F1-F7",
+    "statistics": "15 training-seed two-level bootstrap comparisons with Holm correction"
+  },
+  "product_sha256": {
+    "runs/v18/realdata/paper_numbers.json": "1b4fe0f07f5bdcc87df7104bd99f7d60ad0117100a47831d909cb302e3df9111",
+    "runs/v18/realdata/report.md": "ff06e8a879eac7503c8a32ad0d67f72bd47d5734c2c1398f325f014db0105f61",
+    "runs/v18/results/F1_scale_curve.png": "9c107919b1efe4a49617b3b847943f3807eec4a46e23dbd169d942469b84f2f0",
+    "runs/v18/results/F2_realism_panel.png": "7524e4677f3ff096e2e4b319823b3d85f28084b7965c347613799e310e1490ed",
+    "runs/v18/results/F3_severity.png": "938120b248ece444794c0c3f2a1714a89852432b37c47f62039fa6e89c4f1c9c",
+    "runs/v18/results/F4_shortage_path.png": "485dc14418a347fabe6d60639b307b22a1e991c4168eeaf458c1a7704f928e66",
+    "runs/v18/results/F5_learning_curves.png": "c3de19c542cf925008bd32cbc3f3caf23210e4d3ae67d68e5d41ef5874209743",
+    "runs/v18/results/F6_same_regression.png": "f914a6e77f0a18fbff60c86065544c0786fb75c99c04d80a37e9c298807699ff",
+    "runs/v18/results/F7_real_events.png": "1b241da2694267c4171e99c941f14443cb70dd0bc0374b256d151fe092eb68c8",
+    "runs/v18/results/INDEX.json": "e442a8a5aff186c067df8e78fba6afd2ce6c42d85e164b939c3c4cb88ec2a97f",
+    "runs/v18/results/T10_realism_sensitivity.csv": "73f5bfbd6b55b0ba91bb6dcf5cb133f575af5a39fde17ea25682897269489d97",
+    "runs/v18/results/T1_setup_scale.csv": "74a48ff7a11e33e5e775934e3e651b9539e59686d6ffad7e4c95d806948e0313",
+    "runs/v18/results/T2_validation.csv": "18b71cc0d2fe04f0f75271b8c848c317a5ac1b2fb807b46608af035a1bcebebb",
+    "runs/v18/results/T3_main_results.csv": "ba09c2d3b5af77a83bbe4368b11657a75fe4537636ea3d0672f2580d9c57329f",
+    "runs/v18/results/T4_value_of_timing.csv": "8be86c7cde9a49ba394a8cae3cf95be610326650a6c3d446d898df14747426fe",
+    "runs/v18/results/T5_learning_ladder.csv": "42b6ea8a9a5228d6973a99bbb43d32fba99383e2573264fc47d833d6785acefc",
+    "runs/v18/results/T6_thresholds.csv": "5d72502caf3c95c7400a8160d5d3880d1b44fe19c3b57df286855b7cd18f6f68",
+    "runs/v18/results/T7_objective_weight.csv": "bfe81d8aa33526b4b1f0e845b5b9a64eb7d9c67fb5a6ed505f8ac3a5b0176829",
+    "runs/v18/results/T8_credit_probe.csv": "9d8356c26a7d863e8f25f10750d8c5071f7438ba152b649350a9080b0d9b4907",
+    "runs/v18/results/T9_natural_year.csv": "c0766850406c778d5fd3e76c361a7c1d1b9118c5ac249c70fccf3fbd640aa0e2",
+    "runs/v18/results/report.md": "f2425a1f5d772b7feefe684475b98f03f52e1569c925f3341595a73c1149601d",
+    "runs/v18/results/stats.json": "fa0b2d58fccca33f3ab8b89012a56335f588b47c8397e0bde05b674faff1a52d",
+    "runs/v18/results/validation.json": "70f66d7854ae6d8d3b03823f1bc4050704f4e42aef187917c84048974f645c46"
+  }
+}

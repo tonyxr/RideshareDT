@@ -1,14 +1,14 @@
 {
   "counts": {
-    "complete": 8,
+    "complete": 9,
     "failed": 1,
-    "pending": 1,
+    "pending": 0,
     "skipped": 0
   },
-  "current_job": "Section 9 products validated; final audit and parity pending",
-  "current_phase": "results_reporting",
-  "projected_hours_left": 0.25,
-  "state": "running",
-  "updated_utc": "2026-11-21T15:55:00Z",
+  "current_job": "CRISP-Ride V18 complete",
+  "current_phase": "complete",
+  "projected_hours_left": 0.0,
+  "state": "complete",
+  "updated_utc": "2026-11-21T15:20:36Z",
   "workers": 10
 }
